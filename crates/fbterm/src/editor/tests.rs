@@ -512,3 +512,33 @@ fn rsa_key_file_shows_a_warning_that_follows_the_path() {
     ed.update(EditorMsg::Auth(AuthChoice::Agent));
     assert!(!ed.selected_key_is_rsa());
 }
+
+#[test]
+fn rsa_warning_does_not_outlive_the_selected_profile() {
+    let dir = std::env::temp_dir().join(format!("fbterm-keys-{}", ProfileId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rsa = dir.join("id_rsa");
+    std::fs::write(
+        &rsa,
+        "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let a = ssh_with(
+        "a",
+        AuthMethod::Key {
+            path: rsa,
+            passphrase: false,
+        },
+    );
+    let a_id = a.id;
+    let b = ssh_with("b", AuthMethod::Agent);
+    let (mut ed, _) = editor(&ProfileStore {
+        profiles: vec![a, b],
+    });
+    assert!(ed.selected_key_is_rsa());
+    ed.update(EditorMsg::Delete);
+    assert!(ed.draft(a_id).is_none());
+    assert!(!ed.selected_key_is_rsa());
+    ed.update(EditorMsg::NewSsh);
+    assert!(!ed.selected_key_is_rsa());
+}

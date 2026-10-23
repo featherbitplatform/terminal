@@ -28,7 +28,3 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 ## Bundled fonts
 
 Geist and Geist Mono are bundled under the SIL Open Font License 1.1. The license text is in `crates/fbterm/assets/fonts/LICENSE`.
-
-## Security advisory exception
-
-`deny.toml` ignores RUSTSEC-2023-0071 (the Marvin timing side channel in the `rsa` crate, which has no fixed release). RSA user keys stay supported, and the app warns when one is used to log in. Verifying a server's RSA host key is not affected.
