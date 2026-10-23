@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Vendored, patched dependencies are not workspace members (not formatted or linted here).
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,3 +37,7 @@ notify = { version = "8", default-features = false, features = ["macos_fsevent"]
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# alacritty_terminal 0.26.0 with one fix; see vendor/alacritty_terminal/FBTERM_PATCHES.md.
+[patch.crates-io]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }

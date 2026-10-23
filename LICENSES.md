@@ -25,6 +25,10 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 - BSL-1.0 is used only by Windows builds, through `clipboard-win` and `error-code`, which `iced_winit` pulls in for Windows clipboard support (`iced_winit` > `window_clipboard` > `clipboard-win` > `error-code`).
 - CC0-1.0 comes from `hexf-parse`, used by the `naga` shader compiler that `wgpu` depends on, and from `notify`, the file-watching crate fbterm uses directly.
 
+## Vendored code
+
+`vendor/alacritty_terminal/` is a copy of `alacritty_terminal` 0.26.0 (Apache-2.0, license in `vendor/alacritty_terminal/LICENSE-APACHE`) with one bug fix, described in `vendor/alacritty_terminal/FBTERM_PATCHES.md`.
+
 ## Bundled fonts
 
 Geist and Geist Mono are bundled under the SIL Open Font License 1.1. The license text is in `crates/fbterm/assets/fonts/LICENSE`.

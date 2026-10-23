@@ -11,7 +11,6 @@ use fbterm_config::Rgb;
 use parking_lot::Mutex;
 
 use crate::Selection;
-use crate::kitty_guard::KittyGuard;
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::{Selection as EmuSelection, SelectionType};
 
@@ -167,7 +166,6 @@ fn dims(size: GridSize) -> Dims {
 pub struct Terminal {
     term: Term<EventProxy>,
     config: Config,
-    kitty_guard: KittyGuard,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
     generation: u64,
@@ -197,7 +195,6 @@ impl Terminal {
         Self {
             term,
             config,
-            kitty_guard: KittyGuard::default(),
             parser: Processor::new(),
             shared,
             generation: 0,
@@ -206,15 +203,7 @@ impl Terminal {
 
     /// Feed bytes received from the session into the emulator.
     pub fn feed(&mut self, bytes: &[u8]) {
-        if self.config.kitty_keyboard {
-            // Keep the protocol's flag stack bounded (see `kitty_guard` for the upstream bug).
-            let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
-            self.kitty_guard.sync_screen(alt);
-            let bytes = self.kitty_guard.filter(bytes);
-            self.parser.advance(&mut self.term, &bytes);
-        } else {
-            self.parser.advance(&mut self.term, bytes);
-        }
+        self.parser.advance(&mut self.term, bytes);
         self.generation += 1;
     }
 
@@ -226,8 +215,6 @@ impl Terminal {
             return;
         }
         self.config.kitty_keyboard = enabled;
-        // Output held back by the guard mid-sequence goes to the emulator unfiltered now.
-        let held = self.kitty_guard.take_held();
         let before = self.shared.lock().events.len();
         self.term.set_options(self.config.clone());
         // Setting options re-announces the current title; nothing changed, so drop that one
@@ -239,11 +226,6 @@ impl Terminal {
             {
                 sh.events.remove(i);
             }
-        }
-        // The emulator dropped both flag stacks.
-        self.kitty_guard.clear_depths();
-        if !held.is_empty() {
-            self.parser.advance(&mut self.term, &held);
         }
         self.generation += 1;
     }
@@ -574,40 +556,56 @@ mod tests {
         assert_eq!(esc(&t), b"\x1b");
     }
 
+    /// Depth of the flag stack, measured by popping: pops `n` and reports whether any
+    /// flags remain. Leaves the stack shorter.
+    fn flags_after_popping(t: &mut Terminal, n: u16) -> bool {
+        t.feed(format!("\x1b[<{n}u").as_bytes());
+        t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL)
+    }
+
+    fn pushes(n: usize) -> Vec<u8> {
+        b"\x1b[>1u".repeat(n)
+    }
+
+    /// Regression test for the vendored alacritty_terminal fix (FBTERM_PATCHES.md): a full
+    /// flag stack evicts its oldest entry instead of panicking.
     #[test]
-    fn flag_stack_floods_do_not_crash_and_pops_still_work() {
+    fn flag_stack_floods_do_not_crash_and_stay_capped() {
         let mut t = Terminal::new(size(80, 24), 100);
         t.set_kitty_keyboard(true);
-        let push = b"\x1b[>1u";
-        let mut flood = Vec::new();
-        for _ in 0..5000 {
-            flood.extend_from_slice(push);
-        }
+        let flood = pushes(5000);
         t.feed(&flood);
-        // Again, split at every possible boundary.
-        for chunk in flood.chunks(7) {
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        // Capped at 4096 entries: popping 4095 leaves one, the next pop empties it.
+        assert!(flags_after_popping(&mut t, 4095));
+        assert!(!flags_after_popping(&mut t, 1));
+        // One byte at a time.
+        for chunk in flood.chunks(1) {
             t.feed(chunk);
         }
-        for chunk in flood[..3000].chunks(1) {
-            t.feed(chunk);
+        assert!(flags_after_popping(&mut t, 4095));
+        assert!(!flags_after_popping(&mut t, 1));
+    }
+
+    #[test]
+    fn screen_swaps_cannot_grow_the_flag_stack_past_its_cap() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        t.set_kitty_keyboard(true);
+        // `CSI ? 1049 ; 0 ; 0 ... h` with 31 extra parameters still swaps screens.
+        let extra = ";0".repeat(31);
+        let enter = format!("\x1b[?1049{extra}h");
+        let leave = format!("\x1b[?1049{extra}l");
+        let burst = pushes(128);
+        for _ in 0..40 {
+            t.feed(&burst);
+            t.feed(enter.as_bytes());
+            t.feed(b"\x1b[<128u");
+            t.feed(leave.as_bytes());
         }
-        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
-        // The stack is full: a further push is dropped, a pop makes room for one.
-        t.feed(b"\x1b[>8u");
-        assert!(!t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
-        t.feed(b"\x1b[<1u\x1b[>8u");
-        assert!(t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
-        t.feed(b"\x1b[<1u");
-        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
-        assert!(!t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
-        t.feed(b"\x1b[<65535u");
-        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
-        // Same on the alternate screen.
-        t.feed(b"\x1b[?1049h");
-        t.feed(&flood);
-        t.feed(b"\x1b[?1049l");
-        t.feed(&flood);
-        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        // Main screen holds 40 * 128 = 5120 pushes, capped at 4096.
+        assert!(flags_after_popping(&mut t, 4095));
+        assert!(!flags_after_popping(&mut t, 1));
     }
 
     #[test]
