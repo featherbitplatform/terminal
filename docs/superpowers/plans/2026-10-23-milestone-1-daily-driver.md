@@ -343,7 +343,7 @@ Plus unit tests (not gated) in `known_hosts.rs`: parse plain and `[host]:port` e
 
 - [ ] **Step 3: Run** `docker compose -f dev/ssh-test/compose.yaml up -d && FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live` — Expected: FAIL.
 
-- [ ] **Step 4: Implement.** Auth order follows `AuthMethod`: `Agent` → `russh::keys::agent::client::AgentClient::connect_env()`; `Key` → `russh::keys::load_secret_key(path, passphrase)` asking `KeyPassphrase` when the store has none or it fails; `Password` → store, then prompter with `retry = true` up to 3 tries. Save to the store only after the server accepts and only if `remember`. Host-key check happens in `ClientHandler::check_server_key` via the context. Enable keepalive (`keepalive_interval` 30 s, `keepalive_max` 3) so dead connections are detected.
+- [ ] **Step 4: Implement.** Auth order follows `AuthMethod`: `Agent` → `russh::keys::agent::client::AgentClient::connect_env()`; `Key` → `russh::keys::load_secret_key(path, passphrase)` asking `KeyPassphrase` when the store has none or it fails; `Password` → store, then prompter with `retry = true` up to 3 tries. Save to the store only after the server accepts and only if `remember`. Host-key check happens in `ClientHandler::check_server_key` via the context. Enable keepalive (`keepalive_interval` 15 s, `keepalive_max` 2) so dead connections are detected.
 
 - [ ] **Step 5: Run** — Expected: PASS. Enable the `ssh-live` CI job (ubuntu: compose up, wait for port 2222, run with `FBTERM_TEST_SSH=1`).
 
