@@ -4,3 +4,4 @@
 .superpowers/
 *.dmg
 /website/.docusaurus
+.DS_Store
