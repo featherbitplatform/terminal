@@ -9,9 +9,9 @@ idle CPU near zero. The numbers may be retuned after measuring.
 
 - `fbterm --perf-tabs <N> --perf-cmd "<cmd>" [--perf-exit-after <secs>]` opens N local tabs in
   one window, each running the command through the user's shell (`$SHELL -c`), the last tab
-  active. The flag implies no session restore, no state saving and in-memory secrets (no
+  active (each shell gets `FBTERM_PERF_TAB` and `FBTERM_PERF_TABS`). The flag implies no session restore, no state saving and in-memory secrets (no
   keychain). It works in release builds. `--perf-exit-after` quits the app cleanly.
-- The script uses a temporary `FBTERM_CONFIG_DIR`, so nothing touches a real config. No screen
+- The script uses a temporary `FBTERM_CONFIG_DIR` (and `--perf-tabs` alone defaults to a fresh temp dir), so nothing touches a real config. No screen
   capture is involved.
 - Per run: wait 30 s (warm-up), read RSS of the fbterm process (`ps -o rss=`), then mean CPU
   over 10 s from the process CPU-time delta (`ps -o cputime=`). The RSS and CPU are of the
@@ -28,52 +28,78 @@ idle CPU near zero. The numbers may be retuned after measuring.
 ## Results
 
 Machine: Apple M5 Max, 128 GB, macOS (Darwin 27.0.0), the owner's working Mac with other apps
-running. Date: 2026-10-23. Commit: see `git log` for `test(perf)`. Load averages (1/5/15 min,
-from `uptime` at the start of each sampling window) are in the raw lines below.
+running. Date: 2026-10-23. Commit: see `git log` for `test(perf)`. Load averages (1/5/15 min)
+are sampled twice per run (`load_start` when the process launches, `load_at_sample` at the
+start of the CPU window) and are in the raw lines. The fbterm window must be visible and
+unoccluded during runs (a hidden window may not render, which would understate CPU).
 
 | Scenario | fbterm RSS (MB), median [range] | fbterm CPU over 10 s, median [range] | child shells RSS (MB) |
 |---|---|---|---|
-| A: 20 tabs, 19 idle + 1 streaming log | 124.9 [122.1 - 143.9] | 0.30% [0.30 - 21.30] | ~29.5 (20 processes) |
-| B: 20 idle tabs | 107.1 [107.0 - 107.5] | 0.00% [0.00 - 0.00] | ~24.2 (20 processes) |
-| C: 19 idle + 1 `yes` flood | 170.7 [126.6 - 170.8] | 102.2% [99.0 - 102.5] | ~24.2 (20 processes) |
+| A: 20 tabs, 19 idle + 1 visible streaming the log | 144.5 [144.0 - 148.2] | 21.9% [5.5 - 22.1] | ~29 (20 processes) |
+| B: 20 idle tabs | 107.1 [107.0 - 107.5] | 0.00% [0.00 - 0.00] | ~24 (20 processes) |
+| C: 19 idle + 1 visible `yes` flood | 168.7 [168.6 - 278.0] | 104.4% [104.3 - 104.5] | ~24 (20 processes) |
 | D: 1 idle tab (baseline) | 103.0 [102.6 - 104.3] | 0.00% [0.00 - 0.00] | ~1.2 |
+| E: 20 tabs, every scrollback full (12,000 lines each), last visible, 120 s soak, then idle | 528.3 [527.5 - 528.8] | 0.00% [0.00 - 0.00] | ~24 (20 processes) |
 
-Verdict: the spec scenario (A) is about 125 MB against the 300 MB target, and 20 idle tabs
-use no measurable CPU. Idle CPU target met.
+Verdict against the ~300 MB target:
 
-Notes on the numbers:
+- Meets it: A (the spec scenario as literally written: idle tabs have little output, ~145 MB),
+  B, C (the one 278 MB run is just under) and D.
+- DOES NOT meet it: E. With every one of the 20 tabs holding its full default scrollback
+  (10,000 lines), fbterm uses about 528 MB resident, roughly 1.75x the target. This is the
+  realistic worst case for a long-lived 20-session workday (every session has produced a lot
+  of output), and the owner should decide between retuning the target or the default
+  scrollback, or optimizing the scrollback storage. Nothing has been tuned.
+- Per-full-tab cost: (E - B) / 20 = (528.3 - 107.1) / 20, about 21 MB per tab with a full
+  10,000-line scrollback of ~100-column lines; an idle tab with an empty scrollback costs
+  about 0.2 MB ((B - D) / 19). The process base is about 103 MB.
+- Idle CPU is near zero (0.00%) in B and E. A with a log streaming into the visible tab costs
+  about 22% of a core (one run 5.5%), at roughly 100 lines per second; C pins one core
+  (about 104%) as it drains `yes` unthrottled.
 
-- Per-tab cost is small: B minus D is about 4 MB for 19 more tabs (roughly 0.2 MB each, idle
-  terminals with a mostly empty 10,000-line scrollback). The base of about 103 MB is the
-  process itself (GPU stack, fonts, UI), not sessions.
-- A run 3 was a CPU outlier (21.3%, RSS 143.9 MB). The load average was falling from a busy
-  period (3.6 at the start of that run) and the log stream had a burst; the other two runs are
-  0.30%. The median is the representative figure; the range is shown for honesty.
-- C runs one core at the cap (about 100%) while the app drains `yes` as fast as the PTY delivers it. RSS was 171 MB in two runs and 127 MB in one; the cause of the spread was not investigated (the default scrollback is 10,000 lines). It is a flood stress case, not the daily target.
-- Child shell RSS includes 19 `sleep` processes plus the visible command.
+Notes:
+
+- Earlier A and C numbers (first commit) were wrong: the streaming command was handed to
+  whichever shell started in the last slot, not reliably the visible tab. Now each tab gets
+  `FBTERM_PERF_TAB` / `FBTERM_PERF_TABS` in its environment and the command branches on it,
+  so the visible tab is deterministic. A and C were re-run; B and D do not depend on that
+  (all tabs idle the same way) and keep their first-round numbers, which the script change
+  does not affect.
+- The spread in A CPU (5.5% vs about 22%) and in C RSS (278 MB once vs 169 MB) was not
+  investigated; any explanation (log bursts, system load, scrollback fill timing) would be
+  speculation.
+- Child shell RSS includes the `sleep`/`yes`/`awk` processes of each tab.
 
 ## Raw runs
 
+All lines: `scenario rss_mb rss_end_mb children children_rss_mb cpu_pct load_start load_at_sample stragglers`.
+
 ```
-A idle+log-stream  rss=122.1 cpu=0.30  load=6.06 8.35 7.27
-A idle+log-stream  rss=124.9 cpu=0.30  load=5.81 7.85 7.15
-A idle+log-stream  rss=143.9 cpu=21.30 load=3.62 6.91 6.84
-B all-idle         rss=107.1 cpu=0.00  load=3.72 6.34 6.63
-B all-idle         rss=107.5 cpu=0.00  load=2.73 5.58 6.33
-B all-idle         rss=107.0 cpu=0.00  load=2.04 4.91 6.03
-C idle+yes         rss=170.8 cpu=102.20 load=1.98 4.41 5.77
-C idle+yes         rss=170.7 cpu=102.50 load=4.14 4.56 5.74
-C idle+yes         rss=126.6 cpu=99.00 load=3.99 4.43 5.62
-D single-idle      rss=104.3 cpu=0.00  load=3.48 4.24 5.47
-D single-idle      rss=102.6 cpu=0.00  load=2.31 3.80 5.23
-D single-idle      rss=103.0 cpu=0.00  load=1.87 3.45 5.01
+A 148.2 148.2 20 29.1   5.50 3.35 3.05 4.27 3.13 3.04 4.23 0
+A 144.0 144.1 20 29.2  22.10 3.26 3.07 4.23 3.60 3.19 4.23 0
+A 144.5 144.8 20 29.5  21.90 3.50 3.18 4.21 3.80 3.29 4.22 0
+C 168.6 168.6 20 24.2 104.40 4.58 3.48 4.27 4.85 3.66 4.31 0
+C 278.0 278.0 20 24.1 104.50 5.02 3.76 4.34 4.26 3.69 4.29 0
+C 168.7 168.7 20 24.1 104.30 4.21 3.70 4.28 4.74 3.87 4.33 0
+E 528.8 528.8 20 24.2   0.00 4.71 3.89 4.33 2.15 3.18 3.98 0
+E 528.3 528.3 20 24.3   0.00 2.13 3.14 3.96 2.59 3.05 3.82 0
+E 527.5 527.5 20 24.2   0.00 2.40 2.98 3.78 3.45 2.98 3.66 0
 ```
 
-No orphaned processes were left after any run (checked each time).
+B and D (first round, load average at sampling 1.8-3.7, children 20 / 1, stragglers 0):
+
+```
+B 107.1 107.1 20 24.1 0.00   B 107.5 107.5 20 24.2 0.00   B 107.0 107.0 20 24.2 0.00
+D 104.3 104.3 1 1.2 0.00     D 102.6 102.6 1 1.2 0.00     D 103.0 103.0 1 1.2 0.00
+```
+
+The script snapshots each run's process tree, stops fbterm (bounded wait, then SIGKILL), kills
+the descendants, removes the temp dir (also on INT/TERM/EXIT via a trap) and exits non-zero if
+any process of the run survives (`stragglers` is that count; always 0).
 
 ## Re-running
 
 ```
-bash dev/perf/sessions.sh                      # everything, 3 runs each (about 11 minutes)
+bash dev/perf/sessions.sh                      # everything, 3 runs each (about 25 minutes)
 SCENARIOS=A RUNS=1 WARMUP=10 bash dev/perf/sessions.sh   # quick check
 ```

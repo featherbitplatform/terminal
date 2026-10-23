@@ -3,6 +3,9 @@
 //! - `--perf-tabs <N> --perf-cmd "<shell command>"`: open N local tabs in one window, each
 //!   running the command through the user's shell (`$SHELL -c`), the last tab active. The flag
 //!   implies no session restore, no state saving and in-memory secrets (no keychain access).
+//! - Each tab's shell gets `FBTERM_PERF_TAB` (1-based) and `FBTERM_PERF_TABS` in its environment.
+//! - Without `FBTERM_CONFIG_DIR` a fresh temporary config dir is used, so perf profiles can never
+//!   reach the real `profiles.toml`.
 //! - `--perf-exit-after <secs>`: quit cleanly after that long.
 //!
 //! There is no `--help`; this comment is the documentation.
@@ -96,7 +99,12 @@ impl App {
                     program: shell.clone().into(),
                     args: vec!["-c".into(), o.cmd.clone()],
                     cwd: None,
-                    env: Default::default(),
+                    // The command can branch on its own tab (1-based) and the tab count.
+                    env: [
+                        ("FBTERM_PERF_TAB".to_string(), (i + 1).to_string()),
+                        ("FBTERM_PERF_TABS".to_string(), o.tabs.to_string()),
+                    ]
+                    .into(),
                 }),
             });
             ids.push(id);
