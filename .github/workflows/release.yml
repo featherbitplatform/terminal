@@ -3,17 +3,32 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  pull_request:
+    paths:
+      - dev/package-macos.sh
+      - crates/fbterm/macos/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+# Read-only by default; only the publish job (tag pushes) gets write access.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  macos:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  package:
     name: unsigned universal macOS dmg
     runs-on: macos-14
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -21,29 +36,51 @@ jobs:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Check tag matches workspace version
+      - name: Resolve version
         id: version
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
           cargo_version="$(awk '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
-          if [ "$tag_version" != "$cargo_version" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match workspace version $cargo_version"
-            exit 1
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME does not match workspace version $cargo_version"
+              exit 1
+            fi
           fi
-          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
       - name: Package
         run: bash dev/package-macos.sh "${{ steps.version.outputs.version }}"
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: fbterm-macos-universal
+          if-no-files-found: error
+          path: |
             target/dist/fbterm-${{ steps.version.outputs.version }}-macos-universal.dmg
             target/dist/fbterm-${{ steps.version.outputs.version }}-macos-universal.dmg.sha256
+
+  publish:
+    name: publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [deny, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fbterm-macos-universal
+          path: dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/fbterm-${{ needs.package.outputs.version }}-macos-universal.dmg
+            dist/fbterm-${{ needs.package.outputs.version }}-macos-universal.dmg.sha256
           generate_release_notes: true
+          prerelease: ${{ contains(needs.package.outputs.version, '-') }}
           fail_on_unmatched_files: true
