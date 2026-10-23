@@ -44,9 +44,9 @@ pub use pool::SshPool;
 pub const HOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Seconds of silence from the server before a keepalive is sent.
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Unanswered keepalives after which the connection is considered dead.
-const KEEPALIVE_MAX: usize = 3;
+const KEEPALIVE_MAX: usize = 2;
 
 /// Asks the user the questions a connection needs answered.
 #[async_trait]
@@ -621,8 +621,8 @@ mod tests {
                 curve: russh::keys::EcdsaCurve::NistP256
             }
         );
-        assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(30)));
-        assert_eq!(cfg.keepalive_max, 3);
+        assert_eq!(cfg.keepalive_interval, Some(Duration::from_secs(15)));
+        assert_eq!(cfg.keepalive_max, 2);
         // Other hosts keep the default order.
         let other = client_config("other", 22, &path);
         assert_eq!(other.preferred.key[0], russh::keys::Algorithm::Ed25519);
