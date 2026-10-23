@@ -124,6 +124,7 @@ monospace by default (Geist Mono bundled, user-selectable font and size), cursor
 reporting, bracketed paste, OSC 8 hyperlinks, selection + copy/paste, scrollback (default 10,000
 lines, configurable), the kitty keyboard protocol where `alacritty_terminal` provides it (used by
 modern TUIs and AI agents). Inline images (sixel/kitty graphics) are out of scope for now.
+The kitty keyboard protocol is optional and off by default (`kitty_keyboard` in `settings.toml`). (Owner decision, 2026-10-23.)
 Programs cannot read or write the clipboard (OSC 52 ignored for writes, reads answered empty); only the user's own copy and paste commands touch it. (Owner decision, 2026-10-23.)
 
 ### 5.3 Process model

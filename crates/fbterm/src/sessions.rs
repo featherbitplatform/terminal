@@ -43,6 +43,7 @@ pub(crate) fn session_stream(
 impl App {
     pub(crate) fn new_terminal(&self, grid: GridSize) -> SharedTerminal {
         let mut term = Terminal::new(grid, self.settings.scrollback_lines);
+        term.set_kitty_keyboard(self.settings.kitty_keyboard);
         self.style.scheme.apply_to(&mut term);
         Arc::new(Mutex::new(term))
     }

@@ -165,6 +165,7 @@ fn dims(size: GridSize) -> Dims {
 /// An emulated terminal: grid, parser and pending events.
 pub struct Terminal {
     term: Term<EventProxy>,
+    config: Config,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
     generation: u64,
@@ -190,9 +191,10 @@ impl Terminal {
             osc52: alacritty_terminal::term::Osc52::OnlyPaste,
             ..Config::default()
         };
-        let term = Term::new(config, &dims(size), proxy);
+        let term = Term::new(config.clone(), &dims(size), proxy);
         Self {
             term,
+            config,
             parser: Processor::new(),
             shared,
             generation: 0,
@@ -203,6 +205,27 @@ impl Terminal {
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         self.generation += 1;
+    }
+
+    /// Accept the kitty keyboard protocol from programs (off by default). While off, programs'
+    /// requests to push, pop, set or query enhancement flags are ignored, so keys keep their
+    /// legacy encoding. Switching it either way drops any flags a program has set.
+    pub fn set_kitty_keyboard(&mut self, enabled: bool) {
+        if self.config.kitty_keyboard == enabled {
+            return;
+        }
+        self.config.kitty_keyboard = enabled;
+        self.term.set_options(self.config.clone());
+        // Setting options re-announces the title; nothing changed, so drop the event.
+        self.shared
+            .lock()
+            .events
+            .retain(|e| !matches!(e, TermEvent::Title(_)));
+        self.generation += 1;
+    }
+
+    pub fn kitty_keyboard(&self) -> bool {
+        self.config.kitty_keyboard
     }
 
     /// Counter bumped by every change that can alter what is drawn.
@@ -462,6 +485,63 @@ mod tests {
         assert_eq!(t.term().grid().display_offset(), 10);
         t.scroll_to_bottom();
         assert_eq!(t.term().grid().display_offset(), 0);
+    }
+
+    fn esc(t: &Terminal) -> Vec<u8> {
+        use iced::keyboard::key::{Code, Named, Physical};
+        use iced::keyboard::{Key, Modifiers};
+        crate::encode_key(
+            &Key::Named(Named::Escape),
+            Physical::Code(Code::Escape),
+            None,
+            Modifiers::empty(),
+            t.mode(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kitty_requests_ignored_when_setting_off() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        assert!(!t.kitty_keyboard());
+        t.feed(b"\x1b[>1u\x1b[=8;1u\x1b[?u");
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert!(reply(&mut t).is_empty(), "no answer to the flags query");
+        assert_eq!(esc(&t), b"\x1b");
+    }
+
+    #[test]
+    fn kitty_push_query_set_pop_when_setting_on() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        t.set_kitty_keyboard(true);
+        t.feed(b"\x1b[>1u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert_eq!(esc(&t), b"\x1b[27u");
+        t.feed(b"\x1b[?u");
+        assert_eq!(reply(&mut t), "\x1b[?1u");
+        t.feed(b"\x1b[=10;2u");
+        assert!(t.mode().contains(
+            TermMode::DISAMBIGUATE_ESC_CODES
+                | TermMode::REPORT_EVENT_TYPES
+                | TermMode::REPORT_ALL_KEYS_AS_ESC
+        ));
+        t.feed(b"\x1b[<u");
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert_eq!(esc(&t), b"\x1b");
+    }
+
+    #[test]
+    fn turning_kitty_off_drops_active_flags() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        t.feed(b"\x1b]0;keep\x07");
+        t.take_events();
+        t.set_kitty_keyboard(true);
+        t.feed(b"\x1b[>31u");
+        assert!(t.mode().contains(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        t.set_kitty_keyboard(false);
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        assert!(t.take_events().is_empty(), "no spurious title event");
+        assert_eq!(esc(&t), b"\x1b");
     }
 
     #[test]

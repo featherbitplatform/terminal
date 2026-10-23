@@ -1,12 +1,16 @@
 //! Terminal emulation and local shells.
 
 mod input;
+mod kitty;
 mod palette;
 mod selection;
 mod terminal;
 mod widget;
 
-pub use input::{MouseButton, MouseKind, MouseReport, encode_key, encode_mouse, encode_paste};
+pub use input::{
+    KeyAction, KeyInput, MouseButton, MouseKind, MouseReport, encode_key, encode_key_input,
+    encode_mouse, encode_paste,
+};
 pub use palette::{ColorScheme, blend, contrast_ratio};
 pub use selection::Selection;
 pub use terminal::{EventProxy, GridSize, SharedTerminal, TermEvent, TermMode, Terminal};

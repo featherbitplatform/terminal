@@ -919,6 +919,8 @@ impl App {
 
     /// Font, size and theme take effect in every open terminal and window at once (they are
     /// read each frame). The scrollback length applies to terminals opened from now on.
+    /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
+    /// protocol flags programs have set, turning it on affects their requests from then on.
     fn apply_settings(&mut self, new: Settings) {
         if new == self.settings {
             return;
@@ -934,6 +936,13 @@ impl App {
         if new.theme != self.settings.theme {
             self.theme = theme::graphite_theme(new.theme);
             self.tokens = theme::tokens(new.theme);
+        }
+        if new.kitty_keyboard != self.settings.kitty_keyboard {
+            for tab in self.windows.values().flat_map(|w| w.tabs.iter()) {
+                if let Some(term) = tab.terminal() {
+                    term.lock().set_kitty_keyboard(new.kitty_keyboard);
+                }
+            }
         }
         tracing::info!("settings.toml reloaded");
         self.settings = new;

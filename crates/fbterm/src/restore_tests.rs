@@ -317,6 +317,40 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
 }
 
 #[test]
+fn kitty_keyboard_setting_reaches_open_and_new_terminals() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let open = |app: &App| {
+        app.windows.values().next().unwrap().tabs[0]
+            .terminal()
+            .cloned()
+            .expect("started tab has a terminal")
+    };
+    assert!(!app.settings.kitty_keyboard, "off by default");
+    assert!(!open(&app).lock().kitty_keyboard());
+    let changed = Changed {
+        profiles: false,
+        settings: true,
+    };
+    std::fs::write(paths.settings(), "kitty_keyboard = true\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert!(app.settings.kitty_keyboard);
+    assert!(open(&app).lock().kitty_keyboard(), "open terminal updated");
+    let grid = open(&app).lock().size();
+    assert!(app.new_terminal(grid).lock().kitty_keyboard());
+    std::fs::write(paths.settings(), "kitty_keyboard = false\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert!(!open(&app).lock().kitty_keyboard());
+}
+
+#[test]
 fn out_of_range_settings_apply_clamped_and_say_so() {
     let paths = paths_with(&[profile("a")]);
     std::fs::write(

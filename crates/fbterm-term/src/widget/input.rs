@@ -12,8 +12,8 @@ use iced::{Event, Rectangle, mouse};
 use super::TerminalOutput;
 use super::geometry::{pixel_to_cell, pixel_to_point};
 use crate::{
-    GridSize, MouseButton, MouseKind, MouseReport, Selection, SharedTerminal, TermMode, Terminal,
-    encode_key, encode_mouse, encode_paste,
+    GridSize, KeyAction, KeyInput, MouseButton, MouseKind, MouseReport, Selection, SharedTerminal,
+    TermMode, Terminal, encode_key_input, encode_mouse, encode_paste,
 };
 
 /// Lines scrolled per wheel notch.
@@ -63,6 +63,29 @@ pub struct InputState {
     last_click: Option<(Instant, Point, u8)>,
     /// Fractional wheel lines not yet applied (trackpads scroll in pixels).
     scroll_acc: f32,
+    /// Keys whose press reached the program: only their releases are reported (kitty keyboard
+    /// protocol event types), never those of chords the app or widget handled itself.
+    held: Vec<keyboard::key::Physical>,
+}
+
+/// Modifier and lock keys: pressing one alone must not disturb the selection or the view.
+fn is_modifier_key(key: &Key) -> bool {
+    use keyboard::key::Named;
+    matches!(
+        key,
+        Key::Named(
+            Named::Shift
+                | Named::Control
+                | Named::Alt
+                | Named::AltGraph
+                | Named::Super
+                | Named::Meta
+                | Named::Hyper
+                | Named::CapsLock
+                | Named::NumLock
+                | Named::ScrollLock
+        )
+    )
 }
 
 /// The chord that opens links: Cmd on macOS, Ctrl elsewhere.
@@ -188,10 +211,12 @@ impl InputState {
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
+                modified_key,
                 physical_key,
+                location,
                 modifiers,
                 text,
-                ..
+                repeat,
             }) if ctx.focused => {
                 self.modifiers = *modifiers;
                 if let Some(chord) = clipboard_chord(key, *modifiers) {
@@ -201,14 +226,62 @@ impl InputState {
                 if keyboard_scroll(&mut term, key, *modifiers, cfg!(target_os = "macos")) {
                     return Effect::REDRAW;
                 }
-                let Some(bytes) =
-                    encode_key(key, *physical_key, text.as_deref(), *modifiers, term.mode())
-                else {
+                let input = KeyInput {
+                    key,
+                    modified_key,
+                    physical: *physical_key,
+                    location: *location,
+                    text: text.as_deref(),
+                    mods: *modifiers,
+                    action: if *repeat {
+                        KeyAction::Repeat
+                    } else {
+                        KeyAction::Press
+                    },
+                };
+                let Some(bytes) = encode_key_input(&input, term.mode()) else {
                     return Effect::NONE;
                 };
-                reset_view(&mut term);
+                if !self.held.contains(physical_key) {
+                    self.held.push(*physical_key);
+                }
+                if !is_modifier_key(key) {
+                    reset_view(&mut term);
+                }
                 out.push(TerminalOutput::Input(bytes));
                 Effect::REDRAW
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased {
+                key,
+                modified_key,
+                physical_key,
+                location,
+                modifiers,
+            }) => {
+                let Some(i) = self.held.iter().position(|p| p == physical_key) else {
+                    return Effect::NONE;
+                };
+                self.held.swap_remove(i);
+                if !ctx.focused {
+                    return Effect::NONE;
+                }
+                let input = KeyInput {
+                    key,
+                    modified_key,
+                    physical: *physical_key,
+                    location: *location,
+                    text: None,
+                    mods: *modifiers,
+                    action: KeyAction::Release,
+                };
+                let mode = ctx.term.lock().mode();
+                match encode_key_input(&input, mode) {
+                    Some(bytes) => {
+                        out.push(TerminalOutput::Input(bytes));
+                        Effect::CAPTURE
+                    }
+                    None => Effect::NONE,
+                }
             }
             Event::Mouse(mouse::Event::ButtonPressed(button)) => self.press(ctx, *button, out),
             Event::Mouse(mouse::Event::ButtonReleased(button)) => self.release(ctx, *button, out),
@@ -498,6 +571,7 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::encode_key;
 
     #[test]
     fn reset_forgets_terminal_state_but_keeps_modifiers() {
@@ -635,5 +709,83 @@ mod tests {
             clipboard_chord(&Key::Character("x".into()), Modifiers::all()),
             None
         );
+    }
+
+    fn key_event(pressed: bool, named: keyboard::key::Named, code: keyboard::key::Code) -> Event {
+        let key = Key::Named(named);
+        let physical_key = keyboard::key::Physical::Code(code);
+        Event::Keyboard(if pressed {
+            keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }
+        } else {
+            keyboard::Event::KeyReleased {
+                key: key.clone(),
+                modified_key: key,
+                physical_key,
+                location: keyboard::Location::Standard,
+                modifiers: Modifiers::empty(),
+            }
+        })
+    }
+
+    fn inputs(out: Vec<TerminalOutput>) -> Vec<Vec<u8>> {
+        out.into_iter()
+            .filter_map(|o| match o {
+                TerminalOutput::Input(b) => Some(b),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn releases_reported_only_for_keys_sent_to_the_program() {
+        use keyboard::key::{Code, Named};
+        let mut t = filled(24);
+        t.set_kitty_keyboard(true);
+        // Disambiguate + event types.
+        t.feed(b"\x1b[>3u");
+        let grid = t.size();
+        let term: SharedTerminal = std::sync::Arc::new(parking_lot::Mutex::new(t));
+        let ctx = Context {
+            term: &term,
+            focused: true,
+            bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(320.0, 384.0)),
+            grid,
+            cursor: mouse::Cursor::Unavailable,
+        };
+        let mut st = InputState::default();
+        let mut clip = iced::advanced::clipboard::Null;
+        let mut out = Vec::new();
+        st.handle(
+            &ctx,
+            &key_event(true, Named::Escape, Code::Escape),
+            &mut clip,
+            &mut out,
+        );
+        st.handle(
+            &ctx,
+            &key_event(false, Named::Escape, Code::Escape),
+            &mut clip,
+            &mut out,
+        );
+        // Released without a press reaching the program (a scroll chord, an app shortcut).
+        st.handle(
+            &ctx,
+            &key_event(false, Named::F5, Code::F5),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(
+            inputs(out),
+            vec![b"\x1b[27u".to_vec(), b"\x1b[27;1:3u".to_vec()]
+        );
+        assert!(st.held.is_empty());
     }
 }

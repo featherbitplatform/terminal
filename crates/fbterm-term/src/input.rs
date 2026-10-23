@@ -1,9 +1,33 @@
 //! Keyboard, paste and mouse input encoding into the bytes a shell expects.
 
 use iced::keyboard::key::{Named, Physical};
-use iced::keyboard::{Key, Modifiers};
+use iced::keyboard::{Key, Location, Modifiers};
 
 use crate::TermMode;
+use crate::kitty;
+
+/// Whether a key event is a first press, an auto-repeat or a release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    Press,
+    Repeat,
+    Release,
+}
+
+/// One keyboard event, as the windowing layer reports it.
+#[derive(Debug, Clone, Copy)]
+pub struct KeyInput<'a> {
+    /// The key without modifiers applied.
+    pub key: &'a Key,
+    /// The key with modifiers (except Ctrl) applied.
+    pub modified_key: &'a Key,
+    pub physical: Physical,
+    pub location: Location,
+    /// Text the press produced, if any (always `None` for releases).
+    pub text: Option<&'a str>,
+    pub mods: Modifiers,
+    pub action: KeyAction,
+}
 
 fn mod_param(mods: Modifiers) -> u8 {
     1 + u8::from(mods.shift()) + 2 * u8::from(mods.alt()) + 4 * u8::from(mods.control())
@@ -114,21 +138,60 @@ fn is_altgr(mods: Modifiers, printable_text: Option<&str>, is_macos: bool) -> bo
     !is_macos && mods.alt() && mods.control() && printable_text.is_some()
 }
 
-/// Encode a key press. Returns `None` when the key produces no input.
+/// Encode a key press with the legacy encoding, or the kitty keyboard protocol when the
+/// program enabled it. Returns `None` when the key produces no input.
 ///
-/// On macOS, chords with Cmd are never encoded (they belong to the application). Option
-/// sends the composed text when it produced a different character, otherwise it acts as Alt
-/// (ESC prefix). Elsewhere Ctrl+Alt with printable text is AltGr and sends the text.
+/// Shorthand for [`encode_key_input`] with a press of an unshifted key in the standard location.
 pub fn encode_key(
     key: &Key,
-    _physical: Physical,
+    physical: Physical,
     text: Option<&str>,
     mods: Modifiers,
     mode: TermMode,
 ) -> Option<Vec<u8>> {
-    if cfg!(target_os = "macos") && mods.logo() {
+    encode_key_input(
+        &KeyInput {
+            key,
+            modified_key: key,
+            physical,
+            location: Location::Standard,
+            text,
+            mods,
+            action: KeyAction::Press,
+        },
+        mode,
+    )
+}
+
+/// Encode a key event. Returns `None` when the event produces no input.
+///
+/// On macOS, chords with Cmd are never encoded (they belong to the application). Option
+/// sends the composed text when it produced a different character, otherwise it acts as Alt
+/// (ESC prefix). Elsewhere Ctrl+Alt with printable text is AltGr and sends the text.
+///
+/// Without kitty keyboard protocol flags in `mode` the legacy encoding is used and releases
+/// produce nothing. With flags (which the emulator accepts only when the `kitty_keyboard`
+/// setting is on), keys are encoded per the protocol's progressive enhancements.
+pub fn encode_key_input(ev: &KeyInput<'_>, mode: TermMode) -> Option<Vec<u8>> {
+    if cfg!(target_os = "macos") && ev.mods.logo() {
         return None;
     }
+    let flags = mode & TermMode::KITTY_KEYBOARD_PROTOCOL;
+    let legacy = || {
+        if ev.action == KeyAction::Release {
+            None
+        } else {
+            legacy_key(ev.key, ev.text, ev.mods, mode)
+        }
+    };
+    if flags.is_empty() {
+        legacy()
+    } else {
+        kitty::encode(ev, flags, cfg!(target_os = "macos"), legacy)
+    }
+}
+
+fn legacy_key(key: &Key, text: Option<&str>, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
     match key {
         Key::Named(named) => named_key(*named, mods, mode),
         Key::Character(s) => {
