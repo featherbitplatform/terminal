@@ -48,8 +48,9 @@ Verdict against the ~300 MB target:
 - DOES NOT meet it: E. With every one of the 20 tabs holding its full default scrollback
   (10,000 lines), fbterm uses about 528 MB resident, roughly 1.75x the target. This is the
   realistic worst case for a long-lived 20-session workday (every session has produced a lot
-  of output), and the owner should decide between retuning the target or the default
-  scrollback, or optimizing the scrollback storage. Nothing has been tuned.
+  of output). Decision (owner, 2026-10-23): keep the 10,000-line default and accept this
+  worst case. Compact scrollback storage, CPU use while streaming and the ~100 MB base are
+  tracked as a performance follow-up in the design spec (section 6). Nothing has been tuned.
 - Per-full-tab cost: (E - B) / 20 = (528.3 - 107.1) / 20, about 21 MB per tab with a full
   10,000-line scrollback of ~100-column lines; an idle tab with an empty scrollback costs
   about 0.2 MB ((B - D) / 19). The process base is about 103 MB.

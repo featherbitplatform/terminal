@@ -35,6 +35,44 @@ Binding design: `docs/superpowers/specs/2026-10-23-featherbit-terminal-design.md
 - Docs website: Docusaurus in `website/`, deployed to `https://featherbitplatform.github.io/terminal/` by `.github/workflows/docs.yml` — same pattern as `../gateway/website`.
 - CI gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check`.
 
+## Commands
+
+Run `source "$HOME/.cargo/env"` first if cargo is not on PATH.
+
+```
+cargo run -p fbterm                                   # build and run the app
+cargo test -p fbterm-config jump_cycle_detected       # one test by name (any crate: -p <crate> <filter>)
+
+# Full gate, as CI runs it (fmt is Linux-only in CI; deny is cargo-deny-action)
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo deny --all-features check
+
+# Live SSH tests (CI job "ssh live tests"; needs Docker)
+docker compose -f dev/ssh-test/compose.yaml up -d && dev/ssh-test/wait-ready.sh
+FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
+docker compose -f dev/ssh-test/compose.yaml down
+
+bash dev/perf/sessions.sh                # 20-tab memory/CPU measurement, about 25 min; see dev/perf/README.md
+bash dev/package-macos.sh <version>      # universal .app + .dmg into target/dist/ (macOS only)
+bash dev/make-icns.sh [mark.png]         # regenerate crates/fbterm/macos/fbterm.icns (needs Pillow)
+cd website && npm start                  # docs dev server; `npm run build` builds (fails on broken links)
+```
+
+### Debug aids (environment variables)
+
+- Always available: `FBTERM_CONFIG_DIR=<dir>` (use this directory instead of the real config), `FBTERM_SECRETS=memory` (never touch the OS keychain), and the release-build measurement flags `--perf-tabs <N> --perf-cmd <cmd> [--perf-exit-after <secs>]`.
+- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`. Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
+- Rule for agents: look at the app only through its own-window screenshots (`FBTERM_SCREENSHOT`), never full-screen capture. Combine with `FBTERM_CONFIG_DIR` and `FBTERM_SECRETS=memory` so a run cannot touch real profiles or secrets.
+
+## Gotchas learned
+
+- Windows CI clippy fails on imports and helpers used only by `#[cfg(unix)]` tests; gate them with the same `cfg`.
+- `hdiutil create` fails locally on macOS 27 ("Resource busy"); `dev/package-macos.sh` falls back to `diskutil image create` locally, CI uses `hdiutil` only.
+- Redraw contract: call `take_dirty` before locking the terminal to draw; hidden tabs leave `Dirty` pending until they are shown.
+- A session can continue into an existing `SharedTerminal` (`spawn_local_into`, `open_shell_into`), which is how reconnect keeps scrollback.
+
 ## Status
 
-Pre-code: the design is approved, milestone 1 (rendering spike, terminal widget, local shells, tabs, SSH profiles with jump hosts, palette, macOS `.dmg`, docs skeleton) is next. Add build/run/test commands here as the workspace is created.
+Milestone 1 (daily driver) is implemented on `feature/milestone-1`: GPU terminal widget on `alacritty_terminal`, local shells, tabs and multiple windows with layout restore, SSH profiles (password, key, agent) with jump hosts, shared connection per profile and host-key checks, profile editor, quick-launch palette, TOML settings, Graphite theme, CI on macOS/Linux/Windows with live SSH tests, unsigned macOS `.dmg` packaging and release workflow, and the Docusaurus docs site. Memory/CPU measurements and the owner's scrollback decision are in `dev/perf/README.md` and spec section 7. Next: milestone 2 (see the spec, section 6); the 0.1.0 release is the owner's call.
