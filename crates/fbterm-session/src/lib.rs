@@ -62,6 +62,8 @@ pub struct SessionHandle {
     pub terminal: SharedTerminal,
     pub(crate) commands: std::sync::mpsc::Sender<Command>,
     pub(crate) dirty_pending: Arc<AtomicBool>,
+    pub(crate) bell_pending: Arc<AtomicBool>,
+    pub(crate) killer: Arc<parking_lot::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
 }
 
 impl SessionHandle {
@@ -82,13 +84,20 @@ impl SessionHandle {
     }
 
     /// Kill the session and stop its threads. Safe to call repeatedly.
+    ///
+    /// The child is killed directly, so this works even if the writer is blocked.
     pub fn close(&self) {
+        let _ = self.killer.lock().kill();
         let _ = self.commands.send(Command::Close);
     }
 
-    /// The UI calls this when it redraws, re-arming the next `Dirty` event.
-    pub fn ack_dirty(&self) {
-        self.dirty_pending.store(false, Ordering::Release);
+    /// Re-arm redraw notifications; returns whether a `Dirty` was pending.
+    ///
+    /// Call this immediately BEFORE locking the terminal to draw, so output
+    /// fed after the draw starts raises a fresh `Dirty`. Also re-arms `Bell`.
+    pub fn take_dirty(&self) -> bool {
+        self.bell_pending.store(false, Ordering::Release);
+        self.dirty_pending.swap(false, Ordering::AcqRel)
     }
 }
 

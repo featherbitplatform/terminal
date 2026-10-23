@@ -1,9 +1,10 @@
 //! Local PTY sessions.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
+use std::time::Duration;
 
 use fbterm_config::LocalProfile;
 use fbterm_term::{GridSize, TermEvent, Terminal};
@@ -11,6 +12,10 @@ use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 use crate::{Command, EventSink, SessionError, SessionEvent, SessionHandle, SessionId};
+
+/// How long the waiter lets the reader drain after the child exits before
+/// announcing `Exited` anyway (a grandchild may still hold the PTY open).
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 fn pty_size(size: GridSize) -> PtySize {
     PtySize {
@@ -57,37 +62,65 @@ pub fn spawn_local(
     // The child holds its own copy; keeping ours would stop the reader seeing EOF on Unix.
     drop(pair.slave);
 
-    let mut reader = pair
+    let io = pair
         .master
         .try_clone_reader()
-        .map_err(|e| SessionError::Pty(e.to_string()))?;
-    let writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| SessionError::Pty(e.to_string()))?;
-    let mut killer = child.clone_killer();
+        .and_then(|r| pair.master.take_writer().map(|w| (r, w)));
+    let (mut reader, writer) = match io {
+        Ok(io) => io,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SessionError::Pty(e.to_string()));
+        }
+    };
+    let killer = Arc::new(Mutex::new(child.clone_killer()));
 
     let id = SessionId::next();
     let terminal = Arc::new(Mutex::new(Terminal::new(size, scrollback)));
     let dirty_pending = Arc::new(AtomicBool::new(false));
+    let bell_pending = Arc::new(AtomicBool::new(false));
     let (tx, rx) = channel::<Command>();
+    let (done_tx, done_rx) = channel::<()>();
 
     std::thread::Builder::new()
         .name(format!("fbterm-pty-writer-{}", id.0))
-        .spawn(move || writer_loop(rx, writer, pair.master, &mut *killer))?;
+        .spawn(move || writer_loop(rx, writer, pair.master))?;
+
+    // Waiter: the only place `Exited` is produced, so it fires exactly once and
+    // does not depend on the output pipe reaching EOF (ConPTY, lingering grandchildren).
+    let waiter_tx = tx.clone();
+    let waiter_events = events.clone();
+    let waiter_dirty = dirty_pending.clone();
+    std::thread::Builder::new()
+        .name(format!("fbterm-pty-waiter-{}", id.0))
+        .spawn(move || {
+            let code = child.wait().ok().map(|s| s.exit_code() as i32);
+            // Dropping the master closes the pseudoconsole, which unblocks the reader on Windows.
+            let _ = waiter_tx.send(Command::Close);
+            let _ = done_rx.recv_timeout(DRAIN_GRACE);
+            if !waiter_dirty.swap(true, Ordering::AcqRel) {
+                let _ = waiter_events.send((id, SessionEvent::Dirty));
+            }
+            let _ = waiter_events.send((id, SessionEvent::Exited(code)));
+        })?;
 
     let reader_tx = tx.clone();
     let reader_terminal = terminal.clone();
     let reader_dirty = dirty_pending.clone();
+    let reader_bell = bell_pending.clone();
     std::thread::Builder::new()
         .name(format!("fbterm-pty-reader-{}", id.0))
         .spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
+            let mut last_title: Option<String> = None;
             loop {
                 // EOF, or EIO once the child side closes on Unix: either way we are done.
                 let n = match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 };
                 let term_events = {
                     let mut term = reader_terminal.lock();
@@ -100,10 +133,15 @@ pub fn spawn_local(
                             let _ = reader_tx.send(Command::Input(bytes));
                         }
                         TermEvent::Title(t) => {
-                            let _ = events.send((id, SessionEvent::Title(t)));
+                            if last_title.as_deref() != Some(t.as_str()) {
+                                last_title = Some(t.clone());
+                                let _ = events.send((id, SessionEvent::Title(t)));
+                            }
                         }
                         TermEvent::Bell => {
-                            let _ = events.send((id, SessionEvent::Bell));
+                            if !reader_bell.swap(true, Ordering::AcqRel) {
+                                let _ = events.send((id, SessionEvent::Bell));
+                            }
                         }
                         TermEvent::ClipboardStore(s) => {
                             let _ = events.send((id, SessionEvent::ClipboardStore(s)));
@@ -115,13 +153,7 @@ pub fn spawn_local(
                     let _ = events.send((id, SessionEvent::Dirty));
                 }
             }
-            let code = child.wait().ok().map(|s| s.exit_code() as i32);
-            if !reader_dirty.swap(true, Ordering::AcqRel) {
-                let _ = events.send((id, SessionEvent::Dirty));
-            }
-            let _ = events.send((id, SessionEvent::Exited(code)));
-            // Release the master so the writer thread ends too.
-            let _ = reader_tx.send(Command::Close);
+            let _ = done_tx.send(());
         })?;
 
     Ok(SessionHandle {
@@ -129,6 +161,8 @@ pub fn spawn_local(
         terminal,
         commands: tx,
         dirty_pending,
+        bell_pending,
+        killer,
     })
 }
 
@@ -136,7 +170,6 @@ fn writer_loop(
     rx: Receiver<Command>,
     mut writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
-    killer: &mut dyn portable_pty::ChildKiller,
 ) {
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -155,8 +188,6 @@ fn writer_loop(
             Command::Close => break,
         }
     }
-    // Idempotent; a no-op if the child already exited.
-    let _ = killer.kill();
     drop(writer);
     drop(master);
 }

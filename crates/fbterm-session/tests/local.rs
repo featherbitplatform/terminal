@@ -133,7 +133,7 @@ async fn flood_coalesces_dirty_events() {
                     }
                     // Model a UI redrawing at ~60 Hz.
                     tokio::time::sleep(Duration::from_millis(16)).await;
-                    h.ack_dirty();
+                    h.take_dirty();
                 }
                 SessionEvent::Exited(c) => return c,
                 _ => {}
@@ -155,4 +155,55 @@ async fn close_ends_session_and_drop_is_safe() {
     drop(h);
     let (h2, _rx2) = start(&profile("sleep", &["30"]), size(80, 24));
     drop(h2);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn output_after_ack_rearms_dirty() {
+    let (h, mut rx) = start(&profile("cat", &[]), size(80, 24));
+    h.send(b"one\n".to_vec());
+    next_dirty(&mut rx).await;
+    assert!(h.take_dirty());
+    // Drain Dirty events caused by echo/tty output of the first write.
+    wait_for_text(&h, "one", 2).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    while rx.try_recv().is_ok() {}
+    h.take_dirty();
+    h.send(b"two\n".to_vec());
+    next_dirty(&mut rx).await;
+    h.close();
+}
+
+#[cfg(unix)]
+async fn next_dirty(rx: &mut UnboundedReceiver<(SessionId, SessionEvent)>) {
+    timeout(LIMIT, async {
+        loop {
+            if let Some((_, SessionEvent::Dirty)) = rx.recv().await {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("no Dirty");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn exit_fires_even_if_grandchild_holds_pty() {
+    let (h, mut rx) = start(
+        &profile("sh", &["-c", "sleep 30 & echo done"]),
+        size(80, 24),
+    );
+    assert_eq!(wait_exit(&mut rx).await, Some(0));
+    assert!(grid_text(&h).contains("done"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn close_kills_child_with_blocked_writer() {
+    let (h, mut rx) = start(&profile("sleep", &["30"]), size(80, 24));
+    h.send(vec![b'x'; 4 * 1024 * 1024]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    h.close();
+    wait_exit(&mut rx).await;
 }
