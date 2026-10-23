@@ -17,7 +17,7 @@ use tokio::sync::mpsc::unbounded_channel;
 
 use crate::keys::Action;
 use crate::sessions::{EventReceiver, prompter, session_stream, write_notice};
-use crate::tabs::{Tab, TabId, TabState, WindowState};
+use crate::tabs::{self, Tab, TabId, TabState, WindowState};
 use crate::theme;
 
 /// Palette messages. Placeholder until the palette exists (it replaces this enum).
@@ -50,6 +50,14 @@ pub enum EditorMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PromptMsg {
     Dismiss,
+}
+
+/// What a tab bar asks of its own window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabBarMsg {
+    Select(usize),
+    Close(usize),
+    New,
 }
 
 /// A value handed through a (cloneable) message exactly once.
@@ -99,7 +107,10 @@ pub enum Message {
     NewWindow,
     WindowOpened(window::Id),
     WindowFocused(window::Id),
+    WindowUnfocused(window::Id),
     WindowClosed(window::Id),
+    /// A click in a window's tab bar; acts on that window whatever has focus.
+    TabBar(window::Id, TabBarMsg),
     Shortcut(window::Id, Action),
     DismissNotices,
     Palette(PaletteMsg),
@@ -123,13 +134,19 @@ pub struct App {
     /// Config problems found at startup (path:line: message), shown until dismissed.
     pub notices: Vec<String>,
     pub notices_dismissed: bool,
+    /// `profiles.toml` exists but could not be parsed; the in-memory profiles are a stand-in.
+    /// While set, nothing may save the profile store: that would overwrite the user's file.
+    pub profiles_load_failed: bool,
     pub(crate) fallback: Option<Arc<FallbackStore>>,
     pub(crate) pool: Arc<SshPool>,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
     pub windows: BTreeMap<window::Id, WindowState>,
     pub(crate) grids: HashMap<window::Id, GridSize>,
+    /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
+    /// Whether one of our windows has focus at all (the app is in front).
+    pub app_active: bool,
     pub style: TerminalStyle,
     pub style_unfocused: TerminalStyle,
     pub theme: Theme,
@@ -151,13 +168,16 @@ fn paths() -> Paths {
 
 /// Load profiles without ever writing the file. A missing file is seeded with the discovered
 /// shells; a malformed one is reported and replaced in memory by them.
-fn load_profiles(paths: &Paths, notices: &mut Vec<String>) -> ProfileStore {
+/// Returns the store and whether the file failed to load.
+fn load_profiles(paths: &Paths, notices: &mut Vec<String>) -> (ProfileStore, bool) {
     let path = paths.profiles();
+    let mut failed = false;
     let mut store = if path.exists() {
         match ProfileStore::load(&path) {
             Ok(store) => store,
             Err(e) => {
                 notices.push(e.to_string());
+                failed = true;
                 ProfileStore::default()
             }
         }
@@ -174,7 +194,17 @@ fn load_profiles(paths: &Paths, notices: &mut Vec<String>) -> ProfileStore {
     for e in store.validate() {
         notices.push(format!("{}: {e}", path.display()));
     }
-    store
+    (store, failed)
+}
+
+/// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`); release builds
+/// ignore them.
+fn debug_env(name: &str) -> Option<std::ffi::OsString> {
+    if cfg!(debug_assertions) {
+        std::env::var_os(name).filter(|v| !v.is_empty())
+    } else {
+        None
+    }
 }
 
 impl App {
@@ -185,7 +215,7 @@ impl App {
             notices.push(e.to_string());
             Settings::default()
         });
-        let profiles = load_profiles(&paths, &mut notices);
+        let (profiles, profiles_load_failed) = load_profiles(&paths, &mut notices);
 
         // FBTERM_SECRETS=memory (debug aid) keeps secrets in memory and never touches the keychain.
         let (secrets, fallback): (Arc<dyn SecretStore>, _) =
@@ -220,6 +250,7 @@ impl App {
             profiles,
             notices,
             notices_dismissed: false,
+            profiles_load_failed,
             fallback,
             pool,
             events,
@@ -227,12 +258,13 @@ impl App {
             windows: BTreeMap::new(),
             grids: HashMap::new(),
             focused: None,
+            app_active: true,
             style_unfocused: TerminalStyle {
                 focused: false,
                 ..style.clone()
             },
             style,
-            screenshot: std::env::var_os("FBTERM_SCREENSHOT").map(PathBuf::from),
+            screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
             shooting: false,
         };
         let mut task = app.open_window(app.default_profile());
@@ -243,9 +275,10 @@ impl App {
     /// `FBTERM_OPEN_TABS=name,name` (debug aid until restore exists): extra tabs opened in the
     /// first window at startup, by profile name.
     fn open_debug_tabs(&mut self) -> Task<Message> {
-        let Ok(list) = std::env::var("FBTERM_OPEN_TABS") else {
+        let Some(list) = debug_env("FBTERM_OPEN_TABS") else {
             return Task::none();
         };
+        let list = list.to_string_lossy().into_owned();
         let Some(&wid) = self.windows.keys().next() else {
             return Task::none();
         };
@@ -283,6 +316,9 @@ impl App {
             return Vec::new();
         }
         let mut out = self.notices.clone();
+        if self.profiles_load_failed {
+            out.push("Profiles are read-only until profiles.toml is fixed".into());
+        }
         if self.fallback.as_ref().is_some_and(|f| f.degraded()) {
             out.push("Keychain unavailable: passwords are kept for this session only".into());
         }
@@ -302,6 +338,7 @@ impl App {
                 .map(|(id, ev)| Message::Session(id, ev)),
             iced::event::listen_with(|event, _, id| match event {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
+                Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
@@ -360,7 +397,23 @@ impl App {
             }
             Message::WindowFocused(id) => {
                 self.focused = Some(id);
-                self.ensure_started(id)
+                self.app_active = true;
+                self.shown(id)
+            }
+            Message::WindowUnfocused(id) => {
+                // Focus moving to another of our windows reports Focused for it right after.
+                if self.focused == Some(id) {
+                    self.app_active = false;
+                }
+                Task::none()
+            }
+            Message::TabBar(wid, msg) => {
+                self.focused = Some(wid);
+                match msg {
+                    TabBarMsg::Select(i) => self.with_window(wid, |w| w.select(i)),
+                    TabBarMsg::Close(i) => self.close_tab(wid, i),
+                    TabBarMsg::New => self.action(Some(wid), Action::NewTab),
+                }
             }
             Message::WindowClosed(id) => {
                 // Dropping the window's tabs closes their sessions and abandons their dials.
@@ -411,14 +464,22 @@ impl App {
             .or_else(|| self.windows.keys().next().copied())
     }
 
-    /// Change tab selection in the focused window; start the newly shown tab if needed.
+    /// Change tab selection in the focused window.
     fn with_focused(&mut self, f: impl FnOnce(&mut WindowState) -> bool) -> Task<Message> {
-        let Some(wid) = self.focused_window() else {
-            return Task::none();
-        };
-        let changed = self.windows.get_mut(&wid).is_some_and(f);
-        if changed {
-            self.ensure_started(wid)
+        match self.focused_window() {
+            Some(wid) => self.with_window(wid, f),
+            None => Task::none(),
+        }
+    }
+
+    /// Change tab selection in `wid`; the newly shown tab gets [`App::shown`].
+    fn with_window(
+        &mut self,
+        wid: window::Id,
+        f: impl FnOnce(&mut WindowState) -> bool,
+    ) -> Task<Message> {
+        if self.windows.get_mut(&wid).is_some_and(f) {
+            self.shown(wid)
         } else {
             Task::none()
         }
@@ -492,14 +553,19 @@ impl App {
         if closed.window_empty {
             window::close(wid)
         } else {
-            self.ensure_started(wid)
+            self.shown(wid)
         }
     }
 
-    /// Start the active tab of `wid` if it has never been started (restored tabs connect on
-    /// first focus).
-    fn ensure_started(&mut self, wid: window::Id) -> Task<Message> {
-        match self.windows.get(&wid).and_then(WindowState::active_tab) {
+    /// The active tab of `wid` was just shown (selected, created, or its window focused): take
+    /// the redraw its session left pending while hidden (the redraw follows this update), and
+    /// start it if it never was (restored tabs connect on first focus).
+    fn shown(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(window) = self.windows.get(&wid) else {
+            return Task::none();
+        };
+        tabs::on_shown(window);
+        match window.active_tab() {
             Some(t) if t.state == TabState::NotConnected => {
                 let id = t.id;
                 self.start(wid, id)

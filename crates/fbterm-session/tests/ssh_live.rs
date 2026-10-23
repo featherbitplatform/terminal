@@ -894,6 +894,40 @@ mod pool {
     }
 
     #[tokio::test]
+    async fn reconnect_into_existing_terminal_keeps_old_content() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (h, mut rx) = open(&pool, &w, w.bastion).await;
+        run(&h, "echo \"@@first-$((40+2))@@\"");
+        wait_for(&h, "@@first-42@@").await;
+        run(&h, "exit");
+        wait_end(&mut rx).await;
+        let term = h.terminal.clone();
+        drop(h);
+
+        let (tx, _rx2): (EventSink, _) = unbounded_channel();
+        let h2 = tokio::time::timeout(
+            STEP,
+            pool.open_shell_into(&w.store, &w.bastion, term.clone(), tx),
+        )
+        .await
+        .expect("open_shell_into timed out")
+        .expect("open_shell_into");
+        assert!(Arc::ptr_eq(&h2.terminal, &term));
+        run(&h2, "echo \"@@second-$((40+3))@@\"");
+        let text = wait_for(&h2, "@@second-43@@").await;
+        let first = text.find("@@first-42@@").expect("old content kept");
+        let second = text.find("@@second-43@@").unwrap();
+        assert!(
+            first < second,
+            "new output must follow the old content:\n{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn resize_reaches_the_remote_pty() {
         if !enabled() {
             return;

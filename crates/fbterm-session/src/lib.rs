@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use fbterm_term::{GridSize, SharedTerminal, TermEvent};
 
-pub use local::spawn_local;
+pub use local::{spawn_local, spawn_local_into};
 
 /// Identifies one session for the lifetime of the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

@@ -4,6 +4,8 @@
 //! - `FBTERM_CONFIG_DIR=<dir>`: read `profiles.toml` and `settings.toml` from `<dir>` instead of
 //!   the platform config directory.
 //! - `FBTERM_SECRETS=memory`: keep secrets in memory only; the OS keychain is never touched.
+//!
+//! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
