@@ -26,6 +26,28 @@ fn stable_id(program: &std::path::Path) -> ProfileId {
     ProfileId(uuid::Builder::from_custom_bytes(h.to_be_bytes()).into_uuid())
 }
 
+/// Shells known to start as a login shell with a lone `-l` argument.
+const LOGIN_FLAG_SHELLS: [&str; 10] = [
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu",
+];
+
+/// Arguments a discovered shell starts with. On Unix a known shell starts as a login shell, so
+/// it reads the system and user profiles (`/etc/zprofile`, `~/.zprofile`, `~/.bash_profile`,
+/// ...) that set `PATH` and friends: an app started from the desktop inherits only a minimal
+/// environment. Windows shells and unknown programs get no arguments.
+fn discovered_args(program: &std::path::Path) -> Vec<String> {
+    if cfg!(unix)
+        && program
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| LOGIN_FLAG_SHELLS.contains(&n))
+    {
+        vec!["-l".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
 fn local_profile(program: PathBuf) -> Profile {
     let name = program
         .file_stem()
@@ -37,8 +59,8 @@ fn local_profile(program: PathBuf) -> Profile {
         group: None,
         accent: None,
         kind: ProfileKind::Local(LocalProfile {
+            args: discovered_args(&program),
             program,
-            args: Vec::new(),
             cwd: None,
             env: Default::default(),
         }),
@@ -124,6 +146,35 @@ mod tests {
             && sh.is_file()
         {
             assert_eq!(programs[0], sh);
+        }
+    }
+
+    #[test]
+    fn discovered_unix_shells_start_as_login_shells() {
+        for sh in [
+            "/bin/sh",
+            "/bin/bash",
+            "/bin/zsh",
+            "/usr/local/bin/fish",
+            "/bin/dash",
+            "/bin/ksh",
+            "/bin/tcsh",
+        ] {
+            let p = super::local_profile(sh.into());
+            let crate::ProfileKind::Local(l) = &p.kind else {
+                panic!("local")
+            };
+            assert_eq!(l.args, ["-l"], "{sh}");
+        }
+        assert!(super::discovered_args(std::path::Path::new("/opt/bin/myshell")).is_empty());
+        for p in super::discover_shells() {
+            let crate::ProfileKind::Local(l) = &p.kind else {
+                continue;
+            };
+            let name = l.program.file_name().unwrap().to_str().unwrap();
+            if super::LOGIN_FLAG_SHELLS.contains(&name) {
+                assert_eq!(l.args, ["-l"], "{name}");
+            }
         }
     }
 
