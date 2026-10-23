@@ -256,16 +256,83 @@ pub(crate) fn write_notice(tab: &Tab, text: &str, fresh: bool) {
     }
 }
 
-/// Open a link with the system opener. Only web, mail and file links are opened.
-fn open_url(url: &str) {
-    let allowed = ["http://", "https://", "mailto:", "file://"];
-    if !allowed
+/// What to do with a link the user clicked. The link comes from program output, so only
+/// schemes whose handlers never run local programs are opened.
+#[derive(Debug, PartialEq, Eq)]
+enum LinkAction {
+    /// Hand the link to the system opener.
+    Open,
+    /// A local file: show it in the file manager, never open (and so never run) it.
+    Reveal(std::path::PathBuf),
+    Refuse,
+}
+
+/// Decide what a click on `url` does: web and mail links open; `file://` links to an
+/// absolute path are revealed; everything else (`javascript:`, `data:`, `ssh:`, custom app
+/// schemes, malformed file links) is refused.
+fn link_action(url: &str) -> LinkAction {
+    let lower = url.to_ascii_lowercase();
+    if ["http://", "https://", "mailto:"]
         .iter()
-        .any(|p| url.to_ascii_lowercase().starts_with(p))
+        .any(|p| lower.starts_with(p))
     {
-        tracing::warn!(%url, "not opening link with an unsupported scheme");
-        return;
+        return LinkAction::Open;
     }
+    if lower.starts_with("file://") {
+        // file://host/path: the authority (often the host name of the machine that printed
+        // the link) is ignored; only the path is used.
+        let rest = &url["file://".len()..];
+        let path = rest.find('/').map_or("", |i| &rest[i..]);
+        let path = path.split(['?', '#']).next().unwrap_or_default();
+        return match percent_decode(path) {
+            Some(p) if p.starts_with('/') && !p.contains('\0') => {
+                LinkAction::Reveal(std::path::PathBuf::from(p))
+            }
+            _ => LinkAction::Refuse,
+        };
+    }
+    LinkAction::Refuse
+}
+
+/// Decode `%XX` escapes; `None` for a malformed escape or a result that is not UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Act on a clicked link (see [`link_action`]).
+fn open_url(url: &str) {
+    let cmd = match link_action(url) {
+        LinkAction::Open => opener(url),
+        LinkAction::Reveal(path) => match reveal(&path) {
+            Some(cmd) => cmd,
+            None => {
+                tracing::info!(path = %path.display(), "not opening a file link on this system");
+                return;
+            }
+        },
+        LinkAction::Refuse => {
+            tracing::warn!(%url, "not opening link with an unsupported scheme");
+            return;
+        }
+    };
+    spawn_reaped(cmd, url);
+}
+
+/// The system opener for a web or mail link.
+fn opener(url: &str) -> std::process::Command {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("open");
     #[cfg(windows)]
@@ -276,11 +343,84 @@ fn open_url(url: &str) {
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = std::process::Command::new("xdg-open");
-    match cmd.arg(url).spawn() {
+    cmd.arg(url);
+    cmd
+}
+
+/// Show a local file in the file manager without opening it. Only macOS has a reveal that
+/// cannot launch the file; elsewhere file links are logged and left alone.
+#[cfg(target_os = "macos")]
+fn reveal(path: &std::path::Path) -> Option<std::process::Command> {
+    let mut cmd = std::process::Command::new("open");
+    // `path` is absolute, so it can never be taken for an option.
+    cmd.arg("-R").arg(path);
+    Some(cmd)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn reveal(_path: &std::path::Path) -> Option<std::process::Command> {
+    None
+}
+
+fn spawn_reaped(mut cmd: std::process::Command, url: &str) {
+    match cmd.spawn() {
         // Reap the opener so it does not linger as a zombie.
         Ok(mut child) => {
             std::thread::spawn(move || child.wait());
         }
         Err(e) => tracing::warn!(%url, error = %e, "could not open link"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinkAction, link_action};
+
+    #[test]
+    fn web_and_mail_links_open() {
+        for url in [
+            "http://example.com",
+            "https://example.com/a?b#c",
+            "HTTPS://EXAMPLE.COM",
+            "mailto:someone@example.com",
+        ] {
+            assert_eq!(link_action(url), LinkAction::Open, "{url}");
+        }
+    }
+
+    #[test]
+    fn file_links_are_revealed_never_opened() {
+        assert_eq!(
+            link_action("file:///Applications/Calculator.app"),
+            LinkAction::Reveal("/Applications/Calculator.app".into())
+        );
+        assert_eq!(
+            link_action("file://build-host/home/me/My%20File.txt"),
+            LinkAction::Reveal("/home/me/My File.txt".into())
+        );
+        assert_eq!(
+            link_action("FILE://localhost/tmp/x?q#frag"),
+            LinkAction::Reveal("/tmp/x".into())
+        );
+    }
+
+    #[test]
+    fn other_schemes_and_bad_file_links_are_refused() {
+        for url in [
+            "javascript:alert(1)",
+            "data:text/html,hi",
+            "ssh://host",
+            "vscode://file/x",
+            "x-custom-app:run",
+            "ftp://example.com",
+            "/etc/passwd",
+            "",
+            "file://",
+            "file://hostonly",
+            "file:///bad%zz",
+            "file:///a%00b",
+        ] {
+            assert_eq!(link_action(url), LinkAction::Refuse, "{url}");
+        }
     }
 }
