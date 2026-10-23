@@ -25,6 +25,11 @@ impl Selection {
         self.head = point;
     }
 
+    /// First and last selected points, in grid order.
+    pub fn bounds(&self) -> (Point, Point) {
+        self.ordered()
+    }
+
     fn ordered(&self) -> (Point, Point) {
         if self.anchor <= self.head {
             (self.anchor, self.head)

@@ -93,6 +93,8 @@ struct State {
     /// Terminal and grid size last synced to the terminal, to avoid locking on every event.
     synced: Option<(usize, GridSize)>,
     input: input::InputState,
+    /// Terminal the input state belongs to.
+    input_term: Option<usize>,
 }
 
 fn term_id(term: &SharedTerminal) -> usize {
@@ -187,6 +189,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<State>();
+        let id = term_id(self.term);
+        if state.input_term != Some(id) {
+            state.input.reset();
+            state.input_term = Some(id);
+        }
         let bounds = layout.bounds();
         self.sync_size(state, bounds, shell);
         let Some(m) = state.measured else { return };

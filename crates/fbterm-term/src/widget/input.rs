@@ -108,6 +108,14 @@ fn reset_view(term: &mut Terminal) {
 }
 
 impl InputState {
+    /// Forget per-terminal state (the widget slot now shows another terminal); keeps modifiers.
+    pub fn reset(&mut self) {
+        *self = Self {
+            modifiers: self.modifiers,
+            ..Self::default()
+        };
+    }
+
     pub fn hover(&self) -> Option<&Hyperlink> {
         self.hover.as_ref()
     }
@@ -237,12 +245,15 @@ impl InputState {
         let mut term = ctx.term.lock();
         let mode = term.mode();
         let cell = pixel_to_cell(pos, ctx.grid);
-        if button == mouse::Button::Left
-            && link_modifier(self.modifiers)
-            && let Some(link) = &self.hover
-        {
-            out.push(TerminalOutput::OpenUrl(link.uri().to_owned()));
-            return Effect::CAPTURE;
+        let offset = term.term().grid().display_offset();
+        let point = pixel_to_point(pos, ctx.grid, offset);
+        if button == mouse::Button::Left && link_modifier(self.modifiers) {
+            // Read the link from the clicked cell: the content may have changed under a still
+            // pointer since the hover was last computed.
+            if let Some(link) = term.term().grid()[point].hyperlink() {
+                out.push(TerminalOutput::OpenUrl(link.uri().to_owned()));
+                return Effect::CAPTURE;
+            }
         }
         if self.reporting(mode) {
             let b = match button {
@@ -258,8 +269,6 @@ impl InputState {
         if button != mouse::Button::Left {
             return Effect::NONE;
         }
-        let offset = term.term().grid().display_offset();
-        let point = pixel_to_point(pos, ctx.grid, offset);
         let now = Instant::now();
         let count = match self.last_click {
             Some((at, p, n)) if p == point && now.duration_since(at) <= MULTI_CLICK => n % 3 + 1,
@@ -269,10 +278,13 @@ impl InputState {
         self.drag = None;
         match count {
             1 if self.modifiers.shift() && term.selection().is_some() => {
-                let mut sel = *term.selection().expect("checked");
+                // Keep the end farther from the click fixed and move the other one.
+                let (start, end) = term.selection().expect("checked").bounds();
+                let anchor = if point >= start { start } else { end };
+                let mut sel = Selection::start(anchor);
                 sel.update(point);
                 term.set_selection(Some(sel));
-                self.drag = Some((point, true));
+                self.drag = Some((anchor, true));
             }
             1 => {
                 if term.selection().is_some() {
@@ -344,12 +356,12 @@ impl InputState {
         if let Some((anchor, started)) = self.drag {
             let mut term = ctx.term.lock();
             let point = pixel_to_point(pos, ctx.grid, term.term().grid().display_offset());
-            let mut sel = match (started, term.selection()) {
-                (true, Some(s)) => *s,
-                _ => Selection::start(anchor),
-            };
+            if !started && point == anchor {
+                return Effect::CAPTURE;
+            }
+            let mut sel = Selection::start(anchor);
             sel.update(point);
-            if term.selection() != Some(&sel) {
+            if term.selection().map(|s| s.bounds()) != Some(sel.bounds()) {
                 term.set_selection(Some(sel));
             }
             self.drag = Some((anchor, true));
@@ -438,6 +450,22 @@ impl InputState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reset_forgets_terminal_state_but_keeps_modifiers() {
+        let mut st = InputState {
+            modifiers: Modifiers::SHIFT,
+            hover: Some(Hyperlink::new(None::<String>, "https://example.com".into())),
+            drag: Some((Point::default(), true)),
+            reported: Some((MouseButton::Left, (1, 1))),
+            last_click: Some((Instant::now(), Point::default(), 2)),
+            ..InputState::default()
+        };
+        st.reset();
+        assert_eq!(st.modifiers, Modifiers::SHIFT);
+        assert!(st.hover.is_none() && st.drag.is_none() && st.reported.is_none());
+        assert!(st.last_click.is_none());
+    }
 
     #[test]
     fn copy_and_paste_chords_per_platform() {

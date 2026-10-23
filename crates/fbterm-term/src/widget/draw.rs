@@ -134,6 +134,14 @@ fn push_span<K: PartialEq>(out: &mut Vec<(Span, K)>, row: u16, col: u16, cells: 
     out.push((Span { row, col, cells }, key));
 }
 
+/// Narrow characters drawn at their own cell rather than inside a run: anything outside ASCII may
+/// come from a fallback font with a different advance, which would shift the rest of the run.
+/// Box drawing and block elements (U+2500..=U+259F) stay in runs; the monospace fonts cover them
+/// and they make up whole rows of TUI frames and bars.
+fn standalone(c: char) -> bool {
+    !c.is_ascii() && !('\u{2500}'..='\u{259f}').contains(&c)
+}
+
 /// Builds the draw list. Call with the terminal locked; it only reads.
 pub fn build(
     term: &Terminal,
@@ -231,7 +239,7 @@ pub fn build(
             let bold = flags.contains(Flags::BOLD);
             let italic = flags.contains(Flags::ITALIC);
             let zerowidth = cell.zerowidth();
-            if flags.contains(Flags::WIDE_CHAR) || zerowidth.is_some() {
+            if flags.contains(Flags::WIDE_CHAR) || zerowidth.is_some() || standalone(cell.c) {
                 flush(&mut run, &mut list.texts);
                 let mut text = String::from(cell.c);
                 text.extend(zerowidth.into_iter().flatten());
@@ -597,6 +605,18 @@ mod tests {
             .map(|r| (r.span.col, r.span.cells, r.text.as_str()))
             .collect();
         assert_eq!(texts, vec![(0, 1, "a"), (1, 2, "日"), (3, 1, "b")]);
+    }
+
+    #[test]
+    fn non_ascii_narrow_char_breaks_run() {
+        let t = term_with("a❯b █▓─x".as_bytes());
+        let list = build(&t, &scheme(), true, None);
+        let texts: Vec<_> = list
+            .texts
+            .iter()
+            .map(|r| (r.span.col, r.span.cells, r.text.as_str()))
+            .collect();
+        assert_eq!(texts, vec![(0, 1, "a"), (1, 1, "❯"), (2, 6, "b █▓─x")]);
     }
 
     #[test]
