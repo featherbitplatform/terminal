@@ -66,6 +66,7 @@ async fn wait_exit(rx: &mut UnboundedReceiver<(SessionId, SessionEvent)>) -> Opt
     .expect("timed out waiting for Exited")
 }
 
+#[cfg(unix)]
 async fn wait_for_text(handle: &SessionHandle, needle: &str, count: usize) {
     timeout(LIMIT, async {
         loop {
