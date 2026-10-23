@@ -4,8 +4,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use fbterm_config::{Profile, ProfileKind};
-use fbterm_secrets::SecretKind;
-use fbterm_session::ssh::{Prompter, SecretAnswer};
+use fbterm_session::ssh::SshError;
 use fbterm_session::{SessionEvent, SessionHandle, SessionId, spawn_local_into};
 use fbterm_term::{GridSize, SharedTerminal, Terminal, TerminalOutput};
 use iced::Task;
@@ -15,33 +14,8 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{App, DEFAULT_GRID, Delivered, Message};
+use crate::prompts::UiPrompter;
 use crate::tabs::{self, InputRoute, Tab, TabId, TabState, WindowState};
-
-/// The connection prompter. Placeholder until the prompt UI exists: unknown host keys are
-/// refused and no secret is offered, so SSH tabs fail with a visible reason instead of waiting.
-pub(crate) fn prompter() -> Arc<dyn Prompter> {
-    Arc::new(NoPrompter)
-}
-
-struct NoPrompter;
-
-#[async_trait::async_trait]
-impl Prompter for NoPrompter {
-    async fn confirm_host_key(&self, host: &str, port: u16, fingerprint: &str) -> bool {
-        tracing::warn!(%host, port, %fingerprint, "unknown host key refused (no prompt UI yet)");
-        false
-    }
-
-    async fn ask_secret(
-        &self,
-        profile: &str,
-        _kind: SecretKind,
-        _retry: bool,
-    ) -> Option<SecretAnswer> {
-        tracing::warn!(%profile, "secret needed but there is no prompt UI yet");
-        None
-    }
-}
 
 type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
 
@@ -147,14 +121,28 @@ impl App {
                 let pid = profile.id;
                 let requested = terminal.lock().size();
                 let terminal = terminal.clone();
+                // Questions of this dial open over this tab's window.
+                let prompter = Arc::new(UiPrompter::new(Some(wid), self.prompt_tx.clone()));
                 let dial = async move {
-                    pool.open_shell_into(&store, &pid, terminal, events)
+                    pool.open_shell_prompting(&store, &pid, terminal, events, prompter)
                         .await
-                        .map_err(|e| e.to_string())
                 };
                 let (task, handle) = Task::perform(dial, move |r| match r {
                     Ok(h) => Message::Connected(id, Delivered::new(h), requested),
-                    Err(e) => Message::ConnectFailed(id, e),
+                    Err(SshError::HostKeyChanged { host, port }) => {
+                        let reason = SshError::HostKeyChanged {
+                            host: host.clone(),
+                            port,
+                        }
+                        .to_string();
+                        Message::HostKeyChanged {
+                            tab: id,
+                            host,
+                            port,
+                            reason,
+                        }
+                    }
+                    Err(e) => Message::ConnectFailed(id, e.to_string()),
                 })
                 .abortable();
                 tab.connecting = Some(handle.abort_on_drop());

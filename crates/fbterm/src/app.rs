@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use fbterm_config::{Paths, ProfileId, ProfileKind, ProfileStore, Settings, discover_shells};
+use fbterm_config::{
+    ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, Settings, discover_shells,
+};
 use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
@@ -15,32 +17,15 @@ use iced::{Event, Font, Subscription, Task, Theme};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::editor::{EditorMsg, EditorState};
 use crate::keys::Action;
 use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Palettes, Recency};
-use crate::sessions::{EventReceiver, prompter, session_stream, write_notice};
+use crate::prompts::{
+    PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
+};
+use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::tabs::{self, Tab, TabId, TabState, WindowState};
 use crate::theme;
-
-/// Profile editor messages. Placeholder until the editor exists.
-#[allow(
-    dead_code,
-    reason = "variants used by the palette, editor and prompt tasks"
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EditorMsg {
-    Open,
-    Close,
-}
-
-/// Connection prompt messages. Placeholder until prompts exist.
-#[allow(
-    dead_code,
-    reason = "variants used by the palette, editor and prompt tasks"
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PromptMsg {
-    Dismiss,
-}
 
 /// What a tab bar asks of its own window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +80,13 @@ pub enum Message {
     /// A dial finished; carries the pty size it was opened with.
     Connected(TabId, Delivered<SessionHandle>, GridSize),
     ConnectFailed(TabId, String),
+    /// A dial was refused because the host key changed: fail the tab and explain.
+    HostKeyChanged {
+        tab: TabId,
+        host: String,
+        port: u16,
+        reason: String,
+    },
     NewWindow,
     WindowOpened(window::Id),
     WindowFocused(window::Id),
@@ -128,7 +120,9 @@ pub struct App {
     pub notices_dismissed: bool,
     /// `profiles.toml` exists but could not be parsed; the in-memory profiles are a stand-in.
     /// While set, nothing may save the profile store: that would overwrite the user's file.
-    pub profiles_load_failed: bool,
+    pub profiles_error: Option<ConfigError>,
+    pub(crate) paths: Paths,
+    pub(crate) secrets: Arc<dyn fbterm_secrets::SecretStore>,
     pub(crate) fallback: Option<Arc<FallbackStore>>,
     pub(crate) pool: Arc<SshPool>,
     pub(crate) events: EventSink,
@@ -139,6 +133,12 @@ pub struct App {
     pub focused: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
+    /// The profile editor window, when open.
+    pub editor: Option<(window::Id, EditorState)>,
+    /// Connection dialogs waiting per window.
+    pub prompts: PromptQueues,
+    pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
+    pub(crate) prompt_rx: PromptReceiver,
     /// When each profile was last opened (in memory until state persistence).
     pub recency: Recency,
     /// Whether one of our windows has focus at all (the app is in front).
@@ -148,6 +148,8 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
+    /// `FBTERM_SCREENSHOT_WINDOW=editor` (debug aid): capture the editor window instead.
+    pub(crate) screenshot_editor: bool,
     pub(crate) shooting: bool,
 }
 
@@ -171,15 +173,18 @@ fn paths() -> Paths {
 /// Load profiles without ever writing the file. A missing file is seeded with the discovered
 /// shells; a malformed one is reported and replaced in memory by them.
 /// Returns the store and whether the file failed to load.
-fn load_profiles(paths: &Paths, notices: &mut Vec<String>) -> (ProfileStore, bool) {
+pub(crate) fn load_profiles(
+    paths: &Paths,
+    notices: &mut Vec<String>,
+) -> (ProfileStore, Option<ConfigError>) {
     let path = paths.profiles();
-    let mut failed = false;
+    let mut failed = None;
     let mut store = if path.exists() {
         match ProfileStore::load(&path) {
             Ok(store) => store,
             Err(e) => {
                 notices.push(e.to_string());
-                failed = true;
+                failed = Some(e);
                 ProfileStore::default()
             }
         }
@@ -199,9 +204,9 @@ fn load_profiles(paths: &Paths, notices: &mut Vec<String>) -> (ProfileStore, boo
     (store, failed)
 }
 
-/// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`); release builds
-/// ignore them.
-fn debug_env(name: &str) -> Option<std::ffi::OsString> {
+/// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`, ...); release
+/// builds ignore them.
+pub(crate) fn debug_env(name: &str) -> Option<std::ffi::OsString> {
     if cfg!(debug_assertions) {
         std::env::var_os(name).filter(|v| !v.is_empty())
     } else {
@@ -217,7 +222,7 @@ impl App {
             notices.push(e.to_string());
             Settings::default()
         });
-        let (profiles, profiles_load_failed) = load_profiles(&paths, &mut notices);
+        let (profiles, profiles_error) = load_profiles(&paths, &mut notices);
 
         // FBTERM_SECRETS=memory (debug aid) keeps secrets in memory and never touches the keychain.
         let (secrets, fallback): (Arc<dyn SecretStore>, _) =
@@ -230,10 +235,12 @@ impl App {
         let known_hosts = directories::BaseDirs::new()
             .map(|d| d.home_dir().join(".ssh").join("known_hosts"))
             .unwrap_or_else(|| PathBuf::from("known_hosts"));
+        let (prompt_tx, prompt_rx) = unbounded_channel();
+        // Dials pass a prompter for their own window; this one asks over the focused window.
         let pool = Arc::new(SshPool::new(SshContext {
             known_hosts,
-            secrets,
-            prompter: prompter(),
+            secrets: secrets.clone(),
+            prompter: Arc::new(UiPrompter::new(None, prompt_tx.clone())),
         }));
 
         let family: &'static str = Box::leak(settings.font_family.clone().into_boxed_str());
@@ -252,7 +259,9 @@ impl App {
             profiles,
             notices,
             notices_dismissed: false,
-            profiles_load_failed,
+            profiles_error,
+            paths,
+            secrets,
             fallback,
             pool,
             events,
@@ -261,6 +270,10 @@ impl App {
             grids: HashMap::new(),
             focused: None,
             palettes: Palettes::new(),
+            editor: None,
+            prompts: PromptQueues::default(),
+            prompt_tx,
+            prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
             recency: Recency::new(),
             app_active: true,
             style_unfocused: TerminalStyle {
@@ -269,46 +282,15 @@ impl App {
             },
             style,
             screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
+            screenshot_editor: debug_env("FBTERM_SCREENSHOT_WINDOW").is_some_and(|w| w == "editor"),
             shooting: false,
         };
         let mut task = app.open_window(app.default_profile());
         task = task.chain(app.open_debug_tabs());
         task = task.chain(app.open_debug_palette());
+        task = task.chain(app.open_debug_editor());
+        task = task.chain(app.open_debug_prompt());
         (app, task)
-    }
-
-    /// `FBTERM_OPEN_TABS=name,name` (debug aid until restore exists): extra tabs opened in the
-    /// first window at startup, by profile name.
-    fn open_debug_tabs(&mut self) -> Task<Message> {
-        let Some(list) = debug_env("FBTERM_OPEN_TABS") else {
-            return Task::none();
-        };
-        let list = list.to_string_lossy().into_owned();
-        let Some(&wid) = self.windows.keys().next() else {
-            return Task::none();
-        };
-        let ids: Vec<ProfileId> = list
-            .split(',')
-            .filter_map(|n| self.profiles.profiles.iter().find(|p| p.name == n.trim()))
-            .map(|p| p.id)
-            .collect();
-        let tasks: Vec<_> = ids.into_iter().map(|id| self.open_tab(wid, id)).collect();
-        // They open in the background; the first tab stays active.
-        if let Some(w) = self.windows.get_mut(&wid) {
-            w.active = 0;
-        }
-        Task::batch(tasks)
-    }
-
-    /// `FBTERM_PALETTE_QUERY=text` (debug aid): the palette open and pre-filled in the first window.
-    fn open_debug_palette(&mut self) -> Task<Message> {
-        let Some(query) = debug_env("FBTERM_PALETTE_QUERY") else {
-            return Task::none();
-        };
-        match self.windows.keys().next().copied() {
-            Some(wid) => self.open_palette(wid, query.to_string_lossy().into_owned()),
-            None => Task::none(),
-        }
     }
 
     /// The first local profile, preferring the user's login shell.
@@ -332,7 +314,7 @@ impl App {
             return Vec::new();
         }
         let mut out = self.notices.clone();
-        if self.profiles_load_failed {
+        if self.profiles_error.is_some() {
             out.push("Profiles are read-only until profiles.toml is fixed".into());
         }
         if self.fallback.as_ref().is_some_and(|f| f.degraded()) {
@@ -342,6 +324,9 @@ impl App {
     }
 
     pub fn title(&self, id: window::Id) -> String {
+        if self.editor_window() == Some(id) {
+            return "Profiles · fbterm".into();
+        }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title),
             None => "fbterm".into(),
@@ -358,6 +343,7 @@ impl App {
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
+            Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
         ];
         if self.screenshot.is_some() && !self.shooting && self.first_window_ready() {
             // Give the renderer time to load fonts and present a few frames.
@@ -367,6 +353,9 @@ impl App {
     }
 
     fn first_window_ready(&self) -> bool {
+        if self.screenshot_editor && self.editor.is_none() {
+            return false;
+        }
         self.windows
             .values()
             .next()
@@ -394,17 +383,18 @@ impl App {
                 Task::none()
             }
             Message::ConnectFailed(tab, reason) => {
-                if let Some(t) = self.tab_mut(tab) {
-                    t.connecting = None;
-                    let text = if reason.starts_with("could not connect") {
-                        format!("{reason}, press Enter to retry")
-                    } else {
-                        format!("could not connect: {reason}, press Enter to retry")
-                    };
-                    t.state = TabState::Disconnected(reason);
-                    write_notice(t, &text, false);
-                }
+                self.connect_failed(tab, reason);
                 Task::none()
+            }
+            Message::HostKeyChanged {
+                tab,
+                host,
+                port,
+                reason,
+            } => {
+                let task = self.host_key_changed(tab, host, port);
+                self.connect_failed(tab, reason);
+                task
             }
             Message::NewWindow => self.action(None, Action::NewWindow),
             Message::WindowOpened(id) => {
@@ -432,14 +422,19 @@ impl App {
                 }
             }
             Message::WindowClosed(id) => {
-                // Dropping the window's tabs closes their sessions and abandons their dials.
+                if self.editor_window() == Some(id) {
+                    self.editor = None;
+                }
+                // Dropping the window's tabs closes their sessions and abandons their dials;
+                // its dialogs answer "no".
                 self.windows.remove(&id);
                 self.palettes.remove(&id);
+                self.prompts.remove_window(id);
                 self.grids.remove(&id);
                 if self.focused == Some(id) {
                     self.focused = self.windows.keys().next().copied();
                 }
-                if self.windows.is_empty() {
+                if self.windows.is_empty() && self.editor.is_none() {
                     iced::exit()
                 } else {
                     Task::none()
@@ -451,14 +446,8 @@ impl App {
                 Task::none()
             }
             Message::Palette(wid, msg) => self.palette(wid, msg),
-            Message::Editor(msg) => {
-                tracing::info!(?msg, "profile editor not available yet");
-                Task::none()
-            }
-            Message::Prompt(msg) => {
-                tracing::info!(?msg, "prompts not available yet");
-                Task::none()
-            }
+            Message::Editor(msg) => self.editor_msg(msg),
+            Message::Prompt(msg) => self.prompt_msg(msg),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
                 if let Some(path) = &self.screenshot {
@@ -472,7 +461,20 @@ impl App {
         }
     }
 
-    fn focused_window(&self) -> Option<window::Id> {
+    fn connect_failed(&mut self, tab: TabId, reason: String) {
+        if let Some(t) = self.tab_mut(tab) {
+            t.connecting = None;
+            let text = if reason.starts_with("could not connect") {
+                format!("{reason}, press Enter to retry")
+            } else {
+                format!("could not connect: {reason}, press Enter to retry")
+            };
+            t.state = TabState::Disconnected(reason);
+            write_notice(t, &text, false);
+        }
+    }
+
+    pub(crate) fn focused_window(&self) -> Option<window::Id> {
         self.focused
             .filter(|id| self.windows.contains_key(id))
             .or_else(|| self.windows.keys().next().copied())
@@ -528,14 +530,16 @@ impl App {
                 None => Task::none(),
             },
             Action::NewWindow => self.open_window(self.default_profile()),
-            Action::Settings | Action::EditProfiles => {
-                self.update(Message::Editor(EditorMsg::Open))
+            Action::EditProfiles => self.editor_msg(EditorMsg::Open),
+            Action::Settings => {
+                tracing::info!("settings are not available yet");
+                Task::none()
             }
         }
     }
 
     /// Open `wid`'s palette (or reset it) with `query`, and focus its input.
-    fn open_palette(&mut self, wid: window::Id, query: String) -> Task<Message> {
+    pub(crate) fn open_palette(&mut self, wid: window::Id, query: String) -> Task<Message> {
         if !self.windows.contains_key(&wid) {
             return Task::none();
         }
@@ -664,7 +668,12 @@ impl App {
         if self.shooting {
             return Task::none();
         }
-        let Some(&wid) = self.windows.keys().next() else {
+        let target = if self.screenshot_editor {
+            self.editor_window()
+        } else {
+            self.windows.keys().next().copied()
+        };
+        let Some(wid) = target else {
             return Task::none();
         };
         self.shooting = true;
