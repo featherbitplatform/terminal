@@ -241,6 +241,11 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
    (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
 
+Performance follow-up, before or within milestone 2: compact scrollback storage; investigate CPU
+use while streaming output; break down the ~100 MB base memory (RSS vs footprint; GPU/wgpu, font
+database and glyph caches, heap, shared libraries) and try cheap levers (bundled fonts plus a
+small fallback list instead of the full system font database; wgpu memory hints).
+
 ## 7. Performance targets *(builder's call; to be measured, not guessed)*
 
 - 20 sessions open (19 idle in background tabs, one visible streaming logs): resident memory under
@@ -249,6 +254,12 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 - Keypress-to-screen latency comparable to other GPU-accelerated native terminals (target under one
   frame at 60 Hz on Apple Silicon).
 - A benchmark/measurement script lives in the repo and is run before each release.
+
+*Measured 2026-10-23 on Apple M5 Max (`dev/perf/README.md`):* base about 103 MB resident with one
+tab; about 0.2 MB per idle tab; about 21 MB per tab with the full 10,000-line scrollback; 20 full
+tabs about 528 MB, over the ~300 MB target. The owner chose to keep the 10,000-line default and
+accept this worst case. One visible log stream costs about 22% of a core; a `yes` flood about one
+core. Follow-up work is listed in section 6.
 
 ## 8. Repo and release
 
