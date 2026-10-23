@@ -713,13 +713,16 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_does_not_count_prompt_time() {
-        // 100 ms of budget; the step works 50 ms, waits 300 ms on the user, works 30 ms more.
+        // 400 ms of budget; the step works 50 ms, waits 800 ms on the user, works 30 ms more.
+        // Only 80 ms of work is counted, so 320 ms of margin remains for timer granularity
+        // (Windows sleeps can overshoot by ~15 ms each). The 800 ms prompt alone would exceed
+        // the budget if it were counted, so a pass proves prompt time is excluded.
         let clock = Arc::new(PromptClock::new());
         let prompter = ClockedPrompter {
-            inner: Arc::new(Slow(Duration::from_millis(300))),
+            inner: Arc::new(Slow(Duration::from_millis(800))),
             clock: clock.clone(),
         };
-        let out = bounded(&clock, Duration::from_millis(100), || "x".into(), async {
+        let out = bounded(&clock, Duration::from_millis(400), || "x".into(), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             let trusted = prompter.confirm_host_key("h", 22, "SHA256:x").await;
             tokio::time::sleep(Duration::from_millis(30)).await;
