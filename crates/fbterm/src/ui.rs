@@ -1,8 +1,8 @@
 //! Shared chrome pieces for the editor and the dialogs: Graphite controls (radius 6), cards
 //! (radius 8), overlays (radius 12), Lucide icons.
 
-use iced::widget::{button, container, svg, text, text_input};
-use iced::{Background, Border, Color, Element, Font, Padding, Shadow, Vector};
+use iced::widget::{button, column, container, svg, text, text_input};
+use iced::{Background, Border, Color, Element, Font, Length, Padding, Shadow, Vector, window};
 
 use crate::app::Message;
 use crate::theme::{Tokens, UI_FONT};
@@ -202,4 +202,26 @@ pub fn well<'a>(
 
 pub fn to_color(c: fbterm_config::Rgb) -> Color {
     Color::from_rgb8(c.r, c.g, c.b)
+}
+
+/// The bar of the editor and Settings windows where the OS title bar is gone: room for the
+/// window buttons and to move the window. It stays blank; the window's content titles it.
+pub fn window_header<'a>(t: &'static Tokens, window: window::Id) -> Element<'a, Message> {
+    let header = container(text(""))
+        .width(Length::Fill)
+        .height(crate::chrome::Chrome::current().bar_height())
+        .style(move |_| container::Style {
+            background: Some(t.surface.into()),
+            ..container::Style::default()
+        });
+    let rule = container(text(""))
+        .width(Length::Fill)
+        .height(1)
+        .style(move |_| container::Style {
+            background: Some(t.border.into()),
+            ..container::Style::default()
+        });
+    crate::chrome::title_bar(column![header, rule], false, move |a| {
+        Message::TitleBar(window, a)
+    })
 }

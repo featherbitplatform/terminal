@@ -1,4 +1,4 @@
-//! Application keyboard shortcuts: Cmd on macOS, Ctrl+Shift elsewhere.
+//! Application keyboard shortcuts: Cmd on macOS, Ctrl+Shift elsewhere (Settings is Ctrl+,).
 
 use iced::keyboard::{Key, Modifiers};
 
@@ -15,9 +15,10 @@ pub enum Action {
     NewWindow,
     /// Save the layout and exit: Cmd+Q on macOS, Ctrl+Shift+Q elsewhere.
     Quit,
-    /// The profile editor: Cmd+, or Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere (the Settings
-    /// chord until settings have a window).
+    /// The profile editor: Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere.
     EditProfiles,
+    /// The Settings window: Cmd+, on macOS, Ctrl+, elsewhere.
+    Settings,
     /// Create `settings.toml` if missing and open it with the system's default app (palette only).
     OpenSettingsFile,
     /// Show the config folder in the file manager (palette only).
@@ -32,7 +33,8 @@ pub fn shortcut(key: &Key, mods: Modifiers) -> Option<Action> {
 /// The shortcut table, for macOS (`mac`) or the other platforms.
 ///
 /// macOS chords use Cmd (with Shift where noted) and never Ctrl or Option. Elsewhere every chord
-/// is Ctrl+Shift, so plain Ctrl keys keep reaching the terminal.
+/// is Ctrl+Shift, so plain Ctrl keys keep reaching the terminal; the one exception is Ctrl+,
+/// for Settings (the comma has no control code of its own).
 pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
     let Key::Character(s) = key else {
         return None;
@@ -43,6 +45,9 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
         return None;
     }
     let shift = mods.shift();
+    if !mac && c == ',' && mods.control() && !shift && !mods.alt() && !mods.logo() {
+        return Some(Action::Settings);
+    }
     if mac {
         if !mods.logo() || mods.control() || mods.alt() {
             return None;
@@ -58,8 +63,8 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
         'w' if plain => Some(Action::CloseTab),
         'n' if plain => Some(Action::NewWindow),
         'q' if plain => Some(Action::Quit),
-        // Settings has no window yet; its chord opens the profile editor for now.
-        ',' | '<' => Some(Action::EditProfiles),
+        ',' if mac && !shift => Some(Action::Settings),
+        ',' | '<' if shifted => Some(Action::EditProfiles),
         'p' if shifted => Some(Action::Palette),
         ']' | '}' if shifted => Some(Action::NextTab),
         '[' | '{' if shifted => Some(Action::PrevTab),
@@ -92,6 +97,15 @@ pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
         Action::Palette => ('p', true),
         Action::SelectTab(n @ 1..=9) => (char::from(b'0' + n), false),
         Action::EditProfiles => (',', true),
+        Action::Settings if !mac => {
+            return Some(Chord {
+                key: ',',
+                ctrl: true,
+                shift: false,
+                cmd: false,
+            });
+        }
+        Action::Settings => (',', false),
         Action::SelectTab(_) | Action::OpenSettingsFile | Action::RevealConfigFolder => {
             return None;
         }
@@ -167,7 +181,7 @@ impl Chord {
 mod tests {
     use super::*;
 
-    const ALL: [Action; 19] = [
+    const ALL: [Action; 20] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -185,6 +199,7 @@ mod tests {
         Action::NewWindow,
         Action::Quit,
         Action::EditProfiles,
+        Action::Settings,
         Action::OpenSettingsFile,
         Action::RevealConfigFolder,
     ];
@@ -220,6 +235,8 @@ mod tests {
             l(false, Action::EditProfiles).as_deref(),
             Some("Ctrl+Shift+,")
         );
+        assert_eq!(l(true, Action::Settings).as_deref(), Some("⌘,"));
+        assert_eq!(l(false, Action::Settings).as_deref(), Some("Ctrl+,"));
         assert_eq!(l(true, Action::OpenSettingsFile), None);
         assert_eq!(l(false, Action::RevealConfigFolder), None);
     }
@@ -253,8 +270,7 @@ mod tests {
         assert_eq!(m("n", CMD), Some(Action::NewWindow));
         assert_eq!(m("q", CMD), Some(Action::Quit));
         assert_eq!(m("q", cmd_shift()), None, "Cmd+Shift+Q is log out");
-        // Settings has no window yet: both chords open the profile editor.
-        assert_eq!(m(",", CMD), Some(Action::EditProfiles));
+        assert_eq!(m(",", CMD), Some(Action::Settings));
         assert_eq!(m(",", cmd_shift()), Some(Action::EditProfiles));
         assert_eq!(m("<", cmd_shift()), Some(Action::EditProfiles));
     }
@@ -292,6 +308,10 @@ mod tests {
         assert_eq!(m("q", ctrl_shift()), Some(Action::Quit));
         assert_eq!(m("q", Modifiers::CTRL), None);
         assert_eq!(m(",", ctrl_shift()), Some(Action::EditProfiles));
+        assert_eq!(m("<", ctrl_shift()), Some(Action::EditProfiles));
+        assert_eq!(m(",", Modifiers::CTRL), Some(Action::Settings));
+        assert_eq!(m(",", Modifiers::CTRL | Modifiers::ALT), None);
+        assert_eq!(m(",", CMD), None);
         // Plain Ctrl chords belong to the shell (Ctrl+T, Ctrl+W, Ctrl+P ...).
         assert_eq!(m("t", Modifiers::CTRL), None);
         assert_eq!(m("w", Modifiers::CTRL), None);

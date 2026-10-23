@@ -14,14 +14,17 @@
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
-//! - `FBTERM_SCREENSHOT_WINDOW=editor`: capture the profile editor window instead.
+//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings`: capture the profile editor or the Settings
+//!   window instead.
 //! - `FBTERM_OPEN_EDITOR=<profile name>`: open the profile editor at startup, that profile
 //!   selected.
+//! - `FBTERM_OPEN_SETTINGS=1`: open the Settings window at startup.
 //! - `FBTERM_DEMO_PROMPT=hostkey|password|changed`: show a sample connection dialog in the first
 //!   window (nothing waits for the answer).
 //! - `FBTERM_DEMO_TOOLTIP=new|profiles|close`: keep that tab-bar button's tooltip showing (for
 //!   screenshots; `close` is the first tab's).
 
+mod actions;
 mod app;
 mod chrome;
 mod config_files;
@@ -38,12 +41,15 @@ mod restore;
 #[cfg(test)]
 mod restore_tests;
 mod sessions;
+mod settings_window;
+mod shortcuts;
 mod tabs;
 mod theme;
 mod tooltip;
 mod ui;
 mod watch;
 mod window;
+mod windows;
 
 use app::App;
 

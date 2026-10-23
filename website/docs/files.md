@@ -19,7 +19,7 @@ The directory is created the first time the app writes a file. All files are TOM
 | File | Written by | Purpose |
 | --- | --- | --- |
 | `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles. See [Profiles and jump hosts](profiles). |
-| `settings.toml` | you | Font, scrollback, theme and keyboard protocol. |
+| `settings.toml` | you (and the Settings window) | Font, scrollback, theme, background and keyboard protocol. |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
 
 `profiles.toml` and `settings.toml` are reloaded while the app runs. If a file has a syntax error, the app reports the file and line, keeps what it had loaded, and never overwrites the broken file.
@@ -28,7 +28,9 @@ The directory is created the first time the app writes a file. All files are TOM
 
 Every field is optional. A missing file, or a missing field, takes the default shown here.
 
-To start editing, run **Open settings file** from the palette (`Cmd+Shift+P` or `Ctrl+Shift+P`). If `settings.toml` does not exist, the app creates it with every setting written out as a comment, showing its default and what it does, and opens it in your default app. Remove the leading `#` of a line to change that setting. An existing file is never overwritten. **Reveal config folder** shows the folder in your file manager.
+The easiest way to change a setting is the Settings window (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or **Settings** in the palette). Every change applies at once and is written to `settings.toml` in place: only that setting's line changes, and your comments, blank lines, the order of the settings and everything else stay as they are. A setting that is only shown as a comment (as in the file the app creates) is set on the line right after its comment. While `settings.toml` has an error the window is read-only and the file is never written; fix it by hand and the window follows. Edits made to the file while the window is open show in the window at once.
+
+To edit the file by hand, run **Open settings file** from the palette (`Cmd+Shift+P` or `Ctrl+Shift+P`). If `settings.toml` does not exist, the app creates it with every setting written out as a comment, showing its default and what it does, and opens it in your default app. Remove the leading `#` of a line to change that setting. An existing file is never overwritten. **Reveal config folder** shows the folder in your file manager.
 
 ```toml
 font_family = "Geist Mono"

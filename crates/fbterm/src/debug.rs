@@ -59,6 +59,14 @@ impl App {
         task
     }
 
+    /// `FBTERM_OPEN_SETTINGS=1` (debug aid): open the Settings window at startup.
+    pub(crate) fn open_debug_settings(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_OPEN_SETTINGS").is_none() {
+            return Task::none();
+        }
+        self.open_settings()
+    }
+
     /// `FBTERM_DEMO_PROMPT=hostkey|password|changed` (debug aid): show a sample dialog in the
     /// first window. Nothing waits for its answer.
     pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {

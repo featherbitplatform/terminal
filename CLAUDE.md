@@ -63,7 +63,7 @@ cd website && npm start                  # docs dev server; `npm run build` buil
 ### Debug aids (environment variables)
 
 - Always available: `FBTERM_CONFIG_DIR=<dir>` (use this directory instead of the real config), `FBTERM_SECRETS=memory` (never touch the OS keychain), and the release-build measurement flags `--perf-tabs <N> --perf-cmd <cmd> [--perf-exit-after <secs>]`.
-- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`, `FBTERM_DEMO_TOOLTIP=new|profiles|close` (keep that tab-bar tooltip showing). Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
+- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor|settings`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_OPEN_SETTINGS=1`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`, `FBTERM_DEMO_TOOLTIP=new|profiles|close` (keep that tab-bar tooltip showing). Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
 - Rule for agents: look at the app only through its own-window screenshots (`FBTERM_SCREENSHOT`), never full-screen capture. Combine with `FBTERM_CONFIG_DIR` and `FBTERM_SECRETS=memory` so a run cannot touch real profiles or secrets.
 
 ## Gotchas learned

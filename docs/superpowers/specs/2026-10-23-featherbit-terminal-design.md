@@ -241,12 +241,24 @@ Jump-chain references are exported together with the profiles they point to.
   blur (`window::Settings::blur`, through winit); on macOS this relies on an undocumented
   CoreGraphics call; if it stops working, blur is lost but nothing breaks. Replacing it is a
   follow-up item in section 6.
+- *(Owner's decision, 2026-10-24)* **Settings window.** A separate window (unified title bar on
+  macOS, like the profile editor) with a control for every `settings.toml` option: theme, font
+  family (installed monospace families, the bundled Geist Mono first), font size, background
+  opacity and blur, scrollback lines, kitty keyboard protocol. Changes apply live, with no Save
+  button, and are written to `settings.toml` in place: only the changed key, keeping comments,
+  order and other keys (builder's notes: `toml_edit`; slider drags and typing are written after a
+  300 ms pause or when the slider is let go; our own writes do not trigger a reload). A file
+  that does not load is never written: the window is read-only until it is fixed, and edits on
+  disk show in the window. Opened with Cmd+, (Ctrl+, elsewhere) or the palette's **Settings**.
 
 ### 5.11 Keyboard defaults *(builder's call)*
 
 Cmd on macOS, Ctrl+Shift elsewhere: new tab (opens the palette), close, next/prev tab, tab 1..9,
 palette (Cmd+Shift+P), split right/down, focus pane by direction, toggle file panel, find in
-scrollback, settings. All rebindable via config later.
+scrollback. All rebindable via config later. *(Owner's decision, 2026-10-24)* Settings is Cmd+,
+on macOS and Ctrl+, elsewhere (the one Ctrl chord without Shift); the profile editor is
+Cmd+Shift+, (Ctrl+Shift+, elsewhere). Tab-bar buttons show their action and chord in a tooltip,
+derived from the same table.
 
 ## 6. Milestones
 
@@ -267,8 +279,6 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 
 Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVisualEffectView
 (follows Reduce transparency, native vibrancy).
-
-A Settings window with controls for every settings.toml option (owner decision 2026-10-23: after milestone 1).
 
 Performance follow-up, before or within milestone 2: compact scrollback storage; investigate CPU
 use while streaming output; break down the ~100 MB base memory (RSS vs footprint; GPU/wgpu, font
