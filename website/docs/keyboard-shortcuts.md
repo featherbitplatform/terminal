@@ -20,6 +20,17 @@ On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled 
 | New window | `Cmd+N` | `Ctrl+Shift+N` |
 | Quit (saves the layout first) | `Cmd+Q` | `Ctrl+Shift+Q` |
 
+## Scrollback
+
+| Action | macOS | Linux and Windows |
+| --- | --- | --- |
+| Scroll up one page | `Shift+PageUp` | `Shift+PageUp` |
+| Scroll down one page | `Shift+PageDown` | `Shift+PageDown` |
+| Jump to the top of the history | `Shift+Home` or `Cmd+Home` | `Shift+Home` |
+| Jump back to the bottom | `Shift+End` or `Cmd+End` | `Shift+End` |
+
+A page is the height of the terminal less one line, so the last line of the previous page stays in view. Typing anything returns to the bottom. While a full-screen program (an editor, a pager, a system monitor) uses the alternate screen there is no scrollback, so these keys go to the program instead.
+
 ## Palette and settings
 
 | Action | macOS | Linux and Windows |
