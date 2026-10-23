@@ -108,6 +108,12 @@ fn control_byte(c: char) -> Option<u8> {
     }
 }
 
+/// AltGr is reported as Ctrl+Alt with printable text on non-macOS platforms; the text must be
+/// sent as-is rather than turned into a control byte.
+fn is_altgr(mods: Modifiers, printable_text: Option<&str>, is_macos: bool) -> bool {
+    !is_macos && mods.alt() && mods.control() && printable_text.is_some()
+}
+
 /// Encode a key press. Returns `None` when the key produces no input.
 ///
 /// On macOS, chords with Cmd are never encoded (they belong to the application). Option
@@ -129,16 +135,19 @@ pub fn encode_key(
             let mut chars = s.chars();
             let first = chars.next()?;
             let single = chars.next().is_none();
+            let composed = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+            if is_altgr(mods, composed, cfg!(target_os = "macos")) {
+                return composed.map(|t| t.as_bytes().to_vec());
+            }
             if mods.control() && single {
                 let b = control_byte(first)?;
                 return Some(with_alt(vec![b], mods));
             }
-            let composed = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
             // macOS: Option composed a different character (e.g. @); elsewhere Ctrl+Alt is AltGr.
             let composes = if cfg!(target_os = "macos") {
                 mods.alt() && composed.is_some_and(|t| t.to_lowercase() != s.to_lowercase())
             } else {
-                mods.alt() && mods.control() && composed.is_some()
+                false
             };
             if composes {
                 return composed.map(|t| t.as_bytes().to_vec());
@@ -362,6 +371,14 @@ mod tests {
         let m = Modifiers::CTRL | Modifiers::ALT;
         let r = key(ch("q"), m, Some("@"), TermMode::empty());
         assert_eq!(r.unwrap(), b"@");
+    }
+    #[test]
+    fn altgr_detection_is_platform_independent() {
+        let m = Modifiers::CTRL | Modifiers::ALT;
+        assert!(is_altgr(m, Some("@"), false));
+        assert!(!is_altgr(m, None, false));
+        assert!(!is_altgr(Modifiers::CTRL, Some("@"), false));
+        assert!(!is_altgr(m, Some("@"), true));
     }
     #[test]
     fn paste_cannot_terminate_bracket_early() {
