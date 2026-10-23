@@ -110,8 +110,9 @@ fn control_byte(c: char) -> Option<u8> {
 
 /// Encode a key press. Returns `None` when the key produces no input.
 ///
-/// On macOS, chords with Cmd are never encoded (they belong to the application) and Option acts
-/// as Alt, using the unmodified key rather than the composed text.
+/// On macOS, chords with Cmd are never encoded (they belong to the application). Option
+/// sends the composed text when it produced a different character, otherwise it acts as Alt
+/// (ESC prefix). Elsewhere Ctrl+Alt with printable text is AltGr and sends the text.
 pub fn encode_key(
     key: &Key,
     _physical: Physical,
@@ -132,9 +133,20 @@ pub fn encode_key(
                 let b = control_byte(first)?;
                 return Some(with_alt(vec![b], mods));
             }
+            let composed = text.filter(|t| !t.is_empty() && !t.chars().any(char::is_control));
+            // macOS: Option composed a different character (e.g. @); elsewhere Ctrl+Alt is AltGr.
+            let composes = if cfg!(target_os = "macos") {
+                mods.alt() && composed.is_some_and(|t| t.to_lowercase() != s.to_lowercase())
+            } else {
+                mods.alt() && mods.control() && composed.is_some()
+            };
+            if composes {
+                return composed.map(|t| t.as_bytes().to_vec());
+            }
             if mods.alt() {
+                let body = composed.unwrap_or(s.as_str());
                 let mut out = vec![0x1b];
-                out.extend_from_slice(s.as_bytes());
+                out.extend_from_slice(body.as_bytes());
                 return Some(out);
             }
             let t = text.filter(|t| !t.is_empty()).unwrap_or(s.as_str());
@@ -149,7 +161,10 @@ pub fn encode_key(
 /// Encode pasted text, wrapping it in bracketed-paste markers when the mode is set.
 pub fn encode_paste(text: &str, mode: TermMode) -> Vec<u8> {
     if mode.contains(TermMode::BRACKETED_PASTE) {
-        let clean = text.replace("\x1b[201~", "");
+        let clean: String = text
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\t' | '\n' | '\r'))
+            .collect();
         let mut out = b"\x1b[200~".to_vec();
         out.extend_from_slice(clean.as_bytes());
         out.extend_from_slice(b"\x1b[201~");
@@ -323,6 +338,37 @@ mod tests {
     #[test]
     fn cmd_chords_are_not_encoded() {
         assert!(key(ch("c"), Modifiers::LOGO, Some("c"), TermMode::empty()).is_none());
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn option_composed_char_sent_verbatim() {
+        let r = key(ch("l"), Modifiers::ALT, Some("@"), TermMode::empty());
+        assert_eq!(r.unwrap(), b"@");
+    }
+    #[test]
+    fn option_letter_without_composition_is_esc_prefixed() {
+        let r = key(ch("b"), Modifiers::ALT, Some("b"), TermMode::empty());
+        assert_eq!(r.unwrap(), b"\x1bb");
+    }
+    #[test]
+    fn alt_shift_letter_keeps_shift() {
+        let m = Modifiers::ALT | Modifiers::SHIFT;
+        let r = key(ch("b"), m, Some("B"), TermMode::empty());
+        assert_eq!(r.unwrap(), b"\x1bB");
+    }
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn altgr_sends_text_on_non_macos() {
+        let m = Modifiers::CTRL | Modifiers::ALT;
+        let r = key(ch("q"), m, Some("@"), TermMode::empty());
+        assert_eq!(r.unwrap(), b"@");
+    }
+    #[test]
+    fn paste_cannot_terminate_bracket_early() {
+        let out = encode_paste("x\x1b[2\x1b[201~01~y", TermMode::BRACKETED_PASTE);
+        let s = String::from_utf8(out).unwrap();
+        assert_eq!(s.matches("\x1b[201~").count(), 1);
+        assert!(s.ends_with("\x1b[201~"));
     }
     #[test]
     fn paste_is_bracketed_when_mode_set() {

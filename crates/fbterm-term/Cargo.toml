@@ -11,6 +11,7 @@ workspace = true
 iced = { workspace = true }
 alacritty_terminal = { workspace = true }
 parking_lot = { workspace = true }
+fbterm-config = { path = "../fbterm-config" }
 
 [dev-dependencies]
 iced = { workspace = true, features = ["wgpu", "tokio", "advanced"] }
