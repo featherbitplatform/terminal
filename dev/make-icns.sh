@@ -5,6 +5,8 @@
 set -euo pipefail
 [[ "$(uname -s)" == "Darwin" ]] || { echo "make-icns.sh runs on macOS only" >&2; exit 1; }
 
+python3 -c "import PIL" 2>/dev/null || { echo "make-icns.sh needs python3 with Pillow (pip install pillow)" >&2; exit 1; }
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 mark="${1:-$root/../design-system-v2/assets/featherbit-mark.png}"
 out="$root/crates/fbterm/macos/fbterm.icns"

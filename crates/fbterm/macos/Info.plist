@@ -15,8 +15,10 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleShortVersionString</key>
-	<string>__VERSION__</string>
+	<string>__BUILD__</string>
 	<key>CFBundleVersion</key>
+	<string>__BUILD__</string>
+	<key>FBTermVersion</key>
 	<string>__VERSION__</string>
 	<key>CFBundleIconFile</key>
 	<string>fbterm</string>
