@@ -48,11 +48,15 @@ fn discovered_args(program: &std::path::Path) -> Vec<String> {
     }
 }
 
-fn local_profile(program: PathBuf) -> Profile {
-    let name = program
+fn profile_name(program: &std::path::Path) -> String {
+    program
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| program.display().to_string());
+        .unwrap_or_else(|| program.display().to_string())
+}
+
+fn local_profile(program: PathBuf) -> Profile {
+    let name = profile_name(&program);
     Profile {
         id: stable_id(&program),
         name,
@@ -67,14 +71,42 @@ fn local_profile(program: PathBuf) -> Profile {
     }
 }
 
-fn dedup_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<Profile> {
-    let mut seen = Vec::new();
-    for c in candidates {
-        if c.is_file() && !seen.contains(&c) {
-            seen.push(c);
+/// A discovered shell candidate: its path, whether it is a file, and its canonical path if
+/// it could be resolved.
+type Candidate = (PathBuf, bool, Option<PathBuf>);
+
+/// Keep one shell per profile name (file stem), first candidate wins, so `$SHELL` stays first
+/// with its exact path. Candidates that resolve to an already kept file (symlinks, usrmerge
+/// `/bin` versus `/usr/bin`) are dropped too. Pure over its input.
+fn pick_unique(candidates: impl IntoIterator<Item = Candidate>) -> Vec<PathBuf> {
+    let mut kept: Vec<PathBuf> = Vec::new();
+    let mut names = std::collections::HashSet::new();
+    let mut real: Vec<PathBuf> = Vec::new();
+    for (path, is_file, canonical) in candidates {
+        if !is_file || kept.contains(&path) {
+            continue;
         }
+        if canonical.as_ref().is_some_and(|c| real.contains(c)) {
+            continue;
+        }
+        if !names.insert(profile_name(&path)) {
+            continue;
+        }
+        real.extend(canonical);
+        kept.push(path);
     }
-    seen.into_iter().map(local_profile).collect()
+    kept
+}
+
+fn dedup_existing(candidates: impl IntoIterator<Item = PathBuf>) -> Vec<Profile> {
+    pick_unique(candidates.into_iter().map(|c| {
+        let is_file = c.is_file();
+        let canonical = std::fs::canonicalize(&c).ok();
+        (c, is_file, canonical)
+    }))
+    .into_iter()
+    .map(local_profile)
+    .collect()
 }
 
 /// Shells available on this machine, as ready-to-use local profiles.
@@ -183,5 +215,55 @@ mod tests {
         let zsh = super::stable_id(std::path::Path::new("/bin/zsh"));
         assert_eq!(zsh, super::stable_id(std::path::Path::new("/bin/zsh")));
         assert_ne!(zsh, super::stable_id(std::path::Path::new("/bin/bash")));
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use std::path::PathBuf;
+
+    fn cand(p: &str) -> super::Candidate {
+        (PathBuf::from(p), true, None)
+    }
+
+    #[test]
+    fn usrmerge_duplicates_collapse_to_one_per_name() {
+        let kept =
+            super::pick_unique(["/bin/bash", "/usr/bin/bash", "/bin/sh", "/usr/bin/sh"].map(cand));
+        assert_eq!(kept, [PathBuf::from("/bin/bash"), PathBuf::from("/bin/sh")]);
+    }
+
+    #[test]
+    fn first_candidate_keeps_its_exact_path_and_missing_are_skipped() {
+        let mut missing = cand("/nope/zsh");
+        missing.1 = false;
+        let kept = super::pick_unique([
+            cand("/usr/bin/bash"),
+            missing,
+            cand("/bin/bash"),
+            cand("/bin/zsh"),
+        ]);
+        assert_eq!(
+            kept,
+            [PathBuf::from("/usr/bin/bash"), PathBuf::from("/bin/zsh")]
+        );
+    }
+
+    #[test]
+    fn symlinked_shells_with_other_names_are_dropped() {
+        let real = Some(PathBuf::from("/usr/bin/bash"));
+        let kept = super::pick_unique([
+            (PathBuf::from("/bin/bash"), true, real.clone()),
+            (PathBuf::from("/bin/rbash"), true, real),
+        ]);
+        assert_eq!(kept, [PathBuf::from("/bin/bash")]);
+    }
+
+    #[test]
+    fn discovered_shells_pass_validation() {
+        let store = crate::ProfileStore {
+            profiles: super::discover_shells(),
+        };
+        assert!(store.validate().is_empty(), "{:?}", store.validate());
     }
 }
