@@ -14,6 +14,7 @@ use iced::{
 };
 
 use crate::app::{App, Message, TabBarMsg};
+use crate::chrome::{self, Chrome};
 use crate::editor::EditorMsg;
 use crate::keys::{self, Action};
 use crate::palette::{self, PaletteMsg};
@@ -21,7 +22,8 @@ use crate::prompts::PromptMsg;
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
 
-const TAB_BAR_HEIGHT: f32 = 36.0;
+/// Gap between the top of the tab bar and the top of a tab.
+const TAB_TOP_GAP: f32 = 4.0;
 
 // Lucide icons (ISC License, Copyright (c) Lucide Contributors): "x" and "plus".
 const ICON_X: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
@@ -41,8 +43,13 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         && *eid == id
     {
         let degraded = app.fallback.as_ref().is_some_and(|f| f.degraded());
+        let mut content = column![];
+        if Chrome::current().draws_title_bar() {
+            content = content.push(editor_header(t, id));
+        }
+        let content = content.push(crate::editor::view::view(t, state, degraded));
         return Element::new(Shortcuts {
-            content: crate::editor::view::view(t, state, degraded),
+            content: content.into(),
             window: id,
             mode: Mode::Editor,
         });
@@ -163,6 +170,8 @@ fn tab_bar<'a>(
     tabs: &'a [Tab],
     active: usize,
 ) -> Element<'a, Message> {
+    let chrome = Chrome::current();
+    let height = chrome.bar_height();
     let msg = move |m| Message::TabBar(window, m);
     let mut bar = row![].spacing(2).align_y(Alignment::End);
     for (i, tab) in tabs.iter().enumerate() {
@@ -172,6 +181,7 @@ fn tab_bar<'a>(
             tab,
             i,
             (i == active).then_some(active_bg),
+            height - TAB_TOP_GAP,
         ));
     }
     let new_tab = button(icon(ICON_PLUS, 14.0, t.text_muted))
@@ -181,17 +191,17 @@ fn tab_bar<'a>(
     bar = bar.push(
         container(new_tab)
             .padding(Padding::from([0.0, 4.0]))
-            .center_y(TAB_BAR_HEIGHT),
+            .center_y(height),
     );
-    container(bar)
+    let bar = container(bar)
         .padding(Padding {
             top: 0.0,
             right: 8.0,
             bottom: 0.0,
-            left: 8.0,
+            left: chrome.leading_inset(),
         })
         .width(Length::Fill)
-        .height(TAB_BAR_HEIGHT)
+        .height(height)
         .align_y(Alignment::End)
         .style(move |_| container::Style {
             background: Some(t.surface.into()),
@@ -201,8 +211,34 @@ fn tab_bar<'a>(
                 radius: 0.0.into(),
             },
             ..container::Style::default()
-        })
-        .into()
+        });
+    chrome::title_bar(bar, move |a| Message::TitleBar(window, a))
+}
+
+/// The profile editor's own bar where the OS title bar is gone: the window title, and room to
+/// move the window.
+fn editor_header<'a>(t: &'static Tokens, window: window::Id) -> Element<'a, Message> {
+    let chrome = Chrome::current();
+    let header = container(
+        text("Profiles")
+            .font(UI_FONT)
+            .size(12.5)
+            .color(t.text_secondary),
+    )
+    .center_x(Length::Fill)
+    .center_y(chrome.bar_height())
+    .style(move |_| container::Style {
+        background: Some(t.surface.into()),
+        ..container::Style::default()
+    });
+    let rule = container(text(""))
+        .width(Length::Fill)
+        .height(1)
+        .style(move |_| container::Style {
+            background: Some(t.border.into()),
+            ..container::Style::default()
+        });
+    chrome::title_bar(column![header, rule], move |a| Message::TitleBar(window, a))
 }
 
 fn ghost(t: &Tokens, status: button::Status) -> button::Style {
@@ -226,6 +262,7 @@ fn tab_button<'a>(
     tab: &'a Tab,
     index: usize,
     active_bg: Option<Color>,
+    height: f32,
 ) -> Element<'a, Message> {
     let active = active_bg.is_some();
     let stripe = container(text(""))
@@ -261,7 +298,7 @@ fn tab_button<'a>(
     button(inner)
         .on_press(Message::TabBar(window, TabBarMsg::Select(index)))
         .width(Length::Fixed(196.0))
-        .height(TAB_BAR_HEIGHT - 6.0)
+        .height(height)
         .padding(Padding {
             top: 0.0,
             right: 6.0,

@@ -21,6 +21,7 @@
 //!   window (nothing waits for the answer).
 
 mod app;
+mod chrome;
 mod debug;
 mod dialogs;
 mod editor;

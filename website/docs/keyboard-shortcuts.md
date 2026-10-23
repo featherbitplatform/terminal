@@ -20,6 +20,12 @@ On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled 
 | New window | `Cmd+N` | `Ctrl+Shift+N` |
 | Quit (saves the layout first) | `Cmd+Q` | `Ctrl+Shift+Q` |
 
+### The title bar on macOS
+
+On macOS the tab bar is the title bar: the window buttons sit at its left end and the tabs follow them. Drag any empty part of the tab bar (around and after the tabs) to move the window, and double-click it to zoom the window or restore its size. The profile editor window works the same way with its own header. The window title, shown in the Dock, Mission Control and the Window menu, is the active tab's name.
+
+On Linux and Windows the window keeps the system title bar for now.
+
 ## Scrollback
 
 | Action | macOS | Linux and Windows |

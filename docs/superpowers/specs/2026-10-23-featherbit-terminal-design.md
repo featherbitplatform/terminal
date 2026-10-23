@@ -221,6 +221,13 @@ Jump-chain references are exported together with the profiles they point to.
   third-party formats is a nice-to-have)*.
 - Per-profile accent: shown on tab and pane border; a scheme override per profile is a
   nice-to-have.
+- *(Owner's decision, 2026-10-23)* **Unified title bar on macOS.** The tab bar is the title bar:
+  the OS title strip is transparent and hidden, the content runs under it, the native window
+  buttons stay and sit vertically centered on the bar (32 px high, tabs start 78 px in). Empty bar
+  space moves the window, a double click zooms it. The window title is still set (the active
+  tab's) for the Dock, Mission Control and the Window menu. The profile editor gets the same
+  treatment with its own header. Linux and Windows keep OS decorations until milestone 6; the
+  code keeps this behind a per-platform chrome strategy (`crates/fbterm/src/chrome.rs`).
 
 ### 5.11 Keyboard defaults *(builder's call)*
 
@@ -242,6 +249,8 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 5. Export/import, optional main-password vault.
 6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
    (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
+   Windows and Linux: draw OS-styled window controls in the tab bar (no OS title bar),
+   drag/double-click/resize from edges; background blur where the platform supports it.
 
 Performance follow-up, before or within milestone 2: compact scrollback storage; investigate CPU
 use while streaming output; break down the ~100 MB base memory (RSS vs footprint; GPU/wgpu, font

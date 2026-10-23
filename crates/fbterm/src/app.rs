@@ -18,6 +18,7 @@ use iced::{Event, Font, Subscription, Task, Theme};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::chrome::{self, BarAction, Chrome};
 use crate::editor::{EditorMsg, EditorState};
 use crate::keys::Action;
 use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Palettes, Recency};
@@ -97,6 +98,8 @@ pub enum Message {
     WindowClosed(window::Id),
     /// A click in a window's tab bar; acts on that window whatever has focus.
     TabBar(window::Id, TabBarMsg),
+    /// A press on empty title-bar space (unified title bar): move or zoom that window.
+    TitleBar(window::Id, BarAction),
     Shortcut(window::Id, Action),
     DismissNotices,
     /// Palette input for one window.
@@ -512,6 +515,7 @@ impl App {
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                 }
             }
+            Message::TitleBar(wid, action) => chrome::perform(wid, action),
             Message::WindowClosed(id) => {
                 if self.editor_window() == Some(id) {
                     self.editor = None;
@@ -721,12 +725,12 @@ impl App {
 
     /// A new terminal window of `size` (logical pixels), with no tabs yet.
     pub(crate) fn new_window(&mut self, size: (f32, f32)) -> (window::Id, Task<Message>) {
-        let (id, open) = window::open(window::Settings {
+        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
             size: iced::Size::new(size.0, size.1),
             min_size: Some(iced::Size::new(360.0, 200.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        });
+        }));
         self.windows.insert(id, WindowState::new());
         self.sizes.insert(id, size);
         (id, open.map(Message::WindowOpened))
