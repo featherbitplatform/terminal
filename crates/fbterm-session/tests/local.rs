@@ -93,6 +93,7 @@ async fn echo_reaches_terminal() {
     let (h, mut rx) = start(&p, size(80, 24));
     assert_eq!(wait_exit(&mut rx).await, Some(0));
     assert!(grid_text(&h).contains("fbterm-ok"), "{}", grid_text(&h));
+    assert_eq!(h.ended(), Some(fbterm_session::SessionEnd::Exited(Some(0))));
 }
 
 #[cfg(unix)]

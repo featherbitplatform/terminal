@@ -132,6 +132,7 @@ pub fn spawn_local_into(
     let dirty_pending = Arc::new(AtomicBool::new(false));
     let bell_pending = Arc::new(AtomicBool::new(false));
     let detached = Arc::new(AtomicBool::new(false));
+    let ended = crate::Ended::default();
     let (tx, rx) = unbounded_channel::<Command>();
     let (done_tx, done_rx) = channel::<()>();
 
@@ -149,6 +150,7 @@ pub fn spawn_local_into(
         dirty_pending.clone(),
         bell_pending.clone(),
         detached.clone(),
+        ended.clone(),
     );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-waiter-{}", id.0))
@@ -173,6 +175,7 @@ pub fn spawn_local_into(
         dirty_pending.clone(),
         bell_pending.clone(),
         detached.clone(),
+        ended.clone(),
     );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-reader-{}", id.0))
@@ -204,6 +207,7 @@ pub fn spawn_local_into(
         dirty_pending,
         bell_pending,
         detached,
+        ended,
         closer: kill_unless_reaped(reaped, move || {
             let _ = killer.lock().kill();
         }),

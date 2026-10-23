@@ -145,6 +145,18 @@ pub fn on_shown(window: &WindowState) -> bool {
         .is_some_and(SessionHandle::take_dirty)
 }
 
+/// Install a running session in its tab and mark the tab connected. A session that already
+/// ended before it was installed (its `Exited` or `Disconnected` event found no tab) is applied
+/// at once; returns that end's notice.
+pub fn install_session(tab: &mut Tab, handle: SessionHandle) -> Option<String> {
+    let ended = handle.ended();
+    tab.session = Some(handle);
+    tab.placeholder = None;
+    tab.connecting = None;
+    tab.state = TabState::Connected;
+    ended.and_then(|end| apply_event(tab, &end.into()))
+}
+
 /// Apply a session event to its tab. Returns the notice to print, if the state changed to one
 /// that has one.
 pub fn apply_event(tab: &mut Tab, event: &SessionEvent) -> Option<String> {
@@ -402,6 +414,61 @@ mod tests {
         assert!(!on_shown(&w), "taken once");
         // Visible now: a Dirty re-arms and redraws.
         assert!(on_dirty(&w, 0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installing_an_already_ended_session_applies_its_end() {
+        use std::time::{Duration, Instant};
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let start = |script: &str| {
+            let local = fbterm_config::LocalProfile {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                cwd: None,
+                env: Default::default(),
+            };
+            let size = fbterm_term::GridSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 8.0,
+                cell_height: 16.0,
+            };
+            fbterm_session::spawn_local(&local, size, 100, tx.clone()).expect("spawn")
+        };
+
+        // The end was reported before the handle reached its tab.
+        let session = start("exit 3");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while session.ended().is_none() {
+            assert!(Instant::now() < deadline, "session never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut t = tab("early");
+        t.state = TabState::Connecting;
+        let notice = install_session(&mut t, session);
+        assert_eq!(t.state, TabState::Exited(Some(3)));
+        assert!(notice.is_some());
+        assert!(t.session.is_some() && t.connecting.is_none() && t.placeholder.is_none());
+
+        // A running session just connects.
+        let mut t = tab("running");
+        t.state = TabState::Connecting;
+        assert_eq!(install_session(&mut t, start("sleep 5")), None);
+        assert_eq!(t.state, TabState::Connected);
+    }
+
+    #[test]
+    fn a_session_end_converts_to_its_event() {
+        use fbterm_session::SessionEnd;
+        let mut t = tab("ssh");
+        t.state = TabState::Connected;
+        assert!(apply_event(&mut t, &SessionEnd::Disconnected("gone".into()).into()).is_some());
+        assert_eq!(t.state, TabState::Disconnected("gone".into()));
+        assert_eq!(
+            SessionEvent::from(SessionEnd::Exited(None)),
+            SessionEvent::Exited(None)
+        );
     }
 
     #[test]
