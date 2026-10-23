@@ -320,3 +320,48 @@ fn non_finite_font_size_takes_the_default() {
     assert_eq!(s.font_size, 13.0);
     assert_eq!(problems[0].0, "font_size");
 }
+
+#[test]
+fn background_settings_default_to_opaque_without_blur() {
+    let s = Settings::load_or_default(&tmp("nope.toml"));
+    assert_eq!(s.background_opacity, 1.0);
+    assert!(!s.background_blur);
+}
+
+#[test]
+fn background_settings_parse() {
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "background_opacity = 0.85\nbackground_blur = true\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.background_opacity, 0.85);
+    assert!(s.background_blur);
+    assert!(warning.is_none());
+}
+
+#[test]
+fn out_of_range_opacity_is_clamped_and_reported() {
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "theme = \"dark\"\nbackground_opacity = 1.5\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.background_opacity, 1.0);
+    let w = warning.expect("an out-of-range opacity is reported");
+    assert_eq!(w.line, Some(2));
+    assert!(
+        w.message.contains("background_opacity 1.5"),
+        "{}",
+        w.message
+    );
+
+    std::fs::write(&path, "background_opacity = -0.2\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.background_opacity, 0.0);
+    assert_eq!(warning.unwrap().line, Some(1));
+
+    let mut s = Settings {
+        background_opacity: f32::NAN,
+        ..Settings::default()
+    };
+    let problems = s.clamp();
+    assert_eq!(s.background_opacity, 1.0);
+    assert_eq!(problems[0].0, "background_opacity");
+}

@@ -108,6 +108,29 @@ impl Chrome {
     }
 }
 
+/// How a terminal window is created for a background opacity and blur setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Backdrop {
+    /// The window can show what is behind it. Fixed when the window opens.
+    pub transparent: bool,
+    /// What shows through is blurred. Fixed when the window opens.
+    pub blur: bool,
+}
+
+impl Chrome {
+    /// The backdrop of a terminal window opened now. On macOS windows are always created
+    /// transparent and paint an opaque background at full opacity, so a changed opacity applies
+    /// to open windows at once; elsewhere only a window opened while the opacity is below 1 is
+    /// transparent. Blur only matters, and is only asked for, below full opacity.
+    pub fn backdrop(self, opacity: f32, blur: bool) -> Backdrop {
+        let translucent = opacity < 1.0;
+        Backdrop {
+            transparent: translucent || self == Self::Unified,
+            blur: blur && translucent,
+        }
+    }
+}
+
 /// The task for a bar action on window `id`.
 pub fn perform<T>(id: window::Id, action: BarAction) -> iced::Task<T> {
     match action {
@@ -324,6 +347,36 @@ mod tests {
             Chrome::Native
         };
         assert_eq!(Chrome::current(), expected);
+    }
+
+    #[test]
+    fn windows_are_transparent_when_translucent_and_always_on_macos() {
+        let opaque = Backdrop {
+            transparent: false,
+            blur: false,
+        };
+        assert_eq!(Chrome::Native.backdrop(1.0, true), opaque);
+        assert_eq!(
+            Chrome::Native.backdrop(0.85, true),
+            Backdrop {
+                transparent: true,
+                blur: true
+            }
+        );
+        assert_eq!(
+            Chrome::Native.backdrop(0.85, false),
+            Backdrop {
+                transparent: true,
+                blur: false
+            }
+        );
+        assert_eq!(
+            Chrome::Unified.backdrop(1.0, true),
+            Backdrop {
+                transparent: true,
+                blur: false
+            }
+        );
     }
 
     #[cfg(target_os = "macos")]

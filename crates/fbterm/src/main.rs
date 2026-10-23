@@ -59,6 +59,7 @@ fn main() -> iced::Result {
     let mut daemon = iced::daemon(App::boot, App::update, window::view)
         .title(App::title)
         .theme(|app: &App, _| app.theme.clone())
+        .style(App::style)
         .subscription(App::subscription)
         .default_font(theme::UI_FONT);
     for font in FONTS {

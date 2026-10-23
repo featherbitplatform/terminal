@@ -253,6 +253,9 @@ fn terminal_style(settings: &Settings) -> TerminalStyle {
         font_size: settings.font_size,
         accent: None,
         focused: true,
+        // The window paints the default background (with the padding around the grid) at
+        // `background_opacity`; see `window::view`.
+        background_opacity: 0.0,
     }
 }
 
@@ -415,6 +418,20 @@ impl App {
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title),
             None => "fbterm".into(),
+        }
+    }
+
+    /// The color windows are cleared with: clear when the background is translucent (every
+    /// window then paints its own background), the theme's background otherwise.
+    pub fn style(&self, theme: &Theme) -> iced::theme::Style {
+        let p = theme.palette();
+        iced::theme::Style {
+            background_color: if self.settings.background_opacity < 1.0 {
+                iced::Color::TRANSPARENT
+            } else {
+                p.background
+            },
+            text_color: p.text,
         }
     }
 
@@ -725,10 +742,17 @@ impl App {
 
     /// A new terminal window of `size` (logical pixels), with no tabs yet.
     pub(crate) fn new_window(&mut self, size: (f32, f32)) -> (window::Id, Task<Message>) {
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let chrome = Chrome::current();
+        let backdrop = chrome.backdrop(
+            self.settings.background_opacity,
+            self.settings.background_blur,
+        );
+        let (id, open) = window::open(chrome.window_settings(window::Settings {
             size: iced::Size::new(size.0, size.1),
             min_size: Some(iced::Size::new(360.0, 200.0)),
             exit_on_close_request: false,
+            transparent: backdrop.transparent,
+            blur: backdrop.blur,
             ..window::Settings::default()
         }));
         self.windows.insert(id, WindowState::new());
@@ -925,6 +949,9 @@ impl App {
     /// read each frame). The scrollback length applies to terminals opened from now on.
     /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
     /// protocol flags programs have set, turning it on affects their requests from then on.
+    /// `background_opacity` is read each frame too; a window can only show through if it was
+    /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
+    /// is fixed when a window opens, so those apply to windows opened from now on.
     fn apply_settings(&mut self, new: Settings) {
         if new == self.settings {
             return;
@@ -947,6 +974,11 @@ impl App {
                     term.lock().set_kitty_keyboard(new.kitty_keyboard);
                 }
             }
+        }
+        let backdrop =
+            |s: &Settings| Chrome::current().backdrop(s.background_opacity, s.background_blur);
+        if backdrop(&new) != backdrop(&self.settings) && !self.windows.is_empty() {
+            tracing::info!("window transparency and blur apply to windows opened from now on");
         }
         tracing::info!("settings.toml reloaded");
         self.settings = new;

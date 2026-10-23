@@ -22,6 +22,12 @@ pub struct Settings {
     /// Let programs turn on the kitty keyboard protocol (off: requests are ignored and keys keep
     /// their legacy encoding).
     pub kitty_keyboard: bool,
+    /// Opacity of the terminal's default background and the window chrome around it, from
+    /// `0.0` (clear) to `1.0` (opaque). Text, the cursor, the selection and cells with their own
+    /// background stay opaque.
+    pub background_opacity: f32,
+    /// Blur what shows through a translucent background, where the platform supports it.
+    pub background_blur: bool,
 }
 
 impl Default for Settings {
@@ -32,12 +38,16 @@ impl Default for Settings {
             scrollback_lines: 10_000,
             theme: ThemeMode::Dark,
             kitty_keyboard: false,
+            background_opacity: 1.0,
+            background_blur: false,
         }
     }
 }
 
 /// Allowed range of `font_size`, in points.
 pub const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
+/// Allowed range of `background_opacity`.
+pub const OPACITY_RANGE: (f32, f32) = (0.0, 1.0);
 /// Allowed range of `scrollback_lines`.
 pub const SCROLLBACK_RANGE: (usize, usize) = (0, 1_000_000);
 
@@ -51,9 +61,10 @@ impl Settings {
     }
 
     /// Like [`Settings::load`], and also reports values that were out of range. Such values
-    /// do not reject the file: they are clamped to the nearest allowed value (a `font_size`
-    /// that is not a finite number takes the default), and the returned warning names each
-    /// field, its value and what is used instead, with the line of the first one.
+    /// do not reject the file: they are clamped to the nearest allowed value (a `font_size` or
+    /// `background_opacity` that is not a finite number takes the default), and the returned
+    /// warning names each field, its value and what is used instead, with the line of the first
+    /// one.
     pub fn load_checked(path: &Path) -> Result<(Self, Option<ConfigError>), ConfigError> {
         let text = match std::fs::read_to_string(path) {
             Ok(t) => t,
@@ -111,6 +122,22 @@ impl Settings {
                 ),
             ));
             self.scrollback_lines = used;
+        }
+        let (lo, hi) = OPACITY_RANGE;
+        if !(lo..=hi).contains(&self.background_opacity) {
+            let used = if self.background_opacity.is_finite() {
+                self.background_opacity.clamp(lo, hi)
+            } else {
+                Self::default().background_opacity
+            };
+            problems.push((
+                "background_opacity",
+                format!(
+                    "background_opacity {} is out of range ({lo} to {hi}), using {used}",
+                    self.background_opacity
+                ),
+            ));
+            self.background_opacity = used;
         }
         problems
     }

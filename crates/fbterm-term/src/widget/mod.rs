@@ -34,6 +34,10 @@ pub struct TerminalStyle {
     pub accent: Option<Rgb>,
     /// Keyboard input goes to the terminal and the cursor is solid only when focused.
     pub focused: bool,
+    /// Opacity of the default background, `0.0` to `1.0`. Cells with their own background, the
+    /// selection, the cursor and text stay opaque. At `0.0` the default background is not drawn
+    /// at all, for a host that paints it behind the widget.
+    pub background_opacity: f32,
 }
 
 /// What the widget asks of its host.
@@ -275,6 +279,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                     font_size: m.font_size,
                 },
                 self.style.accent,
+                self.style.background_opacity,
             );
         }
     }

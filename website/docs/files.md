@@ -34,6 +34,8 @@ font_size = 13.0
 scrollback_lines = 10000
 theme = "dark"
 kitty_keyboard = false
+background_opacity = 1.0
+background_blur = false
 ```
 
 | Field | Type | Default | Meaning |
@@ -43,6 +45,8 @@ kitty_keyboard = false
 | `scrollback_lines` | integer, `0` to `1000000` | `10000` | Lines of history kept per tab. |
 | `theme` | `"dark"` or `"light"` | `"dark"` | Color theme. |
 | `kitty_keyboard` | `true` or `false` | `false` | Let programs turn on the kitty keyboard protocol, which reports keys such as Esc, Ctrl and Alt chords, and optionally every key and key releases, as unambiguous escape codes. When `false`, programs' requests for it are ignored and keys use the classic encoding. A change applies to open tabs at once: turning it off returns every tab to the classic encoding, turning it on lets programs enable the protocol from then on (restart a program that asked for it earlier). |
+| `background_opacity` | number, `0.0` to `1.0` | `1.0` | Opacity of the terminal's background and of the tab bar, from `0.0` (fully see-through) to `1.0` (opaque). Text, the cursor, the selection and cells a program gives their own background color stay opaque. On macOS a change applies to open windows at once; on Linux and Windows a window can only become see-through if it was opened while the value was below `1.0`, so open a new window after lowering it. |
+| `background_blur` | `true` or `false` | `false` | Blur what shows through a see-through background (with `background_opacity` below `1.0`). Applies to windows opened after the change. Works on macOS; on Linux and Windows it depends on the system and may have no effect. |
 
 A value outside its range does not reject the file: the app uses the nearest allowed value (for example `font_size = 100` gives `72`) and reports the field, the file and the line the same way it reports a syntax error. The file itself is left as you wrote it.
 

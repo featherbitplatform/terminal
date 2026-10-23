@@ -103,6 +103,7 @@ fn pane(sample: String, focused: bool, accent: Option<Rgb>) -> Pane {
             font_size: 14.0,
             accent,
             focused,
+            background_opacity: 1.0,
         },
         sample,
         fed: false,

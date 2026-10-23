@@ -62,11 +62,16 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     } else {
         &app.style_unfocused
     };
-    let term_bg = to_color(style.scheme.background);
-    let mut body = column![tab_bar(t, id, term_bg, &win.tabs, win.active)];
+    // The default background and the chrome around it take the background opacity; text,
+    // cursor, selection and cells with their own background stay opaque (the terminal widget
+    // draws those and leaves its default background to the container below).
+    let opacity = app.settings.background_opacity;
+    let term_bg = to_color(style.scheme.background).scale_alpha(opacity);
+    let bar_bg = t.surface.scale_alpha(opacity);
+    let mut body = column![tab_bar(t, id, bar_bg, term_bg, &win.tabs, win.active)];
     let notices = app.visible_notices();
     if !notices.is_empty() {
-        body = body.push(notice_banner(t, notices));
+        body = body.push(notice_banner(t, bar_bg, notices));
     }
     // Only the active tab builds a terminal view; background tabs render nothing.
     let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
@@ -166,6 +171,7 @@ fn dot<'a>(color: Color) -> Element<'a, Message> {
 fn tab_bar<'a>(
     t: &'static Tokens,
     window: window::Id,
+    bar_bg: Color,
     active_bg: Color,
     tabs: &'a [Tab],
     active: usize,
@@ -182,6 +188,7 @@ fn tab_bar<'a>(
             i,
             (i == active).then_some(active_bg),
             height - TAB_TOP_GAP,
+            tab_radius(bar_bg),
         ));
     }
     let new_tab = button(icon(ICON_PLUS, 14.0, t.text_muted))
@@ -202,17 +209,207 @@ fn tab_bar<'a>(
         })
         .width(Length::Fill)
         .height(height)
-        .align_y(Alignment::End)
-        .style(move |_| container::Style {
-            background: Some(t.surface.into()),
-            border: Border {
-                color: t.border,
-                width: 0.0,
-                radius: 0.0.into(),
-            },
-            ..container::Style::default()
-        });
+        .align_y(Alignment::End);
+    let bar = Element::new(BarBackground {
+        content: bar.into(),
+        color: bar_bg,
+        hole: (active < tabs.len()).then_some(active),
+        corner: tab_radius(bar_bg),
+    });
     chrome::title_bar(bar, move |a| Message::TitleBar(window, a))
+}
+
+/// Top corner radius of a tab.
+const TAB_RADIUS: f32 = 6.0;
+
+/// The tabs' top corner radius at `bar_bg`: square on a translucent bar, where the bar's
+/// background behind a rounded corner would add to the tab's own alpha and show as a notch.
+fn tab_radius(bar_bg: Color) -> f32 {
+    if bar_bg.a < 1.0 { 0.0 } else { TAB_RADIUS }
+}
+
+/// The pieces of `outer` that cover everything but `hole`, plus the hole's top corner squares
+/// (behind its rounded corners). With a translucent background the active tab must not be
+/// drawn over the bar's background, or the two alphas would add up there.
+fn around(outer: Rectangle, hole: Rectangle, corner: f32) -> Vec<Rectangle> {
+    let hole = match outer.intersection(&hole) {
+        Some(h) => h,
+        None => return vec![outer],
+    };
+    let mut out = Vec::with_capacity(6);
+    let mut push = |x: f32, y: f32, w: f32, h: f32| {
+        if w > 0.0 && h > 0.0 {
+            out.push(Rectangle {
+                x,
+                y,
+                width: w,
+                height: h,
+            });
+        }
+    };
+    let (right, bottom) = (hole.x + hole.width, hole.y + hole.height);
+    push(outer.x, outer.y, outer.width, hole.y - outer.y);
+    push(
+        outer.x,
+        bottom,
+        outer.width,
+        outer.y + outer.height - bottom,
+    );
+    push(outer.x, hole.y, hole.x - outer.x, hole.height);
+    push(right, hole.y, outer.x + outer.width - right, hole.height);
+    let r = corner.min(hole.width / 2.0).min(hole.height);
+    push(hole.x, hole.y, r, r);
+    push(right - r, hole.y, r, r);
+    out
+}
+
+/// Paints the tab bar's background everywhere except under the active tab (child `hole` of
+/// the bar's row), which draws its own.
+struct BarBackground<'a> {
+    content: Element<'a, Message>,
+    color: Color,
+    hole: Option<usize>,
+    /// Top corner radius of the tab in the hole.
+    corner: f32,
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        use iced::advanced::Renderer as _;
+        let bounds = layout.bounds();
+        // container -> row -> tab
+        let hole = self.hole.and_then(|i| {
+            layout
+                .children()
+                .next()
+                .and_then(|row| row.children().nth(i))
+                .map(|tab| tab.bounds())
+        });
+        let pieces = match hole {
+            Some(h) => around(bounds, h, self.corner),
+            None => vec![bounds],
+        };
+        for piece in pieces {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: piece,
+                    snap: true,
+                    ..renderer::Quad::default()
+                },
+                self.color,
+            );
+        }
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 /// The profile editor's own bar where the OS title bar is gone: the window title, and room to
@@ -263,6 +460,7 @@ fn tab_button<'a>(
     index: usize,
     active_bg: Option<Color>,
     height: f32,
+    radius: f32,
 ) -> Element<'a, Message> {
     let active = active_bg.is_some();
     let stripe = container(text(""))
@@ -311,7 +509,7 @@ fn tab_button<'a>(
                 background: surface_bg.or(hovered.then_some(Background::Color(t.hover))),
                 text_color: t.text,
                 border: Border {
-                    radius: iced::border::Radius::default().top(6.0),
+                    radius: iced::border::Radius::default().top(radius),
                     ..Border::default()
                 },
                 ..button::Style::default()
@@ -320,7 +518,11 @@ fn tab_button<'a>(
         .into()
 }
 
-fn notice_banner<'a>(t: &'static Tokens, notices: Vec<String>) -> Element<'a, Message> {
+fn notice_banner<'a>(
+    t: &'static Tokens,
+    base: Color,
+    notices: Vec<String>,
+) -> Element<'a, Message> {
     let mono = iced::Font::with_name("Geist Mono");
     let lines = notices.into_iter().fold(column![].spacing(2), |c, n| {
         c.push(text(n).font(mono).size(12).color(t.text))
@@ -329,7 +531,7 @@ fn notice_banner<'a>(t: &'static Tokens, notices: Vec<String>) -> Element<'a, Me
         .on_press(Message::DismissNotices)
         .padding(Padding::from([3.0, 10.0]))
         .style(move |_, status| ghost(t, status));
-    container(
+    let banner = container(
         row![
             scrollable(lines).height(Length::Shrink).width(Length::Fill),
             dismiss
@@ -341,14 +543,16 @@ fn notice_banner<'a>(t: &'static Tokens, notices: Vec<String>) -> Element<'a, Me
     .width(Length::Fill)
     .style(move |_| container::Style {
         background: Some(t.danger_soft.into()),
-        border: Border {
-            color: t.danger,
-            width: 0.0,
-            radius: 0.0.into(),
-        },
         ..container::Style::default()
-    })
-    .into()
+    });
+    // The tint sits on the chrome's background, so it reads the same at any opacity.
+    container(banner)
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(base.into()),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// How a [`Shortcuts`] wrapper treats keys.
@@ -625,6 +829,38 @@ mod tests {
             press(Mode::Normal, "w", false),
             Some(Some(Message::Shortcut(_, Action::CloseTab)))
         ));
+    }
+
+    #[test]
+    fn the_bar_background_leaves_the_active_tab_to_itself() {
+        let outer = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 32.0,
+        };
+        let tab = Rectangle {
+            x: 100.0,
+            y: 4.0,
+            width: 196.0,
+            height: 28.0,
+        };
+        let pieces = around(outer, tab, 6.0);
+        let area = |r: &Rectangle| r.width * r.height;
+        let covered: f32 = pieces.iter().map(area).sum();
+        // Everything but the tab, plus its two 6x6 corner squares.
+        assert_eq!(covered, area(&outer) - area(&tab) + 2.0 * 36.0);
+        // Nothing covers the middle of the tab.
+        let inside = iced::Point::new(198.0, 20.0);
+        assert!(pieces.iter().all(|r| !r.contains(inside)));
+        // Square tabs (translucent bar) get no corner squares.
+        let covered: f32 = around(outer, tab, 0.0).iter().map(area).sum();
+        assert_eq!(covered, area(&outer) - area(&tab));
+        assert_eq!(tab_radius(Color::WHITE), TAB_RADIUS);
+        assert_eq!(tab_radius(Color::WHITE.scale_alpha(0.85)), 0.0);
+        // With no overlap the whole bar is painted.
+        let away = Rectangle { x: 900.0, ..tab };
+        assert_eq!(around(outer, away, 6.0), vec![outer]);
     }
 
     #[test]
