@@ -218,6 +218,19 @@ fn partial_settings_file_uses_defaults() {
     let s = Settings::load_or_default(&path);
     assert_eq!(s.theme, ThemeMode::Light);
     assert_eq!(s.font_size, 13.0);
+    assert!(
+        !s.kitty_keyboard,
+        "kitty keyboard protocol is off by default"
+    );
+}
+
+#[test]
+fn kitty_keyboard_setting_parses() {
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "kitty_keyboard = true\n").unwrap();
+    let s = Settings::load_or_default(&path);
+    assert!(s.kitty_keyboard);
+    assert_eq!(s.scrollback_lines, 10_000);
 }
 
 #[test]

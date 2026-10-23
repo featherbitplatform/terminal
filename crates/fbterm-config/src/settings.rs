@@ -19,6 +19,9 @@ pub struct Settings {
     pub font_size: f32,
     pub scrollback_lines: usize,
     pub theme: ThemeMode,
+    /// Let programs turn on the kitty keyboard protocol (off: requests are ignored and keys keep
+    /// their legacy encoding).
+    pub kitty_keyboard: bool,
 }
 
 impl Default for Settings {
@@ -28,6 +31,7 @@ impl Default for Settings {
             font_size: 13.0,
             scrollback_lines: 10_000,
             theme: ThemeMode::Dark,
+            kitty_keyboard: false,
         }
     }
 }

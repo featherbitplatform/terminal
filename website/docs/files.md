@@ -19,7 +19,7 @@ The directory is created the first time the app writes a file. All files are TOM
 | File | Written by | Purpose |
 | --- | --- | --- |
 | `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles. See [Profiles and jump hosts](profiles). |
-| `settings.toml` | you | Font, scrollback and theme. |
+| `settings.toml` | you | Font, scrollback, theme and keyboard protocol. |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
 
 `profiles.toml` and `settings.toml` are reloaded while the app runs. If a file has a syntax error, the app reports the file and line, keeps what it had loaded, and never overwrites the broken file.
@@ -33,6 +33,7 @@ font_family = "Geist Mono"
 font_size = 13.0
 scrollback_lines = 10000
 theme = "dark"
+kitty_keyboard = false
 ```
 
 | Field | Type | Default | Meaning |
@@ -41,6 +42,7 @@ theme = "dark"
 | `font_size` | number, `6.0` to `72.0` | `13.0` | Font size in points. |
 | `scrollback_lines` | integer, `0` to `1000000` | `10000` | Lines of history kept per tab. |
 | `theme` | `"dark"` or `"light"` | `"dark"` | Color theme. |
+| `kitty_keyboard` | `true` or `false` | `false` | Let programs turn on the kitty keyboard protocol, which reports keys such as Esc, Ctrl and Alt chords, and optionally every key and key releases, as unambiguous escape codes. When `false`, programs' requests for it are ignored and keys use the classic encoding. A change applies to open tabs at once: turning it off returns every tab to the classic encoding, turning it on lets programs enable the protocol from then on (restart a program that asked for it earlier). |
 
 A value outside its range does not reject the file: the app uses the nearest allowed value (for example `font_size = 100` gives `72`) and reports the field, the file and the line the same way it reports a syntax error. The file itself is left as you wrote it.
 
