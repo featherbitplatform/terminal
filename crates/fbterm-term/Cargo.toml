@@ -8,7 +8,7 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-iced = { workspace = true }
+iced = { workspace = true, features = ["advanced"] }
 alacritty_terminal = { workspace = true }
 parking_lot = { workspace = true }
 fbterm-config = { path = "../fbterm-config" }
@@ -16,3 +16,4 @@ fbterm-config = { path = "../fbterm-config" }
 [dev-dependencies]
 iced = { workspace = true, features = ["wgpu", "tokio", "advanced"] }
 portable-pty = { workspace = true }
+png = "0.17"
