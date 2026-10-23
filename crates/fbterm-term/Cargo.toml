@@ -6,3 +6,8 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+iced = { workspace = true, features = ["wgpu", "tokio", "advanced"] }
+alacritty_terminal = { workspace = true }
+portable-pty = { workspace = true }
