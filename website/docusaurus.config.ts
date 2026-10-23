@@ -4,7 +4,7 @@ import type * as Preset from '@docusaurus/preset-classic';
 
 const config: Config = {
   title: 'featherbit terminal',
-  tagline: 'A fast, light terminal for people who live in many SSH sessions.',
+  tagline: 'A native terminal for people who live in many SSH sessions.',
   favicon: 'img/featherbit-favicon.png',
 
   future: {
