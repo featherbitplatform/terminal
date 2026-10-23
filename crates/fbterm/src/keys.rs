@@ -15,7 +15,6 @@ pub enum Action {
     NewWindow,
     Settings,
     /// Reached from the palette; no default chord.
-    #[allow(dead_code, reason = "sent by the palette")]
     EditProfiles,
 }
 

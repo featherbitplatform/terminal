@@ -13,6 +13,7 @@ fbterm-secrets = { path = "../fbterm-secrets" }
 fbterm-session = { path = "../fbterm-session" }
 fbterm-term = { path = "../fbterm-term" }
 iced = { workspace = true, features = ["tokio", "advanced", "svg"] }
+nucleo-matcher = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }
 async-trait = { workspace = true }

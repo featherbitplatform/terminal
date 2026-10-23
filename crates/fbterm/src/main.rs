@@ -7,11 +7,13 @@
 //!
 //! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
+//! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
 
 mod app;
 mod keys;
+mod palette;
 mod sessions;
 mod tabs;
 mod theme;

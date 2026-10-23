@@ -6,7 +6,7 @@ use fbterm_term::terminal_view;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Operation, Tree, Widget};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
-use iced::widget::{button, column, container, row, scrollable, svg, text};
+use iced::widget::{button, column, container, row, scrollable, stack, svg, text};
 use iced::window::{self, Screenshot};
 use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Padding, Rectangle, Size, Vector,
@@ -15,6 +15,7 @@ use iced::{
 
 use crate::app::{App, Message, TabBarMsg};
 use crate::keys::{self, Action};
+use crate::palette::{self, PaletteMsg};
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
 
@@ -71,10 +72,28 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 ..container::Style::default()
             }),
     );
-    Element::new(Shortcuts {
+    let palette = app.palettes.get(&id);
+    let base = Element::new(Shortcuts {
         content: body.into(),
         window: id,
-    })
+        mode: if palette.is_some() {
+            Mode::Blocked
+        } else {
+            Mode::Normal
+        },
+    });
+    match palette {
+        Some(state) => stack![
+            base,
+            Element::new(Shortcuts {
+                content: palette::view(t, id, state),
+                window: id,
+                mode: Mode::Palette,
+            })
+        ]
+        .into(),
+        None => base,
+    }
 }
 
 fn to_color(c: fbterm_config::Rgb) -> Color {
@@ -263,11 +282,43 @@ fn notice_banner<'a>(t: &'static Tokens, notices: Vec<String>) -> Element<'a, Me
     .into()
 }
 
+/// How a [`Shortcuts`] wrapper treats keys that are not application shortcuts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Pass them on.
+    Normal,
+    /// Drop them: a modal overlay is up, so nothing may reach the terminal beneath it.
+    Blocked,
+    /// The palette's own: Up/Down, Ctrl+P/N, Enter and Escape drive it; the rest goes on to the
+    /// search box.
+    Palette,
+}
+
+/// The palette message a key means while the palette is up.
+fn palette_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<PaletteMsg> {
+    use keyboard::key::Named;
+    match key {
+        keyboard::Key::Named(Named::ArrowUp) => Some(PaletteMsg::Up),
+        keyboard::Key::Named(Named::ArrowDown) => Some(PaletteMsg::Down),
+        keyboard::Key::Named(Named::Enter) => Some(PaletteMsg::Submit),
+        keyboard::Key::Named(Named::Escape) => Some(PaletteMsg::Close),
+        keyboard::Key::Character(c) if mods.control() && !mods.shift() && !mods.logo() => {
+            match c.as_str() {
+                "p" => Some(PaletteMsg::Up),
+                "n" => Some(PaletteMsg::Down),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Wraps a window's content and turns application shortcuts into messages before the terminal
 /// sees the key, so Ctrl+Shift chords never reach the shell.
 struct Shortcuts<'a> {
     content: Element<'a, Message>,
     window: window::Id,
+    mode: Mode,
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
@@ -317,18 +368,31 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Keyboard(keyboard::Event::KeyPressed {
-            key,
-            modifiers,
-            repeat,
-            ..
-        }) = event
+        if self.mode == Mode::Palette
+            && let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
+            && let Some(msg) = palette_key(key, *modifiers)
+        {
+            shell.publish(Message::Palette(self.window, msg));
+            shell.capture_event();
+            return;
+        }
+        if self.mode != Mode::Palette
+            && let Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) = event
             && let Some(action) = keys::shortcut(key, *modifiers)
         {
             // Holding a key repeats tab switching only.
             if !*repeat || matches!(action, Action::NextTab | Action::PrevTab) {
                 shell.publish(Message::Shortcut(self.window, action));
             }
+            shell.capture_event();
+            return;
+        }
+        if self.mode == Mode::Blocked && matches!(event, Event::Keyboard(_)) {
             shell.capture_event();
             return;
         }

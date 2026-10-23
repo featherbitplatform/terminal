@@ -16,20 +16,10 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::keys::Action;
+use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Palettes, Recency};
 use crate::sessions::{EventReceiver, prompter, session_stream, write_notice};
 use crate::tabs::{self, Tab, TabId, TabState, WindowState};
 use crate::theme;
-
-/// Palette messages. Placeholder until the palette exists (it replaces this enum).
-#[allow(
-    dead_code,
-    reason = "variants used by the palette, editor and prompt tasks"
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PaletteMsg {
-    Open,
-    Close,
-}
 
 /// Profile editor messages. Placeholder until the editor exists.
 #[allow(
@@ -114,7 +104,8 @@ pub enum Message {
     TabBar(window::Id, TabBarMsg),
     Shortcut(window::Id, Action),
     DismissNotices,
-    Palette(PaletteMsg),
+    /// Palette input for one window.
+    Palette(window::Id, PaletteMsg),
     Editor(EditorMsg),
     Prompt(PromptMsg),
     Shoot,
@@ -146,6 +137,10 @@ pub struct App {
     pub(crate) grids: HashMap<window::Id, GridSize>,
     /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
+    /// Open quick-launch palettes, by window.
+    pub palettes: Palettes,
+    /// When each profile was last opened (in memory until state persistence).
+    pub recency: Recency,
     /// Whether one of our windows has focus at all (the app is in front).
     pub app_active: bool,
     pub style: TerminalStyle,
@@ -154,6 +149,12 @@ pub struct App {
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
     pub(crate) shooting: bool,
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Configuration directory: `FBTERM_CONFIG_DIR` (debug aid: keeps manual runs away from the
@@ -259,6 +260,8 @@ impl App {
             windows: BTreeMap::new(),
             grids: HashMap::new(),
             focused: None,
+            palettes: Palettes::new(),
+            recency: Recency::new(),
             app_active: true,
             style_unfocused: TerminalStyle {
                 focused: false,
@@ -270,6 +273,7 @@ impl App {
         };
         let mut task = app.open_window(app.default_profile());
         task = task.chain(app.open_debug_tabs());
+        task = task.chain(app.open_debug_palette());
         (app, task)
     }
 
@@ -294,6 +298,17 @@ impl App {
             w.active = 0;
         }
         Task::batch(tasks)
+    }
+
+    /// `FBTERM_PALETTE_QUERY=text` (debug aid): the palette open and pre-filled in the first window.
+    fn open_debug_palette(&mut self) -> Task<Message> {
+        let Some(query) = debug_env("FBTERM_PALETTE_QUERY") else {
+            return Task::none();
+        };
+        match self.windows.keys().next().copied() {
+            Some(wid) => self.open_palette(wid, query.to_string_lossy().into_owned()),
+            None => Task::none(),
+        }
     }
 
     /// The first local profile, preferring the user's login shell.
@@ -419,6 +434,7 @@ impl App {
             Message::WindowClosed(id) => {
                 // Dropping the window's tabs closes their sessions and abandons their dials.
                 self.windows.remove(&id);
+                self.palettes.remove(&id);
                 self.grids.remove(&id);
                 if self.focused == Some(id) {
                     self.focused = self.windows.keys().next().copied();
@@ -434,10 +450,7 @@ impl App {
                 self.notices_dismissed = true;
                 Task::none()
             }
-            Message::Palette(msg) => {
-                tracing::info!(?msg, "palette not available yet");
-                Task::none()
-            }
+            Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::Editor(msg) => {
                 tracing::info!(?msg, "profile editor not available yet");
                 Task::none()
@@ -492,11 +505,10 @@ impl App {
         }
         let wid = self.focused_window();
         match action {
-            // New tab opens the palette once it exists; until then the default local profile.
-            Action::NewTab => match (wid, self.default_profile()) {
-                (Some(wid), Some(profile)) => self.open_tab(wid, profile),
-                (None, profile) => self.open_window(profile),
-                _ => Task::none(),
+            // New tab asks which profile to open: the palette, with nothing preselected.
+            Action::NewTab => match wid {
+                Some(wid) => self.open_palette(wid, String::new()),
+                None => self.open_window(self.default_profile()),
             },
             Action::CloseTab => match wid {
                 Some(wid) => {
@@ -508,11 +520,77 @@ impl App {
             Action::NextTab => self.with_focused(WindowState::next),
             Action::PrevTab => self.with_focused(WindowState::prev),
             Action::SelectTab(n) => self.with_focused(|w| w.select_number(n)),
-            Action::Palette => self.update(Message::Palette(PaletteMsg::Open)),
+            Action::Palette => match wid {
+                Some(wid) if self.palettes.contains_key(&wid) => {
+                    self.palette(wid, PaletteMsg::Close)
+                }
+                Some(wid) => self.palette(wid, PaletteMsg::Open),
+                None => Task::none(),
+            },
             Action::NewWindow => self.open_window(self.default_profile()),
             Action::Settings | Action::EditProfiles => {
                 self.update(Message::Editor(EditorMsg::Open))
             }
+        }
+    }
+
+    /// Open `wid`'s palette (or reset it) with `query`, and focus its input.
+    fn open_palette(&mut self, wid: window::Id, query: String) -> Task<Message> {
+        if !self.windows.contains_key(&wid) {
+            return Task::none();
+        }
+        let state = PaletteState::new(palette::items(&self.profiles), query, &self.recency);
+        let input = state.input.clone();
+        self.palettes.insert(wid, state);
+        iced::widget::operation::focus(input)
+    }
+
+    fn palette(&mut self, wid: window::Id, msg: PaletteMsg) -> Task<Message> {
+        let recency = &self.recency;
+        let Some(state) = self.palettes.get_mut(&wid) else {
+            return match msg {
+                PaletteMsg::Open => self.open_palette(wid, String::new()),
+                _ => Task::none(),
+            };
+        };
+        let chosen = match msg {
+            PaletteMsg::Open => return self.open_palette(wid, String::new()),
+            PaletteMsg::Query(q) => {
+                state.set_query(q, recency);
+                return Task::none();
+            }
+            PaletteMsg::Up => {
+                state.up();
+                return Task::none();
+            }
+            PaletteMsg::Down => {
+                state.down();
+                return Task::none();
+            }
+            PaletteMsg::Close => None,
+            PaletteMsg::Submit => state.selected_item().cloned(),
+            PaletteMsg::Pick(position) => state.at(position).cloned(),
+        };
+        if matches!(msg, PaletteMsg::Submit | PaletteMsg::Pick(_)) && chosen.is_none() {
+            // Nothing matches: Enter does nothing, the palette stays open.
+            return Task::none();
+        }
+        self.palettes.remove(&wid);
+        match chosen {
+            Some(PaletteItem::Profile { id, .. }) => self.open_tab(wid, id),
+            Some(PaletteItem::Action { action, .. }) => self.run_palette_action(wid, action),
+            None => Task::none(),
+        }
+    }
+
+    fn run_palette_action(&mut self, wid: window::Id, action: Action) -> Task<Message> {
+        match action {
+            // From the palette, "New tab" is the default shell (the palette itself just closed).
+            Action::NewTab => match self.default_profile() {
+                Some(profile) => self.open_tab(wid, profile),
+                None => Task::none(),
+            },
+            other => self.action(Some(wid), other),
         }
     }
 
@@ -535,6 +613,7 @@ impl App {
             return Task::none();
         };
         let tab = Tab::new(profile, p.name.clone(), p.accent);
+        self.recency.bump(profile, unix_now());
         let id = tab.id;
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();
