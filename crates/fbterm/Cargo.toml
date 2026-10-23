@@ -6,3 +6,18 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+fbterm-config = { path = "../fbterm-config" }
+fbterm-secrets = { path = "../fbterm-secrets" }
+fbterm-session = { path = "../fbterm-session" }
+fbterm-term = { path = "../fbterm-term" }
+iced = { workspace = true, features = ["tokio", "advanced", "svg"] }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+async-trait = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
+# Only for the FBTERM_SCREENSHOT debug aid.
+png = "0.17"

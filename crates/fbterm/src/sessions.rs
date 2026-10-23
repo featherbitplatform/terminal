@@ -1,0 +1,274 @@
+//! Session lifecycle: starting local and SSH sessions, their events and terminal input.
+
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
+use fbterm_config::{Profile, ProfileKind};
+use fbterm_secrets::SecretKind;
+use fbterm_session::ssh::{Prompter, SecretAnswer};
+use fbterm_session::{SessionEvent, SessionHandle, SessionId, spawn_local};
+use fbterm_term::{GridSize, SharedTerminal, Terminal, TerminalOutput};
+use iced::Task;
+use iced::futures::Stream;
+use iced::window;
+use parking_lot::Mutex;
+use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::app::{App, DEFAULT_GRID, Delivered, Message};
+use crate::tabs::{self, InputRoute, Tab, TabId, TabState, WindowState};
+
+/// The connection prompter. Placeholder until the prompt UI exists: unknown host keys are
+/// refused and no secret is offered, so SSH tabs fail with a visible reason instead of waiting.
+pub(crate) fn prompter() -> Arc<dyn Prompter> {
+    Arc::new(NoPrompter)
+}
+
+struct NoPrompter;
+
+#[async_trait::async_trait]
+impl Prompter for NoPrompter {
+    async fn confirm_host_key(&self, host: &str, port: u16, fingerprint: &str) -> bool {
+        tracing::warn!(%host, port, %fingerprint, "unknown host key refused (no prompt UI yet)");
+        false
+    }
+
+    async fn ask_secret(
+        &self,
+        profile: &str,
+        _kind: SecretKind,
+        _retry: bool,
+    ) -> Option<SecretAnswer> {
+        tracing::warn!(%profile, "secret needed but there is no prompt UI yet");
+        None
+    }
+}
+
+type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
+
+/// Session events from every session, delivered to the update loop by one subscription.
+#[derive(Clone)]
+pub(crate) struct EventReceiver(pub(crate) Arc<Mutex<Option<Events>>>);
+
+impl Hash for EventReceiver {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        "fbterm-session-events".hash(state);
+    }
+}
+
+pub(crate) fn session_stream(
+    rx: &EventReceiver,
+) -> impl Stream<Item = (SessionId, SessionEvent)> + use<> {
+    let rx = rx.0.lock().take();
+    iced::futures::stream::unfold(rx, |rx| async move {
+        let mut rx = rx?;
+        let event = rx.recv().await?;
+        Some((event, Some(rx)))
+    })
+}
+
+impl App {
+    pub(crate) fn new_terminal(&self, grid: GridSize) -> SharedTerminal {
+        let mut term = Terminal::new(grid, self.settings.scrollback_lines);
+        self.style.scheme.apply_to(&mut term);
+        Arc::new(Mutex::new(term))
+    }
+
+    /// (Re)start a tab's session: spawn a local program, or dial an SSH profile.
+    pub(crate) fn start(&mut self, wid: window::Id, id: TabId) -> Task<Message> {
+        let grid = self.grids.get(&wid).copied().unwrap_or(DEFAULT_GRID);
+        let scrollback = self.settings.scrollback_lines;
+        let placeholder = self.new_terminal(grid);
+        let events = self.events.clone();
+        let profile: Option<Profile> = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.find(id).map(|i| w.tabs[i].profile))
+            .and_then(|p| self.profiles.get(p).cloned());
+        let scheme = self.style.scheme;
+        let Some(tab) = self.windows.get_mut(&wid).and_then(|w| {
+            let i = w.find(id)?;
+            w.tabs.get_mut(i)
+        }) else {
+            return Task::none();
+        };
+        // Drop the previous session (and any dial in flight) before starting again.
+        tab.session = None;
+        tab.connecting = None;
+        tab.title = tab.name.clone();
+        tab.placeholder = Some(placeholder);
+        let Some(profile) = profile else {
+            tab.state = TabState::Disconnected("profile not found".into());
+            write_notice(tab, "this profile no longer exists", true);
+            return Task::none();
+        };
+        match &profile.kind {
+            ProfileKind::Local(local) => {
+                match spawn_local(local, grid, scrollback, events) {
+                    Ok(handle) => {
+                        scheme.apply_to(&mut handle.terminal.lock());
+                        tab.session = Some(handle);
+                        tab.placeholder = None;
+                        tab.state = TabState::Connected;
+                    }
+                    Err(e) => {
+                        let text = format!(
+                            "could not start {}: {e}, press Enter to retry",
+                            profile.name
+                        );
+                        tab.state = TabState::Disconnected(e.to_string());
+                        write_notice(tab, &text, true);
+                    }
+                }
+                Task::none()
+            }
+            ProfileKind::Ssh(ssh) => {
+                tab.state = TabState::Connecting;
+                write_notice(
+                    tab,
+                    &format!("connecting to {}@{}:{}", ssh.user, ssh.host, ssh.port),
+                    true,
+                );
+                let pool = self.pool.clone();
+                let store = self.profiles.clone();
+                let pid = profile.id;
+                let dial = async move {
+                    pool.open_shell(&store, &pid, grid, scrollback, events)
+                        .await
+                        .map_err(|e| e.to_string())
+                };
+                let (task, handle) = Task::perform(dial, move |r| match r {
+                    Ok(h) => Message::Connected(id, Delivered::new(h)),
+                    Err(e) => Message::ConnectFailed(id, e),
+                })
+                .abortable();
+                tab.connecting = Some(handle.abort_on_drop());
+                task
+            }
+        }
+    }
+
+    pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle) {
+        let scheme = self.style.scheme;
+        // A tab closed meanwhile drops the handle here, closing the shell.
+        let Some(tab) = self.tab_mut(id) else { return };
+        scheme.apply_to(&mut handle.terminal.lock());
+        tab.session = Some(handle);
+        tab.placeholder = None;
+        tab.connecting = None;
+        tab.state = TabState::Connected;
+    }
+
+    pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {
+        let Some(tab) = self.windows.values_mut().find_map(|w| {
+            w.tabs
+                .iter_mut()
+                .find(|t| t.session.as_ref().is_some_and(|s| s.id == sid))
+        }) else {
+            return Task::none();
+        };
+        match &event {
+            SessionEvent::Dirty => {
+                // Re-arm before the redraw that follows this update locks the terminal. Only the
+                // active tab of a window builds a terminal view, so a hidden tab just re-arms and
+                // draws nothing until it is shown.
+                if let Some(s) = &tab.session {
+                    s.take_dirty();
+                }
+                Task::none()
+            }
+            SessionEvent::ClipboardStore(text) => iced::clipboard::write(text.clone()),
+            _ => {
+                if let Some(text) = tabs::apply_event(tab, &event) {
+                    write_notice(tab, &text, false);
+                }
+                Task::none()
+            }
+        }
+    }
+
+    pub(crate) fn terminal_output(
+        &mut self,
+        wid: window::Id,
+        output: TerminalOutput,
+    ) -> Task<Message> {
+        match output {
+            TerminalOutput::Input(bytes) => {
+                let Some(tab) = self
+                    .windows
+                    .get_mut(&wid)
+                    .and_then(WindowState::active_tab_mut)
+                else {
+                    return Task::none();
+                };
+                match tabs::route_input(&tab.state, &bytes) {
+                    InputRoute::Send => {
+                        if let Some(s) = &tab.session {
+                            s.send(bytes);
+                        }
+                        Task::none()
+                    }
+                    InputRoute::Reconnect | InputRoute::Respawn => {
+                        let id = tab.id;
+                        self.start(wid, id)
+                    }
+                    InputRoute::Ignore => Task::none(),
+                }
+            }
+            TerminalOutput::Resized(grid) => {
+                self.grids.insert(wid, grid);
+                if let Some(s) = self
+                    .windows
+                    .get(&wid)
+                    .and_then(WindowState::active_tab)
+                    .and_then(|t| t.session.as_ref())
+                {
+                    s.resize(grid);
+                }
+                Task::none()
+            }
+            // The widget already put the text on the clipboard.
+            TerminalOutput::Copy(_) => Task::none(),
+            TerminalOutput::OpenUrl(url) => {
+                open_url(&url);
+                Task::none()
+            }
+        }
+    }
+}
+
+/// Write a dim notice into the tab's visible terminal, keeping its scrollback.
+/// `fresh`: the terminal was just created and is still empty.
+pub(crate) fn write_notice(tab: &Tab, text: &str, fresh: bool) {
+    if let Some(term) = tab.terminal() {
+        term.lock().feed(&tabs::notice_bytes(text, fresh));
+    }
+}
+
+/// Open a link with the system opener. Only web, mail and file links are opened.
+fn open_url(url: &str) {
+    let allowed = ["http://", "https://", "mailto:", "file://"];
+    if !allowed
+        .iter()
+        .any(|p| url.to_ascii_lowercase().starts_with(p))
+    {
+        tracing::warn!(%url, "not opening link with an unsupported scheme");
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    let mut cmd = std::process::Command::new("open");
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut c = std::process::Command::new("rundll32");
+        c.arg("url.dll,FileProtocolHandler");
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = std::process::Command::new("xdg-open");
+    match cmd.arg(url).spawn() {
+        // Reap the opener so it does not linger as a zombie.
+        Ok(mut child) => {
+            std::thread::spawn(move || child.wait());
+        }
+        Err(e) => tracing::warn!(%url, error = %e, "could not open link"),
+    }
+}
