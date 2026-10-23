@@ -189,6 +189,9 @@ pub struct App {
     /// `FBTERM_SCREENSHOT_WINDOW=editor` (debug aid): capture the editor window instead.
     pub(crate) screenshot_editor: bool,
     pub(crate) shooting: bool,
+    /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
+    /// shows.
+    pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
 }
 
 fn unix_now() -> i64 {
@@ -388,6 +391,8 @@ impl App {
             screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
             screenshot_editor: debug_env("FBTERM_SCREENSHOT_WINDOW").is_some_and(|w| w == "editor"),
             shooting: false,
+            demo_tip: debug_env("FBTERM_DEMO_TOOLTIP")
+                .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
         };
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),

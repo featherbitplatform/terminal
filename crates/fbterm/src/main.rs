@@ -19,6 +19,8 @@
 //!   selected.
 //! - `FBTERM_DEMO_PROMPT=hostkey|password|changed`: show a sample connection dialog in the first
 //!   window (nothing waits for the answer).
+//! - `FBTERM_DEMO_TOOLTIP=new|profiles|close`: keep that tab-bar button's tooltip showing (for
+//!   screenshots; `close` is the first tab's).
 
 mod app;
 mod chrome;
@@ -38,6 +40,7 @@ mod restore_tests;
 mod sessions;
 mod tabs;
 mod theme;
+mod tooltip;
 mod ui;
 mod watch;
 mod window;

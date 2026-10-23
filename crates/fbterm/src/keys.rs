@@ -68,9 +68,161 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
     }
 }
 
+/// A chord as the user presses it: the key plus its modifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Chord {
+    /// The key, lowercase for letters.
+    pub key: char,
+    pub ctrl: bool,
+    pub shift: bool,
+    /// Cmd on macOS.
+    pub cmd: bool,
+}
+
+/// The chord that triggers `action` on macOS (`mac`) or the other platforms, if it has one.
+/// Kept in step with [`shortcut_for`] by the tests, so what the app shows is what works.
+pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
+    let (key, mac_shift) = match action {
+        Action::NewTab => ('t', false),
+        Action::CloseTab => ('w', false),
+        Action::NewWindow => ('n', false),
+        Action::Quit => ('q', false),
+        Action::NextTab => (']', true),
+        Action::PrevTab => ('[', true),
+        Action::Palette => ('p', true),
+        Action::SelectTab(n @ 1..=9) => (char::from(b'0' + n), false),
+        Action::EditProfiles => (',', true),
+        Action::SelectTab(_) | Action::OpenSettingsFile | Action::RevealConfigFolder => {
+            return None;
+        }
+    };
+    Some(if mac {
+        Chord {
+            key,
+            ctrl: false,
+            shift: mac_shift,
+            cmd: true,
+        }
+    } else {
+        Chord {
+            key,
+            ctrl: true,
+            shift: true,
+            cmd: false,
+        }
+    })
+}
+
+impl Chord {
+    /// How the chord is written: `⇧⌘,` on macOS, `Ctrl+Shift+T` elsewhere.
+    pub fn label(self, mac: bool) -> String {
+        let key = self.key.to_ascii_uppercase();
+        if mac {
+            let mut s = String::new();
+            if self.ctrl {
+                s.push('⌃');
+            }
+            if self.shift {
+                s.push('⇧');
+            }
+            if self.cmd {
+                s.push('⌘');
+            }
+            s.push(key);
+            s
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if self.ctrl {
+                parts.push("Ctrl".into());
+            }
+            if self.shift {
+                parts.push("Shift".into());
+            }
+            if self.cmd {
+                parts.push("Super".into());
+            }
+            parts.push(key.to_string());
+            parts.join("+")
+        }
+    }
+
+    /// The modifiers held for this chord.
+    #[cfg(test)]
+    pub fn modifiers(self) -> Modifiers {
+        let mut m = Modifiers::empty();
+        if self.ctrl {
+            m |= Modifiers::CTRL;
+        }
+        if self.shift {
+            m |= Modifiers::SHIFT;
+        }
+        if self.cmd {
+            m |= Modifiers::LOGO;
+        }
+        m
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALL: [Action; 19] = [
+        Action::NewTab,
+        Action::CloseTab,
+        Action::NextTab,
+        Action::PrevTab,
+        Action::SelectTab(1),
+        Action::SelectTab(2),
+        Action::SelectTab(3),
+        Action::SelectTab(4),
+        Action::SelectTab(5),
+        Action::SelectTab(6),
+        Action::SelectTab(7),
+        Action::SelectTab(8),
+        Action::SelectTab(9),
+        Action::Palette,
+        Action::NewWindow,
+        Action::Quit,
+        Action::EditProfiles,
+        Action::OpenSettingsFile,
+        Action::RevealConfigFolder,
+    ];
+
+    #[test]
+    fn every_shown_chord_triggers_its_action() {
+        for mac in [true, false] {
+            for action in ALL {
+                let Some(c) = chord_for(mac, action) else {
+                    continue;
+                };
+                let key = Key::Character(c.key.to_string().into());
+                assert_eq!(
+                    shortcut_for(mac, &key, c.modifiers()),
+                    Some(action),
+                    "{} (mac: {mac})",
+                    c.label(mac)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn chord_labels_per_platform() {
+        let l = |mac, a| chord_for(mac, a).map(|c| c.label(mac));
+        assert_eq!(l(true, Action::NewTab).as_deref(), Some("⌘T"));
+        assert_eq!(l(true, Action::CloseTab).as_deref(), Some("⌘W"));
+        assert_eq!(l(true, Action::EditProfiles).as_deref(), Some("⇧⌘,"));
+        assert_eq!(l(true, Action::Palette).as_deref(), Some("⇧⌘P"));
+        assert_eq!(l(false, Action::NewTab).as_deref(), Some("Ctrl+Shift+T"));
+        assert_eq!(l(false, Action::CloseTab).as_deref(), Some("Ctrl+Shift+W"));
+        assert_eq!(
+            l(false, Action::EditProfiles).as_deref(),
+            Some("Ctrl+Shift+,")
+        );
+        assert_eq!(l(true, Action::OpenSettingsFile), None);
+        assert_eq!(l(false, Action::RevealConfigFolder), None);
+    }
 
     fn k(s: &str) -> Key {
         Key::Character(s.into())

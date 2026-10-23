@@ -21,6 +21,7 @@ use crate::palette::{self, PaletteMsg};
 use crate::prompts::PromptMsg;
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
+use crate::tooltip::{DemoTip, tip};
 
 /// Gap between the top of the tab bar and the top of a tab.
 const TAB_TOP_GAP: f32 = 4.0;
@@ -77,6 +78,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         active_bg: term_bg,
         fullscreen: app.fullscreen.contains(&id),
         modal: palette.is_some() || dialog.is_some(),
+        demo_tip: app.demo_tip,
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -187,6 +189,8 @@ struct TabBar {
     fullscreen: bool,
     /// The palette or a dialog covers the window.
     modal: bool,
+    /// `FBTERM_DEMO_TOOLTIP` (debug aid): the button whose tooltip always shows.
+    demo_tip: Option<DemoTip>,
 }
 
 fn tab_bar<'a>(
@@ -201,7 +205,9 @@ fn tab_bar<'a>(
         active_bg,
         fullscreen,
         modal,
+        demo_tip,
     } = bar;
+    let tabs_bar = bar;
     let chrome = Chrome::current();
     let height = chrome.bar_height();
     let msg = move |m| Message::TabBar(window, m);
@@ -209,7 +215,7 @@ fn tab_bar<'a>(
     for (i, tab) in tabs.iter().enumerate() {
         bar = bar.push(tab_button(
             t,
-            window,
+            tabs_bar,
             tab,
             i,
             (i == active).then_some(active_bg),
@@ -225,6 +231,20 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::Profiles))
         .padding(7)
         .style(move |_, status| ghost(t, status));
+    let new_tab = tip(
+        t,
+        new_tab,
+        "New tab",
+        Action::NewTab,
+        demo_tip == Some(DemoTip::New),
+    );
+    let profiles = tip(
+        t,
+        profiles,
+        "Edit profiles",
+        Action::EditProfiles,
+        demo_tip == Some(DemoTip::Profiles),
+    );
     bar = bar.push(
         container(new_tab)
             .padding(Padding::from([0.0, 4.0]))
@@ -482,13 +502,15 @@ fn ghost(t: &Tokens, status: button::Status) -> button::Style {
 /// two read as one surface.
 fn tab_button<'a>(
     t: &'static Tokens,
-    window: window::Id,
+    bar: TabBar,
     tab: &'a Tab,
     index: usize,
     active_bg: Option<Color>,
     height: f32,
     radius: f32,
 ) -> Element<'a, Message> {
+    let window = bar.window;
+    let demo_tip = index == 0 && bar.demo_tip == Some(DemoTip::Close);
     let active = active_bg.is_some();
     let stripe = container(text(""))
         .width(3)
@@ -510,6 +532,7 @@ fn tab_button<'a>(
         .on_press(Message::TabBar(window, TabBarMsg::Close(index)))
         .padding(3)
         .style(move |_, status| ghost(t, status));
+    let close = tip(t, close, "Close tab", Action::CloseTab, demo_tip);
     let inner = row![
         stripe,
         dot(state_color(t, &tab.state)),
