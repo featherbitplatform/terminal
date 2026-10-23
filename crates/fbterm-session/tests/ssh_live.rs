@@ -936,4 +936,84 @@ mod pool {
         );
         assert!(pool.connected_profiles().is_empty());
     }
+
+    /// Blocks every host-key question until released; records whether the question was
+    /// dropped (cancelled) before it was answered.
+    #[derive(Default)]
+    struct Gate {
+        asked: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        dropped_unanswered: AtomicUsize,
+        answered: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Prompter for Gate {
+        async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
+            struct Pending<'a>(&'a AtomicUsize, bool);
+            impl Drop for Pending<'_> {
+                fn drop(&mut self) {
+                    if !self.1 {
+                        self.0.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            let mut pending = Pending(&self.dropped_unanswered, false);
+            let released = self.release.notified();
+            self.asked.notify_one();
+            released.await;
+            pending.1 = true;
+            self.answered.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+        async fn ask_secret(
+            &self,
+            name: &str,
+            kind: SecretKind,
+            _retry: bool,
+        ) -> Option<SecretAnswer> {
+            panic!("unexpected {kind:?} prompt for {name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_dial_cancels_host_key_prompt() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let gate = Arc::new(Gate::default());
+        let pool = SshPool::new(w.fx.ctx(gate.clone()));
+        let (tx, _rx): (EventSink, _) = unbounded_channel();
+        // Open a tab and close it (drop the open) while the host-key question is showing.
+        tokio::time::timeout(STEP, async {
+            tokio::select! {
+                r = pool.open_shell(&w.store, &w.bastion, SIZE, 10, tx) => {
+                    panic!("open finished without an answer: {:?}", r.err())
+                }
+                () = gate.asked.notified() => {}
+            }
+        })
+        .await
+        .expect("the host-key question never came");
+
+        // The question is withdrawn ...
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gate.dropped_unanswered.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the host-key prompt stayed open after the dial was aborted");
+        // ... and a late "yes" goes nowhere: nothing is learned for the closed tab.
+        gate.release.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(gate.answered.load(Ordering::SeqCst), 0);
+        assert!(
+            w.fx.known_hosts_lines().is_empty(),
+            "{:?}",
+            w.fx.known_hosts_lines()
+        );
+        assert!(pool.connected_profiles().is_empty());
+    }
 }

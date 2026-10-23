@@ -156,6 +156,56 @@ pub struct ClientHandler {
     accepted: Option<PublicKey>,
     /// Why the connection ended, set once it has.
     lost: Arc<Mutex<Option<String>>>,
+    /// Raised when the connect that created this handler was given up before it finished.
+    cancel: Arc<Cancel>,
+}
+
+/// A one-way "give up" signal.
+#[derive(Default)]
+struct Cancel {
+    raised: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl Cancel {
+    fn raise(&self) {
+        self.raised
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.raised.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            // Registered before the check, so a raise in between still wakes us.
+            let notified = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// Raises its [`Cancel`] when dropped before [`Self::disarm`]: when the connect future that
+/// owns it is dropped (aborted dial) or fails.
+struct CancelOnDrop(Option<Arc<Cancel>>);
+
+impl CancelOnDrop {
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.0.take() {
+            cancel.raise();
+        }
+    }
 }
 
 impl client::Handler for ClientHandler {
@@ -191,11 +241,17 @@ impl client::Handler for ClientHandler {
             }
             HostKeyStatus::Unknown => {
                 let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
-                if !self
-                    .prompter
-                    .confirm_host_key(&self.host, self.port, &fingerprint)
-                    .await
-                {
+                // russh runs this check in a task of its own, which outlives a connect that
+                // was given up (tab closed, dial aborted): the cancel signal closes the prompt
+                // then, and a "yes" racing with it is ignored, so nothing is learned.
+                let trusted = tokio::select! {
+                    trusted = self.prompter.confirm_host_key(&self.host, self.port, &fingerprint) => trusted,
+                    () = self.cancel.cancelled() => false,
+                };
+                if self.cancel.is_cancelled() {
+                    return Err(SshError::Cancelled);
+                }
+                if !trusted {
                     return Err(SshError::HostKeyRejected);
                 }
                 // Like OpenSSH: failing to record the key is reported but does not undo the
@@ -458,7 +514,10 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         ..ctx.clone()
     };
     let lost = Arc::new(Mutex::new(None));
+    let cancel = Arc::new(Cancel::default());
+    let give_up = CancelOnDrop(Some(cancel.clone()));
     let handler = ClientHandler {
+        cancel,
         host: ssh.host.clone(),
         port: ssh.port,
         known_hosts: ctx.known_hosts.clone(),
@@ -490,6 +549,7 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         auth::authenticate(&mut handle, profile, ssh, &ctx),
     )
     .await??;
+    give_up.disarm();
     Ok(Hop { handle, lost })
 }
 
@@ -740,5 +800,25 @@ mod tests {
                 .to_string()
                 .contains("bastion-1 ([fe80::1]:22): x")
         );
+    }
+
+    #[tokio::test]
+    async fn cancel_on_drop_raises_unless_disarmed() {
+        let cancel = Arc::new(Cancel::default());
+        CancelOnDrop(Some(cancel.clone())).disarm();
+        assert!(!cancel.is_cancelled());
+
+        let waiter = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move { cancel.cancelled().await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+        drop(CancelOnDrop(Some(cancel.clone())));
+        assert!(cancel.is_cancelled());
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("a raised cancel wakes its waiters")
+            .unwrap();
     }
 }
