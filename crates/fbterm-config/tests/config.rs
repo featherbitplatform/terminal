@@ -255,3 +255,55 @@ fn missing_settings_load_is_ok_defaults() {
         Settings::default()
     );
 }
+
+#[test]
+fn out_of_range_settings_are_clamped_and_reported() {
+    let path = tmp("settings.toml");
+    std::fs::write(
+        &path,
+        "theme = \"light\"\nfont_size = 200.0\nscrollback_lines = 5000000\n",
+    )
+    .unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.font_size, 72.0);
+    assert_eq!(s.scrollback_lines, 1_000_000);
+    assert_eq!(s.theme, ThemeMode::Light);
+    let w = warning.expect("out-of-range values are reported");
+    assert_eq!(w.path, path);
+    assert_eq!(w.line, Some(2));
+    assert!(w.message.contains("font_size"), "{}", w.message);
+    assert!(w.message.contains("scrollback_lines"), "{}", w.message);
+    // `load` applies the same clamping, without the warning.
+    assert_eq!(Settings::load(&path).unwrap(), s);
+}
+
+#[test]
+fn small_font_size_is_raised_to_the_minimum() {
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "font_size = 1.5\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.font_size, 6.0);
+    let w = warning.unwrap();
+    assert_eq!(w.line, Some(1));
+    assert!(w.message.contains("font_size 1.5"), "{}", w.message);
+}
+
+#[test]
+fn in_range_settings_load_without_warning() {
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "font_size = 6.0\nscrollback_lines = 0\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!((s.font_size, s.scrollback_lines), (6.0, 0));
+    assert!(warning.is_none());
+}
+
+#[test]
+fn non_finite_font_size_takes_the_default() {
+    let mut s = Settings {
+        font_size: f32::NAN,
+        ..Settings::default()
+    };
+    let problems = s.clamp();
+    assert_eq!(s.font_size, 13.0);
+    assert_eq!(problems[0].0, "font_size");
+}

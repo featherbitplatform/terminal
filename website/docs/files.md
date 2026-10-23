@@ -38,9 +38,11 @@ theme = "dark"
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `font_family` | string | `"Geist Mono"` | Terminal font family. |
-| `font_size` | number | `13.0` | Font size in points. |
-| `scrollback_lines` | integer | `10000` | Lines of history kept per tab. |
+| `font_size` | number, `6.0` to `72.0` | `13.0` | Font size in points. |
+| `scrollback_lines` | integer, `0` to `1000000` | `10000` | Lines of history kept per tab. |
 | `theme` | `"dark"` or `"light"` | `"dark"` | Color theme. |
+
+A value outside its range does not reject the file: the app uses the nearest allowed value (for example `font_size = 100` gives `72`) and reports the field, the file and the line the same way it reports a syntax error. The file itself is left as you wrote it.
 
 ## state.toml
 
