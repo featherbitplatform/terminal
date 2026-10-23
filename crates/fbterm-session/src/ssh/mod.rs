@@ -39,6 +39,22 @@ use tokio::sync::Notify;
 pub use known_hosts::{HostKeyStatus, check_host_key, learn_host_key};
 pub use pool::SshPool;
 
+use crate::AuthWarning;
+
+/// Whether `contents` (a private key file) holds an RSA key, decided without the passphrase:
+/// the legacy PEM header names the algorithm, and an OpenSSH key file carries its public half
+/// in clear even when encrypted. Anything else (other formats, garbage) is `false`.
+pub fn private_key_is_rsa(contents: &str) -> bool {
+    if contents
+        .trim_start()
+        .starts_with("-----BEGIN RSA PRIVATE KEY-----")
+    {
+        return true;
+    }
+    russh::keys::PrivateKey::from_openssh(contents)
+        .is_ok_and(|k| matches!(k.algorithm(), russh::keys::Algorithm::Rsa { .. }))
+}
+
 /// Bound on each step of reaching one hop: the TCP connect, and the SSH handshake plus
 /// authentication. Time spent waiting on the user does not count.
 pub const HOP_TIMEOUT: Duration = Duration::from_secs(15);
@@ -486,6 +502,8 @@ pub(crate) struct Hop {
     pub handle: Handle<ClientHandler>,
     /// Why the connection ended, once it has.
     pub lost: Arc<Mutex<Option<String>>>,
+    /// Set when authentication succeeded in a way the user should hear about.
+    pub warning: Option<AuthWarning>,
 }
 
 /// Run SSH over `stream` to the host of `profile`: verify its host key and authenticate.
@@ -537,7 +555,7 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     )
     .await??;
     clock.restart();
-    bounded(
+    let warning = bounded(
         &clock,
         limit,
         || {
@@ -550,7 +568,11 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     )
     .await??;
     give_up.disarm();
-    Ok(Hop { handle, lost })
+    Ok(Hop {
+        handle,
+        lost,
+        warning,
+    })
 }
 
 /// Open a TCP connection to the profile's host, bounded by [`HOP_TIMEOUT`].
@@ -593,6 +615,23 @@ pub async fn connect_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_rsa_private_keys() {
+        // Throwaway keys made for these tests; they protect nothing.
+        assert!(private_key_is_rsa(include_str!("testdata/rsa_openssh")));
+        // Encrypted OpenSSH keys keep their public half readable.
+        let enc = include_str!("testdata/rsa_openssh_enc");
+        assert!(enc.contains("BEGIN OPENSSH PRIVATE KEY"));
+        assert!(private_key_is_rsa(enc));
+        // Legacy PEM: the header alone says RSA.
+        assert!(private_key_is_rsa(include_str!("testdata/rsa_legacy_pem")));
+        assert!(!private_key_is_rsa(include_str!(
+            "testdata/ed25519_openssh"
+        )));
+        assert!(!private_key_is_rsa("not a key at all"));
+        assert!(!private_key_is_rsa(""));
+    }
 
     #[test]
     fn secret_answer_debug_redacts_value() {

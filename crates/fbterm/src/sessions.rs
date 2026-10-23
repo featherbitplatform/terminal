@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use fbterm_config::{Profile, ProfileKind};
 use fbterm_session::ssh::SshError;
-use fbterm_session::{SessionEvent, SessionHandle, SessionId, spawn_local_into};
+use fbterm_session::{AuthWarning, SessionEvent, SessionHandle, SessionId, spawn_local_into};
 use fbterm_term::{GridSize, SharedTerminal, Terminal, TerminalOutput};
 use iced::Task;
 use iced::futures::Stream;
@@ -168,8 +168,15 @@ impl App {
             handle.resize(current);
         }
         let tab = &mut window.tabs[index];
+        let warnings = handle.auth_warnings().to_vec();
         if let Some(text) = tabs::install_session(tab, handle) {
             write_notice(tab, &text, false);
+        }
+        // Once per tab: each tab's own handle carries its connection's warnings.
+        for warning in warnings {
+            match warning {
+                AuthWarning::RsaUserKey => write_notice(tab, crate::editor::RSA_ADVICE, false),
+            }
         }
         // The shell's reader started before the handle got here, so a `Dirty` it raised went
         // nowhere and is still pending: take it as a visible tab does (the redraw after this

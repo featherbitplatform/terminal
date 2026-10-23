@@ -14,6 +14,7 @@ use russh::client::Handle;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 
 use super::{ClientHandler, SecretAnswer, SshContext, SshError};
+use crate::AuthWarning;
 
 /// Prompts per secret before giving up.
 const MAX_PROMPTS: usize = 3;
@@ -23,9 +24,9 @@ pub(super) async fn authenticate(
     profile: &Profile,
     ssh: &SshProfile,
     ctx: &SshContext,
-) -> Result<(), SshError> {
+) -> Result<Option<AuthWarning>, SshError> {
     match &ssh.auth {
-        AuthMethod::Password => password(handle, profile, ssh, ctx).await,
+        AuthMethod::Password => password(handle, profile, ssh, ctx).await.map(|()| None),
         AuthMethod::Key { path, .. } => key(handle, profile, ssh, ctx, path).await,
         AuthMethod::Agent => agent(handle, profile, ssh).await,
     }
@@ -173,9 +174,10 @@ async fn key(
     ssh: &SshProfile,
     ctx: &SshContext,
     path: &Path,
-) -> Result<(), SshError> {
+) -> Result<Option<AuthWarning>, SshError> {
     let path = expand_home(path);
     let (key, answer) = unlock(&path, profile, ctx).await?;
+    let warning = rsa_warning(&key.algorithm());
     let hash = rsa_hash(handle, &key.algorithm()).await?;
     let accepted = handle
         .authenticate_publickey(&ssh.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
@@ -187,7 +189,13 @@ async fn key(
     if let Some(answer) = answer {
         remember(ctx, profile, SecretKind::KeyPassphrase, &answer);
     }
-    Ok(())
+    Ok(warning)
+}
+
+/// Signing with an RSA user key is worth a warning (timing side channel in the `rsa` crate);
+/// verifying a server's RSA host key is not affected and never warns.
+fn rsa_warning(algorithm: &russh::keys::Algorithm) -> Option<AuthWarning> {
+    matches!(algorithm, russh::keys::Algorithm::Rsa { .. }).then_some(AuthWarning::RsaUserKey)
 }
 
 #[cfg(unix)]
@@ -195,7 +203,7 @@ async fn agent(
     handle: &mut Handle<ClientHandler>,
     profile: &Profile,
     ssh: &SshProfile,
-) -> Result<(), SshError> {
+) -> Result<Option<AuthWarning>, SshError> {
     use russh::keys::agent::AgentIdentity;
     use russh::keys::agent::client::AgentClient;
 
@@ -218,12 +226,13 @@ async fn agent(
         let AgentIdentity::PublicKey { key, .. } = identity else {
             continue;
         };
+        let warning = rsa_warning(&key.algorithm());
         let hash = rsa_hash(handle, &key.algorithm()).await?;
         match handle
             .authenticate_publickey_with(&ssh.user, key, hash, &mut client)
             .await
         {
-            Ok(result) if result.success() => return Ok(()),
+            Ok(result) if result.success() => return Ok(warning),
             Ok(_) => {}
             Err(e) => tracing::info!(error = %e, "ssh-agent could not sign"),
         }
@@ -237,7 +246,7 @@ async fn agent(
     _handle: &mut Handle<ClientHandler>,
     profile: &Profile,
     _ssh: &SshProfile,
-) -> Result<(), SshError> {
+) -> Result<Option<AuthWarning>, SshError> {
     Err(SshError::Protocol(format!(
         "profile {:?}: ssh-agent authentication is not available on this platform yet",
         profile.name
@@ -247,6 +256,16 @@ async fn agent(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_rsa_user_keys_warn() {
+        use russh::keys::Algorithm;
+        assert_eq!(
+            rsa_warning(&Algorithm::Rsa { hash: None }),
+            Some(AuthWarning::RsaUserKey)
+        );
+        assert_eq!(rsa_warning(&Algorithm::Ed25519), None);
+    }
 
     #[test]
     fn rsa_hash_selection() {

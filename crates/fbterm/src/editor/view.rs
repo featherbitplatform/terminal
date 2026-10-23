@@ -360,7 +360,7 @@ fn form<'a>(
                 )
                 .push(field(t, "User", "user", &s.user, true, on(EditorMsg::User)))
                 .push(section(t, "Authentication"))
-                .push(auth(t, s, editable, degraded))
+                .push(auth(t, s, editable, degraded, state.selected_key_is_rsa()))
                 .push(section(t, "Jump hosts"))
                 .push(jumps(t, state, d.id, s, editable));
         }

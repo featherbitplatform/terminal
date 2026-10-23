@@ -28,7 +28,7 @@ use super::{
     ClientHandler, HOP_TIMEOUT, Hop, Prompter, SshContext, SshError, connect_hop, in_hop,
     ssh_profile, tcp_connect, timed_out,
 };
-use crate::{Command, EventSink, Feeder, SessionEvent, SessionHandle, SessionId};
+use crate::{AuthWarning, Command, EventSink, Feeder, SessionEvent, SessionHandle, SessionId};
 
 /// How long a closed shell spends sending its channel close.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
@@ -134,6 +134,8 @@ pub(crate) struct Connection {
     chain: Option<Chain>,
     /// Set when using the connection failed although its transport looked alive.
     dead: AtomicBool,
+    /// What authenticating any hop of the chain turned up; every shell reports it once.
+    warnings: Vec<AuthWarning>,
     runtime: tokio::runtime::Handle,
 }
 
@@ -255,12 +257,19 @@ async fn dial(
         hops.push(std::mem::replace(&mut current, hop));
         via = next;
     }
+    let mut warnings: Vec<AuthWarning> = hops
+        .iter()
+        .chain(std::iter::once(&current))
+        .filter_map(|h| h.warning)
+        .collect();
+    warnings.dedup();
     Ok(Connection {
         chain: Some(Chain {
             hops,
             target: current,
         }),
         dead: AtomicBool::new(false),
+        warnings,
         runtime: tokio::runtime::Handle::current(),
     })
 }
@@ -324,6 +333,7 @@ async fn open_shell_channel(
         bell_pending,
         detached,
         ended,
+        auth_warnings: connection.warnings.clone(),
         closer: Box::new(move || {
             closed_tx.send_replace(true);
         }),

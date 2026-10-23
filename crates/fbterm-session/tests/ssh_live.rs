@@ -554,7 +554,7 @@ mod pool {
     use alacritty_terminal::index::{Column, Line};
     use fbterm_config::ProfileStore;
     use fbterm_session::ssh::SshPool;
-    use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
+    use fbterm_session::{AuthWarning, EventSink, SessionEvent, SessionHandle, SessionId};
     use fbterm_term::GridSize;
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -763,6 +763,40 @@ mod pool {
         run(&h, "echo \"@@$(hostname)@@\"");
         wait_for(&h, "@@target2@@").await;
         assert_eq!(w.prompter.host_key_calls.lock().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn rsa_user_key_is_reported_per_tab_and_ed25519_is_not() {
+        if !enabled() {
+            return;
+        }
+        let mut rsa = ssh("rsa", HOST, vec![]);
+        if let ProfileKind::Ssh(s) = &mut rsa.kind {
+            s.auth = AuthMethod::Key {
+                path: keys_dir().join("fb_test_rsa"),
+                passphrase: false,
+            };
+        }
+        let rsa_id = rsa.id;
+        let w = World::new();
+        let w = World {
+            store: ProfileStore {
+                profiles: vec![rsa],
+            },
+            ..w
+        };
+        let pool = w.pool();
+        let (a, _ra) = open(&pool, &w, rsa_id).await;
+        let (b, _rb) = open(&pool, &w, rsa_id).await;
+        // Both tabs share one connection and each reports the warning exactly once.
+        assert_eq!(ssh_connection(&a).await, ssh_connection(&b).await);
+        assert_eq!(a.auth_warnings(), [AuthWarning::RsaUserKey]);
+        assert_eq!(b.auth_warnings(), [AuthWarning::RsaUserKey]);
+
+        let w = World::new();
+        let pool = w.pool();
+        let (c, _rc) = open(&pool, &w, w.target2).await;
+        assert!(c.auth_warnings().is_empty());
     }
 
     #[tokio::test]

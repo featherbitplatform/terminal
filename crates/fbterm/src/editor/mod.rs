@@ -253,6 +253,34 @@ pub struct EditorState {
     /// Unsaved edits exist.
     pub dirty: bool,
     secrets: Arc<dyn SecretStore>,
+    /// Whether the key file at this path (as typed) is an RSA private key; refreshed when the
+    /// path or the selection changes, so drawing never touches the disk.
+    key_check: Option<(String, bool)>,
+}
+
+/// The advice shown (editor, terminal) when a login uses an RSA key.
+pub const RSA_ADVICE: &str =
+    "This login uses an RSA key. Consider switching to an ed25519 key (ssh-keygen -t ed25519).";
+
+/// Key files are small; anything bigger is not read.
+const MAX_KEY_FILE: u64 = 64 * 1024;
+
+/// Whether the file at `path` (`~` expanded) is an RSA private key; unreadable means no.
+fn key_file_is_rsa(path: &str) -> bool {
+    use std::io::Read;
+    let path = std::path::Path::new(path);
+    let path = match path.strip_prefix("~") {
+        Ok(rest) => match directories::BaseDirs::new() {
+            Some(d) => d.home_dir().join(rest),
+            None => return false,
+        },
+        Err(_) => path.to_path_buf(),
+    };
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .and_then(|f| f.take(MAX_KEY_FILE).read_to_string(&mut text))
+        .is_ok()
+        && fbterm_session::ssh::private_key_is_rsa(&text)
 }
 
 impl EditorState {
@@ -262,7 +290,7 @@ impl EditorState {
         read_only: Option<ConfigError>,
     ) -> Self {
         let drafts: Vec<Draft> = store.profiles.iter().map(Draft::from_profile).collect();
-        Self {
+        let mut state = Self {
             selected: drafts.first().map(|d| d.id),
             drafts,
             removed: Vec::new(),
@@ -271,7 +299,35 @@ impl EditorState {
             read_only,
             dirty: false,
             secrets,
+            key_check: None,
+        };
+        state.refresh_key_check();
+        state
+    }
+
+    /// Re-check the selected draft's key file when its path differs from the last check.
+    fn refresh_key_check(&mut self) {
+        let path = match self.selected_draft().map(|d| &d.kind) {
+            Some(DraftKind::Ssh(s))
+                if s.auth == AuthChoice::Key && !s.key_path.trim().is_empty() =>
+            {
+                s.key_path.trim().to_owned()
+            }
+            _ => {
+                self.key_check = None;
+                return;
+            }
+        };
+        if self.key_check.as_ref().is_some_and(|(p, _)| *p == path) {
+            return;
         }
+        let rsa = key_file_is_rsa(&path);
+        self.key_check = Some((path, rsa));
+    }
+
+    /// Whether the selected draft uses a key file that is an RSA private key.
+    pub fn selected_key_is_rsa(&self) -> bool {
+        self.key_check.as_ref().is_some_and(|(_, rsa)| *rsa)
     }
 
     #[cfg(test)]
@@ -426,6 +482,7 @@ impl EditorState {
             if self.draft(id).is_some() {
                 self.selected = Some(id);
                 self.notice = None;
+                self.refresh_key_check();
             }
             return;
         }
@@ -464,6 +521,7 @@ impl EditorState {
             self.dirty = true;
             self.notice = None;
         }
+        self.refresh_key_check();
     }
 
     /// Validate the drafts against the saved `current` store. Returns the store to write and
