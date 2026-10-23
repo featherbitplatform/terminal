@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use alacritty_terminal::index::{Column, Line};
 use fbterm_config::LocalProfile;
-use fbterm_session::{
-    EventSink, SessionEvent, SessionHandle, SessionId, spawn_local, spawn_local_into,
-};
-use fbterm_term::{GridSize, Terminal};
+#[cfg(unix)]
+use fbterm_session::spawn_local_into;
+use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId, spawn_local};
+use fbterm_term::GridSize;
+#[cfg(unix)]
+use fbterm_term::Terminal;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::time::timeout;
 
