@@ -51,8 +51,14 @@ pub fn private_key_is_rsa(contents: &str) -> bool {
     {
         return true;
     }
-    russh::keys::PrivateKey::from_openssh(contents)
-        .is_ok_and(|k| matches!(k.algorithm(), russh::keys::Algorithm::Rsa { .. }))
+    let is_rsa =
+        |k: &russh::keys::PrivateKey| matches!(k.algorithm(), russh::keys::Algorithm::Rsa { .. });
+    if russh::keys::PrivateKey::from_openssh(contents).is_ok_and(|k| is_rsa(&k)) {
+        return true;
+    }
+    // Unencrypted PKCS#8 (`BEGIN PRIVATE KEY`). Encrypted PKCS#8 needs the passphrase to read
+    // its algorithm, so it stays undetected here (the login itself still warns).
+    russh::keys::decode_secret_key(contents, None).is_ok_and(|k| is_rsa(&k))
 }
 
 /// Bound on each step of reaching one hop: the TCP connect, and the SSH handshake plus
@@ -626,6 +632,8 @@ mod tests {
         assert!(private_key_is_rsa(enc));
         // Legacy PEM: the header alone says RSA.
         assert!(private_key_is_rsa(include_str!("testdata/rsa_legacy_pem")));
+        // Unencrypted PKCS#8 is read through the generic decoder.
+        assert!(private_key_is_rsa(include_str!("testdata/rsa_pkcs8")));
         assert!(!private_key_is_rsa(include_str!(
             "testdata/ed25519_openssh"
         )));

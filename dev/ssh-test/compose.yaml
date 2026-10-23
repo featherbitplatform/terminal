@@ -5,7 +5,7 @@
 #   FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
 #   docker compose -f dev/ssh-test/compose.yaml down
 #
-# Topology (every server: user `fb`, password `fb-pass`, both keys in keys/pub authorized):
+# Topology (every server: user `fb`, password `fb-pass`, all keys in keys/pub authorized):
 #   host 127.0.0.1:2222 -> bastion -> target -> target2
 # `target` is reachable only from `bastion`, and `target2` only from `target`.
 # Host keys are generated on each fresh start, so tests always use a temp known_hosts.

@@ -327,7 +327,13 @@ impl EditorState {
 
     /// Whether the selected draft uses a key file that is an RSA private key.
     pub fn selected_key_is_rsa(&self) -> bool {
-        self.key_check.as_ref().is_some_and(|(_, rsa)| *rsa)
+        let path = match self.selected_draft().map(|d| &d.kind) {
+            Some(DraftKind::Ssh(s)) if s.auth == AuthChoice::Key => s.key_path.trim(),
+            _ => return false,
+        };
+        self.key_check
+            .as_ref()
+            .is_some_and(|(p, rsa)| *rsa && p == path)
     }
 
     #[cfg(test)]
@@ -405,6 +411,7 @@ impl EditorState {
                 .or_else(|| self.drafts.last())
                 .map(|d| d.id);
         }
+        self.refresh_key_check();
         Ok(())
     }
 
@@ -431,6 +438,7 @@ impl EditorState {
         self.drafts.push(draft);
         self.selected = Some(id);
         self.dirty = true;
+        self.refresh_key_check();
         id
     }
 
@@ -478,11 +486,16 @@ impl EditorState {
     /// Apply a form message. Edits are ignored while read-only; app-level messages are not
     /// handled here.
     pub fn update(&mut self, msg: EditorMsg) {
+        self.apply(msg);
+        // Every path that can change the selection or its key path ends here.
+        self.refresh_key_check();
+    }
+
+    fn apply(&mut self, msg: EditorMsg) {
         if let EditorMsg::Select(id) = msg {
             if self.draft(id).is_some() {
                 self.selected = Some(id);
                 self.notice = None;
-                self.refresh_key_check();
             }
             return;
         }
@@ -521,7 +534,6 @@ impl EditorState {
             self.dirty = true;
             self.notice = None;
         }
-        self.refresh_key_check();
     }
 
     /// Validate the drafts against the saved `current` store. Returns the store to write and
