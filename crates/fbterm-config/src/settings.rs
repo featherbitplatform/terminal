@@ -185,15 +185,32 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 "##;
 
 impl Settings {
-    /// Write [`SETTINGS_TEMPLATE`] to `path` unless a file is already there. Returns whether it
-    /// was written. An existing file is never touched.
+    /// Write [`SETTINGS_TEMPLATE`] to `path` unless something is already there (a file, or a
+    /// symlink, even a dangling one). Returns whether it was written. The target is created
+    /// exclusively, so an existing file is never touched, even if it appears concurrently.
     pub fn write_template_if_missing(path: &Path) -> Result<bool, ConfigError> {
-        match path.try_exists() {
-            Ok(false) => {}
-            Ok(true) => return Ok(false),
-            Err(e) => return Err(ConfigError::new(path, None, e.to_string())),
+        use std::io::Write;
+        let io = |e: std::io::Error| ConfigError::new(path, None, e.to_string());
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(io)?;
         }
-        atomic_write(path, SETTINGS_TEMPLATE.as_bytes())?;
+        let mut file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(e) => return Err(io(e)),
+        };
+        let written = file
+            .write_all(SETTINGS_TEMPLATE.as_bytes())
+            .and_then(|()| file.sync_all());
+        if let Err(e) = written {
+            // Do not leave a partial template behind.
+            let _ = std::fs::remove_file(path);
+            return Err(io(e));
+        }
         Ok(true)
     }
 }

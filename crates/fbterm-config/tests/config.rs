@@ -421,3 +421,14 @@ fn writing_the_template_never_overwrites_a_file() {
         "font_size = 20.0\n"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn writing_the_template_leaves_a_dangling_symlink_alone() {
+    let path = tmp("settings.toml");
+    let target = path.with_file_name("elsewhere.toml");
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    assert!(!Settings::write_template_if_missing(&path).unwrap());
+    assert!(!target.exists());
+    assert_eq!(std::fs::read_link(&path).unwrap(), target);
+}
