@@ -22,6 +22,7 @@
 
 mod app;
 mod chrome;
+mod config_files;
 mod debug;
 mod dialogs;
 mod editor;

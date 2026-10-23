@@ -341,6 +341,18 @@ mod tests {
     }
 
     #[test]
+    fn tab_bar_buttons_never_drag_or_zoom() {
+        // The "+" and profiles buttons capture their press, so the bar sees `captured`.
+        for kind in [
+            click::Kind::Single,
+            click::Kind::Double,
+            click::Kind::Triple,
+        ] {
+            assert_eq!(Chrome::Unified.bar_press(true, false, kind), None);
+        }
+    }
+
+    #[test]
     fn os_title_bars_keep_moving_the_window_themselves() {
         let c = Chrome::Native;
         for captured in [false, true] {

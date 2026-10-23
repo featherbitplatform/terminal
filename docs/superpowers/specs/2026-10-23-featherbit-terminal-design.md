@@ -268,6 +268,8 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVisualEffectView
 (follows Reduce transparency, native vibrancy).
 
+A Settings window with controls for every settings.toml option (owner decision 2026-10-23: after milestone 1).
+
 Performance follow-up, before or within milestone 2: compact scrollback storage; investigate CPU
 use while streaming output; break down the ~100 MB base memory (RSS vs footprint; GPU/wgpu, font
 database and glyph caches, heap, shared libraries) and try cheap levers (bundled fonts plus a

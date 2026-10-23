@@ -155,6 +155,49 @@ impl Settings {
     }
 }
 
+/// The commented template written as a new `settings.toml`: every setting with its default and
+/// a one-line explanation. Removing the leading `#` of any setting line gives its default
+/// value, so the file as written changes nothing.
+pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
+# Every setting is shown with its default. Remove the leading "#" of a line to change it.
+# Changes are picked up while the app runs.
+
+# Terminal font family.
+#font_family = "Geist Mono"
+
+# Font size in points, from 6.0 to 72.0.
+#font_size = 13.0
+
+# Lines of history kept per tab, from 0 to 1000000.
+#scrollback_lines = 10000
+
+# Color theme: "dark" or "light".
+#theme = "dark"
+
+# Let programs turn on the kitty keyboard protocol (true or false).
+#kitty_keyboard = false
+
+# Opacity of the terminal background and tab bar, from 0.05 (nearly clear) to 1.0 (opaque).
+#background_opacity = 1.0
+
+# Blur what shows through a see-through background (true or false; macOS only for now).
+#background_blur = false
+"##;
+
+impl Settings {
+    /// Write [`SETTINGS_TEMPLATE`] to `path` unless a file is already there. Returns whether it
+    /// was written. An existing file is never touched.
+    pub fn write_template_if_missing(path: &Path) -> Result<bool, ConfigError> {
+        match path.try_exists() {
+            Ok(false) => {}
+            Ok(true) => return Ok(false),
+            Err(e) => return Err(ConfigError::new(path, None, e.to_string())),
+        }
+        atomic_write(path, SETTINGS_TEMPLATE.as_bytes())?;
+        Ok(true)
+    }
+}
+
 /// The 1-based line on which `key` is assigned at the top level, if any.
 fn key_line(text: &str, key: &str) -> Option<usize> {
     text.lines()
