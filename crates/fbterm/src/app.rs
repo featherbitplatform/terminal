@@ -196,6 +196,12 @@ fn paths() -> Paths {
         Some(dir) if !dir.is_empty() => Paths {
             config_dir: dir.into(),
         },
+        _ if crate::perf::opts().is_some() => {
+            // Measurement runs never touch the real config.
+            let dir = std::env::temp_dir().join(format!("fbterm-perf-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            Paths { config_dir: dir }
+        }
         _ => Paths::from_env(),
     }
 }
