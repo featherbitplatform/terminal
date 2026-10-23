@@ -865,6 +865,10 @@ mod pool {
                 );
             }
         }
+        assert!(matches!(
+            a.ended(),
+            Some(fbterm_session::SessionEnd::Disconnected(_))
+        ));
         assert!(
             grid_text(&a).contains("@@keep-42@@"),
             "terminal content lost"
@@ -891,6 +895,8 @@ mod pool {
         let (h, mut rx) = open(&pool, &w, w.bastion).await;
         run(&h, "exit 3");
         assert_eq!(wait_end(&mut rx).await, SessionEvent::Exited(Some(3)));
+        // The handle remembers it, for a tab that installs it only after the event.
+        assert_eq!(h.ended(), Some(fbterm_session::SessionEnd::Exited(Some(3))));
     }
 
     #[tokio::test]

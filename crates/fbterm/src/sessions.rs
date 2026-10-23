@@ -157,15 +157,24 @@ impl App {
     pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle, requested: GridSize) {
         // A tab closed meanwhile drops the handle here, closing the shell. The session writes
         // into the tab's own terminal, which already carries the color scheme.
-        let Some(tab) = self.tab_mut(id) else { return };
+        let Some((window, index)) = self.windows.values_mut().find_map(|w| {
+            let i = w.find(id)?;
+            Some((w, i))
+        }) else {
+            return;
+        };
         let current = handle.terminal.lock().size();
         if current != requested {
             handle.resize(current);
         }
-        tab.session = Some(handle);
-        tab.placeholder = None;
-        tab.connecting = None;
-        tab.state = TabState::Connected;
+        let tab = &mut window.tabs[index];
+        if let Some(text) = tabs::install_session(tab, handle) {
+            write_notice(tab, &text, false);
+        }
+        // The shell's reader started before the handle got here, so a `Dirty` it raised went
+        // nowhere and is still pending: take it as a visible tab does (the redraw after this
+        // update shows the output); a hidden tab keeps it pending until it is shown.
+        tabs::on_dirty(window, index);
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {

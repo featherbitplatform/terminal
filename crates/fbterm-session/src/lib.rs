@@ -38,6 +38,25 @@ pub enum SessionEvent {
     Disconnected(String),
 }
 
+/// How a session ended, as last reported by its `Exited` or `Disconnected` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEnd {
+    Exited(Option<i32>),
+    Disconnected(String),
+}
+
+impl From<SessionEnd> for SessionEvent {
+    fn from(end: SessionEnd) -> Self {
+        match end {
+            SessionEnd::Exited(code) => Self::Exited(code),
+            SessionEnd::Disconnected(reason) => Self::Disconnected(reason),
+        }
+    }
+}
+
+/// Shared between a session's handle and its feeders: set when the session reports its end.
+pub(crate) type Ended = Arc<parking_lot::Mutex<Option<SessionEnd>>>;
+
 pub type EventSink = tokio::sync::mpsc::UnboundedSender<(SessionId, SessionEvent)>;
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +92,7 @@ pub struct SessionHandle {
     /// terminal that a new session has taken over.
     pub(crate) detached: Arc<AtomicBool>,
     pub(crate) closer: Closer,
+    pub(crate) ended: Ended,
     /// SSH sessions keep their shared connection alive until closed.
     pub(crate) connection: parking_lot::Mutex<Option<Arc<ssh::pool::Connection>>>,
 }
@@ -117,6 +137,13 @@ impl SessionHandle {
         self.bell_pending.store(false, Ordering::Release);
         self.dirty_pending.swap(false, Ordering::AcqRel)
     }
+
+    /// How the session ended, once it has reported `Exited` or `Disconnected`. A handle that
+    /// is installed after its session started running (an SSH shell is handed over after its
+    /// reader is already going) uses this to catch an end whose event arrived too early.
+    pub fn ended(&self) -> Option<SessionEnd> {
+        self.ended.lock().clone()
+    }
 }
 
 impl Drop for SessionHandle {
@@ -134,6 +161,7 @@ pub(crate) struct Feeder {
     pub dirty_pending: Arc<AtomicBool>,
     pub bell_pending: Arc<AtomicBool>,
     pub detached: Arc<AtomicBool>,
+    pub ended: Ended,
     last_title: Option<String>,
 }
 
@@ -145,6 +173,7 @@ impl Feeder {
         dirty_pending: Arc<AtomicBool>,
         bell_pending: Arc<AtomicBool>,
         detached: Arc<AtomicBool>,
+        ended: Ended,
     ) -> Self {
         Self {
             id,
@@ -153,6 +182,7 @@ impl Feeder {
             dirty_pending,
             bell_pending,
             detached,
+            ended,
             last_title: None,
         }
     }
@@ -206,7 +236,17 @@ impl Feeder {
         }
     }
 
+    /// Report an event. The end of the session is recorded first, so a handle installed after
+    /// the event was delivered still learns of it through [`SessionHandle::ended`].
     pub fn send(&self, event: SessionEvent) {
+        let end = match &event {
+            SessionEvent::Exited(code) => Some(SessionEnd::Exited(*code)),
+            SessionEvent::Disconnected(reason) => Some(SessionEnd::Disconnected(reason.clone())),
+            _ => None,
+        };
+        if let Some(end) = end {
+            *self.ended.lock() = Some(end);
+        }
         let _ = self.events.send((self.id, event));
     }
 }
