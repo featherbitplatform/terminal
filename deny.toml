@@ -9,6 +9,10 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "OFL-1.1",
+    # clipboard-win and error-code (iced_winit on Windows)
+    "BSL-1.0",
+    # hexf-parse (naga, via wgpu)
+    "CC0-1.0",
 ]
 
 [advisories]
