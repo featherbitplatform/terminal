@@ -46,8 +46,10 @@ fn a_click_applies_live_and_writes_the_template_with_the_key_set() {
         )
     );
     // The watcher's report of our own write changes nothing.
+    // (Startup may already carry environment notices, so compare rather than expect none.)
+    let before = app.notices.clone();
     let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
-    assert!(app.notices.is_empty());
+    assert_eq!(app.notices, before);
     assert_eq!(app.settings.theme, ThemeMode::Light);
 }
 
