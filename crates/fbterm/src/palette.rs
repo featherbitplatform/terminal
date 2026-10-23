@@ -7,7 +7,7 @@ use iced::widget::{
     button, column, container, mouse_area, opaque, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::Message;
@@ -165,7 +165,14 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
         return order;
     }
 
-    let pattern = Pattern::parse(query, CaseMatching::Smart, Normalization::Smart);
+    // Every whitespace-separated word is a literal fuzzy atom (no `!`, `^`, `'` or `$` syntax),
+    // matched against name and detail together so one query can span both.
+    let pattern = Pattern::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+    );
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
     let mut score = |s: &str| pattern.score(Utf32Str::new(s, &mut buf), &mut matcher);
@@ -175,7 +182,7 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
         .enumerate()
         .filter_map(|(i, item)| {
             let best = match item {
-                PaletteItem::Profile { name, detail, .. } => score(name).max(score(detail)),
+                PaletteItem::Profile { name, detail, .. } => score(&format!("{name} {detail}")),
                 PaletteItem::Action { label, .. } => score(label),
             };
             best.map(|s| (i, s))
@@ -524,6 +531,34 @@ mod tests {
         ];
         let order = rank("10.0.4", &items, &Recency::new());
         assert_eq!(names(&items, &order), ["db"]);
+    }
+
+    #[test]
+    fn query_syntax_characters_match_literally() {
+        let items = vec![
+            profile("!bang", "u@h"),
+            profile("^caret", "u@h"),
+            profile("it's", "u@h"),
+            profile("cost$", "u@h"),
+            profile("plain", "u@h"),
+        ];
+        let r = |q: &str| names(&items, &rank(q, &items, &Recency::new())).join(",");
+        assert_eq!(r("!bang"), "!bang");
+        assert_eq!(r("^car"), "^caret");
+        assert_eq!(r("'s"), "it's");
+        assert_eq!(r("t$"), "cost$");
+        assert_eq!(r("!plain"), "", "! is not negation");
+    }
+
+    #[test]
+    fn multi_word_query_spans_name_and_detail() {
+        let items = vec![
+            profile("prod", "root@10.0.4.17"),
+            profile("prod-web", "deploy@10.0.4.18"),
+            profile("staging", "root@10.0.9.1"),
+        ];
+        let order = rank("prod root", &items, &Recency::new());
+        assert_eq!(names(&items, &order), ["prod"]);
     }
 
     #[test]
