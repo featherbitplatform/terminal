@@ -231,3 +231,66 @@ async fn respawn_into_existing_terminal_keeps_old_content() {
     let new = text.find("new-session-line").expect("new output shown");
     assert!(old < new, "new output must follow the old content:\n{text}");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn respawn_ignores_output_from_old_sessions_orphans() {
+    let term = std::sync::Arc::new(parking_lot::Mutex::new(Terminal::new(size(80, 24), 100)));
+    let (tx, mut rx): (EventSink, _) = unbounded_channel();
+    // The shell exits at once; its background child ignores the hangup, keeps the PTY and
+    // writes later.
+    let old = spawn_local_into(
+        &profile(
+            "sh",
+            &["-c", "(trap '' HUP; sleep 0.3; echo ORPHAN) & exit 0"],
+        ),
+        term.clone(),
+        tx,
+    )
+    .expect("spawn");
+    assert_eq!(wait_exit(&mut rx).await, Some(0));
+    // What the app does on Enter: close the old session, then continue in the same terminal.
+    drop(old);
+    let (tx2, _rx2): (EventSink, _) = unbounded_channel();
+    let new =
+        spawn_local_into(&profile("sh", &["-c", "echo NEW; sleep 2"]), term, tx2).expect("respawn");
+    wait_for_text(&new, "NEW", 1).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        !grid_text(&new).contains("ORPHAN"),
+        "orphan output reached the reused terminal:\n{}",
+        grid_text(&new)
+    );
+    new.close();
+}
+
+/// The same guarantee where the platform lets the old program keep writing: a child that
+/// ignores the hangup `close` sends is still writing when the terminal is reused.
+#[cfg(unix)]
+#[tokio::test]
+async fn closed_session_output_never_reaches_reused_terminal() {
+    let term = std::sync::Arc::new(parking_lot::Mutex::new(Terminal::new(size(80, 24), 100)));
+    let (tx, _rx): (EventSink, _) = unbounded_channel();
+    let old = spawn_local_into(
+        &profile(
+            "sh",
+            &["-c", "trap '' HUP; sleep 0.3; echo LINGER; sleep 3"],
+        ),
+        term.clone(),
+        tx,
+    )
+    .expect("spawn");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(old);
+    let (tx2, _rx2): (EventSink, _) = unbounded_channel();
+    let new =
+        spawn_local_into(&profile("sh", &["-c", "echo NEW; sleep 2"]), term, tx2).expect("respawn");
+    wait_for_text(&new, "NEW", 1).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        !grid_text(&new).contains("LINGER"),
+        "closed session's output reached the reused terminal:\n{}",
+        grid_text(&new)
+    );
+    new.close();
+}

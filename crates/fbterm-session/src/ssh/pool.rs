@@ -273,6 +273,7 @@ async fn open_shell_channel(
     let id = SessionId::next();
     let dirty_pending = Arc::new(AtomicBool::new(false));
     let bell_pending = Arc::new(AtomicBool::new(false));
+    let detached = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::unbounded_channel::<Command>();
     let (closed_tx, closed_rx) = watch::channel(false);
     let feeder = Feeder::new(
@@ -281,6 +282,7 @@ async fn open_shell_channel(
         events,
         dirty_pending.clone(),
         bell_pending.clone(),
+        detached.clone(),
     );
 
     tokio::spawn(write_loop(write, rx, closed_rx.clone(), connection.clone()));
@@ -298,6 +300,7 @@ async fn open_shell_channel(
         commands: tx,
         dirty_pending,
         bell_pending,
+        detached,
         closer: Box::new(move || {
             closed_tx.send_replace(true);
         }),

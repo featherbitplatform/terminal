@@ -92,16 +92,20 @@ impl App {
         };
         // A restart continues in the tab's terminal, so its output and scrollback stay; the
         // first start gets a new one.
-        let (terminal, fresh) = match tab.terminal() {
+        let previous = tab.terminal().cloned();
+        // Close the previous session (and drop any dial in flight) before anything touches
+        // the terminal again: once closed, its lingering output is discarded, never fed.
+        if let Some(old) = tab.session.take() {
+            old.close();
+        }
+        tab.connecting = None;
+        let (terminal, fresh) = match previous {
             Some(t) => {
                 t.lock().feed(tabs::RESTART_RESET);
-                (t.clone(), false)
+                (t, false)
             }
             None => (fresh_terminal, true),
         };
-        // Drop the previous session (and any dial in flight) before starting again.
-        tab.session = None;
-        tab.connecting = None;
         tab.title = tab.name.clone();
         tab.placeholder = Some(terminal.clone());
         let Some(profile) = profile else {
@@ -141,6 +145,7 @@ impl App {
                 let pool = self.pool.clone();
                 let store = self.profiles.clone();
                 let pid = profile.id;
+                let requested = terminal.lock().size();
                 let terminal = terminal.clone();
                 let dial = async move {
                     pool.open_shell_into(&store, &pid, terminal, events)
@@ -148,7 +153,7 @@ impl App {
                         .map_err(|e| e.to_string())
                 };
                 let (task, handle) = Task::perform(dial, move |r| match r {
-                    Ok(h) => Message::Connected(id, Delivered::new(h)),
+                    Ok(h) => Message::Connected(id, Delivered::new(h), requested),
                     Err(e) => Message::ConnectFailed(id, e),
                 })
                 .abortable();
@@ -158,10 +163,16 @@ impl App {
         }
     }
 
-    pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle) {
+    /// `requested`: the size the remote pty was opened with. The window may have resized the
+    /// terminal while the dial was in flight; the remote side then gets the current size.
+    pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle, requested: GridSize) {
         // A tab closed meanwhile drops the handle here, closing the shell. The session writes
         // into the tab's own terminal, which already carries the color scheme.
         let Some(tab) = self.tab_mut(id) else { return };
+        let current = handle.terminal.lock().size();
+        if current != requested {
+            handle.resize(current);
+        }
         tab.session = Some(handle);
         tab.placeholder = None;
         tab.connecting = None;

@@ -92,6 +92,7 @@ pub fn spawn_local_into(
     let id = SessionId::next();
     let dirty_pending = Arc::new(AtomicBool::new(false));
     let bell_pending = Arc::new(AtomicBool::new(false));
+    let detached = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded_channel::<Command>();
     let (done_tx, done_rx) = channel::<()>();
 
@@ -108,6 +109,7 @@ pub fn spawn_local_into(
         events.clone(),
         dirty_pending.clone(),
         bell_pending.clone(),
+        detached.clone(),
     );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-waiter-{}", id.0))
@@ -127,6 +129,7 @@ pub fn spawn_local_into(
         events,
         dirty_pending.clone(),
         bell_pending.clone(),
+        detached.clone(),
     );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-reader-{}", id.0))
@@ -143,6 +146,10 @@ pub fn spawn_local_into(
                 for reply in feeder.feed(&buf[..n]) {
                     let _ = reader_tx.send(Command::Input(reply));
                 }
+                // Closed: whoever still holds the PTY no longer reaches the terminal.
+                if feeder.is_detached() {
+                    break;
+                }
             }
             let _ = done_tx.send(());
         })?;
@@ -153,6 +160,7 @@ pub fn spawn_local_into(
         commands: tx,
         dirty_pending,
         bell_pending,
+        detached,
         closer: Box::new(move || {
             let _ = killer.lock().kill();
         }),

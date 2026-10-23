@@ -68,6 +68,10 @@ pub struct SessionHandle {
     pub(crate) commands: tokio::sync::mpsc::UnboundedSender<Command>,
     pub(crate) dirty_pending: Arc<AtomicBool>,
     pub(crate) bell_pending: Arc<AtomicBool>,
+    /// Set once the handle is closed: from then on the session's output is dropped instead of
+    /// fed, so a lingering reader (a grandchild still holding the PTY) can never write into a
+    /// terminal that a new session has taken over.
+    pub(crate) detached: Arc<AtomicBool>,
     pub(crate) closer: Closer,
     /// SSH sessions keep their shared connection alive until closed.
     pub(crate) connection: parking_lot::Mutex<Option<Arc<ssh::pool::Connection>>>,
@@ -92,10 +96,14 @@ impl SessionHandle {
 
     /// Kill the session and stop its threads or tasks. Safe to call repeatedly.
     ///
+    /// Output that arrives after this is discarded, never fed into the terminal, so the
+    /// terminal can be handed to a new session right away.
+    ///
     /// The child (or channel) is stopped directly, so this works even if the writer is
     /// blocked. An SSH session also lets go of its connection, which closes once its last
     /// session has.
     pub fn close(&self) {
+        self.detached.store(true, Ordering::Release);
         (self.closer)();
         let _ = self.commands.send(Command::Close);
         self.connection.lock().take();
@@ -125,6 +133,7 @@ pub(crate) struct Feeder {
     pub events: EventSink,
     pub dirty_pending: Arc<AtomicBool>,
     pub bell_pending: Arc<AtomicBool>,
+    pub detached: Arc<AtomicBool>,
     last_title: Option<String>,
 }
 
@@ -135,6 +144,7 @@ impl Feeder {
         events: EventSink,
         dirty_pending: Arc<AtomicBool>,
         bell_pending: Arc<AtomicBool>,
+        detached: Arc<AtomicBool>,
     ) -> Self {
         Self {
             id,
@@ -142,6 +152,7 @@ impl Feeder {
             events,
             dirty_pending,
             bell_pending,
+            detached,
             last_title: None,
         }
     }
@@ -149,10 +160,14 @@ impl Feeder {
     /// Feed output; returns the replies the terminal wants written back to the program.
     ///
     /// `Dirty` and `Bell` are raised at most once until [`SessionHandle::take_dirty`] re-arms
-    /// them; a title is reported only when it changes.
+    /// them; a title is reported only when it changes. Once the handle is closed the bytes are
+    /// dropped (checked under the terminal lock, so nothing lands after `close` returns).
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
         let term_events = {
             let mut term = self.terminal.lock();
+            if self.is_detached() {
+                return Vec::new();
+            }
             term.feed(bytes);
             term.take_events()
         };
@@ -177,6 +192,11 @@ impl Feeder {
         }
         self.mark_dirty();
         replies
+    }
+
+    /// Whether the handle was closed and output must be dropped.
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
     }
 
     /// Raise `Dirty` unless one is already pending.
