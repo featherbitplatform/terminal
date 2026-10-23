@@ -5,6 +5,7 @@
 //! reuses the same handle and event types.
 
 mod local;
+pub mod ssh;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

@@ -1,0 +1,54 @@
+# Throwaway sshd servers for the live SSH tests (crates/fbterm-session/tests/ssh_live.rs).
+#
+#   docker compose -f dev/ssh-test/compose.yaml up -d
+#   dev/ssh-test/wait-ready.sh
+#   FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
+#   docker compose -f dev/ssh-test/compose.yaml down
+#
+# Topology (every server: user `fb`, password `fb-pass`, both keys in keys/pub authorized):
+#   host 127.0.0.1:2222 -> bastion -> target -> target2
+# `target` is reachable only from `bastion`, and `target2` only from `target`.
+# Host keys are generated on each fresh start, so tests always use a temp known_hosts.
+
+x-sshd: &sshd
+  image: lscr.io/linuxserver/openssh-server:10.3_p1-r1-ls239
+  environment:
+    PUID: "1000"
+    PGID: "1000"
+    TZ: Etc/UTC
+    USER_NAME: fb
+    USER_PASSWORD: fb-pass
+    PASSWORD_ACCESS: "true"
+    PUBLIC_KEY_DIR: /keys
+  volumes:
+    - ./keys/pub:/keys:ro
+    # The image includes /config/sshd/sshd_config.d/*.conf ahead of its own settings when the
+    # directory is mounted: fbterm-test.conf turns TCP forwarding on (jump hosts, tunnels)
+    # and per-source penalties off (the tests fail authentication on purpose).
+    - ./sshd_config.d:/config/sshd/sshd_config.d:ro
+
+services:
+  bastion:
+    <<: *sshd
+    hostname: bastion
+    ports:
+      - "127.0.0.1:2222:2222"
+    networks: [edge, inner]
+
+  target:
+    <<: *sshd
+    hostname: target
+    networks: [inner, deep]
+
+  target2:
+    <<: *sshd
+    hostname: target2
+    networks: [deep]
+
+networks:
+  # Only `edge` reaches the host; the others are internal.
+  edge: {}
+  inner:
+    internal: true
+  deep:
+    internal: true
