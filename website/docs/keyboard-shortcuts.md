@@ -4,7 +4,9 @@ title: Keyboard shortcuts
 sidebar_label: Keyboard shortcuts
 ---
 
-Application shortcuts use `Cmd` on macOS. On Linux and Windows every shortcut is `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it.
+Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it. The one exception is `Ctrl+,` for Settings.
+
+Hover over a button in the tab bar to see what it does and its shortcut.
 
 On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled by the terminal view and are not in this table. Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
 
@@ -22,7 +24,7 @@ On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled 
 
 ### The title bar on macOS
 
-On macOS the tab bar is the title bar: the window buttons sit at its left end and the tabs follow them. Drag any empty part of the tab bar (around and after the tabs) to move the window, and double-click it to zoom the window or restore its size. The profile editor window works the same way with its own header. The window title, shown in the Dock, Mission Control and the Window menu, is the active tab's name.
+On macOS the tab bar is the title bar: the window buttons sit at its left end and the tabs follow them. Drag any empty part of the tab bar (around and after the tabs) to move the window, and double-click it to zoom the window or restore its size. The profile editor and Settings windows work the same way with their own header. The window title, shown in the Dock, Mission Control and the Window menu, is the active tab's name.
 
 On Linux and Windows the window keeps the system title bar for now.
 
@@ -42,9 +44,10 @@ A page is the height of the terminal less one line, so the last line of the prev
 | Action | macOS | Linux and Windows |
 | --- | --- | --- |
 | Open the palette | `Cmd+Shift+P` | `Ctrl+Shift+P` |
-| Open the profile editor | `Cmd+,` or `Cmd+Shift+,` | `Ctrl+Shift+,` |
+| Open Settings | `Cmd+,` | `Ctrl+,` |
+| Open the profile editor | `Cmd+Shift+,` | `Ctrl+Shift+,` |
 
-The profiles button after the new-tab button in the tab bar opens the profile editor too. Settings themselves are edited in [`settings.toml`](files#settingstoml).
+The profiles button after the new-tab button in the tab bar opens the profile editor too. The Settings window has a control for every option in [`settings.toml`](files#settingstoml); changes apply at once and are saved to the file. In the profile editor and Settings windows, `Cmd+W` (`Ctrl+Shift+W`) closes the window, and each window's shortcut opens the other.
 
 ## Palette actions
 
@@ -56,6 +59,7 @@ These actions are listed after your profiles. Type part of a name to find one.
 | New window | Open a new window. |
 | Close tab | Close the active tab. |
 | Edit profiles | Open the profile editor. |
+| Settings | Open the Settings window. |
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
 | Reveal config folder | Show the config folder in your file manager, with `settings.toml` selected on macOS when it exists. The folder is created if it is missing. |
 | Quit | Save the layout and quit. |

@@ -6,28 +6,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbterm_config::{
-    ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, SavedWindow, Settings,
-    discover_shells,
+    ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, Settings, discover_shells,
 };
 use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
-use fbterm_term::{ColorScheme, GridSize, TerminalOutput, TerminalStyle};
+use fbterm_term::{GridSize, TerminalOutput, TerminalStyle};
 use iced::window::{self, Screenshot};
-use iced::{Event, Font, Subscription, Task, Theme};
+use iced::{Event, Subscription, Task, Theme};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
-use crate::chrome::{self, BarAction, Chrome};
+use crate::chrome::{self, BarAction};
 use crate::editor::{EditorMsg, EditorState};
 use crate::keys::Action;
-use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Palettes, Recency};
+use crate::palette::{PaletteMsg, Palettes, Recency};
 use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
 };
 use crate::restore;
 use crate::sessions::{EventReceiver, session_stream, write_notice};
-use crate::tabs::{self, Tab, TabId, TabState, WindowState};
+use crate::settings_window::{SettingsMsg, SettingsState};
+use crate::tabs::{Tab, TabId, TabState, WindowState};
 use crate::theme;
 use crate::watch::{self, Changed, ConfigDir};
 
@@ -106,6 +106,7 @@ pub enum Message {
     /// Palette input for one window.
     Palette(window::Id, PaletteMsg),
     Editor(EditorMsg),
+    Settings(SettingsMsg),
     Prompt(PromptMsg),
     Shoot,
     Shot(Screenshot),
@@ -128,6 +129,14 @@ pub(crate) const DEFAULT_GRID: GridSize = GridSize {
     cell_width: 8.0,
     cell_height: 16.0,
 };
+
+/// Which window `FBTERM_SCREENSHOT` captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShotWindow {
+    Terminal,
+    Editor,
+    Settings,
+}
 
 pub struct App {
     pub settings: Settings,
@@ -152,6 +161,8 @@ pub struct App {
     pub palettes: Palettes,
     /// The profile editor window, when open.
     pub editor: Option<(window::Id, EditorState)>,
+    /// The Settings window, when open.
+    pub settings_win: Option<(window::Id, SettingsState)>,
     /// Connection dialogs waiting per window.
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
@@ -186,15 +197,15 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor` (debug aid): capture the editor window instead.
-    pub(crate) screenshot_editor: bool,
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings` (debug aid): capture that window instead.
+    pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
     /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
     /// shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
 }
 
-fn unix_now() -> i64 {
+pub(crate) fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
@@ -249,22 +260,6 @@ pub(crate) fn load_profiles(
         notices.push(format!("{}: {e}", path.display()));
     }
     (store, failed)
-}
-
-/// The look of terminals for `settings` (the font name lives for the whole process: iced wants a
-/// `'static` name, and a changed font in `settings.toml` costs one small allocation).
-fn terminal_style(settings: &Settings) -> TerminalStyle {
-    let family: &'static str = Box::leak(settings.font_family.clone().into_boxed_str());
-    TerminalStyle {
-        scheme: ColorScheme::graphite(),
-        font: Font::with_name(family),
-        font_size: settings.font_size,
-        accent: None,
-        focused: true,
-        // The window paints the default background (with the padding around the grid) at
-        // `background_opacity`; see `window::view`.
-        background_opacity: 0.0,
-    }
 }
 
 /// Ask for `id`'s mode now and once the full-screen animation is over (the last resize can
@@ -346,7 +341,7 @@ impl App {
             prompter: Arc::new(UiPrompter::new(None, prompt_tx.clone())),
         }));
 
-        let style = terminal_style(&settings);
+        let style = crate::settings_window::terminal_style(&settings);
         let (events, rx) = unbounded_channel();
         let mut app = Self {
             theme: theme::graphite_theme(settings.theme),
@@ -367,6 +362,7 @@ impl App {
             focused: None,
             palettes: Palettes::new(),
             editor: None,
+            settings_win: None,
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
@@ -389,7 +385,11 @@ impl App {
             },
             style,
             screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
-            screenshot_editor: debug_env("FBTERM_SCREENSHOT_WINDOW").is_some_and(|w| w == "editor"),
+            screenshot_window: match debug_env("FBTERM_SCREENSHOT_WINDOW") {
+                Some(w) if w == "editor" => ShotWindow::Editor,
+                Some(w) if w == "settings" => ShotWindow::Settings,
+                _ => ShotWindow::Terminal,
+            },
             shooting: false,
             demo_tip: debug_env("FBTERM_DEMO_TOOLTIP")
                 .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
@@ -401,6 +401,7 @@ impl App {
         task = task.chain(app.open_debug_tabs());
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
+        task = task.chain(app.open_debug_settings());
         task = task.chain(app.open_debug_prompt());
         (app, task)
     }
@@ -438,6 +439,9 @@ impl App {
     pub fn title(&self, id: window::Id) -> String {
         if self.editor_window() == Some(id) {
             return "Profiles · fbterm".into();
+        }
+        if self.settings_window() == Some(id) {
+            return "Settings · fbterm".into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title),
@@ -488,8 +492,10 @@ impl App {
     }
 
     fn first_window_ready(&self) -> bool {
-        if self.screenshot_editor && self.editor.is_none() {
-            return false;
+        match self.screenshot_window {
+            ShotWindow::Editor if self.editor.is_none() => return false,
+            ShotWindow::Settings if self.settings_win.is_none() => return false,
+            _ => {}
         }
         self.windows
             .values()
@@ -562,6 +568,11 @@ impl App {
                 if self.editor_window() == Some(id) {
                     self.editor = None;
                 }
+                if self.settings_window() == Some(id) {
+                    // Closed by the OS button or Quit: what is still waiting is written.
+                    self.write_pending_settings();
+                    self.settings_win = None;
+                }
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
                 // stop saving.
@@ -583,7 +594,7 @@ impl App {
                 if was_terminal {
                     self.save_state();
                 }
-                if self.windows.is_empty() && self.editor.is_none() {
+                if self.windows.is_empty() && self.editor.is_none() && self.settings_win.is_none() {
                     iced::exit()
                 } else {
                     Task::none()
@@ -596,6 +607,7 @@ impl App {
             }
             Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::Editor(msg) => self.editor_msg(msg),
+            Message::Settings(msg) => self.settings_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::WindowResized(id, size) => {
                 Task::batch([self.window_resized(id, size), query_mode(id)])
@@ -657,7 +669,10 @@ impl App {
     }
 
     /// Change tab selection in the focused window.
-    fn with_focused(&mut self, f: impl FnOnce(&mut WindowState) -> bool) -> Task<Message> {
+    pub(crate) fn with_focused(
+        &mut self,
+        f: impl FnOnce(&mut WindowState) -> bool,
+    ) -> Task<Message> {
         match self.focused_window() {
             Some(wid) => self.with_window(wid, f),
             None => Task::none(),
@@ -665,7 +680,7 @@ impl App {
     }
 
     /// Change tab selection in `wid`; the newly shown tab gets [`App::shown`].
-    fn with_window(
+    pub(crate) fn with_window(
         &mut self,
         wid: window::Id,
         f: impl FnOnce(&mut WindowState) -> bool,
@@ -678,361 +693,6 @@ impl App {
         }
     }
 
-    fn action(&mut self, window: Option<window::Id>, action: Action) -> Task<Message> {
-        if let Some(wid) = window {
-            self.focused = Some(wid);
-        }
-        let wid = self.focused_window();
-        match action {
-            // New tab asks which profile to open: the palette, with nothing preselected.
-            Action::NewTab => match wid {
-                Some(wid) => self.open_palette(wid, String::new()),
-                None => self.open_window(self.default_profile()),
-            },
-            Action::CloseTab => match wid {
-                Some(wid) => {
-                    let active = self.windows.get(&wid).map_or(0, |w| w.active);
-                    self.close_tab(wid, active)
-                }
-                None => Task::none(),
-            },
-            Action::NextTab => self.with_focused(WindowState::next),
-            Action::PrevTab => self.with_focused(WindowState::prev),
-            Action::SelectTab(n) => self.with_focused(|w| w.select_number(n)),
-            Action::Palette => match wid {
-                Some(wid) if self.palettes.contains_key(&wid) => {
-                    self.palette(wid, PaletteMsg::Close)
-                }
-                Some(wid) => self.palette(wid, PaletteMsg::Open),
-                None => Task::none(),
-            },
-            Action::NewWindow => self.open_window(self.default_profile()),
-            Action::EditProfiles => self.editor_msg(EditorMsg::Open),
-            Action::OpenSettingsFile => {
-                crate::config_files::open_settings_file(&self.paths);
-                Task::none()
-            }
-            Action::RevealConfigFolder => {
-                crate::config_files::reveal_config_folder(&self.paths);
-                Task::none()
-            }
-            Action::Quit => self.quit(),
-        }
-    }
-
-    /// Open `wid`'s palette (or reset it) with `query`, and focus its input.
-    pub(crate) fn open_palette(&mut self, wid: window::Id, query: String) -> Task<Message> {
-        if !self.windows.contains_key(&wid) {
-            return Task::none();
-        }
-        let state = PaletteState::new(palette::items(&self.profiles), query, &self.recency);
-        let input = state.input.clone();
-        self.palettes.insert(wid, state);
-        iced::widget::operation::focus(input)
-    }
-
-    fn palette(&mut self, wid: window::Id, msg: PaletteMsg) -> Task<Message> {
-        let recency = &self.recency;
-        let Some(state) = self.palettes.get_mut(&wid) else {
-            return match msg {
-                PaletteMsg::Open => self.open_palette(wid, String::new()),
-                _ => Task::none(),
-            };
-        };
-        let chosen = match msg {
-            PaletteMsg::Open => return self.open_palette(wid, String::new()),
-            PaletteMsg::Query(q) => {
-                state.set_query(q, recency);
-                return Task::none();
-            }
-            PaletteMsg::Up => {
-                state.up();
-                return Task::none();
-            }
-            PaletteMsg::Down => {
-                state.down();
-                return Task::none();
-            }
-            PaletteMsg::Close => None,
-            PaletteMsg::Submit => state.selected_item().cloned(),
-            PaletteMsg::Pick(position) => state.at(position).cloned(),
-        };
-        if matches!(msg, PaletteMsg::Submit | PaletteMsg::Pick(_)) && chosen.is_none() {
-            // Nothing matches: Enter does nothing, the palette stays open.
-            return Task::none();
-        }
-        self.palettes.remove(&wid);
-        match chosen {
-            Some(PaletteItem::Profile { id, .. }) => self.open_tab(wid, id),
-            Some(PaletteItem::Action { action, .. }) => self.run_palette_action(wid, action),
-            None => Task::none(),
-        }
-    }
-
-    fn run_palette_action(&mut self, wid: window::Id, action: Action) -> Task<Message> {
-        match action {
-            // From the palette, "New tab" is the default shell (the palette itself just closed).
-            Action::NewTab => match self.default_profile() {
-                Some(profile) => self.open_tab(wid, profile),
-                None => Task::none(),
-            },
-            other => self.action(Some(wid), other),
-        }
-    }
-
-    /// A new terminal window of `size` (logical pixels), with no tabs yet.
-    pub(crate) fn new_window(&mut self, size: (f32, f32)) -> (window::Id, Task<Message>) {
-        let chrome = Chrome::current();
-        let backdrop = chrome.backdrop(
-            self.settings.background_opacity,
-            self.settings.background_blur,
-        );
-        let (id, open) = window::open(chrome.window_settings(window::Settings {
-            size: iced::Size::new(size.0, size.1),
-            min_size: Some(iced::Size::new(360.0, 200.0)),
-            exit_on_close_request: false,
-            transparent: backdrop.transparent,
-            blur: backdrop.blur,
-            ..window::Settings::default()
-        }));
-        self.windows.insert(id, WindowState::new());
-        self.sizes.insert(id, size);
-        (id, open.map(Message::WindowOpened))
-    }
-
-    /// Reopen the saved windows with their tabs not connected, then connect the active tab of
-    /// each; the others connect when first selected (see [`App::shown`]). With nothing to
-    /// restore, the default single window opens.
-    fn restore_windows(&mut self, plan: &[SavedWindow]) -> Task<Message> {
-        if plan.is_empty() {
-            return self.open_window(self.default_profile());
-        }
-        let mut tasks = Vec::new();
-        for saved in plan {
-            let (wid, open) = self.new_window(saved.size);
-            let window = self.windows.get_mut(&wid).expect("just inserted");
-            for &profile in &saved.tabs {
-                if let Some(p) = self.profiles.get(profile) {
-                    window
-                        .tabs
-                        .push(Tab::new(profile, p.name.clone(), p.accent));
-                }
-            }
-            window.active = saved.active.min(window.tabs.len().saturating_sub(1));
-            tracing::info!(
-                tabs = window.tabs.len(),
-                active = window.active,
-                "restoring window"
-            );
-            tasks.push(open);
-            tasks.push(self.shown(wid));
-        }
-        Task::batch(tasks)
-    }
-
-    pub fn open_window(&mut self, profile: Option<ProfileId>) -> Task<Message> {
-        let (id, open) = self.new_window(restore::DEFAULT_SIZE);
-        let start = match profile {
-            Some(p) => self.open_tab(id, p),
-            None => Task::none(),
-        };
-        open.chain(start)
-    }
-
-    pub fn open_tab(&mut self, wid: window::Id, profile: ProfileId) -> Task<Message> {
-        let Some(p) = self.profiles.get(profile) else {
-            return Task::none();
-        };
-        let tab = Tab::new(profile, p.name.clone(), p.accent);
-        self.recency.bump(profile, unix_now());
-        let id = tab.id;
-        let Some(window) = self.windows.get_mut(&wid) else {
-            return Task::none();
-        };
-        window.push(tab);
-        self.save_state();
-        self.start(wid, id)
-    }
-
-    fn close_tab(&mut self, wid: window::Id, index: usize) -> Task<Message> {
-        let Some(window) = self.windows.get_mut(&wid) else {
-            return Task::none();
-        };
-        let Some(closed) = window.close(index) else {
-            return Task::none();
-        };
-        drop(closed.tab);
-        self.save_state();
-        if closed.window_empty {
-            self.close_window(wid)
-        } else {
-            self.shown(wid)
-        }
-    }
-
-    /// The active tab of `wid` was just shown (selected, created, or its window focused): take
-    /// the redraw its session left pending while hidden (the redraw follows this update), and
-    /// start it if it never was (restored tabs connect on first focus).
-    fn shown(&mut self, wid: window::Id) -> Task<Message> {
-        let Some(window) = self.windows.get(&wid) else {
-            return Task::none();
-        };
-        tabs::on_shown(window);
-        match window.active_tab() {
-            Some(t) if t.state == TabState::NotConnected => {
-                let id = t.id;
-                self.start(wid, id)
-            }
-            _ => Task::none(),
-        }
-    }
-
-    /// Write `state.toml`: windows, tabs, selection, sizes and recency. Does nothing for debug
-    /// runs (see `state_saving_enabled`) and while `profiles.toml` is unreadable (the tabs would
-    /// look orphaned; the file keeps the layout until the profiles load again).
-    pub(crate) fn save_state(&self) {
-        if !self.state_saving_enabled || self.quitting || self.profiles_error.is_some() {
-            return;
-        }
-        let state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
-        if let Err(e) = state.save(&self.paths.state()) {
-            tracing::warn!(error = %e, "could not save the session state");
-        }
-    }
-
-    /// Close a window on purpose (its `Closed` event then is not an OS teardown).
-    pub(crate) fn close_window(&mut self, id: window::Id) -> Task<Message> {
-        self.closing.insert(id);
-        window::close(id)
-    }
-
-    /// How windows close and the app quits, as far as `state.toml` is concerned:
-    /// - Quit (Cmd+Q / Ctrl+Shift+Q / palette) saves once while every window still exists, then
-    ///   closes them all and exits; nothing saves after that, so every window comes back.
-    /// - The close button on the last terminal window is Quit. On any other terminal window it
-    ///   drops that window from the layout. Closing the last tab of the last window leaves no
-    ///   tabs to save, so the next launch opens the default window.
-    /// - macOS Cmd+Q from the app menu is `terminate:`: winit closes the windows without a
-    ///   close request and the process ends; windows closing unasked count as a quit, and
-    ///   state.toml is already current because it is saved on every layout change.
-    pub(crate) fn quit(&mut self) -> Task<Message> {
-        if self.quitting {
-            return Task::none();
-        }
-        self.save_state();
-        self.quitting = true;
-        let ids: Vec<_> = self
-            .windows
-            .keys()
-            .copied()
-            .chain(self.editor_window())
-            .collect();
-        self.closing.extend(ids.iter().copied());
-        Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
-    }
-
-    fn close_requested(&mut self, id: window::Id) -> Task<Message> {
-        if self.editor_window() == Some(id) || self.windows.len() > 1 {
-            self.close_window(id)
-        } else {
-            self.quit()
-        }
-    }
-
-    fn window_resized(&mut self, id: window::Id, size: iced::Size) -> Task<Message> {
-        if !self.windows.contains_key(&id) {
-            return Task::none();
-        }
-        self.sizes.insert(id, (size.width, size.height));
-        self.resize_count += 1;
-        let n = self.resize_count;
-        // Dragging a window edge resizes continuously: save once it settles.
-        Task::perform(
-            async { tokio::time::sleep(Duration::from_millis(500)).await },
-            move |()| Message::SaveState(n),
-        )
-    }
-
-    /// `settings.toml` changed on disk: apply it, or keep the previous settings and say why.
-    pub(crate) fn settings_file_changed(&mut self) {
-        let path = self.paths.settings();
-        let text = std::fs::read_to_string(&path).ok();
-        if text == self.settings_seen {
-            return;
-        }
-        self.settings_seen = text;
-        if let Some(old) = self.settings_notice.take() {
-            self.notices.retain(|n| *n != old);
-        }
-        match Settings::load_checked(&path) {
-            Ok((new, warning)) => {
-                if let Some(w) = warning {
-                    tracing::warn!(warning = %w, "settings.toml values clamped");
-                    self.show_settings_notice(w.to_string());
-                }
-                self.apply_settings(new);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "settings.toml not applied");
-                self.show_settings_notice(e.to_string());
-            }
-        }
-    }
-
-    fn show_settings_notice(&mut self, line: String) {
-        self.notices.push(line.clone());
-        self.settings_notice = Some(line);
-        self.notices_dismissed = false;
-    }
-
-    /// Font, size and theme take effect in every open terminal and window at once (they are
-    /// read each frame). The scrollback length applies to terminals opened from now on.
-    /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
-    /// protocol flags programs have set, turning it on affects their requests from then on.
-    /// `background_opacity` is read each frame too; a window can only show through if it was
-    /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
-    /// is fixed when a window opens, so those apply to windows opened from now on.
-    fn apply_settings(&mut self, new: Settings) {
-        if new == self.settings {
-            return;
-        }
-        if new.font_family != self.settings.font_family || new.font_size != self.settings.font_size
-        {
-            self.style = terminal_style(&new);
-            self.style_unfocused = TerminalStyle {
-                focused: false,
-                ..self.style.clone()
-            };
-        }
-        if new.theme != self.settings.theme {
-            self.theme = theme::graphite_theme(new.theme);
-            self.tokens = theme::tokens(new.theme);
-        }
-        if new.kitty_keyboard != self.settings.kitty_keyboard {
-            for tab in self.windows.values().flat_map(|w| w.tabs.iter()) {
-                if let Some(term) = tab.terminal() {
-                    term.lock().set_kitty_keyboard(new.kitty_keyboard);
-                }
-            }
-        }
-        let backdrop =
-            |s: &Settings| Chrome::current().backdrop(s.background_opacity, s.background_blur);
-        let (old_b, new_b) = (backdrop(&self.settings), backdrop(&new));
-        if !self.windows.is_empty() {
-            if new_b.blur != old_b.blur {
-                tracing::info!("background blur applies to windows opened from now on");
-            }
-            if new_b.transparent && !old_b.transparent {
-                tracing::info!(
-                    "a see-through background shows in windows opened from now on; open windows \
-                     were created opaque"
-                );
-            }
-        }
-        tracing::info!("settings.toml reloaded");
-        self.settings = new;
-    }
-
     pub(crate) fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
         self.windows
             .values_mut()
@@ -1043,10 +703,10 @@ impl App {
         if self.shooting {
             return Task::none();
         }
-        let target = if self.screenshot_editor {
-            self.editor_window()
-        } else {
-            self.windows.keys().next().copied()
+        let target = match self.screenshot_window {
+            ShotWindow::Editor => self.editor_window(),
+            ShotWindow::Settings => self.settings_window(),
+            ShotWindow::Terminal => self.windows.keys().next().copied(),
         };
         let Some(wid) = target else {
             return Task::none();

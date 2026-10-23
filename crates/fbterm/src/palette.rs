@@ -96,6 +96,7 @@ fn actions() -> Vec<PaletteItem> {
         (Action::NewWindow, "New window"),
         (Action::CloseTab, "Close tab"),
         (Action::EditProfiles, "Edit profiles"),
+        (Action::Settings, "Settings"),
         (Action::OpenSettingsFile, "Open settings file"),
         (Action::RevealConfigFolder, "Reveal config folder"),
         (Action::Quit, "Quit"),
@@ -485,7 +486,7 @@ mod tests {
             profile("Beta", "b@b"),
             profile("alpha", "a@a"),
             profile("mid", "m@m"),
-            action(Action::EditProfiles, "Settings"),
+            action(Action::Settings, "Settings"),
         ];
         let mut recency = Recency::new();
         recency.bump(id(&items[0]), 100);
@@ -498,7 +499,7 @@ mod tests {
     }
 
     #[test]
-    fn actions_list_the_settings_file_actions_after_edit_profiles() {
+    fn actions_list_settings_and_the_settings_file_actions_after_edit_profiles() {
         let labels: Vec<String> = actions().iter().map(|a| a.label().to_string()).collect();
         assert_eq!(
             labels,
@@ -507,6 +508,7 @@ mod tests {
                 "New window",
                 "Close tab",
                 "Edit profiles",
+                "Settings",
                 "Open settings file",
                 "Reveal config folder",
                 "Quit"
@@ -545,10 +547,7 @@ mod tests {
 
     #[test]
     fn no_match_returns_empty() {
-        let items = vec![
-            profile("prod", "u@h"),
-            action(Action::EditProfiles, "Settings"),
-        ];
+        let items = vec![profile("prod", "u@h"), action(Action::Settings, "Settings")];
         assert!(rank("qqqq", &items, &Recency::new()).is_empty());
     }
 
@@ -649,6 +648,6 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 7);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 8);
     }
 }
