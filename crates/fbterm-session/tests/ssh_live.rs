@@ -911,4 +911,29 @@ mod pool {
         run(&h, "echo \"@@$(stty size)@@\"");
         wait_for(&h, "@@25 90@@").await;
     }
+
+    #[tokio::test]
+    async fn unreachable_hop_error_names_the_hop() {
+        if !enabled() {
+            return;
+        }
+        let mut w = World::new();
+        let ghost = ssh("ghost", "no-such-host.invalid", vec![w.bastion]);
+        let ghost_id = ghost.id;
+        w.store.profiles.push(ghost);
+        let pool = w.pool();
+        let (tx, _rx): (EventSink, _) = unbounded_channel();
+        let err = tokio::time::timeout(STEP, pool.open_shell(&w.store, &ghost_id, SIZE, 10, tx))
+            .await
+            .expect("open_shell timed out")
+            .err()
+            .expect("an unreachable target must fail");
+        let text = err.to_string();
+        assert!(matches!(err, SshError::Connect(_)), "{err:?}");
+        assert!(
+            text.contains("bastion (127.0.0.1:2222)") && text.contains("no-such-host.invalid"),
+            "{text}"
+        );
+        assert!(pool.connected_profiles().is_empty());
+    }
 }
