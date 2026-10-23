@@ -404,6 +404,27 @@ fn ssh_profile(profile: &Profile) -> Result<&SshProfile, SshError> {
     }
 }
 
+/// Prefix a hop's connection and protocol errors with its profile name and address, so the
+/// user can tell which hop of a chain failed. Other errors already say whose they are.
+pub(crate) fn in_hop(profile: &Profile, e: SshError) -> SshError {
+    let Ok(ssh) = ssh_profile(profile) else {
+        return e;
+    };
+    let at = if ssh.host.contains(':') {
+        format!("[{}]:{}", ssh.host, ssh.port)
+    } else {
+        format!("{}:{}", ssh.host, ssh.port)
+    };
+    let prefix = format!("{} ({at})", profile.name);
+    match e {
+        SshError::Connect(io) => {
+            SshError::Connect(std::io::Error::new(io.kind(), format!("{prefix}: {io}")))
+        }
+        SshError::Protocol(m) => SshError::Protocol(format!("{prefix}: {m}")),
+        other => other,
+    }
+}
+
 /// One authenticated SSH connection of a chain.
 pub(crate) struct Hop {
     pub handle: Handle<ClientHandler>,
@@ -446,6 +467,9 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         lost: lost.clone(),
     };
     let config = client_config(&ssh.host, ssh.port, &ctx.known_hosts);
+    // Limitation: if the server stalls after the banner, the timeout drops our side of the
+    // handshake, but the session task russh already spawned keeps the socket until the server
+    // gives up (its LoginGraceTime); russh offers no handle to abort that task.
     let mut handle = bounded(
         &clock,
         limit,
@@ -499,8 +523,11 @@ pub async fn connect_direct(
             profile.name
         )));
     }
-    let stream = tcp_connect(ssh).await?;
-    Ok(connect_hop(stream, profile, ctx).await?.handle)
+    let stream = tcp_connect(ssh).await.map_err(|e| in_hop(profile, e))?;
+    let hop = connect_hop(stream, profile, ctx)
+        .await
+        .map_err(|e| in_hop(profile, e))?;
+    Ok(hop.handle)
 }
 
 #[cfg(test)]
@@ -671,6 +698,47 @@ mod tests {
             .duplicate()
             .to_string(),
             "authentication failed for \"p\""
+        );
+    }
+
+    #[test]
+    fn hop_errors_name_the_hop() {
+        let mut p = Profile {
+            id: fbterm_config::ProfileId::new(),
+            name: "bastion-1".into(),
+            group: None,
+            accent: None,
+            kind: ProfileKind::Ssh(SshProfile {
+                host: "10.0.0.5".into(),
+                port: 22,
+                user: "u".into(),
+                auth: fbterm_config::AuthMethod::Agent,
+                jump: vec![],
+            }),
+        };
+        match in_hop(&p, timed_out("no answer".into())) {
+            SshError::Connect(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+                assert_eq!(io.to_string(), "bastion-1 (10.0.0.5:22): no answer");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            in_hop(&p, SshError::Protocol("bad packet".into())).to_string(),
+            "ssh error: bastion-1 (10.0.0.5:22): bad packet"
+        );
+        // Errors that already say whose they are stay as they were.
+        assert!(matches!(
+            in_hop(&p, SshError::HostKeyRejected),
+            SshError::HostKeyRejected
+        ));
+        if let ProfileKind::Ssh(ssh) = &mut p.kind {
+            ssh.host = "fe80::1".into();
+        }
+        assert!(
+            in_hop(&p, SshError::Protocol("x".into()))
+                .to_string()
+                .contains("bastion-1 ([fe80::1]:22): x")
         );
     }
 }
