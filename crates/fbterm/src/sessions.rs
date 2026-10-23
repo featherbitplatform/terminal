@@ -378,13 +378,14 @@ fn reveal(_path: &std::path::Path) -> Option<std::process::Command> {
     None
 }
 
-pub(crate) fn spawn_reaped(mut cmd: std::process::Command, url: &str) {
+/// Start `cmd` (the system opener) and reap it; `what` names the thing being opened, for the log.
+pub(crate) fn spawn_reaped(mut cmd: std::process::Command, what: &str) {
     match cmd.spawn() {
         // Reap the opener so it does not linger as a zombie.
         Ok(mut child) => {
             std::thread::spawn(move || child.wait());
         }
-        Err(e) => tracing::warn!(%url, error = %e, "could not open link"),
+        Err(e) => tracing::warn!(%what, error = %e, "could not start the system opener"),
     }
 }
 

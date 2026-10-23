@@ -77,4 +77,27 @@ mod tests {
         assert_eq!(args.len(), 1);
         assert_eq!(args[0], dir.as_os_str());
     }
+
+    #[test]
+    fn reveal_selects_an_existing_file_where_the_platform_can() {
+        let dir = Path::new("/tmp/fb dir");
+        let file = dir.join("settings.toml");
+        let cmd = reveal_command(dir, &file, true);
+        let args: Vec<_> = cmd.get_args().collect();
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(cmd.get_program(), "open");
+            assert_eq!(args, [std::ffi::OsStr::new("-R"), file.as_os_str()]);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(cmd.get_program(), "explorer");
+            assert_eq!(args, [dir.as_os_str()]);
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            assert_eq!(cmd.get_program(), "xdg-open");
+            assert_eq!(args, [dir.as_os_str()]);
+        }
+    }
 }
