@@ -24,7 +24,7 @@ impl App {
                 Task::none()
             }
             EditorMsg::Reload => {
-                self.reload_profiles();
+                self.reload_profiles(true);
                 Task::none()
             }
             EditorMsg::PickKey => {
@@ -102,16 +102,41 @@ impl App {
             }
         };
         if saved {
+            // Our own write is not an edit to pick up again.
+            self.profiles_seen = std::fs::read_to_string(&path).ok();
             self.profiles_changed();
         }
     }
 
-    /// Re-read `profiles.toml` after it failed to load.
-    fn reload_profiles(&mut self) {
-        let mut notices = Vec::new();
-        let (store, error) = load_profiles(&self.paths, &mut notices);
+    /// `profiles.toml` changed on disk (hand edit, or a tool). Changes that are only our own
+    /// write (or a touch) leave the same text and are ignored.
+    pub(crate) fn profiles_file_changed(&mut self) {
+        let text = std::fs::read_to_string(self.paths.profiles()).ok();
+        if text == self.profiles_seen {
+            return;
+        }
+        self.reload_profiles(false);
+    }
+
+    /// Re-read `profiles.toml`. A file that does not parse changes nothing in memory: the
+    /// previous profiles stay, the error is shown, and saving is refused until it loads. A file
+    /// that parses replaces the profiles; open tabs keep their sessions (by profile id) and
+    /// validation problems go to the banner. `explicit`: the editor's Reload button, which
+    /// discards unsaved edits; a reload triggered by a file change keeps them.
+    fn reload_profiles(&mut self, explicit: bool) {
+        let path = self.paths.profiles();
+        self.profiles_seen = std::fs::read_to_string(&path).ok();
+        let mut found = Vec::new();
+        let (store, error) = load_profiles(&self.paths, &mut found);
+        let prefix = path.display().to_string();
+        self.notices.retain(|n| !n.starts_with(&prefix));
+        if !found.is_empty() {
+            self.notices_dismissed = false;
+        }
+        self.notices.extend(found);
         match error {
             Some(e) => {
+                tracing::warn!(error = %e, "profiles.toml not applied");
                 if let Some((_, ed)) = &mut self.editor {
                     ed.read_only = Some(e.clone());
                     ed.notice = Some("Still not readable".into());
@@ -119,15 +144,23 @@ impl App {
                 self.profiles_error = Some(e);
             }
             None => {
-                if let Some(old) = self.profiles_error.take() {
-                    let old = old.to_string();
-                    self.notices.retain(|n| *n != old);
-                }
+                self.profiles_error = None;
                 self.profiles = store;
                 if let Some((_, ed)) = &mut self.editor {
-                    *ed = EditorState::new(&self.profiles, self.secrets.clone(), None);
-                    ed.notice = Some("Reloaded".into());
+                    if explicit || !ed.dirty || ed.read_only.is_some() {
+                        *ed = EditorState::new(&self.profiles, self.secrets.clone(), None);
+                        ed.notice = Some("Reloaded".into());
+                    } else {
+                        ed.notice = Some(
+                            "profiles.toml changed on disk: Reload to discard your edits and see it"
+                                .into(),
+                        );
+                    }
                 }
+                tracing::info!(
+                    profiles = self.profiles.profiles.len(),
+                    "profiles.toml reloaded"
+                );
                 self.profiles_changed();
             }
         }

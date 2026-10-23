@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use fbterm_config::{
-    ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, Settings, discover_shells,
+    ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, SavedWindow, Settings,
+    discover_shells,
 };
 use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
 use fbterm_session::ssh::{SshContext, SshPool};
@@ -23,9 +24,11 @@ use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Palettes, Rece
 use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
 };
+use crate::restore;
 use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::tabs::{self, Tab, TabId, TabState, WindowState};
 use crate::theme;
+use crate::watch::{self, Changed, ConfigDir};
 
 /// What a tab bar asks of its own window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +105,12 @@ pub enum Message {
     Prompt(PromptMsg),
     Shoot,
     Shot(Screenshot),
+    /// A window was resized (or has just reported its size).
+    WindowResized(window::Id, iced::Size),
+    /// The quiet period after a resize passed; saves if no newer resize happened (its count).
+    SaveState(u64),
+    /// `profiles.toml` and/or `settings.toml` changed on disk.
+    ConfigChanged(Changed),
 }
 
 /// Size used for sessions started before their window has laid out.
@@ -139,8 +148,21 @@ pub struct App {
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
     pub(crate) prompt_rx: PromptReceiver,
-    /// When each profile was last opened (in memory until state persistence).
+    /// When each profile was last opened (persisted in `state.toml`).
     pub recency: Recency,
+    /// Whether `state.toml` is written. Off for debug aids that open tabs (`FBTERM_OPEN_TABS`,
+    /// `FBTERM_SCREENSHOT`, the perf runs): they would overwrite the user's real layout.
+    pub(crate) state_saving_enabled: bool,
+    /// Last known inner size of each terminal window.
+    pub(crate) sizes: HashMap<window::Id, (f32, f32)>,
+    /// Counts resizes, so only the last one of a burst saves.
+    pub(crate) resize_count: u64,
+    /// The text of `profiles.toml` / `settings.toml` as last loaded or written by us: a change
+    /// event for exactly this text is our own write (or a touch), not an edit.
+    pub(crate) profiles_seen: Option<String>,
+    pub(crate) settings_seen: Option<String>,
+    /// The banner line for a `settings.toml` that failed to load.
+    pub(crate) settings_notice: Option<String>,
     /// Whether one of our windows has focus at all (the app is in front).
     pub app_active: bool,
     pub style: TerminalStyle,
@@ -204,6 +226,19 @@ pub(crate) fn load_profiles(
     (store, failed)
 }
 
+/// The look of terminals for `settings` (the font name lives for the whole process: iced wants a
+/// `'static` name, and a changed font in `settings.toml` costs one small allocation).
+fn terminal_style(settings: &Settings) -> TerminalStyle {
+    let family: &'static str = Box::leak(settings.font_family.clone().into_boxed_str());
+    TerminalStyle {
+        scheme: ColorScheme::graphite(),
+        font: Font::with_name(family),
+        font_size: settings.font_size,
+        accent: None,
+        focused: true,
+    }
+}
+
 /// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`, ...); release
 /// builds ignore them.
 pub(crate) fn debug_env(name: &str) -> Option<std::ffi::OsString> {
@@ -216,22 +251,37 @@ pub(crate) fn debug_env(name: &str) -> Option<std::ffi::OsString> {
 
 impl App {
     pub fn boot() -> (Self, Task<Message>) {
-        let paths = paths();
+        // FBTERM_SECRETS=memory (debug aid) keeps secrets in memory and never touches the keychain.
+        let memory_secrets = std::env::var("FBTERM_SECRETS").as_deref() == Ok("memory");
+        Self::build(paths(), memory_secrets)
+    }
+
+    pub(crate) fn build(paths: Paths, memory_secrets: bool) -> (Self, Task<Message>) {
         let mut notices = Vec::new();
+        let mut settings_notice = None;
         let settings = Settings::load(&paths.settings()).unwrap_or_else(|e| {
             notices.push(e.to_string());
+            settings_notice = Some(e.to_string());
             Settings::default()
         });
         let (profiles, profiles_error) = load_profiles(&paths, &mut notices);
+        let saved = SavedState::load_or_default(&paths.state());
+        // With a profiles.toml that failed to load every saved tab would look orphaned: restore
+        // nothing, and (see `save_state`) leave state.toml alone until the file loads.
+        let plan = if profiles_error.is_some() {
+            Vec::new()
+        } else {
+            restore::plan(&saved, &profiles)
+        };
+        let profiles_seen = std::fs::read_to_string(paths.profiles()).ok();
+        let settings_seen = std::fs::read_to_string(paths.settings()).ok();
 
-        // FBTERM_SECRETS=memory (debug aid) keeps secrets in memory and never touches the keychain.
-        let (secrets, fallback): (Arc<dyn SecretStore>, _) =
-            if std::env::var("FBTERM_SECRETS").as_deref() == Ok("memory") {
-                (Arc::new(MemoryStore::new()), None)
-            } else {
-                let store = Arc::new(FallbackStore::new());
-                (store.clone(), Some(store))
-            };
+        let (secrets, fallback): (Arc<dyn SecretStore>, _) = if memory_secrets {
+            (Arc::new(MemoryStore::new()), None)
+        } else {
+            let store = Arc::new(FallbackStore::new());
+            (store.clone(), Some(store))
+        };
         let known_hosts = directories::BaseDirs::new()
             .map(|d| d.home_dir().join(".ssh").join("known_hosts"))
             .unwrap_or_else(|| PathBuf::from("known_hosts"));
@@ -243,14 +293,7 @@ impl App {
             prompter: Arc::new(UiPrompter::new(None, prompt_tx.clone())),
         }));
 
-        let family: &'static str = Box::leak(settings.font_family.clone().into_boxed_str());
-        let style = TerminalStyle {
-            scheme: ColorScheme::graphite(),
-            font: Font::with_name(family),
-            font_size: settings.font_size,
-            accent: None,
-            focused: true,
-        };
+        let style = terminal_style(&settings);
         let (events, rx) = unbounded_channel();
         let mut app = Self {
             theme: theme::graphite_theme(settings.theme),
@@ -274,7 +317,14 @@ impl App {
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
-            recency: Recency::new(),
+            recency: Recency::from(saved.recency),
+            state_saving_enabled: debug_env("FBTERM_OPEN_TABS").is_none()
+                && debug_env("FBTERM_SCREENSHOT").is_none(),
+            sizes: HashMap::new(),
+            resize_count: 0,
+            profiles_seen,
+            settings_seen,
+            settings_notice,
             app_active: true,
             style_unfocused: TerminalStyle {
                 focused: false,
@@ -285,7 +335,7 @@ impl App {
             screenshot_editor: debug_env("FBTERM_SCREENSHOT_WINDOW").is_some_and(|w| w == "editor"),
             shooting: false,
         };
-        let mut task = app.open_window(app.default_profile());
+        let mut task = app.restore_windows(&plan);
         task = task.chain(app.open_debug_tabs());
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
@@ -349,6 +399,14 @@ impl App {
             // Give the renderer time to load fonts and present a few frames.
             subs.push(iced::time::every(Duration::from_millis(1500)).map(|_| Message::Shoot));
         }
+        subs.push(window::resize_events().map(|(id, size)| Message::WindowResized(id, size)));
+        subs.push(
+            Subscription::run_with(
+                ConfigDir(self.paths.config_dir.clone()),
+                watch::config_stream,
+            )
+            .map(Message::ConfigChanged),
+        );
         Subscription::batch(subs)
     }
 
@@ -425,14 +483,23 @@ impl App {
                 if self.editor_window() == Some(id) {
                     self.editor = None;
                 }
+                // The last terminal window closing is quitting: its layout is what comes back, so
+                // it is saved before it goes. Any other window closing is the user dropping it.
+                if self.windows.len() == 1 && self.windows.contains_key(&id) {
+                    self.save_state();
+                }
                 // Dropping the window's tabs closes their sessions and abandons their dials;
                 // its dialogs answer "no".
-                self.windows.remove(&id);
+                let was_terminal = self.windows.remove(&id).is_some();
+                self.sizes.remove(&id);
                 self.palettes.remove(&id);
                 self.prompts.remove_window(id);
                 self.grids.remove(&id);
                 if self.focused == Some(id) {
                     self.focused = self.windows.keys().next().copied();
+                }
+                if was_terminal && !self.windows.is_empty() {
+                    self.save_state();
                 }
                 if self.windows.is_empty() && self.editor.is_none() {
                     iced::exit()
@@ -448,6 +515,22 @@ impl App {
             Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::Editor(msg) => self.editor_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
+            Message::WindowResized(id, size) => self.window_resized(id, size),
+            Message::SaveState(n) => {
+                if n == self.resize_count {
+                    self.save_state();
+                }
+                Task::none()
+            }
+            Message::ConfigChanged(changed) => {
+                if changed.profiles {
+                    self.profiles_file_changed();
+                }
+                if changed.settings {
+                    self.settings_file_changed();
+                }
+                Task::none()
+            }
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
                 if let Some(path) = &self.screenshot {
@@ -495,6 +578,7 @@ impl App {
         f: impl FnOnce(&mut WindowState) -> bool,
     ) -> Task<Message> {
         if self.windows.get_mut(&wid).is_some_and(f) {
+            self.save_state();
             self.shown(wid)
         } else {
             Task::none()
@@ -598,18 +682,55 @@ impl App {
         }
     }
 
-    pub fn open_window(&mut self, profile: Option<ProfileId>) -> Task<Message> {
+    /// A new terminal window of `size` (logical pixels), with no tabs yet.
+    fn new_window(&mut self, size: (f32, f32)) -> (window::Id, Task<Message>) {
         let (id, open) = window::open(window::Settings {
-            size: iced::Size::new(1000.0, 640.0),
+            size: iced::Size::new(size.0, size.1),
             min_size: Some(iced::Size::new(360.0, 200.0)),
             ..window::Settings::default()
         });
         self.windows.insert(id, WindowState::new());
+        self.sizes.insert(id, size);
+        (id, open.map(Message::WindowOpened))
+    }
+
+    /// Reopen the saved windows with their tabs not connected, then connect the active tab of
+    /// each; the others connect when first selected (see [`App::shown`]). With nothing to
+    /// restore, the default single window opens.
+    fn restore_windows(&mut self, plan: &[SavedWindow]) -> Task<Message> {
+        if plan.is_empty() {
+            return self.open_window(self.default_profile());
+        }
+        let mut tasks = Vec::new();
+        for saved in plan {
+            let (wid, open) = self.new_window(saved.size);
+            let window = self.windows.get_mut(&wid).expect("just inserted");
+            for &profile in &saved.tabs {
+                if let Some(p) = self.profiles.get(profile) {
+                    window
+                        .tabs
+                        .push(Tab::new(profile, p.name.clone(), p.accent));
+                }
+            }
+            window.active = saved.active.min(window.tabs.len().saturating_sub(1));
+            tracing::info!(
+                tabs = window.tabs.len(),
+                active = window.active,
+                "restoring window"
+            );
+            tasks.push(open);
+            tasks.push(self.shown(wid));
+        }
+        Task::batch(tasks)
+    }
+
+    pub fn open_window(&mut self, profile: Option<ProfileId>) -> Task<Message> {
+        let (id, open) = self.new_window(restore::DEFAULT_SIZE);
         let start = match profile {
             Some(p) => self.open_tab(id, p),
             None => Task::none(),
         };
-        open.map(Message::WindowOpened).chain(start)
+        open.chain(start)
     }
 
     pub fn open_tab(&mut self, wid: window::Id, profile: ProfileId) -> Task<Message> {
@@ -623,6 +744,7 @@ impl App {
             return Task::none();
         };
         window.push(tab);
+        self.save_state();
         self.start(wid, id)
     }
 
@@ -634,6 +756,7 @@ impl App {
             return Task::none();
         };
         drop(closed.tab);
+        self.save_state();
         if closed.window_empty {
             window::close(wid)
         } else {
@@ -656,6 +779,78 @@ impl App {
             }
             _ => Task::none(),
         }
+    }
+
+    /// Write `state.toml`: windows, tabs, selection, sizes and recency. Does nothing for debug
+    /// runs (see `state_saving_enabled`) and while `profiles.toml` is unreadable (the tabs would
+    /// look orphaned; the file keeps the layout until the profiles load again).
+    pub(crate) fn save_state(&self) {
+        if !self.state_saving_enabled || self.profiles_error.is_some() {
+            return;
+        }
+        let state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
+        if let Err(e) = state.save(&self.paths.state()) {
+            tracing::warn!(error = %e, "could not save the session state");
+        }
+    }
+
+    fn window_resized(&mut self, id: window::Id, size: iced::Size) -> Task<Message> {
+        if !self.windows.contains_key(&id) {
+            return Task::none();
+        }
+        self.sizes.insert(id, (size.width, size.height));
+        self.resize_count += 1;
+        let n = self.resize_count;
+        // Dragging a window edge resizes continuously: save once it settles.
+        Task::perform(
+            async { tokio::time::sleep(Duration::from_millis(500)).await },
+            move |()| Message::SaveState(n),
+        )
+    }
+
+    /// `settings.toml` changed on disk: apply it, or keep the previous settings and say why.
+    pub(crate) fn settings_file_changed(&mut self) {
+        let path = self.paths.settings();
+        let text = std::fs::read_to_string(&path).ok();
+        if text == self.settings_seen {
+            return;
+        }
+        self.settings_seen = text;
+        if let Some(old) = self.settings_notice.take() {
+            self.notices.retain(|n| *n != old);
+        }
+        match Settings::load(&path) {
+            Ok(new) => self.apply_settings(new),
+            Err(e) => {
+                tracing::warn!(error = %e, "settings.toml not applied");
+                let line = e.to_string();
+                self.notices.push(line.clone());
+                self.settings_notice = Some(line);
+                self.notices_dismissed = false;
+            }
+        }
+    }
+
+    /// Font, size and theme take effect in every open terminal and window at once (they are
+    /// read each frame). The scrollback length applies to terminals opened from now on.
+    fn apply_settings(&mut self, new: Settings) {
+        if new == self.settings {
+            return;
+        }
+        if new.font_family != self.settings.font_family || new.font_size != self.settings.font_size
+        {
+            self.style = terminal_style(&new);
+            self.style_unfocused = TerminalStyle {
+                focused: false,
+                ..self.style.clone()
+            };
+        }
+        if new.theme != self.settings.theme {
+            self.theme = theme::graphite_theme(new.theme);
+            self.tokens = theme::tokens(new.theme);
+        }
+        tracing::info!("settings.toml reloaded");
+        self.settings = new;
     }
 
     pub(crate) fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {

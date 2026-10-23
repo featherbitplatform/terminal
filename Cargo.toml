@@ -30,6 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 png = "0.17"
 rfd = "0.17.2"
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [profile.release]
 lto = "thin"
