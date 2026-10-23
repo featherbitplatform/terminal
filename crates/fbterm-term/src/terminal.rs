@@ -32,7 +32,6 @@ pub enum TermEvent {
     Bell,
     /// Replies (device attributes, status reports, ...) that must be written back to the session.
     PtyWrite(Vec<u8>),
-    ClipboardStore(String),
     Exit,
 }
 
@@ -105,7 +104,8 @@ impl EventListener for EventProxy {
             Event::Title(t) => TermEvent::Title(t),
             Event::Bell => TermEvent::Bell,
             Event::PtyWrite(s) => TermEvent::PtyWrite(s.into_bytes()),
-            Event::ClipboardStore(_, s) => TermEvent::ClipboardStore(s),
+            // Programs never write the clipboard: OSC 52 stores are dropped.
+            Event::ClipboardStore(..) => return,
             Event::Exit | Event::ChildExit(_) => TermEvent::Exit,
             Event::TextAreaSizeRequest(fmt) => {
                 let s = sh.size;
@@ -187,7 +187,7 @@ impl Terminal {
         };
         let config = Config {
             scrolling_history: scrollback,
-            osc52: alacritty_terminal::term::Osc52::CopyPaste,
+            osc52: alacritty_terminal::term::Osc52::OnlyPaste,
             ..Config::default()
         };
         let term = Term::new(config, &dims(size), proxy);
@@ -404,6 +404,13 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b]52;c;?\x07");
         assert_eq!(reply(&mut t), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn osc52_write_is_ignored() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        t.feed(b"\x1b]52;c;aGVsbG8=\x07");
+        assert!(t.take_events().is_empty());
     }
 
     fn select_word_and_scroll(prefill: usize) -> (String, String) {
