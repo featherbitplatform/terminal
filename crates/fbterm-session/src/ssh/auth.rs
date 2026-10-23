@@ -155,8 +155,16 @@ async fn rsa_hash(
     if !matches!(algorithm, russh::keys::Algorithm::Rsa { .. }) {
         return Ok(None);
     }
-    // The server's strongest supported hash; servers that do not say get legacy `ssh-rsa`.
-    Ok(handle.best_supported_rsa_hash().await?.flatten())
+    Ok(rsa_hash_for(handle.best_supported_rsa_hash().await?))
+}
+
+/// Pick the RSA signature hash from what the server announced in `server-sig-algs`
+/// (`None`: it announced nothing; `Some(None)`: it supports only legacy SHA-1 `ssh-rsa`).
+///
+/// A server that announces nothing gets `rsa-sha2-512`, as OpenSSH does: SHA-1 signatures are
+/// refused by default by current servers, and are only used when the server lists nothing else.
+fn rsa_hash_for(server_sig_algs: Option<Option<HashAlg>>) -> Option<HashAlg> {
+    server_sig_algs.unwrap_or(Some(HashAlg::Sha512))
 }
 
 async fn key(
@@ -234,4 +242,25 @@ async fn agent(
         "profile {:?}: ssh-agent authentication is not available on this platform yet",
         profile.name
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsa_hash_selection() {
+        // Nothing announced: rsa-sha2-512, never legacy ssh-rsa.
+        assert_eq!(rsa_hash_for(None), Some(HashAlg::Sha512));
+        // Announced: the server's strongest choice, legacy only when that is all it has.
+        assert_eq!(
+            rsa_hash_for(Some(Some(HashAlg::Sha256))),
+            Some(HashAlg::Sha256)
+        );
+        assert_eq!(
+            rsa_hash_for(Some(Some(HashAlg::Sha512))),
+            Some(HashAlg::Sha512)
+        );
+        assert_eq!(rsa_hash_for(Some(None)), None);
+    }
 }

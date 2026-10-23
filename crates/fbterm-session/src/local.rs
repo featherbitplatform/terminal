@@ -2,16 +2,17 @@
 
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use fbterm_config::LocalProfile;
-use fbterm_term::{GridSize, TermEvent, Terminal};
+use fbterm_term::{GridSize, Terminal};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
+use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
-use crate::{Command, EventSink, SessionError, SessionEvent, SessionHandle, SessionId};
+use crate::{Command, EventSink, Feeder, SessionError, SessionEvent, SessionHandle, SessionId};
 
 /// How long the waiter lets the reader drain after the child exits before
 /// announcing `Exited` anyway (a grandchild may still hold the PTY open).
@@ -74,13 +75,13 @@ pub fn spawn_local(
             return Err(SessionError::Pty(e.to_string()));
         }
     };
-    let killer = Arc::new(Mutex::new(child.clone_killer()));
+    let killer = Mutex::new(child.clone_killer());
 
     let id = SessionId::next();
     let terminal = Arc::new(Mutex::new(Terminal::new(size, scrollback)));
     let dirty_pending = Arc::new(AtomicBool::new(false));
     let bell_pending = Arc::new(AtomicBool::new(false));
-    let (tx, rx) = channel::<Command>();
+    let (tx, rx) = unbounded_channel::<Command>();
     let (done_tx, done_rx) = channel::<()>();
 
     std::thread::Builder::new()
@@ -90,8 +91,13 @@ pub fn spawn_local(
     // Waiter: the only place `Exited` is produced, so it fires exactly once and
     // does not depend on the output pipe reaching EOF (ConPTY, lingering grandchildren).
     let waiter_tx = tx.clone();
-    let waiter_events = events.clone();
-    let waiter_dirty = dirty_pending.clone();
+    let waiter = Feeder::new(
+        id,
+        terminal.clone(),
+        events.clone(),
+        dirty_pending.clone(),
+        bell_pending.clone(),
+    );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-waiter-{}", id.0))
         .spawn(move || {
@@ -99,21 +105,22 @@ pub fn spawn_local(
             // Dropping the master closes the pseudoconsole, which unblocks the reader on Windows.
             let _ = waiter_tx.send(Command::Close);
             let _ = done_rx.recv_timeout(DRAIN_GRACE);
-            if !waiter_dirty.swap(true, Ordering::AcqRel) {
-                let _ = waiter_events.send((id, SessionEvent::Dirty));
-            }
-            let _ = waiter_events.send((id, SessionEvent::Exited(code)));
+            waiter.mark_dirty();
+            waiter.send(SessionEvent::Exited(code));
         })?;
 
     let reader_tx = tx.clone();
-    let reader_terminal = terminal.clone();
-    let reader_dirty = dirty_pending.clone();
-    let reader_bell = bell_pending.clone();
+    let mut feeder = Feeder::new(
+        id,
+        terminal.clone(),
+        events,
+        dirty_pending.clone(),
+        bell_pending.clone(),
+    );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-reader-{}", id.0))
         .spawn(move || {
             let mut buf = vec![0u8; 64 * 1024];
-            let mut last_title: Option<String> = None;
             loop {
                 // EOF, or EIO once the child side closes on Unix: either way we are done.
                 let n = match reader.read(&mut buf) {
@@ -122,35 +129,8 @@ pub fn spawn_local(
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 };
-                let term_events = {
-                    let mut term = reader_terminal.lock();
-                    term.feed(&buf[..n]);
-                    term.take_events()
-                };
-                for ev in term_events {
-                    match ev {
-                        TermEvent::PtyWrite(bytes) => {
-                            let _ = reader_tx.send(Command::Input(bytes));
-                        }
-                        TermEvent::Title(t) => {
-                            if last_title.as_deref() != Some(t.as_str()) {
-                                last_title = Some(t.clone());
-                                let _ = events.send((id, SessionEvent::Title(t)));
-                            }
-                        }
-                        TermEvent::Bell => {
-                            if !reader_bell.swap(true, Ordering::AcqRel) {
-                                let _ = events.send((id, SessionEvent::Bell));
-                            }
-                        }
-                        TermEvent::ClipboardStore(s) => {
-                            let _ = events.send((id, SessionEvent::ClipboardStore(s)));
-                        }
-                        TermEvent::Exit => {}
-                    }
-                }
-                if !reader_dirty.swap(true, Ordering::AcqRel) {
-                    let _ = events.send((id, SessionEvent::Dirty));
+                for reply in feeder.feed(&buf[..n]) {
+                    let _ = reader_tx.send(Command::Input(reply));
                 }
             }
             let _ = done_tx.send(());
@@ -162,16 +142,19 @@ pub fn spawn_local(
         commands: tx,
         dirty_pending,
         bell_pending,
-        killer,
+        closer: Box::new(move || {
+            let _ = killer.lock().kill();
+        }),
+        connection: Mutex::new(None),
     })
 }
 
 fn writer_loop(
-    rx: Receiver<Command>,
+    mut rx: UnboundedReceiver<Command>,
     mut writer: Box<dyn Write + Send>,
     master: Box<dyn MasterPty + Send>,
 ) {
-    while let Ok(cmd) = rx.recv() {
+    while let Some(cmd) = rx.blocking_recv() {
         match cmd {
             Command::Input(bytes) => {
                 if writer

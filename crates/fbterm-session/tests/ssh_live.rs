@@ -536,3 +536,379 @@ async fn agent_auth() {
         .unwrap();
     assert!(matches!(err, SshError::AuthFailed { .. }), "{err:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Jump chains and the shared connection pool.
+//
+// Topology: 127.0.0.1:2222 -> bastion -> target -> target2 (sshd listens on 2222 everywhere).
+// Every test uses the unencrypted test key, so no secret prompts happen; host keys are trusted
+// on first use into a per-test known_hosts.
+//
+// Tests run in parallel against the same containers, so nothing here counts or kills
+// connections globally: a connection is identified by `$SSH_CONNECTION` (its client address and
+// port as the server sees them), and the drop test kills only its own connection.
+
+mod pool {
+    use super::*;
+
+    use alacritty_terminal::index::{Column, Line};
+    use fbterm_config::ProfileStore;
+    use fbterm_session::ssh::SshPool;
+    use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
+    use fbterm_term::GridSize;
+    use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+    type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
+
+    const SIZE: GridSize = GridSize {
+        cols: 100,
+        rows: 30,
+        cell_width: 8.0,
+        cell_height: 16.0,
+    };
+
+    /// Trusts every host key and counts the questions; never expects a secret prompt.
+    #[derive(Default)]
+    struct TrustAll {
+        host_key_calls: parking_lot::Mutex<Vec<(String, u16)>>,
+    }
+
+    #[async_trait]
+    impl Prompter for TrustAll {
+        async fn confirm_host_key(&self, host: &str, port: u16, _fp: &str) -> bool {
+            self.host_key_calls.lock().push((host.to_owned(), port));
+            true
+        }
+        async fn ask_secret(
+            &self,
+            name: &str,
+            kind: SecretKind,
+            _retry: bool,
+        ) -> Option<SecretAnswer> {
+            panic!("unexpected {kind:?} prompt for {name}");
+        }
+    }
+
+    fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
+        Profile {
+            id: ProfileId::new(),
+            name: name.into(),
+            group: None,
+            accent: None,
+            kind: ProfileKind::Ssh(SshProfile {
+                host: host.into(),
+                port: PORT,
+                user: USER.into(),
+                auth: AuthMethod::Key {
+                    path: keys_dir().join("fb_test_ed25519"),
+                    passphrase: false,
+                },
+                jump,
+            }),
+        }
+    }
+
+    struct World {
+        fx: Fixture,
+        prompter: Arc<TrustAll>,
+        store: ProfileStore,
+        bastion: ProfileId,
+        target: ProfileId,
+        target2: ProfileId,
+    }
+
+    impl World {
+        fn new() -> Self {
+            let bastion = ssh("bastion", HOST, vec![]);
+            let target = ssh("target", "target", vec![bastion.id]);
+            let target2 = ssh("target2", "target2", vec![target.id]);
+            Self {
+                fx: Fixture::new(),
+                prompter: Arc::new(TrustAll::default()),
+                bastion: bastion.id,
+                target: target.id,
+                target2: target2.id,
+                store: ProfileStore {
+                    profiles: vec![bastion, target, target2],
+                },
+            }
+        }
+
+        fn pool(&self) -> SshPool {
+            SshPool::new(self.fx.ctx(self.prompter.clone()))
+        }
+    }
+
+    async fn open(pool: &SshPool, w: &World, id: ProfileId) -> (SessionHandle, Events) {
+        let (tx, rx): (EventSink, _) = unbounded_channel();
+        let h = tokio::time::timeout(STEP, pool.open_shell(&w.store, &id, SIZE, 1000, tx))
+            .await
+            .expect("open_shell timed out")
+            .expect("open_shell");
+        (h, rx)
+    }
+
+    fn grid_text(handle: &SessionHandle) -> String {
+        let t = handle.terminal.lock();
+        let g = t.term().grid();
+        let size = t.size();
+        let mut out = String::new();
+        for row in 0..size.rows as i32 {
+            for col in 0..size.cols as usize {
+                out.push(g[Line(row)][Column(col)].c);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Wait until the screen shows `needle`; returns the screen.
+    async fn wait_for(handle: &SessionHandle, needle: &str) -> String {
+        tokio::time::timeout(STEP, async {
+            loop {
+                let text = grid_text(handle);
+                if text.contains(needle) {
+                    return text;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {needle:?}:\n{}", grid_text(handle)))
+    }
+
+    /// Type a command line into the shell.
+    fn run(handle: &SessionHandle, line: &str) {
+        handle.send(format!("{line}\r").into_bytes());
+    }
+
+    /// The remote `$SSH_CONNECTION` (`client-ip client-port server-ip server-port`): the same
+    /// value in two shells means the same TCP connection.
+    async fn ssh_connection(handle: &SessionHandle) -> String {
+        // The output is `<<C 10.0.0.1 4242 ...>>`; the echoed command line never has `<<C ` next
+        // to a digit, so the match below finds only the output.
+        run(handle, "echo \"<<C $SSH_CONNECTION>>\"");
+        tokio::time::timeout(STEP, async {
+            loop {
+                let text = grid_text(handle);
+                if let Some(v) = text.split("<<C ").skip(1).find_map(|s| {
+                    let v = s.split(">>").next()?;
+                    v.starts_with(|c: char| c.is_ascii_digit())
+                        .then(|| v.to_owned())
+                }) {
+                    return v;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no $SSH_CONNECTION in:\n{}", grid_text(handle)))
+    }
+
+    /// Wait for the first `Exited`/`Disconnected` event.
+    async fn wait_end(rx: &mut Events) -> SessionEvent {
+        tokio::time::timeout(STEP, async {
+            loop {
+                if let (_, e @ (SessionEvent::Exited(_) | SessionEvent::Disconnected(_))) =
+                    rx.recv().await.expect("event sink closed")
+                {
+                    return e;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the session to end")
+    }
+
+    /// Whether the bastion still has an established TCP connection from `client_port`, checked
+    /// over a separate connection.
+    async fn bastion_has_connection_from(w: &World, client_port: &str) -> bool {
+        let p = w.store.get(w.bastion).unwrap();
+        let handle = connect(p, &w.fx.ctx(w.prompter.clone())).await.unwrap();
+        let tables = exec(&handle, "cat /proc/net/tcp /proc/net/tcp6").await;
+        let port_hex = format!("{:04X}", client_port.parse::<u16>().unwrap());
+        // `sl local rem st ...`; `rem` is `ADDR:PORT` in hex and `01` is ESTABLISHED.
+        tables.lines().any(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            f.len() > 3 && f[2].ends_with(&format!(":{port_hex}")) && f[3] == "01"
+        })
+    }
+
+    #[tokio::test]
+    async fn one_hop_reaches_unpublished_target() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (h, _rx) = open(&pool, &w, w.target).await;
+        run(&h, "echo \"@@$(hostname)@@\"");
+        wait_for(&h, "@@target@@").await;
+        // Each hop's key was checked under its own name, in connection order.
+        assert_eq!(
+            *w.prompter.host_key_calls.lock(),
+            vec![(HOST.to_owned(), PORT), ("target".to_owned(), PORT)]
+        );
+        assert_eq!(pool.connected_profiles(), vec![w.target]);
+    }
+
+    #[tokio::test]
+    async fn two_hops_reach_target2() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (h, _rx) = open(&pool, &w, w.target2).await;
+        run(&h, "echo \"@@$(hostname)@@\"");
+        wait_for(&h, "@@target2@@").await;
+        assert_eq!(w.prompter.host_key_calls.lock().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn two_tabs_share_one_connection() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        // Opened concurrently: the second must wait for the first's connect, not dial again.
+        let ((a, _ra), (b, _rb)) =
+            tokio::join!(open(&pool, &w, w.bastion), open(&pool, &w, w.bastion));
+        assert_ne!(a.id, b.id);
+        let (ca, cb) = (ssh_connection(&a).await, ssh_connection(&b).await);
+        assert_eq!(ca, cb, "both tabs must ride the same TCP connection");
+        assert_eq!(
+            w.prompter.host_key_calls.lock().len(),
+            1,
+            "dialled more than once"
+        );
+        // And a third tab, opened later, joins it too.
+        let (c, _rc) = open(&pool, &w, w.bastion).await;
+        assert_eq!(ssh_connection(&c).await, ca);
+        // The server sees exactly that connection from our client port.
+        let client_port = ca.split_whitespace().nth(1).unwrap().to_owned();
+        assert!(bastion_has_connection_from(&w, &client_port).await);
+        assert_eq!(pool.connected_profiles(), vec![w.bastion]);
+    }
+
+    #[tokio::test]
+    async fn connection_closes_after_last_tab() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (a, _ra) = open(&pool, &w, w.bastion).await;
+        let (b, _rb) = open(&pool, &w, w.bastion).await;
+        let conn = ssh_connection(&a).await;
+        assert_eq!(ssh_connection(&b).await, conn);
+        let client_port = conn.split_whitespace().nth(1).unwrap().to_owned();
+
+        a.close();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            pool.connected_profiles(),
+            vec![w.bastion],
+            "one tab is still open"
+        );
+        run(&b, "echo \"@@$((40+2))@@\"");
+        wait_for(&b, "@@42@@").await;
+
+        drop(b);
+        drop(a);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.connected_profiles().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("connection still listed 2 s after its last tab closed");
+        // The server sees the TCP connection go away as well.
+        tokio::time::timeout(STEP, async {
+            while bastion_has_connection_from(&w, &client_port).await {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("server still has the connection");
+    }
+
+    #[tokio::test]
+    async fn server_drop_emits_disconnected() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (a, mut ra) = open(&pool, &w, w.target).await;
+        let (_b, mut rb) = open(&pool, &w, w.target).await;
+        let conn = ssh_connection(&a).await;
+        run(&a, "echo \"@@keep-$((6*7))@@\"");
+        wait_for(&a, "@@keep-42@@").await;
+
+        // The shell's parent is the server process of this one connection: killing it drops
+        // the connection (and only this one) without a clean channel close.
+        run(&a, "kill -9 $PPID");
+        // Both tabs on the dead connection report it.
+        for rx in [&mut ra, &mut rb] {
+            match wait_end(rx).await {
+                SessionEvent::Disconnected(reason) => assert!(!reason.is_empty()),
+                other => panic!("expected Disconnected, got {other:?}"),
+            }
+            // Exactly once, and never followed by Exited.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            while let Ok((_, e)) = rx.try_recv() {
+                assert!(
+                    !matches!(e, SessionEvent::Exited(_) | SessionEvent::Disconnected(_)),
+                    "second end event {e:?}"
+                );
+            }
+        }
+        assert!(
+            grid_text(&a).contains("@@keep-42@@"),
+            "terminal content lost"
+        );
+        assert!(
+            pool.connected_profiles().is_empty(),
+            "a dead connection is listed"
+        );
+
+        // The dead connection is not reused: the next tab dials afresh.
+        let (c, _rc) = open(&pool, &w, w.target).await;
+        let fresh = ssh_connection(&c).await;
+        assert_ne!(fresh, conn);
+        assert_eq!(pool.connected_profiles(), vec![w.target]);
+    }
+
+    #[tokio::test]
+    async fn remote_exit_reports_status() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (h, mut rx) = open(&pool, &w, w.bastion).await;
+        run(&h, "exit 3");
+        assert_eq!(wait_end(&mut rx).await, SessionEvent::Exited(Some(3)));
+    }
+
+    #[tokio::test]
+    async fn resize_reaches_the_remote_pty() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        let (h, _rx) = open(&pool, &w, w.bastion).await;
+        run(&h, "echo \"@@$(stty size)@@\"");
+        wait_for(&h, "@@30 100@@").await;
+        h.resize(GridSize {
+            cols: 90,
+            rows: 25,
+            ..SIZE
+        });
+        run(&h, "echo \"@@$(stty size)@@\"");
+        wait_for(&h, "@@25 90@@").await;
+    }
+}
