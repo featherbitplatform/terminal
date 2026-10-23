@@ -1,0 +1,91 @@
+---
+id: profiles
+title: Profiles and jump hosts
+sidebar_label: Profiles and jump hosts
+---
+
+import CodeBlock from '@theme/CodeBlock';
+import profilesExample from '!!raw-loader!../static/examples/profiles.toml';
+
+A profile describes one thing a tab can open: a local program or an SSH connection. Profiles live in `profiles.toml` in the [configuration directory](files). You can edit them in the app (`Cmd+,`) or by hand; the app reloads the file when it changes.
+
+## A complete example
+
+This file is the one the test suite loads, so it is always valid. Open it in your editor and replace the ids, hosts and users.
+
+<CodeBlock language="toml" title="profiles.toml">{profilesExample}</CodeBlock>
+
+The file is a list of `[[profiles]]` tables. Shells found in `/etc/shells` are offered automatically and are not written to the file.
+
+## Fields common to every profile
+
+| Field | Type | Required | Meaning |
+| --- | --- | --- | --- |
+| `id` | string (UUID) | yes | Stable identifier. Other profiles and `state.toml` refer to it. Never reuse or change it. |
+| `name` | string | yes | Name shown in tabs and the palette. Must be unique. |
+| `kind` | `"local"` or `"ssh"` | yes | Selects which of the fields below apply. |
+| `group` | string | no | Free-form group label. |
+| `accent` | string | no | Tab accent color as `"#rrggbb"` (six hex digits, with the leading `#`). |
+
+## Local profiles (`kind = "local"`)
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `program` | path | required | Program to run, such as `/bin/zsh`. |
+| `args` | array of strings | `[]` | Arguments. |
+| `cwd` | path | the app's default | Working directory. |
+| `env` | table of strings | `{}` | Extra environment variables. |
+
+## SSH profiles (`kind = "ssh"`)
+
+| Field | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `host` | string | required | Host name or address. Must not be empty. |
+| `port` | integer | `22` | TCP port. |
+| `user` | string | required | User to log in as. |
+| `auth` | table | required | How to authenticate; see below. |
+| `jump` | array of profile ids | `[]` | Profiles to hop through before this one. |
+
+### Authentication
+
+`auth` is a table whose `type` selects the method:
+
+| Form | Meaning |
+| --- | --- |
+| `auth = { type = "password" }` | Ask for a password. The app can store it in the keychain. |
+| `auth = { type = "key", path = "~/.ssh/id_ed25519" }` | Use a private key file. A leading `~` is your home directory. |
+| `auth = { type = "key", path = "~/.ssh/id_ed25519", passphrase = true }` | Same, and the key has a passphrase. `passphrase` defaults to `false`. |
+| `auth = { type = "agent" }` | Use the running SSH agent. |
+
+The file never contains a password or a passphrase. The `passphrase = true` flag only records that the key has one. The values themselves are kept in the system keychain (service `fbterm`, account `secrets`), or asked for when you connect.
+
+### Host keys
+
+Host keys are checked against `~/.ssh/known_hosts`, the same file OpenSSH uses. The first time you connect to a host you are asked whether to trust its key, and a trusted key is added to the file. If a host presents a different key than the one recorded, the connection is refused with a message that the host key has changed; remove the old entry from `known_hosts` if the server was reinstalled. Host certificates (`@cert-authority`) are not supported.
+
+## Jump hosts
+
+`jump` lists the profiles to pass through, in connection order, then the profile itself is the final hop. Each entry is the `id` of another SSH profile.
+
+In the example, `api-1` has `jump = ["0b8a6c52-..."]`, which is `bastion`. Opening `api-1` connects to `bastion`, then from `bastion` to `api-1`.
+
+You can chain in two ways, and they combine:
+
+- **Several ids in one `jump`.** `jump = [a, b]` connects to `a`, then `b`, then the target.
+- **A hop that has its own `jump`.** In the example, `db-1` jumps through `api-1`, which itself jumps through `bastion`. Opening `db-1` connects `bastion`, then `api-1`, then `db-1`. A hop's own jumps are expanded first.
+
+Each hop authenticates with its own profile, so every hop needs a working `auth`. Tabs that share a hop reuse its connection, so opening a second host behind `bastion` does not log in to `bastion` again.
+
+## Validation
+
+The app validates `profiles.toml` when it loads it. Each problem is shown as a notice that starts with the file path.
+
+| Problem | Message |
+| --- | --- |
+| Two profiles share a name | `duplicate profile name "<name>"` |
+| `jump` names an id that does not exist | `profile "<name>" jumps through unknown profile <id>` |
+| `jump` names a local profile | `profile "<name>" jumps through a non-SSH profile` |
+| Profiles jump through each other in a loop | `profile "<name>" has a jump cycle` |
+| `host` is empty or blank | `profile "<name>" has an empty host` |
+
+A file that is not valid TOML, or has a bad value (for example `accent = "red"`, which must be `"#rrggbb"`), is reported with its path and line number, for example `profiles.toml:12: invalid colour "red": expected "#rrggbb"`. A malformed file is never modified or overwritten, and profiles are read-only until you fix it.
