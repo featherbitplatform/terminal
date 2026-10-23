@@ -1,12 +1,13 @@
 //! featherbit terminal.
 //!
 //! Debug aids (environment variables):
-//! - `FBTERM_CONFIG_DIR=<dir>`: read `profiles.toml` and `settings.toml` from `<dir>` instead of
-//!   the platform config directory.
+//! - `FBTERM_CONFIG_DIR=<dir>`: read `profiles.toml` and `settings.toml` (and keep `state.toml`)
+//!   in `<dir>` instead of the platform config directory.
 //! - `FBTERM_SECRETS=memory`: keep secrets in memory only; the OS keychain is never touched.
 //!
 //! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
+//!   Runs with this set (or `FBTERM_SCREENSHOT`) never write `state.toml`.
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
@@ -25,10 +26,14 @@ mod palette;
 mod prompt_view;
 mod prompts;
 mod redact;
+mod restore;
+#[cfg(test)]
+mod restore_tests;
 mod sessions;
 mod tabs;
 mod theme;
 mod ui;
+mod watch;
 mod window;
 
 use app::App;

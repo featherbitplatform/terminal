@@ -14,13 +14,25 @@ pub fn parse_etc_shells(contents: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+/// The id of a discovered shell: derived from its path, so the same shell has the same id on
+/// every launch (these profiles are never written to disk, and saved tabs refer to them by id).
+fn stable_id(program: &std::path::Path) -> ProfileId {
+    // FNV-1a, 128 bit, then marked as a (name-based) version 8 UUID.
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    for b in program.to_string_lossy().as_bytes() {
+        h ^= u128::from(*b);
+        h = h.wrapping_mul(0x0000000001000000000000000000013b);
+    }
+    ProfileId(uuid::Builder::from_custom_bytes(h.to_be_bytes()).into_uuid())
+}
+
 fn local_profile(program: PathBuf) -> Profile {
     let name = program
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| program.display().to_string());
     Profile {
-        id: ProfileId::new(),
+        id: stable_id(&program),
         name,
         group: None,
         accent: None,
@@ -113,5 +125,12 @@ mod tests {
         {
             assert_eq!(programs[0], sh);
         }
+    }
+
+    #[test]
+    fn discovered_shells_keep_their_id_across_launches() {
+        let zsh = super::stable_id(std::path::Path::new("/bin/zsh"));
+        assert_eq!(zsh, super::stable_id(std::path::Path::new("/bin/zsh")));
+        assert_ne!(zsh, super::stable_id(std::path::Path::new("/bin/bash")));
     }
 }

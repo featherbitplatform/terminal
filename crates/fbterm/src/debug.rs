@@ -9,8 +9,8 @@ use crate::editor::EditorMsg;
 use crate::prompts::{Ask, Dialog};
 
 impl App {
-    /// `FBTERM_OPEN_TABS=name,name` (debug aid until restore exists): extra tabs opened in the
-    /// first window at startup, by profile name.
+    /// `FBTERM_OPEN_TABS=name,name` (debug aid): extra tabs opened in the first window at
+    /// startup, by profile name. Such runs do not save the session (`state_saving_enabled`).
     pub(crate) fn open_debug_tabs(&mut self) -> Task<Message> {
         let Some(list) = debug_env("FBTERM_OPEN_TABS") else {
             return Task::none();

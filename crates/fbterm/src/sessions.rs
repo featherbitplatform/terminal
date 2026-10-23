@@ -50,6 +50,7 @@ impl App {
     /// (Re)start a tab's session: spawn a local program, or dial an SSH profile.
     pub(crate) fn start(&mut self, wid: window::Id, id: TabId) -> Task<Message> {
         let grid = self.grids.get(&wid).copied().unwrap_or(DEFAULT_GRID);
+        tracing::info!(tab = id.0, "starting tab");
         let fresh_terminal = self.new_terminal(grid);
         let events = self.events.clone();
         let profile: Option<Profile> = self
