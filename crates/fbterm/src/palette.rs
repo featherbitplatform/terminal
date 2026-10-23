@@ -222,6 +222,13 @@ impl PaletteState {
         }
     }
 
+    /// Replace the listed items (the profiles changed), keeping the query and the input.
+    pub fn set_items(&mut self, items: Vec<PaletteItem>, recency: &Recency) {
+        self.items = items;
+        self.ranked = rank(&self.query, &self.items, recency);
+        self.selected = self.selected.min(self.ranked.len().saturating_sub(1));
+    }
+
     pub fn set_query(&mut self, query: String, recency: &Recency) {
         self.ranked = rank(&query, &self.items, recency);
         self.query = query;

@@ -10,13 +10,24 @@
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
+//! - `FBTERM_SCREENSHOT_WINDOW=editor`: capture the profile editor window instead.
+//! - `FBTERM_OPEN_EDITOR=<profile name>`: open the profile editor at startup, that profile
+//!   selected.
+//! - `FBTERM_DEMO_PROMPT=hostkey|password|changed`: show a sample connection dialog in the first
+//!   window (nothing waits for the answer).
 
 mod app;
+mod debug;
+mod dialogs;
+mod editor;
 mod keys;
 mod palette;
+mod prompt_view;
+mod prompts;
 mod sessions;
 mod tabs;
 mod theme;
+mod ui;
 mod window;
 
 use app::App;

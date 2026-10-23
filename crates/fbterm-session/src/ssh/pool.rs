@@ -25,8 +25,8 @@ use russh::client::{Handle, Msg};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    ClientHandler, HOP_TIMEOUT, Hop, SshContext, SshError, connect_hop, in_hop, ssh_profile,
-    tcp_connect, timed_out,
+    ClientHandler, HOP_TIMEOUT, Hop, Prompter, SshContext, SshError, connect_hop, in_hop,
+    ssh_profile, tcp_connect, timed_out,
 };
 use crate::{Command, EventSink, Feeder, SessionEvent, SessionHandle, SessionId};
 
@@ -72,6 +72,23 @@ impl SshPool {
         terminal: SharedTerminal,
         events: EventSink,
     ) -> Result<SessionHandle, SshError> {
+        let prompter = self.ctx.prompter.clone();
+        self.open_shell_prompting(store, profile, terminal, events, prompter)
+            .await
+    }
+
+    /// Like [`SshPool::open_shell_into`], with the questions of this call's connect (host key,
+    /// secrets, for every hop) going to `prompter` instead of the pool's own. When the call
+    /// joins a connect already in flight for the profile, that connect keeps asking whoever
+    /// started it.
+    pub async fn open_shell_prompting(
+        &self,
+        store: &ProfileStore,
+        profile: &ProfileId,
+        terminal: SharedTerminal,
+        events: EventSink,
+        prompter: Arc<dyn Prompter>,
+    ) -> Result<SessionHandle, SshError> {
         let target = store
             .get(*profile)
             .ok_or_else(|| {
@@ -88,7 +105,10 @@ impl SshPool {
             .into_iter()
             .cloned()
             .collect();
-        let ctx = self.ctx.clone();
+        let ctx = SshContext {
+            prompter,
+            ..self.ctx.clone()
+        };
         self.slots
             .open_with(
                 *profile,

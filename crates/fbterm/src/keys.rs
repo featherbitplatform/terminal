@@ -14,7 +14,7 @@ pub enum Action {
     Palette,
     NewWindow,
     Settings,
-    /// Reached from the palette; no default chord.
+    /// The profile editor: Cmd+Shift+, on macOS, otherwise from the palette.
     EditProfiles,
 }
 
@@ -51,6 +51,7 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
         't' if plain => Some(Action::NewTab),
         'w' if plain => Some(Action::CloseTab),
         'n' if plain => Some(Action::NewWindow),
+        ',' | '<' if mac && shifted => Some(Action::EditProfiles),
         ',' | '<' if plain => Some(Action::Settings),
         'p' if shifted => Some(Action::Palette),
         ']' | '}' if shifted => Some(Action::NextTab),
@@ -92,6 +93,8 @@ mod tests {
         assert_eq!(m("P", cmd_shift()), Some(Action::Palette));
         assert_eq!(m("n", CMD), Some(Action::NewWindow));
         assert_eq!(m(",", CMD), Some(Action::Settings));
+        assert_eq!(m(",", cmd_shift()), Some(Action::EditProfiles));
+        assert_eq!(m("<", cmd_shift()), Some(Action::EditProfiles));
     }
 
     #[test]
