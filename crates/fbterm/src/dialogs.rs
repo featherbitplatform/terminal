@@ -16,7 +16,7 @@ impl App {
         match msg {
             EditorMsg::Open => self.open_editor(),
             EditorMsg::Close => match self.editor_window() {
-                Some(id) => window::close(id),
+                Some(id) => self.close_window(id),
                 None => Task::none(),
             },
             EditorMsg::Save => {
@@ -57,6 +57,7 @@ impl App {
         let (id, open) = window::open(window::Settings {
             size: iced::Size::new(920.0, 720.0),
             min_size: Some(iced::Size::new(640.0, 420.0)),
+            exit_on_close_request: false,
             ..window::Settings::default()
         });
         let state = EditorState::new(
