@@ -98,7 +98,6 @@ fn actions() -> Vec<PaletteItem> {
         (Action::EditProfiles, "Edit profiles"),
         (Action::OpenSettingsFile, "Open settings file"),
         (Action::RevealConfigFolder, "Reveal config folder"),
-        (Action::Settings, "Settings"),
         (Action::Quit, "Quit"),
     ]
     .into_iter()
@@ -486,7 +485,7 @@ mod tests {
             profile("Beta", "b@b"),
             profile("alpha", "a@a"),
             profile("mid", "m@m"),
-            action(Action::Settings, "Settings"),
+            action(Action::EditProfiles, "Settings"),
         ];
         let mut recency = Recency::new();
         recency.bump(id(&items[0]), 100);
@@ -510,7 +509,6 @@ mod tests {
                 "Edit profiles",
                 "Open settings file",
                 "Reveal config folder",
-                "Settings",
                 "Quit"
             ]
         );
@@ -547,7 +545,10 @@ mod tests {
 
     #[test]
     fn no_match_returns_empty() {
-        let items = vec![profile("prod", "u@h"), action(Action::Settings, "Settings")];
+        let items = vec![
+            profile("prod", "u@h"),
+            action(Action::EditProfiles, "Settings"),
+        ];
         assert!(rank("qqqq", &items, &Recency::new()).is_empty());
     }
 
@@ -648,6 +649,6 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 8);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 7);
     }
 }

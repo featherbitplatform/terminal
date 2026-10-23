@@ -15,7 +15,6 @@ pub enum Action {
     NewWindow,
     /// Save the layout and exit: Cmd+Q on macOS, Ctrl+Shift+Q elsewhere.
     Quit,
-    Settings,
     /// The profile editor: Cmd+, or Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere (the Settings
     /// chord until settings have a window).
     EditProfiles,

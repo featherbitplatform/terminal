@@ -712,10 +712,6 @@ impl App {
                 Task::none()
             }
             Action::Quit => self.quit(),
-            Action::Settings => {
-                tracing::info!("settings are not available yet");
-                Task::none()
-            }
         }
     }
 
