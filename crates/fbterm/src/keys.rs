@@ -19,6 +19,10 @@ pub enum Action {
     /// The profile editor: Cmd+, or Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere (the Settings
     /// chord until settings have a window).
     EditProfiles,
+    /// Create `settings.toml` if missing and open it with the system's default app (palette only).
+    OpenSettingsFile,
+    /// Show the config folder in the file manager (palette only).
+    RevealConfigFolder,
 }
 
 /// The shortcut for `key` (as pressed, without modifiers applied) on this platform.

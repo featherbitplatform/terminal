@@ -25,8 +25,9 @@ use crate::theme::{Tokens, UI_FONT};
 /// Gap between the top of the tab bar and the top of a tab.
 const TAB_TOP_GAP: f32 = 4.0;
 
-// Lucide icons (ISC License, Copyright (c) Lucide Contributors): "x" and "plus".
+// Lucide icons (ISC License, Copyright (c) Lucide Contributors): "x", "plus" and "users".
 const ICON_X: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
+const ICON_USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/></svg>"#;
 const ICON_PLUS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>"#;
 
 fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Message> {
@@ -220,11 +221,16 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::New))
         .padding(7)
         .style(move |_, status| ghost(t, status));
+    let profiles = button(icon(ICON_USERS, 14.0, t.text_muted))
+        .on_press(msg(TabBarMsg::Profiles))
+        .padding(7)
+        .style(move |_, status| ghost(t, status));
     bar = bar.push(
         container(new_tab)
             .padding(Padding::from([0.0, 4.0]))
             .center_y(height),
     );
+    bar = bar.push(container(profiles).center_y(height));
     let bar = container(bar)
         .padding(Padding {
             top: 0.0,

@@ -370,3 +370,54 @@ fn out_of_range_opacity_is_clamped_and_reported() {
     assert_eq!(s.background_opacity, 1.0);
     assert_eq!(problems[0].0, "background_opacity");
 }
+
+#[test]
+fn settings_template_parses_to_defaults_as_is() {
+    let path = tmp("settings.toml");
+    std::fs::write(&path, SETTINGS_TEMPLATE).unwrap();
+    let (loaded, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(loaded, Settings::default());
+    assert!(warning.is_none());
+}
+
+#[test]
+fn settings_template_parses_to_defaults_with_every_setting_uncommented() {
+    let uncommented: String = SETTINGS_TEMPLATE
+        .lines()
+        .map(|l| {
+            // Setting lines are `#name = value`; prose lines start with `# `.
+            match l.strip_prefix('#') {
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_lowercase()) => rest,
+                _ => l,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let path = tmp("settings.toml");
+    std::fs::write(&path, &uncommented).unwrap();
+    let (loaded, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(loaded, Settings::default());
+    assert!(warning.is_none());
+    // Every field of Settings is written out.
+    let table: toml::Table = toml::from_str(&uncommented).unwrap();
+    let defaults: toml::Table =
+        toml::from_str(&toml::to_string(&Settings::default()).unwrap()).unwrap();
+    let mut keys: Vec<_> = table.keys().collect();
+    let mut want: Vec<_> = defaults.keys().collect();
+    keys.sort();
+    want.sort();
+    assert_eq!(keys, want);
+}
+
+#[test]
+fn writing_the_template_never_overwrites_a_file() {
+    let path = tmp("settings.toml");
+    assert!(Settings::write_template_if_missing(&path).unwrap());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), SETTINGS_TEMPLATE);
+    std::fs::write(&path, "font_size = 20.0\n").unwrap();
+    assert!(!Settings::write_template_if_missing(&path).unwrap());
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        "font_size = 20.0\n"
+    );
+}

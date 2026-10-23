@@ -96,6 +96,8 @@ fn actions() -> Vec<PaletteItem> {
         (Action::NewWindow, "New window"),
         (Action::CloseTab, "Close tab"),
         (Action::EditProfiles, "Edit profiles"),
+        (Action::OpenSettingsFile, "Open settings file"),
+        (Action::RevealConfigFolder, "Reveal config folder"),
         (Action::Settings, "Settings"),
         (Action::Quit, "Quit"),
     ]
@@ -497,6 +499,24 @@ mod tests {
     }
 
     #[test]
+    fn actions_list_the_settings_file_actions_after_edit_profiles() {
+        let labels: Vec<String> = actions().iter().map(|a| a.label().to_string()).collect();
+        assert_eq!(
+            labels,
+            [
+                "New tab",
+                "New window",
+                "Close tab",
+                "Edit profiles",
+                "Open settings file",
+                "Reveal config folder",
+                "Settings",
+                "Quit"
+            ]
+        );
+    }
+
+    #[test]
     fn fuzzy_matches_noncontiguous() {
         let items = vec![profile("prod-db-01", "u@h"), profile("staging", "u@h")];
         let order = rank("prdb", &items, &Recency::new());
@@ -628,6 +648,6 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 6);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 8);
     }
 }

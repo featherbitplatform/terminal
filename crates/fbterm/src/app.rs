@@ -37,6 +37,7 @@ pub enum TabBarMsg {
     Select(usize),
     Close(usize),
     New,
+    Profiles,
 }
 
 /// A value handed through a (cloneable) message exactly once.
@@ -548,6 +549,7 @@ impl App {
                     TabBarMsg::Select(i) => self.with_window(wid, |w| w.select(i)),
                     TabBarMsg::Close(i) => self.close_tab(wid, i),
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
+                    TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
                 }
             }
             Message::TitleBar(wid, action) => chrome::perform(wid, action),
@@ -701,6 +703,14 @@ impl App {
             },
             Action::NewWindow => self.open_window(self.default_profile()),
             Action::EditProfiles => self.editor_msg(EditorMsg::Open),
+            Action::OpenSettingsFile => {
+                crate::config_files::open_settings_file(&self.paths);
+                Task::none()
+            }
+            Action::RevealConfigFolder => {
+                crate::config_files::reveal_config_folder(&self.paths);
+                Task::none()
+            }
             Action::Quit => self.quit(),
             Action::Settings => {
                 tracing::info!("settings are not available yet");

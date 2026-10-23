@@ -28,6 +28,8 @@ The directory is created the first time the app writes a file. All files are TOM
 
 Every field is optional. A missing file, or a missing field, takes the default shown here.
 
+To start editing, run **Open settings file** from the palette (`Cmd+Shift+P` or `Ctrl+Shift+P`). If `settings.toml` does not exist, the app creates it with every setting written out as a comment, showing its default and what it does, and opens it in your default app. Remove the leading `#` of a line to change that setting. An existing file is never overwritten. **Reveal config folder** shows the folder in your file manager.
+
 ```toml
 font_family = "Geist Mono"
 font_size = 13.0

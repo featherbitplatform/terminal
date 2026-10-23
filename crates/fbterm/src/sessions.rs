@@ -348,7 +348,7 @@ fn open_url(url: &str) {
 }
 
 /// The system opener for a web or mail link.
-fn opener(url: &str) -> std::process::Command {
+pub(crate) fn opener(url: &str) -> std::process::Command {
     #[cfg(target_os = "macos")]
     let mut cmd = std::process::Command::new("open");
     #[cfg(windows)]
@@ -378,7 +378,7 @@ fn reveal(_path: &std::path::Path) -> Option<std::process::Command> {
     None
 }
 
-fn spawn_reaped(mut cmd: std::process::Command, url: &str) {
+pub(crate) fn spawn_reaped(mut cmd: std::process::Command, url: &str) {
     match cmd.spawn() {
         // Reap the opener so it does not linger as a zombie.
         Ok(mut child) => {

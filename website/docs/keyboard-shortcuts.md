@@ -44,7 +44,22 @@ A page is the height of the terminal less one line, so the last line of the prev
 | Open the palette | `Cmd+Shift+P` | `Ctrl+Shift+P` |
 | Open the profile editor | `Cmd+,` or `Cmd+Shift+,` | `Ctrl+Shift+,` |
 
-The settings shortcut currently opens the profile editor. Settings themselves are edited in [`settings.toml`](files#settingstoml).
+The settings shortcut currently opens the profile editor. The profiles button after the new-tab button in the tab bar opens it too. Settings themselves are edited in [`settings.toml`](files#settingstoml).
+
+## Palette actions
+
+These actions are listed after your profiles. Type part of a name to find one.
+
+| Action | Does |
+| --- | --- |
+| New tab | Choose a profile to open in a new tab. |
+| New window | Open a new window. |
+| Close tab | Close the active tab. |
+| Edit profiles | Open the profile editor. |
+| Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
+| Reveal config folder | Show the config folder in your file manager, with `settings.toml` selected on macOS when it exists. The folder is created if it is missing. |
+| Settings | Currently opens nothing; see the settings shortcut above. |
+| Quit | Save the layout and quit. |
 
 ## Inside the palette
 
