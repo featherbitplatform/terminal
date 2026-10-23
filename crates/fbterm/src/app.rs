@@ -274,11 +274,22 @@ impl App {
     pub(crate) fn build(paths: Paths, memory_secrets: bool) -> (Self, Task<Message>) {
         let mut notices = Vec::new();
         let mut settings_notice = None;
-        let settings = Settings::load(&paths.settings()).unwrap_or_else(|e| {
-            notices.push(e.to_string());
-            settings_notice = Some(e.to_string());
-            Settings::default()
-        });
+        // A settings warning (a value out of range, already clamped) is shown like an error,
+        // but the clamped settings are used.
+        let settings = match Settings::load_checked(&paths.settings()) {
+            Ok((settings, warning)) => {
+                if let Some(w) = warning {
+                    notices.push(w.to_string());
+                    settings_notice = Some(w.to_string());
+                }
+                settings
+            }
+            Err(e) => {
+                notices.push(e.to_string());
+                settings_notice = Some(e.to_string());
+                Settings::default()
+            }
+        };
         let (profiles, profiles_error) = load_profiles(&paths, &mut notices);
         let saved = SavedState::load_or_default(&paths.state());
         // With a profiles.toml that failed to load every saved tab would look orphaned: restore
@@ -885,16 +896,25 @@ impl App {
         if let Some(old) = self.settings_notice.take() {
             self.notices.retain(|n| *n != old);
         }
-        match Settings::load(&path) {
-            Ok(new) => self.apply_settings(new),
+        match Settings::load_checked(&path) {
+            Ok((new, warning)) => {
+                if let Some(w) = warning {
+                    tracing::warn!(warning = %w, "settings.toml values clamped");
+                    self.show_settings_notice(w.to_string());
+                }
+                self.apply_settings(new);
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "settings.toml not applied");
-                let line = e.to_string();
-                self.notices.push(line.clone());
-                self.settings_notice = Some(line);
-                self.notices_dismissed = false;
+                self.show_settings_notice(e.to_string());
             }
         }
+    }
+
+    fn show_settings_notice(&mut self, line: String) {
+        self.notices.push(line.clone());
+        self.settings_notice = Some(line);
+        self.notices_dismissed = false;
     }
 
     /// Font, size and theme take effect in every open terminal and window at once (they are

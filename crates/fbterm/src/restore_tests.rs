@@ -316,6 +316,50 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
     assert!(app.notices.is_empty());
 }
 
+#[test]
+fn out_of_range_settings_apply_clamped_and_say_so() {
+    let paths = paths_with(&[profile("a")]);
+    std::fs::write(
+        paths.settings(),
+        "font_size = 300.0
+",
+    )
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    assert_eq!(app.settings.font_size, 72.0, "clamped at startup");
+    assert_eq!(app.notices.len(), 1);
+    assert!(
+        app.notices[0].contains("settings.toml:1"),
+        "{}",
+        app.notices[0]
+    );
+    assert!(app.notices[0].contains("font_size"), "{}", app.notices[0]);
+
+    let changed = Changed {
+        profiles: false,
+        settings: true,
+    };
+    std::fs::write(
+        paths.settings(),
+        "scrollback_lines = 2000000
+",
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(
+        app.settings.scrollback_lines, 1_000_000,
+        "clamped on reload"
+    );
+    assert_eq!(app.settings.font_size, 13.0);
+    assert_eq!(app.notices.len(), 1, "the previous warning is replaced");
+    assert!(app.notices[0].contains("scrollback_lines"));
+
+    std::fs::write(paths.settings(), "scrollback_lines = 20\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(app.settings.scrollback_lines, 20);
+    assert!(app.notices.is_empty());
+}
+
 fn three_windows() -> (App, Paths, Vec<iced::window::Id>) {
     let (a, b) = (profile("a"), profile("b"));
     let paths = paths_with(&[a.clone(), b.clone()]);
