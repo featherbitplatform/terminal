@@ -107,7 +107,10 @@ impl App {
     }
 
     /// Write the Settings window's unwritten changes to `settings.toml`, each key in place.
-    /// Our own write is remembered so the file watcher does not reload it.
+    /// Our own write is remembered so the file watcher does not reload it. If the file was
+    /// edited on disk since we last saw it (and the watcher has not reported it yet), that edit
+    /// is not ours to hide: after writing, the file is reloaded as for any edit on disk.
+    /// A change that cannot be written stays pending (a later write retries it) and is reported.
     pub(crate) fn write_pending_settings(&mut self) {
         let path = self.paths.settings();
         let Some((_, state)) = &mut self.settings_win else {
@@ -117,16 +120,28 @@ impl App {
         if pending.is_empty() {
             return;
         }
-        state.write_error = None;
-        for change in &pending {
-            if let Err(e) = Settings::write_field(&path, change) {
-                tracing::warn!(error = %e, "settings.toml not written");
-                state.write_error = Some(format!("Could not save: {e}"));
-                break;
+        let external = std::fs::read_to_string(&path).ok() != self.settings_seen;
+        let mut failed = Vec::new();
+        let mut errors = Vec::new();
+        for change in pending {
+            if let Err(e) = Settings::write_field(&path, &change) {
+                tracing::warn!(error = %e, key = change.key(), "settings.toml not written");
+                let e = e.to_string();
+                if !errors.contains(&e) {
+                    errors.push(e);
+                }
+                failed.push(change);
             }
         }
-        self.settings_seen = std::fs::read_to_string(&path).ok();
-        self.refresh_settings_notice();
+        state.write_error = (!errors.is_empty())
+            .then(|| format!("Could not save {}: {}", keys(&failed), errors.join("; ")));
+        state.requeue(failed);
+        if external {
+            self.reload_settings();
+        } else {
+            self.settings_seen = std::fs::read_to_string(&path).ok();
+            self.refresh_settings_notice();
+        }
     }
 
     /// After our own write: the banner keeps a warning only if the file still has one.
@@ -154,7 +169,14 @@ impl App {
         if text == self.settings_seen {
             return;
         }
-        self.settings_seen = text;
+        self.reload_settings();
+    }
+
+    /// Load `settings.toml` and apply it (or keep the previous settings and show why), and
+    /// remember its text as seen.
+    fn reload_settings(&mut self) {
+        let path = self.paths.settings();
+        self.settings_seen = std::fs::read_to_string(&path).ok();
         if let Some(old) = self.settings_notice.take() {
             self.notices.retain(|n| *n != old);
         }
@@ -234,4 +256,13 @@ impl App {
         }
         self.settings = new;
     }
+}
+
+/// The keys of `changes`, for a message.
+fn keys(changes: &[fbterm_config::SettingChange]) -> String {
+    changes
+        .iter()
+        .map(fbterm_config::SettingChange::key)
+        .collect::<Vec<_>>()
+        .join(", ")
 }

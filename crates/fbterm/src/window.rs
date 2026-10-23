@@ -249,14 +249,14 @@ fn tab_bar<'a>(
         t,
         new_tab,
         "New tab",
-        Action::NewTab,
+        Some(Action::NewTab),
         demo_tip == Some(DemoTip::New),
     );
     let profiles = tip(
         t,
         profiles,
         "Edit profiles",
-        Action::EditProfiles,
+        Some(Action::EditProfiles),
         demo_tip == Some(DemoTip::Profiles),
     );
     bar = bar.push(
@@ -524,7 +524,14 @@ fn tab_button<'a>(
         .on_press(Message::TabBar(window, TabBarMsg::Close(index)))
         .padding(3)
         .style(move |_, status| ghost(t, status));
-    let close = tip(t, close, "Close tab", Action::CloseTab, demo_tip);
+    // The shortcut closes the active tab only, so only its button names it.
+    let close = tip(
+        t,
+        close,
+        "Close tab",
+        active.then_some(Action::CloseTab),
+        demo_tip,
+    );
     let inner = row![
         stripe,
         dot(state_color(t, &tab.state)),

@@ -68,17 +68,21 @@ impl Settings {
     /// Set one setting in the file at `path`, leaving everything else in it as it is. A missing
     /// file is first created from the commented template. A file that does not load (bad
     /// syntax, or a value of the wrong type) is never written: the error is returned instead.
-    /// The write is atomic.
+    /// The write is atomic and keeps the file's permissions. A symlinked `settings.toml` (for
+    /// example into a dotfiles folder) stays a symlink: the file it points to is written.
     pub fn write_field(path: &Path, change: &SettingChange) -> Result<(), ConfigError> {
         Self::write_template_if_missing(path)?;
-        let text = std::fs::read_to_string(path)
+        let resolved = std::fs::canonicalize(path);
+        let target = resolved.as_deref().unwrap_or(path);
+        let text = std::fs::read_to_string(target)
             .map_err(|e| ConfigError::new(path, None, e.to_string()))?;
         let edited =
             edit_text(&text, change).map_err(|(line, msg)| ConfigError::new(path, line, msg))?;
         if edited == text {
             return Ok(());
         }
-        atomic_write(path, edited.as_bytes())
+        // Errors name the file as the user knows it, not the resolved target.
+        atomic_write(target, edited.as_bytes()).map_err(|e| ConfigError::new(path, None, e.message))
     }
 }
 
@@ -108,12 +112,22 @@ pub fn edit_text(text: &str, change: &SettingChange) -> Result<String, (Option<u
         let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
         let line = format!("{key} = {}", value.to_string().trim());
         let (head, tail) = text.split_at(after);
-        return Ok(if head.ends_with('\n') {
+        let edited = if head.ends_with('\n') {
             format!("{head}{line}{newline}{tail}")
         } else {
             // The comment is the last line and has no line break.
             format!("{head}{newline}{line}{newline}{tail}")
-        });
+        };
+        // The "comment" may really be inside a multi-line string or array: use the line only
+        // if the result sets the key at the top level.
+        let set_at_top = edited
+            .parse::<DocumentMut>()
+            .ok()
+            .and_then(|d| d.get(key).and_then(Item::as_value).map(ToString::to_string))
+            .is_some_and(|v| v.trim() == value.to_string().trim());
+        if set_at_top {
+            return Ok(edited);
+        }
     }
     doc.insert(key, Item::Value(value));
     Ok(doc.to_string())
@@ -220,6 +234,46 @@ mod tests {
             "{after}"
         );
         assert!(after.contains("#font_size = 13.0"));
+    }
+
+    #[test]
+    fn a_commented_key_inside_a_multi_line_string_is_not_used() {
+        let text = "font_family = \"\"\"\n#font_size = 13.0\n\"\"\"\n";
+        let after = edit_text(text, &SettingChange::FontSize(15.0)).unwrap();
+        let s: Settings = toml::from_str(&after).unwrap();
+        assert_eq!(s.font_size, 15.0, "{after}");
+        assert_eq!(s.font_family, "#font_size = 13.0\n");
+        let text = "theme = \"dark\"\nextra = [\n#font_size = 13.0\n1]\n";
+        let after = edit_text(text, &SettingChange::FontSize(15.0)).unwrap();
+        assert_eq!(toml::from_str::<Settings>(&after).unwrap().font_size, 15.0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_file_stays_a_symlink_and_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("fbterm-link-{}", uuid::Uuid::new_v4()));
+        let dotfiles = dir.join("dotfiles");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        let real = dotfiles.join("settings.toml");
+        std::fs::write(&real, "# mine\ntheme = \"dark\"\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("settings.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        Settings::write_field(&link, &SettingChange::Theme(ThemeMode::Light)).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real).unwrap(),
+            "# mine\ntheme = \"light\"\n"
+        );
+        let mode = std::fs::metadata(&real).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

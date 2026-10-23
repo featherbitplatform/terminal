@@ -150,6 +150,8 @@ impl App {
         if self.quitting {
             return Task::none();
         }
+        // Settings changes still waiting for their quiet period are written now.
+        self.write_pending_settings();
         self.save_state();
         self.quitting = true;
         let ids: Vec<_> = self
@@ -164,6 +166,9 @@ impl App {
     }
 
     pub(crate) fn close_requested(&mut self, id: window::Id) -> Task<Message> {
+        if self.settings_window() == Some(id) {
+            self.write_pending_settings();
+        }
         if self.editor_window() == Some(id)
             || self.settings_window() == Some(id)
             || self.windows.len() > 1

@@ -160,3 +160,46 @@ fn the_font_list_puts_the_bundled_face_first() {
     let list = fonts::choices(vec!["Menlo".into()], "Menlo");
     assert!(list.iter().all(|f| f.installed));
 }
+
+#[test]
+fn typed_opacity_is_kept_in_whole_percent() {
+    let mut s = state();
+    let e = s.update(SettingsMsg::OpacityText("85.4".into()));
+    assert_eq!(e.apply, Some(SettingChange::BackgroundOpacity(0.85)));
+    s.update(SettingsMsg::OpacityText("85.5".into()));
+    s.update(SettingsMsg::OpacitySubmit);
+    assert_eq!(s.values.background_opacity, 0.86);
+    assert_eq!(s.opacity_text, "86");
+}
+
+#[test]
+fn unwritten_changes_go_back_in_line_unless_newer_ones_wait() {
+    let mut s = state();
+    s.update(SettingsMsg::Kitty(true));
+    let failed = s.take_pending();
+    s.update(SettingsMsg::Theme(ThemeMode::Light));
+    s.requeue(failed);
+    assert_eq!(
+        s.take_pending(),
+        [
+            SettingChange::KittyKeyboard(true),
+            SettingChange::Theme(ThemeMode::Light)
+        ]
+    );
+    s.update(SettingsMsg::Kitty(false));
+    s.requeue(vec![SettingChange::KittyKeyboard(true)]);
+    assert_eq!(s.take_pending(), [SettingChange::KittyKeyboard(false)]);
+}
+
+#[test]
+fn blur_says_when_it_has_no_effect() {
+    assert_eq!(
+        view::blur_hint(true, 0.8),
+        ("Applies to new windows", false)
+    );
+    assert_eq!(
+        view::blur_hint(true, 1.0),
+        ("Needs opacity below 100%", true)
+    );
+    assert_eq!(view::blur_hint(false, 0.8), ("macOS only for now", true));
+}

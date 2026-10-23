@@ -82,7 +82,8 @@ pub(crate) fn line_of(text: &str, offset: usize) -> usize {
         + 1
 }
 
-/// Write `bytes` to a temp file next to `path`, then rename over it.
+/// Write `bytes` to a temp file next to `path`, then rename over it. An existing file's
+/// permissions carry over to the new one.
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     let io = |e: std::io::Error| ConfigError::new(path, None, e.to_string());
     let dir = match path.parent() {
@@ -95,10 +96,14 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError>
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
     let tmp = dir.join(format!(".{file_name}.{}.tmp", ProfileId::new()));
+    let permissions = std::fs::metadata(path).ok().map(|m| m.permissions());
     let result = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()?;
+        if let Some(p) = permissions {
+            std::fs::set_permissions(&tmp, p)?;
+        }
         std::fs::rename(&tmp, path)
     })();
     if let Err(e) = result {

@@ -145,6 +145,16 @@ impl SettingsState {
         std::mem::take(&mut self.pending)
     }
 
+    /// Put back changes that could not be written, unless a newer change to the same key is
+    /// already waiting.
+    pub fn requeue(&mut self, failed: Vec<SettingChange>) {
+        for change in failed.into_iter().rev() {
+            if !self.pending.iter().any(|p| p.key() == change.key()) {
+                self.pending.insert(0, change);
+            }
+        }
+    }
+
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -225,7 +235,7 @@ impl SettingsState {
                 self.change(SettingChange::BackgroundOpacity(v), true)
             }
             SettingsMsg::OpacityText(s) => {
-                let parsed = parse_percent(&s);
+                let parsed = parse_percent(&s).map(|v| snap(v, 100.0));
                 self.opacity_text = s;
                 match parsed {
                     Some(v) if (OPACITY_RANGE.0..=OPACITY_RANGE.1).contains(&v) => {
@@ -236,7 +246,7 @@ impl SettingsState {
             }
             SettingsMsg::OpacitySubmit => match parse_percent(&self.opacity_text) {
                 Some(v) => {
-                    let v = v.clamp(OPACITY_RANGE.0, OPACITY_RANGE.1);
+                    let v = snap(v, 100.0).clamp(OPACITY_RANGE.0, OPACITY_RANGE.1);
                     self.opacity_text = percent_text(v);
                     self.change(SettingChange::BackgroundOpacity(v), false)
                 }
