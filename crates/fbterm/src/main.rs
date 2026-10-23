@@ -5,6 +5,9 @@
 //!   in `<dir>` instead of the platform config directory.
 //! - `FBTERM_SECRETS=memory`: keep secrets in memory only; the OS keychain is never touched.
 //!
+//! Measurement mode (works in release builds, see `perf.rs`): `--perf-tabs <N> --perf-cmd <cmd>
+//! [--perf-exit-after <secs>]`.
+//!
 //! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
 //!   Runs with this set (or `FBTERM_SCREENSHOT`) never write `state.toml`.
@@ -23,6 +26,7 @@ mod dialogs;
 mod editor;
 mod keys;
 mod palette;
+mod perf;
 mod prompt_view;
 mod prompts;
 mod redact;
@@ -46,6 +50,7 @@ const FONTS: [&[u8]; 4] = [
 ];
 
 fn main() -> iced::Result {
+    perf::init_from_env();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)

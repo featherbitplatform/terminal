@@ -260,7 +260,8 @@ pub(crate) fn debug_env(name: &str) -> Option<std::ffi::OsString> {
 impl App {
     pub fn boot() -> (Self, Task<Message>) {
         // FBTERM_SECRETS=memory (debug aid) keeps secrets in memory and never touches the keychain.
-        let memory_secrets = std::env::var("FBTERM_SECRETS").as_deref() == Ok("memory");
+        let memory_secrets = std::env::var("FBTERM_SECRETS").as_deref() == Ok("memory")
+            || crate::perf::opts().is_some();
         Self::build(paths(), memory_secrets)
     }
 
@@ -276,7 +277,7 @@ impl App {
         let saved = SavedState::load_or_default(&paths.state());
         // With a profiles.toml that failed to load every saved tab would look orphaned: restore
         // nothing, and (see `save_state`) leave state.toml alone until the file loads.
-        let plan = if profiles_error.is_some() {
+        let plan = if profiles_error.is_some() || crate::perf::opts().is_some() {
             Vec::new()
         } else {
             restore::plan(&saved, &profiles)
@@ -327,7 +328,8 @@ impl App {
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
             recency: Recency::from(saved.recency),
             state_saving_enabled: debug_env("FBTERM_OPEN_TABS").is_none()
-                && debug_env("FBTERM_SCREENSHOT").is_none(),
+                && debug_env("FBTERM_SCREENSHOT").is_none()
+                && crate::perf::opts().is_none(),
             quitting: false,
             closing: Default::default(),
             sizes: HashMap::new(),
@@ -345,7 +347,10 @@ impl App {
             screenshot_editor: debug_env("FBTERM_SCREENSHOT_WINDOW").is_some_and(|w| w == "editor"),
             shooting: false,
         };
-        let mut task = app.restore_windows(&plan);
+        let mut task = match crate::perf::opts() {
+            Some(o) => app.open_perf_tabs(o),
+            None => app.restore_windows(&plan),
+        };
         task = task.chain(app.open_debug_tabs());
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
@@ -698,7 +703,7 @@ impl App {
     }
 
     /// A new terminal window of `size` (logical pixels), with no tabs yet.
-    fn new_window(&mut self, size: (f32, f32)) -> (window::Id, Task<Message>) {
+    pub(crate) fn new_window(&mut self, size: (f32, f32)) -> (window::Id, Task<Message>) {
         let (id, open) = window::open(window::Settings {
             size: iced::Size::new(size.0, size.1),
             min_size: Some(iced::Size::new(360.0, 200.0)),
