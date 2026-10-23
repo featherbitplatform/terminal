@@ -2,6 +2,7 @@
 
 mod input;
 mod kitty;
+mod kitty_guard;
 mod palette;
 mod selection;
 mod terminal;

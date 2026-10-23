@@ -225,8 +225,9 @@ fn mod_value(mods: Modifiers) -> u32 {
 
 /// Encode a key event for the active enhancement `flags` (never empty here).
 ///
-/// `legacy` produces the key's legacy bytes; it is used where the protocol keeps them (plain
-/// text, unmodified Enter/Tab/Backspace and unmodified cursor and function keys without flag 8).
+/// `legacy` produces the key's legacy bytes; it is used only where the protocol keeps them
+/// (unmodified Enter/Tab/Backspace without flag 8). Cursor and function keys always use their
+/// CSI forms here, never the SS3 forms of application cursor mode.
 pub(crate) fn encode(
     ev: &KeyInput<'_>,
     flags: TermMode,
@@ -311,9 +312,6 @@ pub(crate) fn encode(
                 }
             }
             Kind::Control(13 | 9 | 127) if plain => return (!release).then(legacy).flatten(),
-            Kind::Letter(_) | Kind::Tilde(_) if plain && action == KeyAction::Press => {
-                return legacy();
-            }
             Kind::Modifier(_) => return None,
             _ => {}
         }
@@ -546,7 +544,9 @@ mod tests {
                 A,
                 s("\x1b[32u"),
             ),
-            ("f5 flag 1", K::named(Named::F5), D, s("<legacy>")),
+            ("f5 flag 1", K::named(Named::F5), D, s("\x1b[15~")),
+            ("f3 flag 1", K::named(Named::F3), D, s("\x1b[13~")),
+            ("f1 flag 1", K::named(Named::F1), D, s("\x1b[P")),
             ("f5 flag 8", K::named(Named::F5), A, s("\x1b[15~")),
             (
                 "ctrl+f5",
@@ -563,7 +563,7 @@ mod tests {
                 s("\x1b[1;2P"),
             ),
             ("f13", K::named(Named::F13), D, s("\x1b[57376u")),
-            ("arrow flag 1", K::named(Named::ArrowUp), D, s("<legacy>")),
+            ("arrow flag 1", K::named(Named::ArrowUp), D, s("\x1b[A")),
             ("arrow flag 8", K::named(Named::ArrowUp), A, s("\x1b[A")),
             (
                 "ctrl+shift+right",
