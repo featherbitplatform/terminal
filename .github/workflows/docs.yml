@@ -43,7 +43,7 @@ jobs:
         with:
           path: website/build
 
-  # Deploys only from main (push) or a manual run. Requires GitHub Pages with
+  # Deploys only from main (on push, or a manual run on main). Requires GitHub Pages with
   # source "GitHub Actions" in the repository settings.
   deploy:
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
