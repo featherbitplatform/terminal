@@ -173,8 +173,14 @@ pub fn encode_key(
 /// produce nothing. With flags (which the emulator accepts only when the `kitty_keyboard`
 /// setting is on), keys are encoded per the protocol's progressive enhancements.
 pub fn encode_key_input(ev: &KeyInput<'_>, mode: TermMode) -> Option<Vec<u8>> {
+    let mut ev = *ev;
     if cfg!(target_os = "macos") && ev.mods.logo() {
-        return None;
+        // A release still goes out (its press was sent before Cmd went down); Cmd itself is
+        // never reported.
+        if ev.action != KeyAction::Release {
+            return None;
+        }
+        ev.mods.remove(Modifiers::LOGO);
     }
     let flags = mode & TermMode::KITTY_KEYBOARD_PROTOCOL;
     let legacy = || {
@@ -184,10 +190,14 @@ pub fn encode_key_input(ev: &KeyInput<'_>, mode: TermMode) -> Option<Vec<u8>> {
             legacy_key(ev.key, ev.text, ev.mods, mode)
         }
     };
-    if flags.is_empty() {
-        legacy()
+    // Only flags 1, 2 and 8 change the encoding; 4 and 16 alone refine nothing.
+    let switching = TermMode::DISAMBIGUATE_ESC_CODES
+        | TermMode::REPORT_EVENT_TYPES
+        | TermMode::REPORT_ALL_KEYS_AS_ESC;
+    if flags.intersects(switching) {
+        kitty::encode(&ev, flags, cfg!(target_os = "macos"), legacy)
     } else {
-        kitty::encode(ev, flags, cfg!(target_os = "macos"), legacy)
+        legacy()
     }
 }
 
@@ -479,5 +489,89 @@ mod tests {
             encode_mouse(r, TermMode::MOUSE_REPORT_CLICK).unwrap(),
             vec![0x1b, b'[', b'M', 32, 37, 35]
         );
+    }
+
+    fn named_in(n: Named, mods: Modifiers, mode: TermMode) -> Option<Vec<u8>> {
+        key(Key::Named(n), mods, None, mode)
+    }
+
+    #[test]
+    fn kitty_flags_never_produce_ss3() {
+        let mode = TermMode::APP_CURSOR | TermMode::DISAMBIGUATE_ESC_CODES;
+        let none = Modifiers::empty();
+        assert_eq!(
+            named_in(Named::ArrowUp, none, TermMode::APP_CURSOR).unwrap(),
+            b"\x1bOA"
+        );
+        for flags in [
+            TermMode::DISAMBIGUATE_ESC_CODES,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES,
+            TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_ALTERNATE_KEYS,
+        ] {
+            let m = TermMode::APP_CURSOR | flags;
+            assert_eq!(named_in(Named::ArrowUp, none, m).unwrap(), b"\x1b[A");
+            assert_eq!(named_in(Named::ArrowLeft, none, m).unwrap(), b"\x1b[D");
+            assert_eq!(named_in(Named::Home, none, m).unwrap(), b"\x1b[H");
+            assert_eq!(named_in(Named::End, none, m).unwrap(), b"\x1b[F");
+            assert_eq!(named_in(Named::F1, none, m).unwrap(), b"\x1b[P");
+            assert_eq!(named_in(Named::F2, none, m).unwrap(), b"\x1b[Q");
+            assert_eq!(named_in(Named::F3, none, m).unwrap(), b"\x1b[13~");
+            assert_eq!(named_in(Named::F4, none, m).unwrap(), b"\x1b[S");
+            assert_eq!(named_in(Named::F5, none, m).unwrap(), b"\x1b[15~");
+            assert_eq!(named_in(Named::PageUp, none, m).unwrap(), b"\x1b[5~");
+        }
+        // Unmodified Enter keeps its legacy byte through the real legacy path.
+        assert_eq!(named_in(Named::Enter, none, mode).unwrap(), b"\r");
+        assert_eq!(named_in(Named::Backspace, none, mode).unwrap(), vec![0x7f]);
+        assert_eq!(named_in(Named::Escape, none, mode).unwrap(), b"\x1b[27u");
+    }
+
+    #[test]
+    fn refinement_flags_alone_keep_legacy_encoding() {
+        let none = Modifiers::empty();
+        for flags in [
+            TermMode::REPORT_ALTERNATE_KEYS,
+            TermMode::REPORT_ASSOCIATED_TEXT,
+            TermMode::REPORT_ALTERNATE_KEYS | TermMode::REPORT_ASSOCIATED_TEXT,
+        ] {
+            let m = TermMode::APP_CURSOR | flags;
+            assert_eq!(named_in(Named::Escape, none, m).unwrap(), vec![0x1b]);
+            assert_eq!(named_in(Named::ArrowUp, none, m).unwrap(), b"\x1bOA");
+            assert_eq!(key(ch("a"), Modifiers::CTRL, None, m).unwrap(), vec![0x01]);
+            let release = KeyInput {
+                key: &Key::Named(Named::Escape),
+                modified_key: &Key::Named(Named::Escape),
+                physical: Physical::Code(Code::Escape),
+                location: Location::Standard,
+                text: None,
+                mods: none,
+                action: KeyAction::Release,
+            };
+            assert!(encode_key_input(&release, m).is_none(), "press only");
+        }
+        // Flag 2 alone does switch.
+        let m = TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(named_in(Named::Escape, none, m).unwrap(), b"\x1b[27u");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn release_goes_out_while_cmd_is_held() {
+        let ev = KeyInput {
+            key: &ch("a"),
+            modified_key: &ch("a"),
+            physical: Physical::Code(Code::KeyA),
+            location: Location::Standard,
+            text: None,
+            mods: Modifiers::LOGO,
+            action: KeyAction::Release,
+        };
+        let m = TermMode::DISAMBIGUATE_ESC_CODES | TermMode::REPORT_EVENT_TYPES;
+        assert_eq!(encode_key_input(&ev, m).unwrap(), b"\x1b[97;1:3u");
+        let press = KeyInput {
+            action: KeyAction::Press,
+            ..ev
+        };
+        assert!(encode_key_input(&press, m).is_none());
     }
 }

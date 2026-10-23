@@ -65,7 +65,15 @@ pub struct InputState {
     scroll_acc: f32,
     /// Keys whose press reached the program: only their releases are reported (kitty keyboard
     /// protocol event types), never those of chords the app or widget handled itself.
-    held: Vec<keyboard::key::Physical>,
+    held: Vec<HeldKey>,
+}
+
+/// A key whose press was sent to the program, kept to encode its release.
+struct HeldKey {
+    physical: keyboard::key::Physical,
+    key: Key,
+    modified_key: Key,
+    location: keyboard::Location,
 }
 
 /// Modifier and lock keys: pressing one alone must not disturb the selection or the view.
@@ -200,6 +208,11 @@ impl InputState {
         clipboard: &mut dyn Clipboard,
         out: &mut Vec<TerminalOutput>,
     ) -> Effect {
+        // Losing focus: the releases of keys still down would never arrive, so send them now.
+        let unfocused = matches!(event, Event::Window(iced::window::Event::Unfocused));
+        if (unfocused || !ctx.focused) && !self.held.is_empty() {
+            self.release_all(ctx, out);
+        }
         match event {
             Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => {
                 let was = self.link_armed();
@@ -242,8 +255,13 @@ impl InputState {
                 let Some(bytes) = encode_key_input(&input, term.mode()) else {
                     return Effect::NONE;
                 };
-                if !self.held.contains(physical_key) {
-                    self.held.push(*physical_key);
+                if !self.held.iter().any(|h| h.physical == *physical_key) {
+                    self.held.push(HeldKey {
+                        physical: *physical_key,
+                        key: key.clone(),
+                        modified_key: modified_key.clone(),
+                        location: *location,
+                    });
                 }
                 if !is_modifier_key(key) {
                     reset_view(&mut term);
@@ -258,7 +276,7 @@ impl InputState {
                 location,
                 modifiers,
             }) => {
-                let Some(i) = self.held.iter().position(|p| p == physical_key) else {
+                let Some(i) = self.held.iter().position(|h| h.physical == *physical_key) else {
                     return Effect::NONE;
                 };
                 self.held.swap_remove(i);
@@ -295,6 +313,26 @@ impl InputState {
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => self.wheel(ctx, *delta, out),
             _ => Effect::NONE,
+        }
+    }
+
+    /// Report the release of every key whose press reached the program (only produces output
+    /// when the program asked for event types).
+    fn release_all(&mut self, ctx: &Context<'_>, out: &mut Vec<TerminalOutput>) {
+        let mode = ctx.term.lock().mode();
+        for h in std::mem::take(&mut self.held) {
+            let input = KeyInput {
+                key: &h.key,
+                modified_key: &h.modified_key,
+                physical: h.physical,
+                location: h.location,
+                text: None,
+                mods: self.modifiers,
+                action: KeyAction::Release,
+            };
+            if let Some(bytes) = encode_key_input(&input, mode) {
+                out.push(TerminalOutput::Input(bytes));
+            }
         }
     }
 
@@ -787,5 +825,70 @@ mod tests {
             vec![b"\x1b[27u".to_vec(), b"\x1b[27;1:3u".to_vec()]
         );
         assert!(st.held.is_empty());
+    }
+
+    #[test]
+    fn losing_focus_releases_held_keys() {
+        use keyboard::key::{Code, Named};
+        let mut t = filled(24);
+        t.set_kitty_keyboard(true);
+        t.feed(b"\x1b[>3u");
+        let grid = t.size();
+        let term: SharedTerminal = std::sync::Arc::new(parking_lot::Mutex::new(t));
+        let mut ctx = Context {
+            term: &term,
+            focused: true,
+            bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(320.0, 384.0)),
+            grid,
+            cursor: mouse::Cursor::Unavailable,
+        };
+        let mut clip = iced::advanced::clipboard::Null;
+        let mut out = Vec::new();
+        let mut st = InputState::default();
+        st.handle(
+            &ctx,
+            &key_event(true, Named::Escape, Code::Escape),
+            &mut clip,
+            &mut out,
+        );
+        st.handle(
+            &ctx,
+            &key_event(true, Named::F5, Code::F5),
+            &mut clip,
+            &mut out,
+        );
+        let unfocus = Event::Window(iced::window::Event::Unfocused);
+        st.handle(&ctx, &unfocus, &mut clip, &mut out);
+        assert!(st.held.is_empty());
+        let mut got = inputs(out);
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                b"\x1b[15;1:3~".to_vec(),
+                b"\x1b[15~".to_vec(),
+                b"\x1b[27;1:3u".to_vec(),
+                b"\x1b[27u".to_vec(),
+            ]
+        );
+        // The pane losing focus (no window event) flushes too; the late release is dropped.
+        let mut out = Vec::new();
+        st.handle(
+            &ctx,
+            &key_event(true, Named::Escape, Code::Escape),
+            &mut clip,
+            &mut out,
+        );
+        ctx.focused = false;
+        st.handle(
+            &ctx,
+            &key_event(false, Named::Escape, Code::Escape),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(
+            inputs(out),
+            vec![b"\x1b[27u".to_vec(), b"\x1b[27;1:3u".to_vec()]
+        );
     }
 }

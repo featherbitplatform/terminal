@@ -11,6 +11,7 @@ use fbterm_config::Rgb;
 use parking_lot::Mutex;
 
 use crate::Selection;
+use crate::kitty_guard::KittyGuard;
 use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::{Selection as EmuSelection, SelectionType};
 
@@ -166,6 +167,7 @@ fn dims(size: GridSize) -> Dims {
 pub struct Terminal {
     term: Term<EventProxy>,
     config: Config,
+    kitty_guard: KittyGuard,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
     generation: u64,
@@ -195,6 +197,7 @@ impl Terminal {
         Self {
             term,
             config,
+            kitty_guard: KittyGuard::default(),
             parser: Processor::new(),
             shared,
             generation: 0,
@@ -203,7 +206,15 @@ impl Terminal {
 
     /// Feed bytes received from the session into the emulator.
     pub fn feed(&mut self, bytes: &[u8]) {
-        self.parser.advance(&mut self.term, bytes);
+        if self.config.kitty_keyboard {
+            // Keep the protocol's flag stack bounded (see `kitty_guard` for the upstream bug).
+            let alt = self.term.mode().contains(TermMode::ALT_SCREEN);
+            self.kitty_guard.sync_screen(alt);
+            let bytes = self.kitty_guard.filter(bytes);
+            self.parser.advance(&mut self.term, &bytes);
+        } else {
+            self.parser.advance(&mut self.term, bytes);
+        }
         self.generation += 1;
     }
 
@@ -215,12 +226,25 @@ impl Terminal {
             return;
         }
         self.config.kitty_keyboard = enabled;
+        // Output held back by the guard mid-sequence goes to the emulator unfiltered now.
+        let held = self.kitty_guard.take_held();
+        let before = self.shared.lock().events.len();
         self.term.set_options(self.config.clone());
-        // Setting options re-announces the title; nothing changed, so drop the event.
-        self.shared
-            .lock()
-            .events
-            .retain(|e| !matches!(e, TermEvent::Title(_)));
+        // Setting options re-announces the current title; nothing changed, so drop that one
+        // event and keep any title a program set before.
+        {
+            let mut sh = self.shared.lock();
+            if let Some(i) =
+                (before..sh.events.len()).find(|&i| matches!(sh.events[i], TermEvent::Title(_)))
+            {
+                sh.events.remove(i);
+            }
+        }
+        // The emulator dropped both flag stacks.
+        self.kitty_guard.clear_depths();
+        if !held.is_empty() {
+            self.parser.advance(&mut self.term, &held);
+        }
         self.generation += 1;
     }
 
@@ -535,13 +559,55 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b]0;keep\x07");
         t.take_events();
+        t.feed(b"\x1b]0;pending\x07");
         t.set_kitty_keyboard(true);
+        assert_eq!(
+            t.take_events(),
+            vec![TermEvent::Title("pending".into())],
+            "a title set before the toggle is kept, the re-announcement dropped"
+        );
         t.feed(b"\x1b[>31u");
         assert!(t.mode().contains(TermMode::KITTY_KEYBOARD_PROTOCOL));
         t.set_kitty_keyboard(false);
         assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
         assert!(t.take_events().is_empty(), "no spurious title event");
         assert_eq!(esc(&t), b"\x1b");
+    }
+
+    #[test]
+    fn flag_stack_floods_do_not_crash_and_pops_still_work() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        t.set_kitty_keyboard(true);
+        let push = b"\x1b[>1u";
+        let mut flood = Vec::new();
+        for _ in 0..5000 {
+            flood.extend_from_slice(push);
+        }
+        t.feed(&flood);
+        // Again, split at every possible boundary.
+        for chunk in flood.chunks(7) {
+            t.feed(chunk);
+        }
+        for chunk in flood[..3000].chunks(1) {
+            t.feed(chunk);
+        }
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        // The stack is full: a further push is dropped, a pop makes room for one.
+        t.feed(b"\x1b[>8u");
+        assert!(!t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        t.feed(b"\x1b[<1u\x1b[>8u");
+        assert!(t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        t.feed(b"\x1b[<1u");
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
+        assert!(!t.mode().contains(TermMode::REPORT_ALL_KEYS_AS_ESC));
+        t.feed(b"\x1b[<65535u");
+        assert!(!t.mode().intersects(TermMode::KITTY_KEYBOARD_PROTOCOL));
+        // Same on the alternate screen.
+        t.feed(b"\x1b[?1049h");
+        t.feed(&flood);
+        t.feed(b"\x1b[?1049l");
+        t.feed(&flood);
+        assert!(t.mode().contains(TermMode::DISAMBIGUATE_ESC_CODES));
     }
 
     #[test]
