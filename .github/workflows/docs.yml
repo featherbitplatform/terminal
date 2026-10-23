@@ -46,7 +46,7 @@ jobs:
   # Deploys only from main (push) or a manual run. Requires GitHub Pages with
   # source "GitHub Actions" in the repository settings.
   deploy:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
     permissions:
