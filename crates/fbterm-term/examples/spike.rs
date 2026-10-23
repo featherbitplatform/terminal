@@ -4,6 +4,9 @@
 //! `alacritty_terminal` grid with iced's own primitives: one `fill_quad` per background run and
 //! one `fill_text` per foreground run (consecutive cells sharing color and style).
 //!
+//! `--mode widget` renders through the production `fbterm_term::terminal_view` widget instead,
+//! fed by `fbterm_term::Terminal` (Task 4 check).
+//!
 //! `--mode null` is a control: identical app, PTY and frame loop, but no cells are drawn, to
 //! separate grid rendering cost from the environment (compositor, display, other GPU load).
 //!
@@ -52,6 +55,8 @@ const DEFAULT_BG: [u8; 3] = [0x10, 0x10, 0x14];
 type SharedTerm = Arc<FairMutex<Term<VoidListener>>>;
 
 static TERM: OnceLock<SharedTerm> = OnceLock::new();
+static WIDGET_TERM: OnceLock<fbterm_term::SharedTerminal> = OnceLock::new();
+static WIDGET_STYLE: OnceLock<fbterm_term::TerminalStyle> = OnceLock::new();
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static BYTES: AtomicU64 = AtomicU64::new(0);
 static WAKE_PENDING: AtomicBool = AtomicBool::new(false);
@@ -95,8 +100,8 @@ fn parse_args() -> Args {
         }
     }
     // "null" is a control: same app, PTY and frame loop, but the widget draws no cells.
-    if args.mode != "native" && args.mode != "null" {
-        panic!("only --mode native (approach A) and --mode null (control) are implemented");
+    if !matches!(args.mode.as_str(), "native" | "null" | "widget") {
+        panic!("--mode native (approach A), widget (production widget) or null (control)");
     }
     args
 }
@@ -185,6 +190,54 @@ fn spawn_child(workload: &str) -> Box<dyn Read + Send> {
     // Keep the master alive for the life of the process.
     std::mem::forget(pair.master);
     reader
+}
+
+fn start_widget_io(workload: &str) {
+    let scheme = fbterm_term::ColorScheme::graphite();
+    let mut t = fbterm_term::Terminal::new(
+        fbterm_term::GridSize {
+            cols: COLS as u16,
+            rows: ROWS as u16,
+            cell_width: 7.0,
+            cell_height: 15.0,
+        },
+        10_000,
+    );
+    scheme.apply_to(&mut t);
+    let term = Arc::new(parking_lot::Mutex::new(t));
+    WIDGET_TERM.set(term.clone()).ok();
+    WIDGET_STYLE
+        .set(fbterm_term::TerminalStyle {
+            scheme,
+            font: Font::MONOSPACE,
+            font_size: FONT_SIZE,
+            accent: None,
+            focused: true,
+        })
+        .ok();
+    let (tx, rx) = mpsc::unbounded();
+    WAKE_RX.set(Mutex::new(Some(rx))).ok();
+    let mut reader = spawn_child(workload);
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            {
+                let mut t = term.lock();
+                t.feed(&buf[..n]);
+                // Replies to queries are not written back in the spike; drop them.
+                t.take_events();
+            }
+            BYTES.fetch_add(n as u64, Ordering::Relaxed);
+            GENERATION.fetch_add(1, Ordering::Release);
+            if !WAKE_PENDING.swap(true, Ordering::AcqRel) {
+                let _ = tx.unbounded_send(());
+            }
+        }
+    });
 }
 
 fn start_io(workload: &str) {
@@ -512,11 +565,79 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for GridWidget<'_> {
     }
 }
 
+// ---------- timing wrapper for --mode widget ----------
+
+/// Delegates to the production widget and records its draw() CPU time like GridWidget does.
+struct Timed<'a> {
+    inner: Element<'a, Message>,
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for Timed<'_> {
+    fn size(&self) -> Size<Length> {
+        self.inner.as_widget().size()
+    }
+    fn tag(&self) -> widget::tree::Tag {
+        self.inner.as_widget().tag()
+    }
+    fn state(&self) -> widget::tree::State {
+        self.inner.as_widget().state()
+    }
+    fn children(&self) -> Vec<widget::Tree> {
+        self.inner.as_widget().children()
+    }
+    fn diff(&self, tree: &mut widget::Tree) {
+        self.inner.as_widget().diff(tree)
+    }
+    fn layout(
+        &mut self,
+        tree: &mut widget::Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.inner.as_widget_mut().layout(tree, renderer, limits)
+    }
+    fn update(
+        &mut self,
+        tree: &mut widget::Tree,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn iced::advanced::Clipboard,
+        shell: &mut iced::advanced::Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.inner.as_widget_mut().update(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        )
+    }
+    fn draw(
+        &self,
+        tree: &widget::Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let t0 = Instant::now();
+        self.inner
+            .as_widget()
+            .draw(tree, renderer, theme, style, layout, cursor, viewport);
+        let ns = t0.elapsed().as_nanos() as u64;
+        DRAW_NS_SUM.fetch_add(ns, Ordering::Relaxed);
+        DRAW_NS_MAX.fetch_max(ns, Ordering::Relaxed);
+        DRAW_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 // ---------- app ----------
 
 #[derive(Debug, Clone)]
 enum Message {
     Wakeup,
+    Term,
     Frame(Instant),
     Second,
 }
@@ -555,7 +676,11 @@ impl App {
 }
 
 fn boot(args: Args) -> (App, Task<Message>) {
-    start_io(&args.workload);
+    if args.mode == "widget" {
+        start_widget_io(&args.workload);
+    } else {
+        start_io(&args.workload);
+    }
     println!(
         "spike pid={} mode={} workload={} grid={}x{} warmup={}s seconds={}s",
         std::process::id(),
@@ -595,6 +720,7 @@ fn boot(args: Args) -> (App, Task<Message>) {
 
 fn update(app: &mut App, msg: Message) -> Task<Message> {
     match msg {
+        Message::Term => {}
         Message::Wakeup => {
             app.active = true;
             app.idle_frames = 0;
@@ -616,7 +742,9 @@ fn update(app: &mut App, msg: Message) -> Task<Message> {
             if generation != app.seen_generation {
                 app.seen_generation = generation;
                 app.idle_frames = 0;
-                take_snapshot(&mut app.snap);
+                if app.args.mode != "widget" {
+                    take_snapshot(&mut app.snap);
+                }
             } else {
                 app.idle_frames += 1;
                 if app.idle_frames > 3 {
@@ -712,6 +840,13 @@ fn update(app: &mut App, msg: Message) -> Task<Message> {
 }
 
 fn view(app: &App) -> Element<'_, Message> {
+    if app.args.mode == "widget" {
+        let term = WIDGET_TERM.get().expect("widget terminal");
+        let style = WIDGET_STYLE.get().expect("widget style");
+        return Element::new(Timed {
+            inner: fbterm_term::terminal_view(term, style, |_| Message::Term),
+        });
+    }
     Element::new(GridWidget {
         snap: &app.snap,
         null: app.args.mode == "null",

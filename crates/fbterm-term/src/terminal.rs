@@ -10,6 +10,8 @@ use alacritty_terminal::vte::ansi::{Processor, Rgb as VteRgb};
 use fbterm_config::Rgb;
 use parking_lot::Mutex;
 
+use crate::Selection;
+
 pub use alacritty_terminal::term::TermMode;
 
 /// Terminal size in cells plus the pixel size of one cell.
@@ -163,6 +165,8 @@ pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
+    selection: Option<Selection>,
+    generation: u64,
 }
 
 pub type SharedTerminal = Arc<Mutex<Terminal>>;
@@ -190,17 +194,42 @@ impl Terminal {
             term,
             parser: Processor::new(),
             shared,
+            selection: None,
+            generation: 0,
         }
     }
 
     /// Feed bytes received from the session into the emulator.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
+        self.generation += 1;
+    }
+
+    /// Counter bumped by every change that can alter what is drawn.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The current text selection, in grid coordinates.
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    pub fn set_selection(&mut self, selection: Option<Selection>) {
+        self.selection = selection;
+        self.generation += 1;
+    }
+
+    /// Show the newest output (leave scrollback).
+    pub fn scroll_to_bottom(&mut self) {
+        self.term.scroll_display(Scroll::Bottom);
+        self.generation += 1;
     }
 
     pub fn resize(&mut self, size: GridSize) {
         self.shared.lock().size = size;
         self.term.resize(dims(size));
+        self.generation += 1;
     }
 
     /// Set the palette used to answer colour queries.
@@ -210,6 +239,8 @@ impl Terminal {
         sh.background = background;
         sh.cursor = cursor;
         sh.ansi = ansi;
+        drop(sh);
+        self.generation += 1;
     }
 
     pub fn size(&self) -> GridSize {
@@ -219,6 +250,7 @@ impl Terminal {
     /// Scroll the viewport; positive moves towards older history.
     pub fn scroll(&mut self, delta_lines: i32) {
         self.term.scroll_display(Scroll::Delta(delta_lines));
+        self.generation += 1;
     }
 
     pub fn mode(&self) -> TermMode {
@@ -355,6 +387,29 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b]52;c;?\x07");
         assert_eq!(reply(&mut t), "\x1b]52;c;\x07");
+    }
+
+    #[test]
+    fn generation_tracks_changes() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        let g0 = t.generation();
+        t.feed(b"x");
+        let g1 = t.generation();
+        assert!(g1 > g0);
+        t.set_selection(None);
+        assert!(t.generation() > g1);
+    }
+
+    #[test]
+    fn scroll_to_bottom_leaves_history() {
+        let mut t = Terminal::new(size(80, 24), 1000);
+        for i in 0..100 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t.scroll(10);
+        assert_eq!(t.term().grid().display_offset(), 10);
+        t.scroll_to_bottom();
+        assert_eq!(t.term().grid().display_offset(), 0);
     }
 
     #[test]
