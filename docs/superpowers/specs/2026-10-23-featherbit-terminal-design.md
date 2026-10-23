@@ -228,6 +228,16 @@ Jump-chain references are exported together with the profiles they point to.
   tab's) for the Dock, Mission Control and the Window menu. The profile editor gets the same
   treatment with its own header. Linux and Windows keep OS decorations until milestone 6; the
   code keeps this behind a per-platform chrome strategy (`crates/fbterm/src/chrome.rs`).
+- *(Owner's decision, 2026-10-23)* **Background opacity and optional blur.** `settings.toml`
+  `background_opacity` (0.0 to 1.0, default 1.0) applies to the terminal's default background
+  and the tab bar only; text, cursor, selection and cells with their own background stay
+  opaque. `background_blur` (default off) blurs what shows through. Builder's notes: on macOS
+  terminal windows are always created transparent and paint an opaque background at 1.0, so
+  opacity changes apply live; on Linux and Windows only windows opened below 1.0 are
+  transparent. Blur is a window-creation setting in iced 0.14 (winit `set_blur`), so it applies
+  to windows opened after a change; on macOS winit implements it with a private
+  CoreGraphics call (`CGSSetWindowBackgroundBlurRadius`), which is the owner's to keep or
+  replace (for example with an `NSVisualEffectView`) before signed releases.
 
 ### 5.11 Keyboard defaults *(builder's call)*
 

@@ -319,6 +319,14 @@ fn color(c: Rgb) -> iced::Color {
     iced::Color::from_rgb8(c.r, c.g, c.b)
 }
 
+/// The fill of the default background at `opacity`; `None` when it is not drawn (fully clear).
+/// Everything else in the list is drawn opaque with [`color`].
+fn background_fill(list: &DrawList, opacity: f32) -> Option<iced::Color> {
+    list.background
+        .filter(|_| opacity > 0.0)
+        .map(|bg| color(bg).scale_alpha(opacity.min(1.0)))
+}
+
 /// Font metrics used to place cells.
 #[derive(Debug, Clone, Copy)]
 pub struct Metrics {
@@ -363,6 +371,7 @@ pub fn render(
     bounds: Rectangle,
     m: Metrics,
     accent: Option<Rgb>,
+    background_opacity: f32,
 ) {
     let (cw, ch) = (m.cell.width, m.cell.height);
     let rect = |s: Span| Rectangle {
@@ -371,8 +380,15 @@ pub fn render(
         width: f32::from(s.cells) * cw,
         height: ch,
     };
-    if let Some(bg) = list.background {
-        fill(renderer, bounds, bg);
+    if let Some(bg) = background_fill(list, background_opacity) {
+        renderer.fill_quad(
+            Quad {
+                bounds,
+                snap: true,
+                ..Quad::default()
+            },
+            bg,
+        );
     }
     for (span, c) in &list.quads {
         fill(renderer, rect(*span), *c);
@@ -585,6 +601,33 @@ mod tests {
                 .any(|(s, c)| s.col == 9 && *c == scheme().cursor)
         );
         assert!(list.cursor.is_none());
+    }
+
+    #[test]
+    fn only_the_default_background_is_translucent() {
+        // Green background on "ab", then default cells.
+        let t = term_with(b"\x1b[42mab\x1b[0m cd");
+        let list = build(&t, &scheme(), true, None);
+        let bg = background_fill(&list, 0.85).expect("drawn");
+        assert!((bg.a - 0.85).abs() < f32::EPSILON);
+        assert_eq!(
+            iced::Color { a: 1.0, ..bg },
+            color(scheme().background),
+            "same color, only the alpha changes"
+        );
+        // The explicit background (and the cursor) are quads, drawn opaque.
+        let green = list
+            .quads
+            .iter()
+            .find(|(s, _)| s.col == 0)
+            .expect("explicit background quad");
+        assert_eq!(green.0.cells, 2);
+        assert_eq!(color(green.1).a, 1.0);
+        assert!(list.quads.iter().all(|(_, c)| *c != scheme().background));
+        assert!(list.texts.iter().all(|r| color(r.fg).a == 1.0));
+        // Opaque by default, and not drawn at all at zero.
+        assert_eq!(background_fill(&list, 1.0).map(|c| c.a), Some(1.0));
+        assert_eq!(background_fill(&list, 0.0), None);
     }
 
     #[test]

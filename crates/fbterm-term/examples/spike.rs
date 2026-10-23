@@ -213,6 +213,7 @@ fn start_widget_io(workload: &str) {
             font_size: FONT_SIZE,
             accent: None,
             focused: true,
+            background_opacity: 1.0,
         })
         .ok();
     let (tx, rx) = mpsc::unbounded();

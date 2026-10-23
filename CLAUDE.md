@@ -71,6 +71,7 @@ cd website && npm start                  # docs dev server; `npm run build` buil
 - Windows CI clippy fails on imports and helpers used only by `#[cfg(unix)]` tests; gate them with the same `cfg`.
 - `hdiutil create` fails locally on macOS 27 ("Resource busy"); `dev/package-macos.sh` falls back to `diskutil image create` locally, CI uses `hdiutil` only.
 - Redraw contract: call `take_dirty` before locking the terminal to draw; hidden tabs leave `Dirty` pending until they are shown.
+- `alacritty_terminal` is vendored and patched (`vendor/alacritty_terminal`, changes listed in its `FBTERM_PATCHES.md`) and wired in through `[patch.crates-io]` in the root `Cargo.toml`; bumping the crate means re-applying the patches or dropping the vendored copy.
 - A session can continue into an existing `SharedTerminal` (`spawn_local_into`, `open_shell_into`), which is how reconnect keeps scrollback.
 
 ## Status
