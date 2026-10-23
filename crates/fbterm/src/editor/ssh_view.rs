@@ -18,6 +18,7 @@ pub(super) fn auth<'a>(
     s: &'a SshDraft,
     editable: bool,
     degraded: bool,
+    rsa_key: bool,
 ) -> Element<'a, Message> {
     let segment = |caption: &'a str, choice: AuthChoice| {
         let selected = s.auth == choice;
@@ -122,6 +123,14 @@ pub(super) fn auth<'a>(
                         .text_size(13)
                         .size(15),
                 );
+            if rsa_key {
+                col = col.push(
+                    text(super::RSA_ADVICE)
+                        .font(UI_FONT)
+                        .size(12.5)
+                        .color(t.warning),
+                );
+            }
             if s.key_passphrase {
                 col = col.push(secret(
                     "Passphrase",

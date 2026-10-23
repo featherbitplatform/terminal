@@ -208,6 +208,7 @@ pub fn spawn_local_into(
         bell_pending,
         detached,
         ended,
+        auth_warnings: Vec::new(),
         closer: kill_unless_reaped(reaped, move || {
             let _ = killer.lock().kill();
         }),

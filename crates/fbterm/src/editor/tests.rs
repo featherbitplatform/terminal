@@ -482,3 +482,33 @@ fn debug_output_never_shows_a_typed_secret() {
     let draft = format!("{:?}", ed.draft(web.id).unwrap());
     assert!(!draft.contains("hunter2"), "{draft}");
 }
+
+#[test]
+fn rsa_key_file_shows_a_warning_that_follows_the_path() {
+    let dir = std::env::temp_dir().join(format!("fbterm-keys-{}", ProfileId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let rsa = dir.join("id_rsa");
+    std::fs::write(
+        &rsa,
+        "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----\n",
+    )
+    .unwrap();
+    let other = dir.join("id_other");
+    std::fs::write(&other, "not a key").unwrap();
+
+    let p = ssh_with(
+        "k",
+        AuthMethod::Key {
+            path: rsa.clone(),
+            passphrase: false,
+        },
+    );
+    let (mut ed, _) = editor(&ProfileStore { profiles: vec![p] });
+    assert!(ed.selected_key_is_rsa());
+    ed.update(EditorMsg::KeyPath(other.display().to_string()));
+    assert!(!ed.selected_key_is_rsa());
+    ed.update(EditorMsg::KeyPicked(Some(rsa)));
+    assert!(ed.selected_key_is_rsa());
+    ed.update(EditorMsg::Auth(AuthChoice::Agent));
+    assert!(!ed.selected_key_is_rsa());
+}

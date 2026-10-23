@@ -36,6 +36,14 @@ pub enum SessionEvent {
     Disconnected(String),
 }
 
+/// Something about how a connection was authenticated that the user should hear about. It
+/// never fails the connection; every session on that connection reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthWarning {
+    /// Login used an RSA private key (the `rsa` crate's signing has a known timing side channel).
+    RsaUserKey,
+}
+
 /// How a session ended, as last reported by its `Exited` or `Disconnected` event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEnd {
@@ -90,12 +98,19 @@ pub struct SessionHandle {
     /// terminal that a new session has taken over.
     pub(crate) detached: Arc<AtomicBool>,
     pub(crate) closer: Closer,
+    pub(crate) auth_warnings: Vec<AuthWarning>,
     pub(crate) ended: Ended,
     /// SSH sessions keep their shared connection alive until closed.
     pub(crate) connection: parking_lot::Mutex<Option<Arc<ssh::pool::Connection>>>,
 }
 
 impl SessionHandle {
+    /// Warnings from authenticating this session's connection; empty for local sessions.
+    /// Read it once when the handle is installed (once per tab), not from events.
+    pub fn auth_warnings(&self) -> &[AuthWarning] {
+        &self.auth_warnings
+    }
+
     /// Write bytes to the session's input.
     pub fn send(&self, bytes: Vec<u8>) {
         let _ = self.commands.send(Command::Input(bytes));
