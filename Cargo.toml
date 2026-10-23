@@ -22,6 +22,8 @@ nucleo-matcher = "0.3.1"
 directories = "6.0.0"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+# Same major as the one `toml` uses; edits settings.toml in place.
+toml_edit = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
