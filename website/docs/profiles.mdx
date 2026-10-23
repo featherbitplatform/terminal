@@ -15,7 +15,7 @@ This file is the one the test suite loads, so it is always valid. Open it in you
 
 <CodeBlock language="toml" title="profiles.toml">{profilesExample}</CodeBlock>
 
-The file is a list of `[[profiles]]` tables. Shells found in `/etc/shells` are offered automatically and are not written to the file.
+The file is a list of `[[profiles]]` tables. Shells found in `/etc/shells` are offered automatically and are not written to the file. On macOS and Linux they start as login shells (`-l`), so your shell profile sets `PATH` even when the app was opened from the Dock or Finder. A local session that inherits no locale (none of `LANG`, `LC_ALL` or `LC_CTYPE`, and the profile sets none) gets `LANG=en_US.UTF-8` on macOS and `LANG=C.UTF-8` on Linux.
 
 ## Fields common to every profile
 
