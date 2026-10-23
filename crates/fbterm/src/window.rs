@@ -68,7 +68,16 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let opacity = app.settings.background_opacity;
     let term_bg = to_color(style.scheme.background).scale_alpha(opacity);
     let bar_bg = t.surface.scale_alpha(opacity);
-    let mut body = column![tab_bar(t, id, bar_bg, term_bg, &win.tabs, win.active)];
+    let palette = app.palettes.get(&id);
+    let dialog = app.prompts.front(id);
+    let bar = TabBar {
+        window: id,
+        bar_bg,
+        active_bg: term_bg,
+        fullscreen: app.fullscreen.contains(&id),
+        modal: palette.is_some() || dialog.is_some(),
+    };
+    let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
     if !notices.is_empty() {
         body = body.push(notice_banner(t, bar_bg, notices));
@@ -96,8 +105,6 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 ..container::Style::default()
             }),
     );
-    let palette = app.palettes.get(&id);
-    let dialog = app.prompts.front(id);
     // Under an overlay nothing reaches the terminal; only the palette toggle still works,
     // and not while a dialog waits for an answer.
     let covered = if dialog.is_some() {
@@ -168,14 +175,32 @@ fn dot<'a>(color: Color) -> Element<'a, Message> {
         .into()
 }
 
-fn tab_bar<'a>(
-    t: &'static Tokens,
+/// How a window's tab bar is drawn.
+#[derive(Clone, Copy)]
+struct TabBar {
     window: window::Id,
     bar_bg: Color,
+    /// The active tab's background (the terminal's).
     active_bg: Color,
+    /// The window is in full screen: no room needed for the window buttons.
+    fullscreen: bool,
+    /// The palette or a dialog covers the window.
+    modal: bool,
+}
+
+fn tab_bar<'a>(
+    t: &'static Tokens,
+    bar: TabBar,
     tabs: &'a [Tab],
     active: usize,
 ) -> Element<'a, Message> {
+    let TabBar {
+        window,
+        bar_bg,
+        active_bg,
+        fullscreen,
+        modal,
+    } = bar;
     let chrome = Chrome::current();
     let height = chrome.bar_height();
     let msg = move |m| Message::TabBar(window, m);
@@ -205,7 +230,7 @@ fn tab_bar<'a>(
             top: 0.0,
             right: 8.0,
             bottom: 0.0,
-            left: chrome.leading_inset(),
+            left: chrome.leading_inset(fullscreen),
         })
         .width(Length::Fill)
         .height(height)
@@ -216,7 +241,7 @@ fn tab_bar<'a>(
         hole: (active < tabs.len()).then_some(active),
         corner: tab_radius(bar_bg),
     });
-    chrome::title_bar(bar, move |a| Message::TitleBar(window, a))
+    chrome::title_bar(bar, modal, move |a| Message::TitleBar(window, a))
 }
 
 /// Top corner radius of a tab.
@@ -412,22 +437,16 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
     }
 }
 
-/// The profile editor's own bar where the OS title bar is gone: the window title, and room to
-/// move the window.
+/// The profile editor's own bar where the OS title bar is gone: room for the window buttons
+/// and to move the window. It stays blank; the sidebar already titles the window.
 fn editor_header<'a>(t: &'static Tokens, window: window::Id) -> Element<'a, Message> {
-    let chrome = Chrome::current();
-    let header = container(
-        text("Profiles")
-            .font(UI_FONT)
-            .size(12.5)
-            .color(t.text_secondary),
-    )
-    .center_x(Length::Fill)
-    .center_y(chrome.bar_height())
-    .style(move |_| container::Style {
-        background: Some(t.surface.into()),
-        ..container::Style::default()
-    });
+    let header = container(text(""))
+        .width(Length::Fill)
+        .height(Chrome::current().bar_height())
+        .style(move |_| container::Style {
+            background: Some(t.surface.into()),
+            ..container::Style::default()
+        });
     let rule = container(text(""))
         .width(Length::Fill)
         .height(1)
@@ -435,7 +454,9 @@ fn editor_header<'a>(t: &'static Tokens, window: window::Id) -> Element<'a, Mess
             background: Some(t.border.into()),
             ..container::Style::default()
         });
-    chrome::title_bar(column![header, rule], move |a| Message::TitleBar(window, a))
+    chrome::title_bar(column![header, rule], false, move |a| {
+        Message::TitleBar(window, a)
+    })
 }
 
 fn ghost(t: &Tokens, status: button::Status) -> button::Style {
@@ -497,10 +518,12 @@ fn tab_button<'a>(
         .on_press(Message::TabBar(window, TabBarMsg::Select(index)))
         .width(Length::Fixed(196.0))
         .height(height)
+        // The tab starts TAB_TOP_GAP below the top of the bar; the same space below its
+        // content centers the label on the bar (and on the window buttons).
         .padding(Padding {
             top: 0.0,
             right: 6.0,
-            bottom: 0.0,
+            bottom: TAB_TOP_GAP,
             left: 8.0,
         })
         .style(move |_, status| {

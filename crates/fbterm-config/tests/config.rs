@@ -352,10 +352,15 @@ fn out_of_range_opacity_is_clamped_and_reported() {
         w.message
     );
 
-    std::fs::write(&path, "background_opacity = -0.2\n").unwrap();
-    let (s, warning) = Settings::load_checked(&path).unwrap();
-    assert_eq!(s.background_opacity, 0.0);
-    assert_eq!(warning.unwrap().line, Some(1));
+    // Fully clear is not allowed: the floor is 0.05.
+    for value in ["-0.2", "0.0", "0.01"] {
+        std::fs::write(&path, format!("background_opacity = {value}\n")).unwrap();
+        let (s, warning) = Settings::load_checked(&path).unwrap();
+        assert_eq!(s.background_opacity, 0.05, "{value}");
+        assert_eq!(warning.expect(value).line, Some(1));
+    }
+    std::fs::write(&path, "background_opacity = 0.05\n").unwrap();
+    assert!(Settings::load_checked(&path).unwrap().1.is_none());
 
     let mut s = Settings {
         background_opacity: f32::NAN,

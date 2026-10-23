@@ -112,6 +112,8 @@ pub enum Message {
     CloseRequested(window::Id),
     /// A window was resized (or has just reported its size).
     WindowResized(window::Id, iced::Size),
+    /// A window's mode, asked after a resize (entering or leaving full screen resizes).
+    WindowMode(window::Id, window::Mode),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
     SaveState(u64),
     /// `profiles.toml` and/or `settings.toml` changed on disk.
@@ -166,6 +168,8 @@ pub struct App {
     pub(crate) closing: std::collections::HashSet<window::Id>,
     /// Last known inner size of each terminal window.
     pub(crate) sizes: HashMap<window::Id, (f32, f32)>,
+    /// Windows in full screen (terminal windows and the editor).
+    pub fullscreen: std::collections::HashSet<window::Id>,
     /// Counts resizes, so only the last one of a burst saves.
     pub(crate) resize_count: u64,
     /// The text of `profiles.toml` / `settings.toml` as last loaded or written by us: a change
@@ -257,6 +261,19 @@ fn terminal_style(settings: &Settings) -> TerminalStyle {
         // `background_opacity`; see `window::view`.
         background_opacity: 0.0,
     }
+}
+
+/// Ask for `id`'s mode now and once the full-screen animation is over (the last resize can
+/// arrive before the OS reports the window as full screen).
+fn query_mode(id: window::Id) -> Task<Message> {
+    let now = window::mode(id).map(move |m| Message::WindowMode(id, m));
+    let settled = Task::perform(
+        async { tokio::time::sleep(Duration::from_millis(800)).await },
+        |()| (),
+    )
+    .then(move |()| window::mode(id))
+    .map(move |m| Message::WindowMode(id, m));
+    Task::batch([now, settled])
 }
 
 /// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`, ...); release
@@ -356,6 +373,7 @@ impl App {
             quitting: false,
             closing: Default::default(),
             sizes: HashMap::new(),
+            fullscreen: Default::default(),
             resize_count: 0,
             profiles_seen,
             settings_seen,
@@ -547,6 +565,7 @@ impl App {
                 // its dialogs answer "no".
                 let was_terminal = self.windows.remove(&id).is_some();
                 self.sizes.remove(&id);
+                self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
                 self.prompts.remove_window(id);
                 self.grids.remove(&id);
@@ -571,7 +590,17 @@ impl App {
             Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::Editor(msg) => self.editor_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
-            Message::WindowResized(id, size) => self.window_resized(id, size),
+            Message::WindowResized(id, size) => {
+                Task::batch([self.window_resized(id, size), query_mode(id)])
+            }
+            Message::WindowMode(id, mode) => {
+                if mode == window::Mode::Fullscreen {
+                    self.fullscreen.insert(id);
+                } else {
+                    self.fullscreen.remove(&id);
+                }
+                Task::none()
+            }
             Message::SaveState(n) => {
                 if n == self.resize_count {
                     self.save_state();
@@ -977,8 +1006,17 @@ impl App {
         }
         let backdrop =
             |s: &Settings| Chrome::current().backdrop(s.background_opacity, s.background_blur);
-        if backdrop(&new) != backdrop(&self.settings) && !self.windows.is_empty() {
-            tracing::info!("window transparency and blur apply to windows opened from now on");
+        let (old_b, new_b) = (backdrop(&self.settings), backdrop(&new));
+        if !self.windows.is_empty() {
+            if new_b.blur != old_b.blur {
+                tracing::info!("background blur applies to windows opened from now on");
+            }
+            if new_b.transparent && !old_b.transparent {
+                tracing::info!(
+                    "a see-through background shows in windows opened from now on; open windows \
+                     were created opaque"
+                );
+            }
         }
         tracing::info!("settings.toml reloaded");
         self.settings = new;
