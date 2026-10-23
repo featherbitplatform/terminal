@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-use crate::store::{ConfigError, atomic_write};
+use crate::store::{ConfigError, atomic_write, line_of};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,13 +33,24 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// Load settings, falling back to defaults when the file is missing or
-    /// unreadable. Missing fields in a partial file take their defaults.
+    /// Load settings. A missing file gives defaults; a malformed file is an
+    /// error carrying the 1-based line, and the file is never modified.
+    /// Missing fields in a partial file take their defaults.
+    pub fn load(path: &Path) -> Result<Self, ConfigError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(ConfigError::new(path, None, e.to_string())),
+        };
+        toml::from_str(&text).map_err(|e| {
+            let line = e.span().map(|s| line_of(&text, s.start));
+            ConfigError::new(path, line, e.message().to_string())
+        })
+    }
+
+    /// Like [`Settings::load`], but falls back to defaults on any error.
     pub fn load_or_default(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|text| toml::from_str(&text).ok())
-            .unwrap_or_default()
+        Self::load(path).unwrap_or_default()
     }
 
     pub fn save(&self, path: &Path) -> Result<(), ConfigError> {

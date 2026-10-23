@@ -236,3 +236,22 @@ fn paths_filenames() {
     assert_eq!(p.settings(), PathBuf::from("/x/settings.toml"));
     assert_eq!(p.state(), PathBuf::from("/x/state.toml"));
 }
+
+#[test]
+fn broken_settings_reports_line() {
+    let path = tmp("settings.toml");
+    let bytes = b"theme = \"dark\"\nfont_size = [\n";
+    std::fs::write(&path, bytes).unwrap();
+    let err = Settings::load(&path).unwrap_err();
+    assert!(matches!(err.line, Some(n) if n >= 2));
+    assert_eq!(err.path, path);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn missing_settings_load_is_ok_defaults() {
+    assert_eq!(
+        Settings::load(&tmp("nope.toml")).unwrap(),
+        Settings::default()
+    );
+}

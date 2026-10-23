@@ -11,7 +11,7 @@ pub struct Paths {
 impl Paths {
     /// Resolve the per-user configuration directory for the current platform.
     pub fn from_env() -> Self {
-        let config_dir = ProjectDirs::from("dev", "featherbit", "fbterm")
+        let config_dir = ProjectDirs::from("io", "featherbit", "fbterm")
             .map(|d| d.config_dir().to_path_buf())
             .unwrap_or_else(|| PathBuf::from("."));
         Self { config_dir }

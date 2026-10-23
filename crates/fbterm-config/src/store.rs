@@ -73,7 +73,7 @@ pub struct ProfileStore {
     pub profiles: Vec<Profile>,
 }
 
-fn line_of(text: &str, offset: usize) -> usize {
+pub(crate) fn line_of(text: &str, offset: usize) -> usize {
     let end = offset.min(text.len());
     text.as_bytes()[..end]
         .iter()
