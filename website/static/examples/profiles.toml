@@ -1,0 +1,42 @@
+# ~/Library/Application Support/io.featherbit.fbterm/profiles.toml
+
+[[profiles]]
+id = "6f1c2f0e-3a55-4a0b-9d3e-1b6f5c1d0a01"
+name = "Local zsh"
+kind = "local"
+program = "/bin/zsh"
+args = ["-l"]
+cwd = "/Users/ada/src"
+env = { EDITOR = "nvim" }
+
+[[profiles]]
+id = "0b8a6c52-7d4e-4f0c-8a11-5e2d9c7b3a02"
+name = "bastion"
+group = "prod"
+accent = "#e0a030"
+kind = "ssh"
+host = "bastion.example.com"
+user = "ada"
+auth = { type = "key", path = "~/.ssh/id_ed25519", passphrase = true }
+
+[[profiles]]
+id = "c3d94e17-92b6-4c38-b5a0-77f0e41d8a03"
+name = "api-1"
+group = "prod"
+accent = "#7c49e3"
+kind = "ssh"
+host = "10.0.4.21"
+port = 2222
+user = "deploy"
+auth = { type = "agent" }
+jump = ["0b8a6c52-7d4e-4f0c-8a11-5e2d9c7b3a02"]
+
+[[profiles]]
+id = "e57a1b90-1c2d-4e6f-93a4-0d8b6a5f2c04"
+name = "db-1"
+group = "prod"
+kind = "ssh"
+host = "db-1.internal"
+user = "ada"
+auth = { type = "password" }
+jump = ["c3d94e17-92b6-4c38-b5a0-77f0e41d8a03"]
