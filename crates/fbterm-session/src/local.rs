@@ -7,7 +7,7 @@ use std::sync::mpsc::channel;
 use std::time::Duration;
 
 use fbterm_config::LocalProfile;
-use fbterm_term::{GridSize, Terminal};
+use fbterm_term::{GridSize, SharedTerminal, Terminal};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -27,13 +27,25 @@ fn pty_size(size: GridSize) -> PtySize {
     }
 }
 
-/// Spawn the profile's program on a new PTY and feed its output into a shared terminal.
+/// Spawn the profile's program on a new PTY and feed its output into a new shared terminal.
 pub fn spawn_local(
     profile: &LocalProfile,
     size: GridSize,
     scrollback: usize,
     events: EventSink,
 ) -> Result<SessionHandle, SessionError> {
+    let terminal = Arc::new(Mutex::new(Terminal::new(size, scrollback)));
+    spawn_local_into(profile, terminal, events)
+}
+
+/// Like [`spawn_local`], but the program's output continues in an existing terminal (at its
+/// current size), below whatever it already shows; its scrollback is kept.
+pub fn spawn_local_into(
+    profile: &LocalProfile,
+    terminal: SharedTerminal,
+    events: EventSink,
+) -> Result<SessionHandle, SessionError> {
+    let size = terminal.lock().size();
     let pair = native_pty_system()
         .openpty(pty_size(size))
         .map_err(|e| SessionError::Pty(e.to_string()))?;
@@ -78,7 +90,6 @@ pub fn spawn_local(
     let killer = Mutex::new(child.clone_killer());
 
     let id = SessionId::next();
-    let terminal = Arc::new(Mutex::new(Terminal::new(size, scrollback)));
     let dirty_pending = Arc::new(AtomicBool::new(false));
     let bell_pending = Arc::new(AtomicBool::new(false));
     let (tx, rx) = unbounded_channel::<Command>();

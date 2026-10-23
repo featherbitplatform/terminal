@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use alacritty_terminal::index::{Column, Line};
 use fbterm_config::LocalProfile;
-use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId, spawn_local};
-use fbterm_term::GridSize;
+use fbterm_session::{
+    EventSink, SessionEvent, SessionHandle, SessionId, spawn_local, spawn_local_into,
+};
+use fbterm_term::{GridSize, Terminal};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::time::timeout;
 
@@ -207,4 +209,25 @@ async fn close_kills_child_with_blocked_writer() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     h.close();
     wait_exit(&mut rx).await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn respawn_into_existing_terminal_keeps_old_content() {
+    let mut term = Terminal::new(size(80, 24), 100);
+    term.feed(b"old-session-line\r\n");
+    let term = std::sync::Arc::new(parking_lot::Mutex::new(term));
+    let (tx, mut rx): (EventSink, _) = unbounded_channel();
+    let h = spawn_local_into(
+        &profile("sh", &["-c", "echo new-session-line"]),
+        term.clone(),
+        tx,
+    )
+    .expect("spawn");
+    assert!(std::sync::Arc::ptr_eq(&h.terminal, &term));
+    assert_eq!(wait_exit(&mut rx).await, Some(0));
+    let text = grid_text(&h);
+    let old = text.find("old-session-line").expect("old content kept");
+    let new = text.find("new-session-line").expect("new output shown");
+    assert!(old < new, "new output must follow the old content:\n{text}");
 }

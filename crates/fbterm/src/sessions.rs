@@ -6,7 +6,7 @@ use std::sync::Arc;
 use fbterm_config::{Profile, ProfileKind};
 use fbterm_secrets::SecretKind;
 use fbterm_session::ssh::{Prompter, SecretAnswer};
-use fbterm_session::{SessionEvent, SessionHandle, SessionId, spawn_local};
+use fbterm_session::{SessionEvent, SessionHandle, SessionId, spawn_local_into};
 use fbterm_term::{GridSize, SharedTerminal, Terminal, TerminalOutput};
 use iced::Task;
 use iced::futures::Stream;
@@ -76,8 +76,7 @@ impl App {
     /// (Re)start a tab's session: spawn a local program, or dial an SSH profile.
     pub(crate) fn start(&mut self, wid: window::Id, id: TabId) -> Task<Message> {
         let grid = self.grids.get(&wid).copied().unwrap_or(DEFAULT_GRID);
-        let scrollback = self.settings.scrollback_lines;
-        let placeholder = self.new_terminal(grid);
+        let fresh_terminal = self.new_terminal(grid);
         let events = self.events.clone();
         let profile: Option<Profile> = self
             .windows
@@ -91,21 +90,32 @@ impl App {
         }) else {
             return Task::none();
         };
+        // A restart continues in the tab's terminal, so its output and scrollback stay; the
+        // first start gets a new one.
+        let (terminal, fresh) = match tab.terminal() {
+            Some(t) => {
+                t.lock().feed(tabs::RESTART_RESET);
+                (t.clone(), false)
+            }
+            None => (fresh_terminal, true),
+        };
         // Drop the previous session (and any dial in flight) before starting again.
         tab.session = None;
         tab.connecting = None;
         tab.title = tab.name.clone();
-        tab.placeholder = Some(placeholder);
+        tab.placeholder = Some(terminal.clone());
         let Some(profile) = profile else {
             tab.state = TabState::Disconnected("profile not found".into());
-            write_notice(tab, "this profile no longer exists", true);
+            write_notice(tab, "this profile no longer exists", fresh);
             return Task::none();
         };
         match &profile.kind {
             ProfileKind::Local(local) => {
-                match spawn_local(local, grid, scrollback, events) {
+                match spawn_local_into(local, terminal, events) {
                     Ok(handle) => {
-                        scheme.apply_to(&mut handle.terminal.lock());
+                        if fresh {
+                            scheme.apply_to(&mut handle.terminal.lock());
+                        }
                         tab.session = Some(handle);
                         tab.placeholder = None;
                         tab.state = TabState::Connected;
@@ -116,7 +126,7 @@ impl App {
                             profile.name
                         );
                         tab.state = TabState::Disconnected(e.to_string());
-                        write_notice(tab, &text, true);
+                        write_notice(tab, &text, fresh);
                     }
                 }
                 Task::none()
@@ -126,13 +136,14 @@ impl App {
                 write_notice(
                     tab,
                     &format!("connecting to {}@{}:{}", ssh.user, ssh.host, ssh.port),
-                    true,
+                    fresh,
                 );
                 let pool = self.pool.clone();
                 let store = self.profiles.clone();
                 let pid = profile.id;
+                let terminal = terminal.clone();
                 let dial = async move {
-                    pool.open_shell(&store, &pid, grid, scrollback, events)
+                    pool.open_shell_into(&store, &pid, terminal, events)
                         .await
                         .map_err(|e| e.to_string())
                 };
@@ -148,10 +159,9 @@ impl App {
     }
 
     pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle) {
-        let scheme = self.style.scheme;
-        // A tab closed meanwhile drops the handle here, closing the shell.
+        // A tab closed meanwhile drops the handle here, closing the shell. The session writes
+        // into the tab's own terminal, which already carries the color scheme.
         let Some(tab) = self.tab_mut(id) else { return };
-        scheme.apply_to(&mut handle.terminal.lock());
         tab.session = Some(handle);
         tab.placeholder = None;
         tab.connecting = None;
@@ -159,23 +169,25 @@ impl App {
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {
-        let Some(tab) = self.windows.values_mut().find_map(|w| {
-            w.tabs
-                .iter_mut()
-                .find(|t| t.session.as_ref().is_some_and(|s| s.id == sid))
+        let Some((window, index)) = self.windows.values_mut().find_map(|w| {
+            let i = w
+                .tabs
+                .iter()
+                .position(|t| t.session.as_ref().is_some_and(|s| s.id == sid))?;
+            Some((w, i))
         }) else {
             return Task::none();
         };
+        if event == SessionEvent::Dirty {
+            // A visible tab re-arms here, before the redraw that follows this update locks
+            // the terminal. A hidden tab leaves the flag pending, so its session raises no
+            // further Dirty until the tab is shown (see `App::shown`).
+            tabs::on_dirty(window, index);
+            return Task::none();
+        }
+        let tab = &mut window.tabs[index];
         match &event {
-            SessionEvent::Dirty => {
-                // Re-arm before the redraw that follows this update locks the terminal. Only the
-                // active tab of a window builds a terminal view, so a hidden tab just re-arms and
-                // draws nothing until it is shown.
-                if let Some(s) = &tab.session {
-                    s.take_dirty();
-                }
-                Task::none()
-            }
+            SessionEvent::Dirty => Task::none(),
             SessionEvent::ClipboardStore(text) => iced::clipboard::write(text.clone()),
             _ => {
                 if let Some(text) = tabs::apply_event(tab, &event) {

@@ -16,4 +16,4 @@ fbterm-config = { path = "../fbterm-config" }
 [dev-dependencies]
 iced = { workspace = true, features = ["wgpu", "tokio", "advanced"] }
 portable-pty = { workspace = true }
-png = "0.17"
+png = { workspace = true }

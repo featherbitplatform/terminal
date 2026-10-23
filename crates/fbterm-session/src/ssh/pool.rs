@@ -17,7 +17,7 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use fbterm_config::{Profile, ProfileId, ProfileStore, ValidationError};
-use fbterm_term::{GridSize, Terminal};
+use fbterm_term::{GridSize, SharedTerminal, Terminal};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use parking_lot::Mutex;
 use russh::ChannelMsg;
@@ -59,6 +59,19 @@ impl SshPool {
         scrollback: usize,
         events: EventSink,
     ) -> Result<SessionHandle, SshError> {
+        let terminal = Arc::new(Mutex::new(Terminal::new(size, scrollback)));
+        self.open_shell_into(store, profile, terminal, events).await
+    }
+
+    /// Like [`SshPool::open_shell`], but the shell's output continues in an existing terminal
+    /// (at its current size), below whatever it already shows; its scrollback is kept.
+    pub async fn open_shell_into(
+        &self,
+        store: &ProfileStore,
+        profile: &ProfileId,
+        terminal: SharedTerminal,
+        events: EventSink,
+    ) -> Result<SessionHandle, SshError> {
         let target = store
             .get(*profile)
             .ok_or_else(|| {
@@ -83,7 +96,7 @@ impl SshPool {
                 Connection::mark_dead,
                 move || dial(chain.clone(), target.clone(), ctx.clone()).boxed(),
                 move |connection| {
-                    open_shell_channel(connection, size, scrollback, events.clone()).boxed()
+                    open_shell_channel(connection, terminal.clone(), events.clone()).boxed()
                 },
             )
             .await
@@ -235,10 +248,10 @@ async fn dial(
 /// Open a shell channel on `connection` and wire it to a new session.
 async fn open_shell_channel(
     connection: Arc<Connection>,
-    size: GridSize,
-    scrollback: usize,
+    terminal: SharedTerminal,
     events: EventSink,
 ) -> Result<SessionHandle, SshError> {
+    let size = terminal.lock().size();
     let channel = tokio::time::timeout(HOP_TIMEOUT, connection.target().channel_open_session())
         .await
         .map_err(|_| timed_out("the server did not open a shell channel".into()))??;
@@ -258,7 +271,6 @@ async fn open_shell_channel(
     let (read, write) = channel.split();
 
     let id = SessionId::next();
-    let terminal = Arc::new(Mutex::new(Terminal::new(size, scrollback)));
     let dirty_pending = Arc::new(AtomicBool::new(false));
     let bell_pending = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::unbounded_channel::<Command>();

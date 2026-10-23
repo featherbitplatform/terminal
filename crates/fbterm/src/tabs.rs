@@ -109,10 +109,40 @@ pub fn notice(state: &TabState) -> Option<String> {
 }
 
 /// The notice as terminal bytes: dim, on a line of its own (unless the terminal is still at
-/// its first column of an empty screen), cursor hidden; scrollback untouched.
+/// its first column of an empty screen); scrollback untouched.
 pub fn notice_bytes(text: &str, fresh: bool) -> Vec<u8> {
     let lead = if fresh { "" } else { "\r\n" };
-    format!("{lead}\x1b[0m\x1b[?25l\x1b[2m{text}\x1b[0m\r\n").into_bytes()
+    format!("{lead}\x1b[0m\x1b[2m{text}\x1b[0m\r\n").into_bytes()
+}
+
+/// Fed into a tab's terminal before a new session continues in it: undoes the modes the
+/// previous program may have left on (alternate screen, hidden cursor, mouse reporting,
+/// bracketed paste, application keys, scroll region, colors) without clearing the screen or
+/// moving the cursor, so the new output starts below the old content.
+pub const RESTART_RESET: &[u8] = b"\x1b[?1049l\x1b[0m\x1b[?25h\x1b[?1l\x1b>\x1b[?6l\
+\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1004l\x1b[?2004l\x1b[?7h\
+\x1b7\x1b[r\x1b8";
+
+/// A session in tab `index` of `window` reported `Dirty`. Only a visible tab takes the flag
+/// (re-arming its next `Dirty`) and asks for a redraw; a hidden tab leaves it pending, so its
+/// session stays quiet until the tab is shown. Returns whether to redraw.
+pub fn on_dirty(window: &WindowState, index: usize) -> bool {
+    if index != window.active {
+        return false;
+    }
+    if let Some(s) = window.tabs.get(index).and_then(|t| t.session.as_ref()) {
+        s.take_dirty();
+    }
+    true
+}
+
+/// The active tab of `window` has just been shown (selected, created, its window focused):
+/// take its pending redraw. Returns whether one was pending.
+pub fn on_shown(window: &WindowState) -> bool {
+    window
+        .active_tab()
+        .and_then(|t| t.session.as_ref())
+        .is_some_and(SessionHandle::take_dirty)
 }
 
 /// Apply a session event to its tab. Returns the notice to print, if the state changed to one
@@ -309,14 +339,80 @@ mod tests {
     }
 
     #[test]
+    fn restart_reset_keeps_old_content_and_continues_below() {
+        use alacritty_terminal::index::{Column, Line};
+        let size = fbterm_term::GridSize {
+            cols: 20,
+            rows: 6,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        };
+        let mut term = fbterm_term::Terminal::new(size, 100);
+        // A program that wrote two lines, then left the alternate screen, a scroll region and
+        // a hidden cursor behind.
+        term.feed(b"aaa\r\nbbb\r\n\x1b[?1049h\x1b[2;4r\x1b[?25lalt");
+        term.feed(RESTART_RESET);
+        term.feed(b"ccc");
+        let row = |r: i32| -> String {
+            (0..3)
+                .map(|c| term.term().grid()[Line(r)][Column(c)].c)
+                .collect()
+        };
+        assert_eq!([row(0), row(1), row(2)], ["aaa", "bbb", "ccc"]);
+        assert!(term.mode().contains(fbterm_term::TermMode::SHOW_CURSOR));
+        assert!(!term.mode().contains(fbterm_term::TermMode::ALT_SCREEN));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hidden_tab_leaves_dirty_pending_until_shown() {
+        use std::time::{Duration, Instant};
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let local = fbterm_config::LocalProfile {
+            program: "/bin/sh".into(),
+            args: vec!["-c".into(), "echo hi; sleep 5".into()],
+            cwd: None,
+            env: Default::default(),
+        };
+        let size = fbterm_term::GridSize {
+            cols: 80,
+            rows: 24,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        };
+        let session = fbterm_session::spawn_local(&local, size, 100, tx).expect("spawn");
+        let mut w = WindowState::new();
+        let mut hidden = tab("busy");
+        hidden.session = Some(session);
+        w.push(hidden);
+        w.push(tab("front"));
+        // Wait for the hidden session's Dirty.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match rx.try_recv() {
+                Ok((_, SessionEvent::Dirty)) => break,
+                _ if Instant::now() > deadline => panic!("no Dirty"),
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(!on_dirty(&w, 0), "hidden tab must not redraw");
+        // Still pending: showing the tab takes it.
+        assert!(w.select(0));
+        assert!(on_shown(&w), "showing the tab takes the pending redraw");
+        assert!(!on_shown(&w), "taken once");
+        // Visible now: a Dirty re-arms and redraws.
+        assert!(on_dirty(&w, 0));
+    }
+
+    #[test]
     fn notice_bytes_are_dim_on_their_own_line() {
         assert_eq!(
             notice_bytes("x", false),
-            b"\r\n\x1b[0m\x1b[?25l\x1b[2mx\x1b[0m\r\n".to_vec()
+            b"\r\n\x1b[0m\x1b[2mx\x1b[0m\r\n".to_vec()
         );
         assert_eq!(
             notice_bytes("x", true),
-            b"\x1b[0m\x1b[?25l\x1b[2mx\x1b[0m\r\n".to_vec()
+            b"\x1b[0m\x1b[2mx\x1b[0m\r\n".to_vec()
         );
     }
 

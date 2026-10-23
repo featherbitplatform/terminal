@@ -13,7 +13,7 @@ use iced::{
     keyboard, mouse,
 };
 
-use crate::app::{App, Message};
+use crate::app::{App, Message, TabBarMsg};
 use crate::keys::{self, Action};
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
@@ -37,13 +37,13 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };
-    let style = if app.focused == Some(id) {
+    let style = if app.app_active && app.focused == Some(id) {
         &app.style
     } else {
         &app.style_unfocused
     };
     let term_bg = to_color(style.scheme.background);
-    let mut body = column![tab_bar(t, term_bg, &win.tabs, win.active)];
+    let mut body = column![tab_bar(t, id, term_bg, &win.tabs, win.active)];
     let notices = app.visible_notices();
     if !notices.is_empty() {
         body = body.push(notice_banner(t, notices));
@@ -51,6 +51,14 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     // Only the active tab builds a terminal view; background tabs render nothing.
     let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
         Some(term) => terminal_view(term, style, move |o| Message::Terminal(id, o)),
+        None if win.tabs.is_empty() => container(
+            text("No shells found. Add a profile in profiles.toml.")
+                .font(UI_FONT)
+                .size(13)
+                .color(t.text_muted),
+        )
+        .center(Length::Fill)
+        .into(),
         None => text("").into(),
     };
     body = body.push(
@@ -99,16 +107,24 @@ fn dot<'a>(color: Color) -> Element<'a, Message> {
 
 fn tab_bar<'a>(
     t: &'static Tokens,
+    window: window::Id,
     active_bg: Color,
     tabs: &'a [Tab],
     active: usize,
 ) -> Element<'a, Message> {
+    let msg = move |m| Message::TabBar(window, m);
     let mut bar = row![].spacing(2).align_y(Alignment::End);
     for (i, tab) in tabs.iter().enumerate() {
-        bar = bar.push(tab_button(t, tab, i, (i == active).then_some(active_bg)));
+        bar = bar.push(tab_button(
+            t,
+            window,
+            tab,
+            i,
+            (i == active).then_some(active_bg),
+        ));
     }
     let new_tab = button(icon(ICON_PLUS, 14.0, t.text_muted))
-        .on_press(Message::NewTab)
+        .on_press(msg(TabBarMsg::New))
         .padding(7)
         .style(move |_, status| ghost(t, status));
     bar = bar.push(
@@ -155,6 +171,7 @@ fn ghost(t: &Tokens, status: button::Status) -> button::Style {
 /// two read as one surface.
 fn tab_button<'a>(
     t: &'static Tokens,
+    window: window::Id,
     tab: &'a Tab,
     index: usize,
     active_bg: Option<Color>,
@@ -177,7 +194,7 @@ fn tab_button<'a>(
         .wrapping(text::Wrapping::None)
         .color(if active { t.text } else { t.text_secondary });
     let close = button(icon(ICON_X, 12.0, t.text_muted))
-        .on_press(Message::CloseTab(index))
+        .on_press(Message::TabBar(window, TabBarMsg::Close(index)))
         .padding(3)
         .style(move |_, status| ghost(t, status));
     let inner = row![
@@ -191,7 +208,7 @@ fn tab_button<'a>(
     .align_y(Alignment::Center);
     let surface_bg = active_bg.map(Background::Color);
     button(inner)
-        .on_press(Message::SelectTab(index))
+        .on_press(Message::TabBar(window, TabBarMsg::Select(index)))
         .width(Length::Fixed(196.0))
         .height(TAB_BAR_HEIGHT - 6.0)
         .padding(Padding {
