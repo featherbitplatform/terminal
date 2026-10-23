@@ -32,8 +32,6 @@ pub enum SessionEvent {
     Dirty,
     Title(String),
     Bell,
-    /// The program asked to store text on the clipboard (OSC 52).
-    ClipboardStore(String),
     Exited(Option<i32>),
     Disconnected(String),
 }
@@ -216,7 +214,6 @@ impl Feeder {
                         self.send(SessionEvent::Bell);
                     }
                 }
-                TermEvent::ClipboardStore(s) => self.send(SessionEvent::ClipboardStore(s)),
                 TermEvent::Exit => {}
             }
         }

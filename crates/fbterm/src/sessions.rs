@@ -197,7 +197,6 @@ impl App {
         let tab = &mut window.tabs[index];
         match &event {
             SessionEvent::Dirty => Task::none(),
-            SessionEvent::ClipboardStore(text) => iced::clipboard::write(text.clone()),
             _ => {
                 if let Some(text) = tabs::apply_event(tab, &event) {
                     write_notice(tab, &text, false);

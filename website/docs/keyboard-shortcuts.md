@@ -6,7 +6,7 @@ sidebar_label: Keyboard shortcuts
 
 Application shortcuts use `Cmd` on macOS. On Linux and Windows every shortcut is `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it.
 
-On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled by the terminal view and are not in this table.
+On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled by the terminal view and are not in this table. Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
 
 ## Windows and tabs
 

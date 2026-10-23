@@ -183,7 +183,7 @@ pub fn apply_event(tab: &mut Tab, event: &SessionEvent) -> Option<String> {
             tab.state = TabState::Disconnected(reason.clone());
             notice(&tab.state)
         }
-        SessionEvent::Dirty | SessionEvent::Bell | SessionEvent::ClipboardStore(_) => None,
+        SessionEvent::Dirty | SessionEvent::Bell => None,
     }
 }
 
