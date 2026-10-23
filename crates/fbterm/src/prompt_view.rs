@@ -8,6 +8,7 @@ use iced::{Alignment, Color, Element, Length, Padding};
 
 use crate::app::Message;
 use crate::prompts::{Dialog, PromptMsg, host_port, keygen_command};
+use crate::redact::Redacted;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -129,8 +130,8 @@ pub fn view<'a>(
             let field = text_input(&format!("Enter the {what}"), value)
                 .id(input.clone())
                 .secure(true)
-                .on_input(move |v| msg(PromptMsg::Input(window, v)))
-                .on_submit(msg(PromptMsg::Submit(window)))
+                .on_input(move |v| msg(PromptMsg::Input(window, Redacted(v))))
+                .on_submit_maybe(dialog.can_submit().then(|| msg(PromptMsg::Submit(window))))
                 .font(UI_FONT)
                 .size(13.5)
                 .padding(Padding::from([8.0, 10.0]))
@@ -162,7 +163,12 @@ pub fn view<'a>(
                 buttons(vec![
                     ui::text_button(t, "Cancel", Some(msg(PromptMsg::Cancel(window))), ui::secondary)
                         .into(),
-                    ui::text_button(t, "Connect", Some(msg(PromptMsg::Submit(window))), ui::primary)
+                    ui::text_button(
+                        t,
+                        "Connect",
+                        dialog.can_submit().then(|| msg(PromptMsg::Submit(window))),
+                        ui::primary,
+                    )
                         .into(),
                 ]),
             ]

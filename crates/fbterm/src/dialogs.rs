@@ -3,7 +3,7 @@
 use iced::{Task, window};
 
 use crate::app::{App, Message, load_profiles};
-use crate::editor::{EditorMsg, EditorState};
+use crate::editor::{EditorMsg, EditorState, SaveError};
 use crate::palette;
 use crate::prompts::{Dialog, PromptEvent, PromptMsg};
 
@@ -68,7 +68,8 @@ impl App {
         open.discard()
     }
 
-    /// Validate, write `profiles.toml` atomically, then use the new profiles everywhere.
+    /// Validate, write `profiles.toml` atomically, then change the keychain and use the new
+    /// profiles everywhere.
     fn save_profiles(&mut self) {
         let path = self.paths.profiles();
         let refused = self.profiles_error.is_some();
@@ -80,21 +81,28 @@ impl App {
                 Some("profiles.toml failed to load: fix it and reload before saving".into());
             return;
         }
-        let mut candidate = self.profiles.clone();
-        if ed.apply(&mut candidate).is_err() {
-            ed.notice = None;
-            return;
-        }
-        match candidate.save(&path) {
+        let saved = match ed.save(&mut self.profiles, &path) {
             Ok(()) => {
                 ed.notice = Some("Saved".into());
-                self.profiles = candidate;
-                self.profiles_changed();
+                true
             }
-            Err(e) => {
-                ed.dirty = true;
+            Err(SaveError::Invalid(errors)) => {
+                tracing::info!(problems = errors.len(), "profiles not saved: invalid");
+                ed.notice = None;
+                false
+            }
+            Err(SaveError::Write(e)) => {
                 ed.notice = Some(format!("Could not save: {e}"));
+                false
             }
+            // The file was written; only some keychain changes failed.
+            Err(SaveError::Secrets(failures)) => {
+                ed.notice = Some(format!("Profiles saved, but {}", failures.join("; ")));
+                true
+            }
+        };
+        if saved {
+            self.profiles_changed();
         }
     }
 
@@ -178,7 +186,7 @@ impl App {
             }
             PromptMsg::Input(w, v) => {
                 if let Some(Dialog::Secret { value, .. }) = self.prompts.front_mut(w) {
-                    *value = v;
+                    *value = v.0;
                 }
                 Task::none()
             }

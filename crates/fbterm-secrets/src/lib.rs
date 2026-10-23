@@ -31,7 +31,10 @@ pub enum SecretError {
 pub trait SecretStore: Send + Sync {
     fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError>;
     fn set(&self, id: &ProfileId, kind: SecretKind, value: &str) -> Result<(), SecretError>;
+    /// Forget every secret of a profile.
     fn remove(&self, id: &ProfileId) -> Result<(), SecretError>;
+    /// Forget one kind of secret of a profile (its other kind is kept).
+    fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError>;
 }
 
 /// The secrets of one profile; also the JSON shape stored per profile.
@@ -59,6 +62,13 @@ impl ProfileSecrets {
     pub(crate) fn set(&mut self, kind: SecretKind, value: &str) {
         *self.slot(kind) = Some(value.to_owned());
     }
+    /// Clear one kind; returns whether there was something to clear.
+    pub(crate) fn clear(&mut self, kind: SecretKind) -> bool {
+        self.slot(kind).take().is_some()
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.password.is_none() && self.key_passphrase.is_none()
+    }
 }
 
 /// In-memory store: used by tests and as the session fallback.
@@ -83,6 +93,16 @@ impl SecretStore for MemoryStore {
     }
     fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
         self.map.lock().remove(id);
+        Ok(())
+    }
+    fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+        let mut map = self.map.lock();
+        if let Some(p) = map.get_mut(id) {
+            p.clear(kind);
+            if p.is_empty() {
+                map.remove(id);
+            }
+        }
         Ok(())
     }
 }
@@ -162,6 +182,12 @@ impl SecretStore for FallbackStore {
             None => self.session.remove(id),
         }
     }
+    fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+        match self.try_primary(|p| p.remove_kind(id, kind)) {
+            Some(()) => Ok(()),
+            None => self.session.remove_kind(id, kind),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,6 +231,9 @@ mod tests {
         fn remove(&self, _: &ProfileId) -> Result<(), SecretError> {
             Err(SecretError::Backend("denied".into()))
         }
+        fn remove_kind(&self, _: &ProfileId, _: SecretKind) -> Result<(), SecretError> {
+            Err(SecretError::Backend("denied".into()))
+        }
     }
 
     #[test]
@@ -225,6 +254,79 @@ mod tests {
         s.remove(&id).unwrap();
         assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
         assert_eq!(s.get(&id, SecretKind::KeyPassphrase).unwrap(), None);
+    }
+
+    #[test]
+    fn memory_store_remove_kind_keeps_the_other_kind() {
+        let s = MemoryStore::new();
+        let id = pid();
+        s.set(&id, SecretKind::Password, "pw").unwrap();
+        s.set(&id, SecretKind::KeyPassphrase, "pp").unwrap();
+        s.remove_kind(&id, SecretKind::Password).unwrap();
+        assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
+        assert_eq!(
+            s.get(&id, SecretKind::KeyPassphrase).unwrap().as_deref(),
+            Some("pp")
+        );
+        s.remove_kind(&id, SecretKind::KeyPassphrase).unwrap();
+        assert!(s.map.lock().is_empty(), "an empty profile entry is pruned");
+        s.remove_kind(&pid(), SecretKind::Password).unwrap();
+    }
+
+    #[test]
+    fn keychain_remove_kind_rewrites_only_when_needed() {
+        let mock = Arc::new(MockBlob::default());
+        let s = KeychainStore::with_backend(Box::new(mock.clone()));
+        let (a, b) = (pid(), pid());
+        s.set(&a, SecretKind::Password, "pw").unwrap();
+        s.set(&a, SecretKind::KeyPassphrase, "pp").unwrap();
+        s.set(&b, SecretKind::Password, "other").unwrap();
+        s.remove_kind(&a, SecretKind::Password).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&mock.blob.lock().clone().unwrap()).unwrap();
+        assert!(v[a.to_string()].get("password").is_none());
+        assert_eq!(v[a.to_string()]["key_passphrase"], "pp");
+        assert_eq!(v[b.to_string()]["password"], "other");
+        let stores = mock.stores.load(Ordering::SeqCst);
+        s.remove_kind(&a, SecretKind::Password).unwrap();
+        s.remove_kind(&pid(), SecretKind::Password).unwrap();
+        assert_eq!(
+            mock.stores.load(Ordering::SeqCst),
+            stores,
+            "nothing to clear"
+        );
+        s.remove_kind(&a, SecretKind::KeyPassphrase).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&mock.blob.lock().clone().unwrap()).unwrap();
+        assert!(v.get(a.to_string()).is_none(), "empty entries are pruned");
+    }
+
+    #[test]
+    fn fallback_remove_kind_uses_the_session_store_when_degraded() {
+        let s = FallbackStore::with_primary(Box::new(FailingStore));
+        let id = pid();
+        s.set(&id, SecretKind::Password, "pw").unwrap();
+        s.set(&id, SecretKind::KeyPassphrase, "pp").unwrap();
+        s.remove_kind(&id, SecretKind::Password).unwrap();
+        assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
+        assert_eq!(
+            s.get(&id, SecretKind::KeyPassphrase).unwrap().as_deref(),
+            Some("pp")
+        );
+    }
+
+    #[test]
+    fn fallback_remove_kind_reaches_the_keychain() {
+        let mock = Arc::new(MockBlob::default());
+        let s = FallbackStore::with_primary(Box::new(KeychainStore::with_backend(Box::new(
+            mock.clone(),
+        ))));
+        let id = pid();
+        s.set(&id, SecretKind::Password, "pw").unwrap();
+        s.remove_kind(&id, SecretKind::Password).unwrap();
+        assert!(!s.degraded());
+        assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
+        assert!(!mock.blob.lock().clone().unwrap().contains("pw"));
     }
 
     #[test]

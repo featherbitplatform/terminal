@@ -1,14 +1,20 @@
 //! Editor state rules.
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use fbterm_secrets::{MemoryStore, SecretError};
 use parking_lot::Mutex;
 
-/// Records every call, backed by memory.
+/// Records every call, backed by memory; `set` can be made to fail.
 #[derive(Default)]
 struct Recording {
     inner: MemoryStore,
     removed: Mutex<Vec<ProfileId>>,
+    removed_kinds: Mutex<Vec<(ProfileId, SecretKind)>>,
+    /// Every call in order: "set", "remove_kind", "remove".
+    log: Mutex<Vec<&'static str>>,
+    fail_set: AtomicBool,
 }
 
 impl SecretStore for Recording {
@@ -16,11 +22,50 @@ impl SecretStore for Recording {
         self.inner.get(id, kind)
     }
     fn set(&self, id: &ProfileId, kind: SecretKind, value: &str) -> Result<(), SecretError> {
+        self.log.lock().push("set");
+        if self.fail_set.load(Ordering::SeqCst) {
+            return Err(SecretError::Backend("denied".into()));
+        }
         self.inner.set(id, kind, value)
     }
     fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
+        self.log.lock().push("remove");
         self.removed.lock().push(*id);
         self.inner.remove(id)
+    }
+    fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+        self.log.lock().push("remove_kind");
+        self.removed_kinds.lock().push((*id, kind));
+        self.inner.remove_kind(id, kind)
+    }
+}
+
+/// A fresh, writable `profiles.toml` path.
+fn file() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("fbterm-editor-{}", ProfileId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.join("profiles.toml")
+}
+
+/// A `profiles.toml` path that cannot be written (its parent is a file).
+fn unwritable() -> PathBuf {
+    let blocker = std::env::temp_dir().join(format!("fbterm-blocker-{}", ProfileId::new()));
+    std::fs::write(&blocker, "not a directory").unwrap();
+    blocker.join("profiles.toml")
+}
+
+fn ssh_with(name: &str, auth: AuthMethod) -> Profile {
+    let mut p = ssh(name, "10.0.0.5", vec![]);
+    if let ProfileKind::Ssh(s) = &mut p.kind {
+        s.auth = auth;
+    }
+    p
+}
+
+fn typed_secret(ed: &EditorState, id: ProfileId) -> String {
+    match &ed.draft(id).unwrap().kind {
+        DraftKind::Ssh(s) => s.secret.clone(),
+        DraftKind::Local(_) => panic!("ssh"),
     }
 }
 
@@ -69,13 +114,17 @@ fn new_ssh_profile_with_empty_host_is_refused() {
     let (mut ed, _) = editor(&store);
     ed.update(EditorMsg::NewSsh);
     let name = ed.selected_draft().unwrap().name.clone();
-    let errs = ed.apply(&mut store).unwrap_err();
+    let path = file();
+    let Err(SaveError::Invalid(errs)) = ed.save(&mut store, &path) else {
+        panic!("refused")
+    };
     assert_eq!(errs, vec![ValidationError::EmptyHost(name)]);
     assert_eq!(ed.errors, errs);
     assert_eq!(store, before, "an invalid store is never applied");
+    assert!(!path.exists(), "an invalid store is never written");
 
     ed.update(EditorMsg::Host("10.0.0.5".into()));
-    ed.apply(&mut store).unwrap();
+    ed.save(&mut store, &file()).unwrap();
     assert_eq!(store.profiles.len(), 2);
     assert!(ed.errors.is_empty());
 }
@@ -128,7 +177,7 @@ fn renaming_keeps_the_id_so_jumps_survive() {
     let (mut ed, _) = editor(&store);
     ed.update(EditorMsg::Select(bastion.id));
     ed.update(EditorMsg::Name("edge".into()));
-    ed.apply(&mut store).unwrap();
+    ed.save(&mut store, &file()).unwrap();
     let renamed = store.get(bastion.id).expect("same id");
     assert_eq!(renamed.name, "edge");
     let chain: Vec<&str> = store
@@ -157,7 +206,7 @@ fn deleting_a_jump_host_is_refused_with_its_dependants() {
     ed.update(EditorMsg::Delete);
     assert!(ed.draft(bastion.id).is_some());
     assert!(ed.notice.as_deref().unwrap().contains("web, db"));
-    ed.apply(&mut store).unwrap();
+    ed.save(&mut store, &file()).unwrap();
     assert_eq!(store.profiles.len(), 3);
     assert!(secrets.removed.lock().is_empty());
 }
@@ -171,8 +220,8 @@ fn typed_password_goes_to_the_secret_store_never_the_profile() {
     let (mut ed, secrets) = editor(&store);
     ed.update(EditorMsg::Select(web.id));
     ed.update(EditorMsg::Auth(AuthChoice::Password));
-    ed.update(EditorMsg::Secret("hunter2-secret".into()));
-    ed.apply(&mut store).unwrap();
+    ed.update(EditorMsg::Secret(Redacted("hunter2-secret".into())));
+    ed.save(&mut store, &file()).unwrap();
     assert_eq!(
         secrets
             .get(&web.id, SecretKind::Password)
@@ -214,7 +263,7 @@ fn deleting_a_profile_removes_its_secrets() {
         secrets.removed.lock().is_empty(),
         "nothing is removed before saving"
     );
-    ed.apply(&mut store).unwrap();
+    ed.save(&mut store, &file()).unwrap();
     assert_eq!(*secrets.removed.lock(), vec![web.id]);
     assert_eq!(secrets.get(&web.id, SecretKind::Password).unwrap(), None);
     assert!(store.get(web.id).is_none());
@@ -282,4 +331,154 @@ fn groups_sort_named_first_then_ungrouped() {
             (String::new(), vec!["zsh"]),
         ]
     );
+}
+
+#[test]
+fn failed_write_keeps_secrets_and_draft() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let gone = ssh("gone", "10.0.0.9", vec![]);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone(), gone.clone()],
+    };
+    let before = store.clone();
+    let (mut ed, secrets) = editor(&store);
+    ed.update(EditorMsg::Select(gone.id));
+    ed.update(EditorMsg::Delete);
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Secret(Redacted("typed-pw".into())));
+
+    let result = ed.save(&mut store, &unwritable());
+    assert!(matches!(result, Err(SaveError::Write(_))), "{result:?}");
+    assert_eq!(store, before, "the in-memory store is unchanged");
+    assert!(secrets.log.lock().is_empty(), "no secret is touched");
+    assert_eq!(typed_secret(&ed, web.id), "typed-pw");
+    assert!(ed.dirty);
+
+    // The same edits saved to a writable path go through, removals after the stores.
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(*secrets.log.lock(), ["set", "remove"]);
+    assert_eq!(*secrets.removed.lock(), vec![gone.id]);
+    assert_eq!(
+        secrets
+            .get(&web.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("typed-pw")
+    );
+    assert!(typed_secret(&ed, web.id).is_empty());
+    assert!(!ed.dirty);
+}
+
+#[test]
+fn removes_happen_only_after_a_successful_write() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone(), local("zsh")],
+    };
+    let (mut ed, secrets) = editor(&store);
+    secrets.set(&web.id, SecretKind::Password, "pw").unwrap();
+    secrets.log.lock().clear();
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Delete);
+    assert!(ed.save(&mut store, &unwritable()).is_err());
+    assert!(secrets.removed.lock().is_empty());
+    assert_eq!(
+        secrets
+            .get(&web.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("pw")
+    );
+    let path = file();
+    ed.save(&mut store, &path).unwrap();
+    assert!(path.exists());
+    assert_eq!(*secrets.removed.lock(), vec![web.id]);
+}
+
+#[test]
+fn refused_secret_keeps_the_draft_dirty() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone()],
+    };
+    let (mut ed, secrets) = editor(&store);
+    secrets.fail_set.store(true, Ordering::SeqCst);
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Secret(Redacted("typed-pw".into())));
+    let Err(SaveError::Secrets(failures)) = ed.save(&mut store, &file()) else {
+        panic!("the refused secret is reported")
+    };
+    assert_eq!(failures.len(), 1);
+    assert!(failures[0].contains("password of web"), "{failures:?}");
+    assert!(!failures[0].contains("typed-pw"));
+    assert_eq!(typed_secret(&ed, web.id), "typed-pw");
+    assert!(ed.dirty);
+    secrets.fail_set.store(false, Ordering::SeqCst);
+    ed.save(&mut store, &file()).unwrap();
+    assert!(typed_secret(&ed, web.id).is_empty());
+}
+
+#[test]
+fn secrets_of_an_auth_no_longer_used_are_removed() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let key = ssh_with(
+        "key",
+        AuthMethod::Key {
+            path: "~/.ssh/id_ed25519".into(),
+            passphrase: true,
+        },
+    );
+    let agent = ssh_with("agent", AuthMethod::Agent);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone(), key.clone(), agent.clone()],
+    };
+    let (mut ed, secrets) = editor(&store);
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Auth(AuthChoice::Agent));
+    ed.update(EditorMsg::Select(key.id));
+    ed.update(EditorMsg::KeyPassphrase(false));
+    ed.update(EditorMsg::Select(agent.id));
+    ed.update(EditorMsg::Auth(AuthChoice::Password));
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(
+        *secrets.removed_kinds.lock(),
+        vec![
+            (web.id, SecretKind::Password),
+            (key.id, SecretKind::KeyPassphrase)
+        ]
+    );
+
+    // Nothing changed: nothing removed again.
+    secrets.removed_kinds.lock().clear();
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Name("web2".into()));
+    ed.save(&mut store, &file()).unwrap();
+    assert!(secrets.removed_kinds.lock().is_empty());
+}
+
+#[test]
+fn debug_output_never_shows_a_typed_secret() {
+    let msg = EditorMsg::Secret(Redacted("hunter2-secret".into()));
+    let app_msg = crate::app::Message::Editor(msg.clone());
+    let op = SecretOp::Set {
+        id: ProfileId::new(),
+        kind: SecretKind::Password,
+        value: Redacted("hunter2-secret".into()),
+    };
+    for shown in [
+        format!("{msg:?}"),
+        format!("{app_msg:?}"),
+        format!("{op:?}"),
+    ] {
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+    }
+    let web = ssh_with("web", AuthMethod::Password);
+    let (mut ed, _) = editor(&ProfileStore {
+        profiles: vec![web.clone()],
+    });
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(msg);
+    let draft = format!("{:?}", ed.draft(web.id).unwrap());
+    assert!(!draft.contains("hunter2"), "{draft}");
 }
