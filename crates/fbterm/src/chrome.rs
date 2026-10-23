@@ -64,11 +64,12 @@ impl Chrome {
         }
     }
 
-    /// Space before the first tab: clear of the window buttons where they sit in the bar.
-    pub fn leading_inset(self) -> f32 {
+    /// Space before the first tab: clear of the window buttons where they sit in the bar. In
+    /// full screen the OS hides them, so the tabs start at the edge.
+    pub fn leading_inset(self, fullscreen: bool) -> f32 {
         match self {
-            Self::Unified => MACOS_TRAFFIC_LIGHTS_INSET,
-            Self::Native => NATIVE_LEADING_INSET,
+            Self::Unified if !fullscreen => MACOS_TRAFFIC_LIGHTS_INSET,
+            Self::Unified | Self::Native => NATIVE_LEADING_INSET,
         }
     }
 
@@ -79,9 +80,10 @@ impl Chrome {
     }
 
     /// What a left press in the bar means. `captured` is whether a widget in the bar (a tab, a
-    /// button) took it; only presses on empty space act on the window.
-    pub fn bar_press(self, captured: bool, kind: click::Kind) -> Option<BarAction> {
-        if captured || self == Self::Native {
+    /// button) took it; only presses on empty space act on the window. `modal` is whether the
+    /// palette or a dialog covers the window: then the bar does nothing.
+    pub fn bar_press(self, captured: bool, modal: bool, kind: click::Kind) -> Option<BarAction> {
+        if captured || modal || self == Self::Native {
             return None;
         }
         match kind {
@@ -140,14 +142,17 @@ pub fn perform<T>(id: window::Id, action: BarAction) -> iced::Task<T> {
 }
 
 /// Wraps a title bar: left presses its children leave alone become [`BarAction`]s.
+/// `modal`: the palette or a dialog covers the window, so presses leave the window alone.
 pub fn title_bar<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
+    modal: bool,
     on_action: impl Fn(BarAction) -> Message + 'a,
 ) -> Element<'a, Message> {
     Element::new(TitleBar {
         content: content.into(),
         on_action: Box::new(on_action),
         chrome: Chrome::current(),
+        modal,
     })
 }
 
@@ -155,6 +160,7 @@ struct TitleBar<'a, Message> {
     content: Element<'a, Message>,
     on_action: Box<dyn Fn(BarAction) -> Message + 'a>,
     chrome: Chrome,
+    modal: bool,
 }
 
 #[derive(Default)]
@@ -238,7 +244,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TitleBar<'_, Mess
         let click = mouse::Click::new(position, mouse::Button::Left, state.previous);
         // A press on a tab breaks a double click on empty space.
         state.previous = (!captured).then_some(click);
-        if let Some(action) = self.chrome.bar_press(captured, click.kind()) {
+        if let Some(action) = self.chrome.bar_press(captured, self.modal, click.kind()) {
             shell.publish((self.on_action)(action));
             shell.capture_event();
         }
@@ -308,21 +314,29 @@ mod tests {
     fn a_press_on_empty_bar_space_moves_the_window() {
         let c = Chrome::Unified;
         assert_eq!(
-            c.bar_press(false, click::Kind::Single),
+            c.bar_press(false, false, click::Kind::Single),
             Some(BarAction::Drag)
         );
         assert_eq!(
-            c.bar_press(false, click::Kind::Double),
+            c.bar_press(false, false, click::Kind::Double),
             Some(BarAction::ToggleMaximize)
         );
-        assert_eq!(c.bar_press(false, click::Kind::Triple), None);
+        assert_eq!(c.bar_press(false, false, click::Kind::Triple), None);
     }
 
     #[test]
     fn a_press_a_tab_or_button_took_leaves_the_window_alone() {
         let c = Chrome::Unified;
         for kind in [click::Kind::Single, click::Kind::Double] {
-            assert_eq!(c.bar_press(true, kind), None);
+            assert_eq!(c.bar_press(true, false, kind), None);
+        }
+    }
+
+    #[test]
+    fn under_the_palette_or_a_dialog_the_bar_does_nothing() {
+        let c = Chrome::Unified;
+        for kind in [click::Kind::Single, click::Kind::Double] {
+            assert_eq!(c.bar_press(false, true, kind), None);
         }
     }
 
@@ -330,16 +344,19 @@ mod tests {
     fn os_title_bars_keep_moving_the_window_themselves() {
         let c = Chrome::Native;
         for captured in [false, true] {
-            assert_eq!(c.bar_press(captured, click::Kind::Single), None);
-            assert_eq!(c.bar_press(captured, click::Kind::Double), None);
+            assert_eq!(c.bar_press(captured, false, click::Kind::Single), None);
+            assert_eq!(c.bar_press(captured, false, click::Kind::Double), None);
         }
     }
 
     #[test]
     fn only_the_unified_bar_makes_room_for_the_window_buttons() {
-        assert_eq!(Chrome::Unified.leading_inset(), MACOS_TRAFFIC_LIGHTS_INSET);
+        assert_eq!(
+            Chrome::Unified.leading_inset(false),
+            MACOS_TRAFFIC_LIGHTS_INSET
+        );
         assert_eq!(Chrome::Unified.bar_height(), MACOS_TITLEBAR_HEIGHT);
-        assert!(Chrome::Native.leading_inset() < MACOS_TRAFFIC_LIGHTS_INSET);
+        assert!(Chrome::Native.leading_inset(false) < MACOS_TRAFFIC_LIGHTS_INSET);
         assert!(!Chrome::Native.draws_title_bar());
         let expected = if cfg!(target_os = "macos") {
             Chrome::Unified
@@ -347,6 +364,15 @@ mod tests {
             Chrome::Native
         };
         assert_eq!(Chrome::current(), expected);
+    }
+
+    #[test]
+    fn full_screen_drops_the_room_for_the_window_buttons() {
+        assert_eq!(Chrome::Unified.leading_inset(true), NATIVE_LEADING_INSET);
+        assert_eq!(
+            Chrome::Native.leading_inset(true),
+            Chrome::Native.leading_inset(false)
+        );
     }
 
     #[test]

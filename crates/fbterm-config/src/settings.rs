@@ -23,7 +23,7 @@ pub struct Settings {
     /// their legacy encoding).
     pub kitty_keyboard: bool,
     /// Opacity of the terminal's default background and the window chrome around it, from
-    /// `0.0` (clear) to `1.0` (opaque). Text, the cursor, the selection and cells with their own
+    /// `0.05` (nearly clear) to `1.0` (opaque). Text, the cursor, the selection and cells with their own
     /// background stay opaque.
     pub background_opacity: f32,
     /// Blur what shows through a translucent background, where the platform supports it.
@@ -46,8 +46,9 @@ impl Default for Settings {
 
 /// Allowed range of `font_size`, in points.
 pub const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
-/// Allowed range of `background_opacity`.
-pub const OPACITY_RANGE: (f32, f32) = (0.0, 1.0);
+/// Allowed range of `background_opacity`. Not quite zero: fully clear pixels can let clicks
+/// through to what is behind the window and leave nothing of it visible.
+pub const OPACITY_RANGE: (f32, f32) = (0.05, 1.0);
 /// Allowed range of `scrollback_lines`.
 pub const SCROLLBACK_RANGE: (usize, usize) = (0, 1_000_000);
 

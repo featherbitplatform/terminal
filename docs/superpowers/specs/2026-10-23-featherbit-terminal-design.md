@@ -223,21 +223,24 @@ Jump-chain references are exported together with the profiles they point to.
   nice-to-have.
 - *(Owner's decision, 2026-10-23)* **Unified title bar on macOS.** The tab bar is the title bar:
   the OS title strip is transparent and hidden, the content runs under it, the native window
-  buttons stay and sit vertically centered on the bar (32 px high, tabs start 78 px in). Empty bar
-  space moves the window, a double click zooms it. The window title is still set (the active
+  buttons stay and sit vertically centered on the bar (32 px high, tabs start 78 px in, at the
+  edge in full screen where the buttons are hidden). Empty bar space moves the window, a double
+  click zooms it; not while the palette or a dialog is open. The window title is still set (the active
   tab's) for the Dock, Mission Control and the Window menu. The profile editor gets the same
   treatment with its own header. Linux and Windows keep OS decorations until milestone 6; the
   code keeps this behind a per-platform chrome strategy (`crates/fbterm/src/chrome.rs`).
 - *(Owner's decision, 2026-10-23)* **Background opacity and optional blur.** `settings.toml`
-  `background_opacity` (0.0 to 1.0, default 1.0) applies to the terminal's default background
-  and the tab bar only; text, cursor, selection and cells with their own background stay
-  opaque. `background_blur` (default off) blurs what shows through. Builder's notes: on macOS
-  terminal windows are always created transparent and paint an opaque background at 1.0, so
-  opacity changes apply live; on Linux and Windows only windows opened below 1.0 are
-  transparent. Blur is a window-creation setting in iced 0.14 (winit `set_blur`), so it applies
-  to windows opened after a change; on macOS winit implements it with a private
-  CoreGraphics call (`CGSSetWindowBackgroundBlurRadius`), which is the owner's to keep or
-  replace (for example with an `NSVisualEffectView`) before signed releases.
+  `background_opacity` (0.05 to 1.0, default 1.0; not 0, since fully clear pixels can pass
+  clicks through and hide the window) applies to the terminal's default background and the tab
+  bar only; text, cursor, selection and cells with their own background stay opaque.
+  `background_blur` (default off) blurs what shows through. Builder's notes: on macOS terminal
+  windows are always created transparent and paint an opaque background at 1.0, so opacity
+  changes apply live; on Linux and Windows only windows opened below 1.0 are transparent. Blur
+  is a window-creation setting, so it applies to windows opened after a change.
+- *(Owner's decision, 2026-10-23)* **Blur implementation.** Blur uses iced's built-in window
+  blur (`window::Settings::blur`, through winit); on macOS this relies on an undocumented
+  CoreGraphics call; if it stops working, blur is lost but nothing breaks. Replacing it is a
+  follow-up item in section 6.
 
 ### 5.11 Keyboard defaults *(builder's call)*
 
@@ -261,6 +264,9 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
    Windows and Linux: draw OS-styled window controls in the tab bar (no OS title bar),
    drag/double-click/resize from edges; background blur where the platform supports it.
+
+Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVisualEffectView
+(follows Reduce transparency, native vibrancy).
 
 Performance follow-up, before or within milestone 2: compact scrollback storage; investigate CPU
 use while streaming output; break down the ~100 MB base memory (RSS vs footprint; GPU/wgpu, font
