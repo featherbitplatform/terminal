@@ -27,21 +27,24 @@ pub fn tooltip_text(label: &str, action: Action, mac: bool) -> String {
     }
 }
 
-/// `content` with a tooltip below it saying `label` and `action`'s shortcut. The content still
-/// receives every press, so the title bar never sees one on a button.
+/// `content` with a tooltip below it saying `label` and, with an `action`, its shortcut. The
+/// content still receives every press, so the title bar never sees one on a button.
 pub fn tip<'a>(
     t: &'static Tokens,
     content: impl Into<Element<'a, Message>>,
     label: &str,
-    action: Action,
+    action: Option<Action>,
     force: bool,
 ) -> Element<'a, Message> {
     let bubble = container(
-        text(tooltip_text(label, action, cfg!(target_os = "macos")))
-            .font(UI_FONT)
-            .size(12)
-            .color(t.text)
-            .wrapping(text::Wrapping::None),
+        text(match action {
+            Some(a) => tooltip_text(label, a, cfg!(target_os = "macos")),
+            None => label.to_owned(),
+        })
+        .font(UI_FONT)
+        .size(12)
+        .color(t.text)
+        .wrapping(text::Wrapping::None),
     )
     .padding(Padding::from([4.0, 8.0]))
     .style(move |_| bubble_style(t));

@@ -253,12 +253,7 @@ fn appearance<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let opaque = v.background_opacity >= 1.0;
-    let blur_hint = if opaque {
-        "Needs opacity below 100%"
-    } else {
-        "Applies to new windows"
-    };
+    let (blur_hint, blur_inert) = blur_hint(cfg!(target_os = "macos"), v.background_opacity);
     vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
@@ -274,8 +269,14 @@ fn appearance<'a>(
             t,
             "Background blur",
             Some(blur_hint),
-            opaque,
-            switch(t, v.background_blur, editable, SettingsMsg::Blur),
+            blur_inert,
+            switch(
+                t,
+                v.background_blur,
+                editable,
+                blur_inert,
+                SettingsMsg::Blur,
+            ),
         ),
     ]
 }
@@ -312,7 +313,13 @@ fn terminal<'a>(
             "Kitty keyboard protocol",
             Some("Lets programs ask for a richer key encoding (modifiers, key releases)"),
             false,
-            switch(t, state.values.kitty_keyboard, editable, SettingsMsg::Kitty),
+            switch(
+                t,
+                state.values.kitty_keyboard,
+                editable,
+                false,
+                SettingsMsg::Kitty,
+            ),
         ),
     ]
 }
@@ -405,16 +412,30 @@ fn number<'a>(
         .into()
 }
 
+/// The blur row's hint, and whether blur has no effect now (it is still saved): only macOS
+/// blurs for now, and only below full opacity.
+pub fn blur_hint(mac: bool, opacity: f32) -> (&'static str, bool) {
+    if !mac {
+        ("macOS only for now", true)
+    } else if opacity >= 1.0 {
+        ("Needs opacity below 100%", true)
+    } else {
+        ("Applies to new windows", false)
+    }
+}
+
+/// A toggle; `inert`: it still works, but is drawn muted because it has no effect right now.
 fn switch<'a>(
     t: &'static Tokens,
     on: bool,
     editable: bool,
+    inert: bool,
     f: fn(bool) -> SettingsMsg,
 ) -> Element<'a, Message> {
     toggler(on)
         .on_toggle_maybe(editable.then_some(move |b| msg(f(b))))
         .size(18)
-        .style(move |_, status| toggler_style(t, status))
+        .style(move |_, status| toggler_style(t, status, inert))
         .into()
 }
 
@@ -503,7 +524,7 @@ fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -> slider::S
     }
 }
 
-fn toggler_style(t: &Tokens, status: toggler::Status) -> toggler::Style {
+fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::Style {
     let (on, hovered, disabled) = match status {
         toggler::Status::Active { is_toggled } => (is_toggled, false, false),
         toggler::Status::Hovered { is_toggled } => (is_toggled, true, false),
@@ -511,6 +532,9 @@ fn toggler_style(t: &Tokens, status: toggler::Status) -> toggler::Style {
     };
     let track = match (on, disabled) {
         (_, true) => t.raised,
+        // Muted like a read-only slider: on reads as the muted text color, off as the border.
+        (true, false) if inert => t.text_muted,
+        (false, false) if inert => t.border,
         (true, false) if hovered => t.accent_edge,
         (true, false) => t.accent,
         (false, false) if hovered => t.text_muted,
@@ -520,7 +544,11 @@ fn toggler_style(t: &Tokens, status: toggler::Status) -> toggler::Style {
         background: Background::Color(track),
         background_border_width: if disabled { 1.0 } else { 0.0 },
         background_border_color: t.border,
-        foreground: Background::Color(if disabled { t.text_muted } else { Color::WHITE }),
+        foreground: Background::Color(if disabled || inert {
+            t.text_muted
+        } else {
+            Color::WHITE
+        }),
         foreground_border_width: 0.0,
         foreground_border_color: Color::TRANSPARENT,
         text_color: None,
