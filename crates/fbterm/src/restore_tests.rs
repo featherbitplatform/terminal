@@ -315,3 +315,90 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
     assert_eq!(app.settings.font_size, 14.0);
     assert!(app.notices.is_empty());
 }
+
+fn three_windows() -> (App, Paths, Vec<iced::window::Id>) {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    SavedState {
+        windows: vec![saved(&[&a], 0), saved(&[&b, &a], 1), saved(&[&b], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (app, _) = App::build(paths.clone(), true);
+    let ids = app.windows.keys().copied().collect();
+    (app, paths, ids)
+}
+
+#[test]
+fn quit_keeps_all_windows_in_state() {
+    let (mut app, paths, ids) = three_windows();
+    // Something changes first, so the saved state is not just the seeded file.
+    let _ = app.update(Message::Shortcut(ids[0], crate::keys::Action::Quit));
+    for id in &ids {
+        let _ = app.update(Message::WindowClosed(*id));
+    }
+    let state = SavedState::load_or_default(&paths.state());
+    assert_eq!(state.windows.len(), 3);
+    assert_eq!(state.windows[1].active, 1);
+}
+
+#[test]
+fn a_close_the_os_did_on_its_own_is_a_quit() {
+    // macOS menu Cmd+Q: windows close without a request.
+    let (mut app, paths, ids) = three_windows();
+    for id in &ids {
+        let _ = app.update(Message::WindowClosed(*id));
+    }
+    assert_eq!(SavedState::load_or_default(&paths.state()).windows.len(), 3);
+}
+
+#[test]
+fn closing_one_of_several_windows_drops_it() {
+    let (mut app, paths, ids) = three_windows();
+    let _ = app.update(Message::CloseRequested(ids[1]));
+    assert!(!app.quitting);
+    let _ = app.update(Message::WindowClosed(ids[1]));
+    let state = SavedState::load_or_default(&paths.state());
+    assert_eq!(state.windows.len(), 2);
+    assert_eq!(state.windows[0].tabs.len(), 1);
+    assert_eq!(state.windows[1].tabs.len(), 1);
+}
+
+#[test]
+fn closing_last_window_keeps_its_tabs() {
+    let (mut app, paths, ids) = three_windows();
+    for id in &ids[..2] {
+        let _ = app.update(Message::CloseRequested(*id));
+        let _ = app.update(Message::WindowClosed(*id));
+    }
+    let _ = app.update(Message::CloseRequested(ids[2]));
+    assert!(app.quitting, "the last window's close button is Quit");
+    let _ = app.update(Message::WindowClosed(ids[2]));
+    let state = SavedState::load_or_default(&paths.state());
+    assert_eq!(state.windows.len(), 1);
+    assert_eq!(state.windows[0].tabs.len(), 1);
+}
+
+#[test]
+fn closing_last_tab_of_last_window_restores_default() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let wid = *app.windows.keys().next().unwrap();
+    let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Close(0)));
+    let _ = app.update(Message::WindowClosed(wid));
+    assert!(
+        SavedState::load_or_default(&paths.state())
+            .windows
+            .is_empty()
+    );
+    let (relaunched, _) = App::build(paths, true);
+    assert_eq!(relaunched.windows.len(), 1, "the default window");
+}

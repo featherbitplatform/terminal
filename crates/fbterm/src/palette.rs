@@ -97,6 +97,7 @@ fn actions() -> Vec<PaletteItem> {
         (Action::CloseTab, "Close tab"),
         (Action::EditProfiles, "Edit profiles"),
         (Action::Settings, "Settings"),
+        (Action::Quit, "Quit"),
     ]
     .into_iter()
     .map(|(action, label)| PaletteItem::Action {
@@ -627,6 +628,6 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 5);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 6);
     }
 }

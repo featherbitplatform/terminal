@@ -392,8 +392,10 @@ fn key_message(
             if mods.command() && matches!(key, keyboard::Key::Character(c) if c.as_str() == "s") {
                 return Some((!repeat).then_some(Message::Editor(EditorMsg::Save)));
             }
-            shortcut.map(|action| {
-                (action == Action::CloseTab && !repeat).then_some(Message::Editor(EditorMsg::Close))
+            shortcut.map(|action| match action {
+                Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
+                Action::Quit if !repeat => Some(Message::Shortcut(w, action)),
+                _ => None,
             })
         }
     }

@@ -105,6 +105,8 @@ pub enum Message {
     Prompt(PromptMsg),
     Shoot,
     Shot(Screenshot),
+    /// The OS close button (or equivalent) was used on a window; see [`App::close_requested`].
+    CloseRequested(window::Id),
     /// A window was resized (or has just reported its size).
     WindowResized(window::Id, iced::Size),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
@@ -153,6 +155,12 @@ pub struct App {
     /// Whether `state.toml` is written. Off for debug aids that open tabs (`FBTERM_OPEN_TABS`,
     /// `FBTERM_SCREENSHOT`, the perf runs): they would overwrite the user's real layout.
     pub(crate) state_saving_enabled: bool,
+    /// The app is quitting: windows closing from now on are not the user dropping them, so
+    /// the layout saved at quit must stay as it is.
+    pub(crate) quitting: bool,
+    /// Windows we asked to close. A window that closes without being asked is the OS tearing
+    /// the app down (macOS Cmd+Q from the menu): that is a quit too.
+    pub(crate) closing: std::collections::HashSet<window::Id>,
     /// Last known inner size of each terminal window.
     pub(crate) sizes: HashMap<window::Id, (f32, f32)>,
     /// Counts resizes, so only the last one of a burst saves.
@@ -320,6 +328,8 @@ impl App {
             recency: Recency::from(saved.recency),
             state_saving_enabled: debug_env("FBTERM_OPEN_TABS").is_none()
                 && debug_env("FBTERM_SCREENSHOT").is_none(),
+            quitting: false,
+            closing: Default::default(),
             sizes: HashMap::new(),
             resize_count: 0,
             profiles_seen,
@@ -393,6 +403,7 @@ impl App {
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
+            window::close_requests().map(Message::CloseRequested),
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
         ];
         if self.screenshot.is_some() && !self.shooting && self.first_window_ready() {
@@ -483,10 +494,11 @@ impl App {
                 if self.editor_window() == Some(id) {
                     self.editor = None;
                 }
-                // The last terminal window closing is quitting: its layout is what comes back, so
-                // it is saved before it goes. Any other window closing is the user dropping it.
-                if self.windows.len() == 1 && self.windows.contains_key(&id) {
-                    self.save_state();
+                // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
+                // ending the app; state.toml is current (saved on every change), so just
+                // stop saving.
+                if !self.closing.remove(&id) {
+                    self.quitting = true;
                 }
                 // Dropping the window's tabs closes their sessions and abandons their dials;
                 // its dialogs answer "no".
@@ -498,7 +510,8 @@ impl App {
                 if self.focused == Some(id) {
                     self.focused = self.windows.keys().next().copied();
                 }
-                if was_terminal && !self.windows.is_empty() {
+                // A window the user closed is dropped from the layout (no-op while quitting).
+                if was_terminal {
                     self.save_state();
                 }
                 if self.windows.is_empty() && self.editor.is_none() {
@@ -531,6 +544,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
                 if let Some(path) = &self.screenshot {
@@ -615,6 +629,7 @@ impl App {
             },
             Action::NewWindow => self.open_window(self.default_profile()),
             Action::EditProfiles => self.editor_msg(EditorMsg::Open),
+            Action::Quit => self.quit(),
             Action::Settings => {
                 tracing::info!("settings are not available yet");
                 Task::none()
@@ -687,6 +702,7 @@ impl App {
         let (id, open) = window::open(window::Settings {
             size: iced::Size::new(size.0, size.1),
             min_size: Some(iced::Size::new(360.0, 200.0)),
+            exit_on_close_request: false,
             ..window::Settings::default()
         });
         self.windows.insert(id, WindowState::new());
@@ -758,7 +774,7 @@ impl App {
         drop(closed.tab);
         self.save_state();
         if closed.window_empty {
-            window::close(wid)
+            self.close_window(wid)
         } else {
             self.shown(wid)
         }
@@ -785,12 +801,51 @@ impl App {
     /// runs (see `state_saving_enabled`) and while `profiles.toml` is unreadable (the tabs would
     /// look orphaned; the file keeps the layout until the profiles load again).
     pub(crate) fn save_state(&self) {
-        if !self.state_saving_enabled || self.profiles_error.is_some() {
+        if !self.state_saving_enabled || self.quitting || self.profiles_error.is_some() {
             return;
         }
         let state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
         if let Err(e) = state.save(&self.paths.state()) {
             tracing::warn!(error = %e, "could not save the session state");
+        }
+    }
+
+    /// Close a window on purpose (its `Closed` event then is not an OS teardown).
+    pub(crate) fn close_window(&mut self, id: window::Id) -> Task<Message> {
+        self.closing.insert(id);
+        window::close(id)
+    }
+
+    /// How windows close and the app quits, as far as `state.toml` is concerned:
+    /// - Quit (Cmd+Q / Ctrl+Shift+Q / palette) saves once while every window still exists, then
+    ///   closes them all and exits; nothing saves after that, so every window comes back.
+    /// - The close button on the last terminal window is Quit. On any other terminal window it
+    ///   drops that window from the layout. Closing the last tab of the last window leaves no
+    ///   tabs to save, so the next launch opens the default window.
+    /// - macOS Cmd+Q from the app menu is `terminate:`: winit closes the windows without a
+    ///   close request and the process ends; windows closing unasked count as a quit, and
+    ///   state.toml is already current because it is saved on every layout change.
+    pub(crate) fn quit(&mut self) -> Task<Message> {
+        if self.quitting {
+            return Task::none();
+        }
+        self.save_state();
+        self.quitting = true;
+        let ids: Vec<_> = self
+            .windows
+            .keys()
+            .copied()
+            .chain(self.editor_window())
+            .collect();
+        self.closing.extend(ids.iter().copied());
+        Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
+    }
+
+    fn close_requested(&mut self, id: window::Id) -> Task<Message> {
+        if self.editor_window() == Some(id) || self.windows.len() > 1 {
+            self.close_window(id)
+        } else {
+            self.quit()
         }
     }
 
