@@ -11,7 +11,7 @@ allow = [
     "OFL-1.1",
     # clipboard-win and error-code (iced_winit on Windows)
     "BSL-1.0",
-    # hexf-parse (naga, via wgpu)
+    # hexf-parse (naga, via wgpu) and notify (file watching)
     "CC0-1.0",
 ]
 
