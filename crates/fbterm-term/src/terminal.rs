@@ -231,6 +231,12 @@ impl Terminal {
         self.generation += 1;
     }
 
+    /// Show the oldest line of the scrollback.
+    pub fn scroll_to_top(&mut self) {
+        self.term.scroll_display(Scroll::Top);
+        self.generation += 1;
+    }
+
     /// Show the newest output (leave scrollback).
     pub fn scroll_to_bottom(&mut self) {
         self.term.scroll_display(Scroll::Bottom);

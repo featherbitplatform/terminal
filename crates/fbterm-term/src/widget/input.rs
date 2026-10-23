@@ -97,6 +97,51 @@ fn clipboard_chord(key: &Key, m: Modifiers) -> Option<Chord> {
     }
 }
 
+/// A keyboard chord that moves through the scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScrollChord {
+    PageUp,
+    PageDown,
+    Top,
+    Bottom,
+}
+
+/// Shift+PageUp/PageDown/Home/End on every system; on macOS also Cmd+Home/End for top and
+/// bottom. Any other modifier held makes it an ordinary key.
+fn scroll_chord(key: &Key, m: Modifiers, is_macos: bool) -> Option<ScrollChord> {
+    use keyboard::key::Named;
+    let Key::Named(named) = key else { return None };
+    let shift_only = m.shift() && !m.control() && !m.alt() && !m.logo();
+    let cmd_only = is_macos && m.logo() && !m.shift() && !m.control() && !m.alt();
+    match named {
+        Named::PageUp if shift_only => Some(ScrollChord::PageUp),
+        Named::PageDown if shift_only => Some(ScrollChord::PageDown),
+        Named::Home if shift_only || cmd_only => Some(ScrollChord::Top),
+        Named::End if shift_only || cmd_only => Some(ScrollChord::Bottom),
+        _ => None,
+    }
+}
+
+/// Scroll the view for a scrollback chord. On the alternate screen (editors, pagers) there is
+/// no scrollback, so the chord is left for the program: returns whether it was consumed.
+fn keyboard_scroll(term: &mut Terminal, key: &Key, m: Modifiers, is_macos: bool) -> bool {
+    if term.mode().contains(TermMode::ALT_SCREEN) {
+        return false;
+    }
+    let Some(chord) = scroll_chord(key, m, is_macos) else {
+        return false;
+    };
+    // A page keeps one line of context.
+    let page = i32::from(term.size().rows.saturating_sub(1).max(1));
+    match chord {
+        ScrollChord::PageUp => term.scroll(page),
+        ScrollChord::PageDown => term.scroll(-page),
+        ScrollChord::Top => term.scroll_to_top(),
+        ScrollChord::Bottom => term.scroll_to_bottom(),
+    }
+    true
+}
+
 /// Typing or pasting: drop the selection and show the newest output.
 fn reset_view(term: &mut Terminal) {
     if term.selection().is_some() {
@@ -153,6 +198,9 @@ impl InputState {
                     return self.clipboard(ctx, chord, clipboard, out);
                 }
                 let mut term = ctx.term.lock();
+                if keyboard_scroll(&mut term, key, *modifiers, cfg!(target_os = "macos")) {
+                    return Effect::REDRAW;
+                }
                 let Some(bytes) =
                     encode_key(key, *physical_key, text.as_deref(), *modifiers, term.mode())
                 else {
@@ -465,6 +513,108 @@ mod tests {
         assert_eq!(st.modifiers, Modifiers::SHIFT);
         assert!(st.hover.is_none() && st.drag.is_none() && st.reported.is_none());
         assert!(st.last_click.is_none());
+    }
+
+    fn filled(rows: u16) -> Terminal {
+        let size = GridSize {
+            cols: 40,
+            rows,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        };
+        let mut t = Terminal::new(size, 1000);
+        for i in 0..200 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        t
+    }
+
+    fn offset(t: &Terminal) -> usize {
+        t.term().grid().display_offset()
+    }
+
+    const PAGE_UP: Key = Key::Named(keyboard::key::Named::PageUp);
+    const PAGE_DOWN: Key = Key::Named(keyboard::key::Named::PageDown);
+    const HOME: Key = Key::Named(keyboard::key::Named::Home);
+    const END: Key = Key::Named(keyboard::key::Named::End);
+
+    #[test]
+    fn shift_page_keys_scroll_one_page_less_a_line() {
+        let mut t = filled(24);
+        assert!(keyboard_scroll(&mut t, &PAGE_UP, Modifiers::SHIFT, false));
+        assert_eq!(offset(&t), 23);
+        assert!(keyboard_scroll(&mut t, &PAGE_UP, Modifiers::SHIFT, true));
+        assert_eq!(offset(&t), 46);
+        assert!(keyboard_scroll(&mut t, &PAGE_DOWN, Modifiers::SHIFT, false));
+        assert_eq!(offset(&t), 23);
+        assert!(keyboard_scroll(&mut t, &PAGE_DOWN, Modifiers::SHIFT, false));
+        assert!(keyboard_scroll(&mut t, &PAGE_DOWN, Modifiers::SHIFT, false));
+        assert_eq!(offset(&t), 0, "never below the bottom");
+    }
+
+    #[test]
+    fn top_and_bottom_chords() {
+        let mut t = filled(24);
+        let history = alacritty_terminal::grid::Dimensions::history_size(t.term().grid());
+        assert!(history > 100);
+        assert!(keyboard_scroll(&mut t, &HOME, Modifiers::SHIFT, false));
+        assert_eq!(offset(&t), history);
+        assert!(keyboard_scroll(&mut t, &END, Modifiers::SHIFT, false));
+        assert_eq!(offset(&t), 0);
+        // macOS aliases.
+        assert!(keyboard_scroll(&mut t, &HOME, Modifiers::LOGO, true));
+        assert_eq!(offset(&t), history);
+        assert!(keyboard_scroll(&mut t, &END, Modifiers::LOGO, true));
+        assert_eq!(offset(&t), 0);
+        // Cmd is not a scroll modifier elsewhere.
+        assert_eq!(scroll_chord(&HOME, Modifiers::LOGO, false), None);
+    }
+
+    #[test]
+    fn other_modifiers_and_keys_are_not_scroll_chords() {
+        assert_eq!(scroll_chord(&PAGE_UP, Modifiers::empty(), false), None);
+        assert_eq!(
+            scroll_chord(&PAGE_UP, Modifiers::SHIFT | Modifiers::CTRL, false),
+            None
+        );
+        assert_eq!(
+            scroll_chord(&HOME, Modifiers::LOGO | Modifiers::SHIFT, true),
+            None
+        );
+        assert_eq!(
+            scroll_chord(&Key::Character("a".into()), Modifiers::SHIFT, false),
+            None
+        );
+        let mut t = filled(24);
+        assert!(!keyboard_scroll(
+            &mut t,
+            &PAGE_UP,
+            Modifiers::empty(),
+            false
+        ));
+        assert_eq!(offset(&t), 0);
+    }
+
+    #[test]
+    fn alternate_screen_passes_scroll_chords_to_the_program() {
+        let mut t = filled(24);
+        t.feed(b"\x1b[?1049h");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        for key in [&PAGE_UP, &PAGE_DOWN, &HOME, &END] {
+            assert!(!keyboard_scroll(&mut t, key, Modifiers::SHIFT, false));
+        }
+        assert_eq!(offset(&t), 0);
+        // ...which then gets the key's usual encoding.
+        let physical =
+            keyboard::key::Physical::Unidentified(keyboard::key::NativeCode::Unidentified);
+        assert_eq!(
+            encode_key(&PAGE_UP, physical, None, Modifiers::SHIFT, t.mode()),
+            Some(b"\x1b[5;2~".to_vec())
+        );
+        assert_eq!(
+            encode_key(&HOME, physical, None, Modifiers::SHIFT, t.mode()),
+            Some(b"\x1b[1;2H".to_vec())
+        );
     }
 
     #[test]
