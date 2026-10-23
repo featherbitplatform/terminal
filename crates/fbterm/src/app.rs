@@ -102,7 +102,8 @@ pub enum Message {
         profile: ProfileId,
         window: window::Id,
     },
-    Connected(TabId, Delivered<SessionHandle>),
+    /// A dial finished; carries the pty size it was opened with.
+    Connected(TabId, Delivered<SessionHandle>, GridSize),
     ConnectFailed(TabId, String),
     NewWindow,
     WindowOpened(window::Id),
@@ -371,9 +372,9 @@ impl App {
             Message::NextTab => self.with_focused(WindowState::next),
             Message::PrevTab => self.with_focused(WindowState::prev),
             Message::OpenProfile { profile, window } => self.open_tab(window, profile),
-            Message::Connected(tab, delivered) => {
+            Message::Connected(tab, delivered, requested) => {
                 if let Some(handle) = delivered.take() {
-                    self.connected(tab, handle);
+                    self.connected(tab, handle, requested);
                 }
                 Task::none()
             }
