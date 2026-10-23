@@ -41,4 +41,26 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # ssh-live: ubuntu job against a live sshd container, added in Task 8.
+  ssh-live:
+    name: ssh live tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libdbus-1-dev pkg-config
+      - name: Start test sshd containers
+        run: docker compose -f dev/ssh-test/compose.yaml up -d
+      - name: Wait for sshd on port 2222
+        run: dev/ssh-test/wait-ready.sh
+      - name: Live SSH tests
+        run: FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
+      - name: Container logs
+        if: failure()
+        run: docker compose -f dev/ssh-test/compose.yaml logs
+      - name: Stop test sshd containers
+        if: always()
+        run: docker compose -f dev/ssh-test/compose.yaml down
