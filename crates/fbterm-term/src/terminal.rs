@@ -11,6 +11,8 @@ use fbterm_config::Rgb;
 use parking_lot::Mutex;
 
 use crate::Selection;
+use alacritty_terminal::index::Side;
+use alacritty_terminal::selection::{Selection as EmuSelection, SelectionType};
 
 pub use alacritty_terminal::term::TermMode;
 
@@ -165,7 +167,6 @@ pub struct Terminal {
     term: Term<EventProxy>,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
-    selection: Option<Selection>,
     generation: u64,
 }
 
@@ -194,7 +195,6 @@ impl Terminal {
             term,
             parser: Processor::new(),
             shared,
-            selection: None,
             generation: 0,
         }
     }
@@ -211,12 +211,23 @@ impl Terminal {
     }
 
     /// The current text selection, in grid coordinates.
-    pub fn selection(&self) -> Option<&Selection> {
-        self.selection.as_ref()
+    ///
+    /// Stored as the emulator's own selection, which moves with its text when output scrolls and
+    /// is dropped when that text is erased or scrolls out of history.
+    pub fn selection(&self) -> Option<Selection> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let mut sel = Selection::start(range.start);
+        sel.update(range.end);
+        Some(sel)
     }
 
     pub fn set_selection(&mut self, selection: Option<Selection>) {
-        self.selection = selection;
+        self.term.selection = selection.map(|s| {
+            let (start, end) = s.bounds();
+            let mut inner = EmuSelection::new(SelectionType::Simple, start, Side::Left);
+            inner.update(end, Side::Right);
+            inner
+        });
         self.generation += 1;
     }
 
@@ -387,6 +398,34 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b]52;c;?\x07");
         assert_eq!(reply(&mut t), "\x1b]52;c;\x07");
+    }
+
+    fn select_word_and_scroll(prefill: usize) -> (String, String) {
+        use alacritty_terminal::index::Point;
+        let mut t = Terminal::new(size(20, 5), 100);
+        for i in 0..prefill {
+            t.feed(format!("old {i}\r\n").as_bytes());
+        }
+        t.feed(b"\x1b[2J\x1b[Hhello world\r\n");
+        let mut sel = Selection::start(Point::new(Line(0), Column(6)));
+        sel.update(Point::new(Line(0), Column(10)));
+        t.set_selection(Some(sel));
+        let before = t.selection().unwrap().text(&t);
+        for i in 0..8 {
+            t.feed(format!("new {i}\r\n").as_bytes());
+        }
+        let after = t.selection().map(|s| s.text(&t)).unwrap_or_default();
+        (before, after)
+    }
+
+    #[test]
+    fn selection_follows_text_when_output_scrolls() {
+        assert_eq!(select_word_and_scroll(0), ("world".into(), "world".into()));
+        // Full history: lines drop off the top while history size stays constant.
+        assert_eq!(
+            select_word_and_scroll(500),
+            ("world".into(), "world".into())
+        );
     }
 
     #[test]
