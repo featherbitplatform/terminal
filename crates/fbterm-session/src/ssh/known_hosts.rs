@@ -156,6 +156,26 @@ fn read_known_hosts(path: &Path) -> Result<String, SshError> {
     }
 }
 
+/// Characters that would change the meaning of a `known_hosts` line if they were part of a
+/// host name: list separators, wildcards, negation, brackets, comments, markers and hashes.
+const HOST_SPECIALS: &str = ",*?![]#@|";
+
+/// Refuse host names that cannot be written to (or looked up in) `known_hosts` literally.
+fn validate_host(host: &str) -> Result<(), SshError> {
+    if host.is_empty() {
+        return Err(SshError::Protocol("empty host name".into()));
+    }
+    if let Some(c) = host
+        .chars()
+        .find(|&c| c.is_control() || c.is_whitespace() || HOST_SPECIALS.contains(c))
+    {
+        return Err(SshError::Protocol(format!(
+            "invalid host name {host:?}: it contains {c:?}, which is not allowed in a host name"
+        )));
+    }
+    Ok(())
+}
+
 /// Classify `key` for `host`:`port` against the `known_hosts` file at `known_hosts`.
 ///
 /// Stricter than "same algorithm" matching: if any key is recorded for the host and `key` is
@@ -167,6 +187,7 @@ pub fn check_host_key(
     port: u16,
     key: &PublicKey,
 ) -> Result<HostKeyStatus, SshError> {
+    validate_host(host)?;
     let text = read_known_hosts(known_hosts)?;
     let entries = matching_entries(&text, &lookup_name(host, port));
     let same = |e: &Entry| e.key.key_data() == key.key_data();
@@ -191,6 +212,9 @@ pub fn check_host_key(
 
 /// Algorithms of the keys recorded for `host`:`port` (empty if none or unreadable).
 pub(crate) fn known_algorithms(known_hosts: &Path, host: &str, port: u16) -> Vec<Algorithm> {
+    if validate_host(host).is_err() {
+        return Vec::new();
+    }
     let Ok(text) = read_known_hosts(known_hosts) else {
         return Vec::new();
     };
@@ -230,6 +254,7 @@ pub fn learn_host_key(
     port: u16,
     key: &PublicKey,
 ) -> Result<(), SshError> {
+    validate_host(host)?;
     let io = |e: std::io::Error| {
         SshError::Protocol(format!("cannot write {}: {e}", known_hosts.display()))
     };
@@ -482,5 +507,36 @@ mod tests {
                 .to_string(),
             "SHA256:ZZ6opCTesVHgmgy+v+LpL6WlhnJ74SrzdAZofsEfPIA"
         );
+    }
+
+    #[test]
+    fn host_names_that_would_change_a_line_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("known_hosts");
+        let k = key(ED_A);
+        for bad in [
+            "", "a b", "a\tb", "a\nb", "a\rb", "a\u{7f}b", "h,evil", "*", "h?", "!h", "[h]",
+            "h]:22", "#h", "@revoked", "|1|x|y", "h\u{0}",
+        ] {
+            for result in [
+                check_host_key(&path, bad, 22, &k).map(|_| ()),
+                learn_host_key(&path, bad, 22, &k),
+            ] {
+                match result {
+                    Err(SshError::Protocol(m)) => assert!(m.contains("host name"), "{bad:?}: {m}"),
+                    other => panic!("{bad:?} accepted: {other:?}"),
+                }
+            }
+            assert!(known_algorithms(&path, bad, 22).is_empty());
+        }
+        assert!(!path.exists(), "nothing may be written for a refused host");
+        // Ordinary names and addresses still work.
+        for good in ["example.com", "10.0.0.1", "::1", "fe80::1%eth0", "host-1_a"] {
+            learn_host_key(&path, good, 2200, &k).unwrap();
+            assert_eq!(
+                check_host_key(&path, good, 2200, &k).unwrap(),
+                HostKeyStatus::Known
+            );
+        }
     }
 }

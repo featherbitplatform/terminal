@@ -1303,6 +1303,7 @@ dependencies = [
  "fbterm-config",
  "fbterm-secrets",
  "fbterm-term",
+ "futures-util",
  "hmac",
  "parking_lot",
  "portable-pty",

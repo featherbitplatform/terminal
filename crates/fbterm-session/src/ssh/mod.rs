@@ -12,22 +12,36 @@
 //! - a secret is saved only after the server accepted it and the user asked to remember it,
 //!   and a saved secret is never removed because it was rejected;
 //! - secret values are never logged and never appear in an [`SshError`].
+//!
+//! Every hop is bounded: the TCP connect (or `direct-tcpip` channel open) and the SSH
+//! handshake and authentication each get [`HOP_TIMEOUT`], not counting time spent waiting for
+//! the user to answer a prompt. [`SshPool`] builds jump chains and shares one connection per
+//! profile between all of its shells.
 
 mod auth;
 mod known_hosts;
+pub(crate) mod pool;
 
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fbterm_config::{Profile, ProfileKind, ValidationError};
+use fbterm_config::{Profile, ProfileKind, SshProfile, ValidationError};
 use fbterm_secrets::{SecretKind, SecretStore};
-use russh::client::{self, Handle};
+use parking_lot::Mutex;
+use russh::client::{self, DisconnectReason, Handle};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::Notify;
 
 pub use known_hosts::{HostKeyStatus, check_host_key, learn_host_key};
+pub use pool::SshPool;
+
+/// Bound on each step of reaching one hop: the TCP connect, and the SSH handshake plus
+/// authentication. Time spent waiting on the user does not count.
+pub const HOP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Seconds of silence from the server before a keepalive is sent.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
@@ -99,6 +113,30 @@ pub enum SshError {
     Protocol(String),
 }
 
+impl SshError {
+    /// An equal error, for handing one failed connect to every tab that waited on it.
+    pub(crate) fn duplicate(&self) -> Self {
+        match self {
+            Self::HostKeyChanged { host, port } => Self::HostKeyChanged {
+                host: host.clone(),
+                port: *port,
+            },
+            Self::HostKeyRejected => Self::HostKeyRejected,
+            Self::AuthFailed { profile } => Self::AuthFailed {
+                profile: profile.clone(),
+            },
+            Self::Cancelled => Self::Cancelled,
+            Self::Connect(e) => Self::Connect(std::io::Error::new(e.kind(), e.to_string())),
+            Self::Jump(e) => Self::Jump(e.clone()),
+            Self::Protocol(m) => Self::Protocol(m.clone()),
+        }
+    }
+}
+
+fn timed_out(what: String) -> SshError {
+    SshError::Connect(std::io::Error::new(std::io::ErrorKind::TimedOut, what))
+}
+
 impl From<russh::Error> for SshError {
     fn from(e: russh::Error) -> Self {
         match e {
@@ -116,6 +154,8 @@ pub struct ClientHandler {
     prompter: Arc<dyn Prompter>,
     /// The key accepted for this connection, so a re-key does not ask again.
     accepted: Option<PublicKey>,
+    /// Why the connection ended, set once it has.
+    lost: Arc<Mutex<Option<String>>>,
 }
 
 impl client::Handler for ClientHandler {
@@ -168,6 +208,166 @@ impl client::Handler for ClientHandler {
         self.accepted = Some(key.clone());
         Ok(true)
     }
+
+    async fn disconnected(&mut self, reason: DisconnectReason<SshError>) -> Result<(), SshError> {
+        let (text, result) = match reason {
+            DisconnectReason::ReceivedDisconnect(info) if info.message.trim().is_empty() => {
+                ("the server closed the connection".to_owned(), Ok(()))
+            }
+            DisconnectReason::ReceivedDisconnect(info) => (
+                format!("the server closed the connection: {}", info.message.trim()),
+                Ok(()),
+            ),
+            DisconnectReason::Error(SshError::Connect(io)) => {
+                let text = format!("connection to {} lost: {io}", self.host);
+                (text, Err(SshError::Connect(io)))
+            }
+            DisconnectReason::Error(e) => {
+                (format!("connection to {} lost: {e}", self.host), Err(e))
+            }
+        };
+        tracing::info!(host = %self.host, port = self.port, reason = %text, "ssh connection ended");
+        self.lost.lock().get_or_insert(text);
+        result
+    }
+}
+
+/// Measures a hop's time against [`HOP_TIMEOUT`], excluding time spent in prompts.
+struct PromptClock {
+    state: Mutex<ClockState>,
+    changed: Notify,
+}
+
+struct ClockState {
+    started: Instant,
+    /// Prompt time already finished since `started`.
+    paused: Duration,
+    /// Open prompts and when the first of them opened.
+    prompts: usize,
+    prompt_since: Option<Instant>,
+}
+
+impl PromptClock {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ClockState {
+                started: Instant::now(),
+                paused: Duration::ZERO,
+                prompts: 0,
+                prompt_since: None,
+            }),
+            changed: Notify::new(),
+        }
+    }
+
+    /// Start a new step: elapsed time goes back to zero.
+    fn restart(&self) {
+        let mut s = self.state.lock();
+        let now = Instant::now();
+        s.started = now;
+        s.paused = Duration::ZERO;
+        if s.prompt_since.is_some() {
+            s.prompt_since = Some(now);
+        }
+    }
+
+    /// Time spent outside prompts since the step started, and whether a prompt is open.
+    fn active(&self) -> (Duration, bool) {
+        let s = self.state.lock();
+        let now = Instant::now();
+        let open = s.prompt_since.map_or(Duration::ZERO, |t| now - t);
+        (
+            (now - s.started).saturating_sub(s.paused + open),
+            s.prompts > 0,
+        )
+    }
+
+    fn pause(&self) -> PromptGuard<'_> {
+        {
+            let mut s = self.state.lock();
+            s.prompts += 1;
+            if s.prompts == 1 {
+                s.prompt_since = Some(Instant::now());
+            }
+        }
+        self.changed.notify_waiters();
+        PromptGuard(self)
+    }
+}
+
+/// Resumes the clock when the prompt ends (also when the prompt is cancelled).
+struct PromptGuard<'a>(&'a PromptClock);
+
+impl Drop for PromptGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut s = self.0.state.lock();
+            s.prompts -= 1;
+            if s.prompts == 0
+                && let Some(since) = s.prompt_since.take()
+            {
+                s.paused += since.elapsed();
+            }
+        }
+        self.0.changed.notify_waiters();
+    }
+}
+
+/// Run `fut`, failing with a timeout once it has used `limit` outside of prompts.
+async fn bounded<T>(
+    clock: &PromptClock,
+    limit: Duration,
+    what: impl Fn() -> String,
+    fut: impl Future<Output = T>,
+) -> Result<T, SshError> {
+    tokio::pin!(fut);
+    loop {
+        // Registered before reading the state, so a prompt opening or closing in between
+        // still wakes us.
+        let changed = clock.changed.notified();
+        let (active, prompting) = clock.active();
+        if prompting {
+            tokio::select! {
+                out = &mut fut => return Ok(out),
+                () = changed => continue,
+            }
+        }
+        let left = limit.saturating_sub(active);
+        if left.is_zero() {
+            return Err(timed_out(what()));
+        }
+        tokio::select! {
+            out = &mut fut => return Ok(out),
+            () = changed => {}
+            () = tokio::time::sleep(left) => {}
+        }
+    }
+}
+
+/// Pauses the hop's clock while the user is being asked something.
+struct ClockedPrompter {
+    inner: Arc<dyn Prompter>,
+    clock: Arc<PromptClock>,
+}
+
+#[async_trait]
+impl Prompter for ClockedPrompter {
+    async fn confirm_host_key(&self, host: &str, port: u16, fingerprint_sha256: &str) -> bool {
+        let _paused = self.clock.pause();
+        self.inner
+            .confirm_host_key(host, port, fingerprint_sha256)
+            .await
+    }
+
+    async fn ask_secret(
+        &self,
+        profile_name: &str,
+        kind: SecretKind,
+        retry: bool,
+    ) -> Option<SecretAnswer> {
+        let _paused = self.clock.pause();
+        self.inner.ask_secret(profile_name, kind, retry).await
+    }
 }
 
 /// Client configuration for one hop: keepalives on, known host-key types preferred.
@@ -194,57 +394,113 @@ fn client_config(host: &str, port: u16, known_hosts: &std::path::Path) -> client
     }
 }
 
+fn ssh_profile(profile: &Profile) -> Result<&SshProfile, SshError> {
+    match &profile.kind {
+        ProfileKind::Ssh(ssh) => Ok(ssh),
+        ProfileKind::Local(_) => Err(SshError::Protocol(format!(
+            "profile {:?} is not an SSH profile",
+            profile.name
+        ))),
+    }
+}
+
+/// One authenticated SSH connection of a chain.
+pub(crate) struct Hop {
+    pub handle: Handle<ClientHandler>,
+    /// Why the connection ended, once it has.
+    pub lost: Arc<Mutex<Option<String>>>,
+}
+
 /// Run SSH over `stream` to the host of `profile`: verify its host key and authenticate.
 pub(crate) async fn connect_hop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     profile: &Profile,
     ctx: &SshContext,
-) -> Result<Handle<ClientHandler>, SshError> {
-    let ProfileKind::Ssh(ssh) = &profile.kind else {
-        return Err(SshError::Protocol(format!(
-            "profile {:?} is not an SSH profile",
-            profile.name
-        )));
+) -> Result<Hop, SshError> {
+    connect_hop_within(stream, profile, ctx, HOP_TIMEOUT).await
+}
+
+/// [`connect_hop`] with the handshake and the authentication each bounded by `limit`.
+async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
+    stream: S,
+    profile: &Profile,
+    ctx: &SshContext,
+    limit: Duration,
+) -> Result<Hop, SshError> {
+    let ssh = ssh_profile(profile)?;
+    let clock = Arc::new(PromptClock::new());
+    let ctx = SshContext {
+        prompter: Arc::new(ClockedPrompter {
+            inner: ctx.prompter.clone(),
+            clock: clock.clone(),
+        }),
+        ..ctx.clone()
     };
+    let lost = Arc::new(Mutex::new(None));
     let handler = ClientHandler {
         host: ssh.host.clone(),
         port: ssh.port,
         known_hosts: ctx.known_hosts.clone(),
         prompter: ctx.prompter.clone(),
         accepted: None,
+        lost: lost.clone(),
     };
     let config = client_config(&ssh.host, ssh.port, &ctx.known_hosts);
-    let mut handle = client::connect_stream(Arc::new(config), stream, handler).await?;
-    auth::authenticate(&mut handle, profile, ssh, ctx).await?;
-    Ok(handle)
+    let mut handle = bounded(
+        &clock,
+        limit,
+        || format!("no SSH handshake with {} port {}", ssh.host, ssh.port),
+        client::connect_stream(Arc::new(config), stream, handler),
+    )
+    .await??;
+    clock.restart();
+    bounded(
+        &clock,
+        limit,
+        || {
+            format!(
+                "authentication with {} port {} did not finish",
+                ssh.host, ssh.port
+            )
+        },
+        auth::authenticate(&mut handle, profile, ssh, &ctx),
+    )
+    .await??;
+    Ok(Hop { handle, lost })
 }
 
-/// Connect straight to the profile's host over TCP (no jump chain).
+/// Open a TCP connection to the profile's host, bounded by [`HOP_TIMEOUT`].
+pub(crate) async fn tcp_connect(ssh: &SshProfile) -> Result<tokio::net::TcpStream, SshError> {
+    let stream = tokio::time::timeout(
+        HOP_TIMEOUT,
+        tokio::net::TcpStream::connect((ssh.host.as_str(), ssh.port)),
+    )
+    .await
+    .map_err(|_| timed_out(format!("no answer from {} port {}", ssh.host, ssh.port)))?
+    .map_err(SshError::Connect)?;
+    if let Err(e) = stream.set_nodelay(true) {
+        tracing::debug!(error = %e, "set_nodelay failed");
+    }
+    Ok(stream)
+}
+
+/// Connect straight to the profile's host over TCP (no jump chain, no pooling).
 ///
-/// Profiles with a jump chain are refused rather than silently connected directly.
+/// Profiles with a jump chain are refused rather than silently connected directly; open
+/// shells through [`SshPool`] instead.
 pub async fn connect_direct(
     profile: &Profile,
     ctx: &SshContext,
 ) -> Result<Handle<ClientHandler>, SshError> {
-    let ProfileKind::Ssh(ssh) = &profile.kind else {
-        return Err(SshError::Protocol(format!(
-            "profile {:?} is not an SSH profile",
-            profile.name
-        )));
-    };
+    let ssh = ssh_profile(profile)?;
     if !ssh.jump.is_empty() {
         return Err(SshError::Protocol(format!(
             "profile {:?} has a jump chain; it cannot be connected directly",
             profile.name
         )));
     }
-    let stream = tokio::net::TcpStream::connect((ssh.host.as_str(), ssh.port))
-        .await
-        .map_err(SshError::Connect)?;
-    if let Err(e) = stream.set_nodelay(true) {
-        tracing::debug!(error = %e, "set_nodelay failed");
-    }
-    connect_hop(stream, profile, ctx).await
+    let stream = tcp_connect(ssh).await?;
+    Ok(connect_hop(stream, profile, ctx).await?.handle)
 }
 
 #[cfg(test)]
@@ -283,5 +539,138 @@ mod tests {
         // Other hosts keep the default order.
         let other = client_config("other", 22, &path);
         assert_eq!(other.preferred.key[0], russh::keys::Algorithm::Ed25519);
+    }
+
+    /// A prompter that takes `delay` to answer and trusts everything.
+    struct Slow(Duration);
+
+    #[async_trait]
+    impl Prompter for Slow {
+        async fn confirm_host_key(&self, _: &str, _: u16, _: &str) -> bool {
+            tokio::time::sleep(self.0).await;
+            true
+        }
+        async fn ask_secret(&self, _: &str, _: SecretKind, _: bool) -> Option<SecretAnswer> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+    }
+
+    fn is_timeout(e: &SshError) -> bool {
+        matches!(e, SshError::Connect(io) if io.kind() == std::io::ErrorKind::TimedOut)
+    }
+
+    #[tokio::test]
+    async fn bounded_times_out_a_stuck_step() {
+        let clock = PromptClock::new();
+        let started = Instant::now();
+        let err = bounded(
+            &clock,
+            Duration::from_millis(100),
+            || "stuck".into(),
+            async { std::future::pending::<()>().await },
+        )
+        .await
+        .unwrap_err();
+        assert!(is_timeout(&err), "{err:?}");
+        assert!(err.to_string().contains("stuck"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn bounded_does_not_count_prompt_time() {
+        // 100 ms of budget; the step works 50 ms, waits 300 ms on the user, works 30 ms more.
+        let clock = Arc::new(PromptClock::new());
+        let prompter = ClockedPrompter {
+            inner: Arc::new(Slow(Duration::from_millis(300))),
+            clock: clock.clone(),
+        };
+        let out = bounded(&clock, Duration::from_millis(100), || "x".into(), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let trusted = prompter.confirm_host_key("h", 22, "SHA256:x").await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            trusted
+        })
+        .await
+        .unwrap();
+        assert!(out);
+        // After the prompt the remaining budget still applies.
+        let clock = Arc::new(PromptClock::new());
+        let prompter = ClockedPrompter {
+            inner: Arc::new(Slow(Duration::from_millis(150))),
+            clock: clock.clone(),
+        };
+        let err = bounded(&clock, Duration::from_millis(100), || "x".into(), async {
+            prompter.ask_secret("p", SecretKind::Password, false).await;
+            std::future::pending::<()>().await
+        })
+        .await
+        .unwrap_err();
+        assert!(is_timeout(&err), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn silent_server_times_out_the_handshake() {
+        // Accepts the TCP connection but never says anything.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            drop(socket);
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = SshContext {
+            known_hosts: dir.path().join("known_hosts"),
+            secrets: Arc::new(fbterm_secrets::MemoryStore::new()),
+            prompter: Arc::new(Slow(Duration::ZERO)),
+        };
+        let profile = Profile {
+            id: fbterm_config::ProfileId::new(),
+            name: "silent".into(),
+            group: None,
+            accent: None,
+            kind: ProfileKind::Ssh(SshProfile {
+                host: "127.0.0.1".into(),
+                port: addr.port(),
+                user: "u".into(),
+                auth: fbterm_config::AuthMethod::Password,
+                jump: vec![],
+            }),
+        };
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let started = Instant::now();
+        let err = connect_hop_within(stream, &profile, &ctx, Duration::from_millis(200))
+            .await
+            .err()
+            .unwrap();
+        assert!(is_timeout(&err), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        hold.abort();
+    }
+
+    #[test]
+    fn hop_timeout_is_fifteen_seconds() {
+        assert_eq!(HOP_TIMEOUT, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn duplicate_keeps_kind_and_message() {
+        let e = SshError::Connect(std::io::Error::new(std::io::ErrorKind::TimedOut, "slow"));
+        match e.duplicate() {
+            SshError::Connect(io) => {
+                assert_eq!(io.kind(), std::io::ErrorKind::TimedOut);
+                assert_eq!(io.to_string(), "slow");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            SshError::AuthFailed {
+                profile: "p".into()
+            }
+            .duplicate()
+            .to_string(),
+            "authentication failed for \"p\""
+        );
     }
 }

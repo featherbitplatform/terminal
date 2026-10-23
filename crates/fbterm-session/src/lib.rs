@@ -10,7 +10,7 @@ pub mod ssh;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use fbterm_term::{GridSize, SharedTerminal};
+use fbterm_term::{GridSize, SharedTerminal, TermEvent};
 
 pub use local::spawn_local;
 
@@ -50,21 +50,27 @@ pub enum SessionError {
     Io(#[from] std::io::Error),
 }
 
-/// Commands consumed by a session's writer side.
+/// Commands consumed by a session's writer side, in order: input bytes and the terminal's
+/// own replies share one queue so they reach the program in the order they were produced.
 pub(crate) enum Command {
     Input(Vec<u8>),
     Resize(GridSize),
     Close,
 }
 
+/// Stops a session immediately, even if its writer is blocked.
+pub(crate) type Closer = Box<dyn Fn() + Send + Sync>;
+
 /// Handle to a running session. Dropping it closes the session.
 pub struct SessionHandle {
     pub id: SessionId,
     pub terminal: SharedTerminal,
-    pub(crate) commands: std::sync::mpsc::Sender<Command>,
+    pub(crate) commands: tokio::sync::mpsc::UnboundedSender<Command>,
     pub(crate) dirty_pending: Arc<AtomicBool>,
     pub(crate) bell_pending: Arc<AtomicBool>,
-    pub(crate) killer: Arc<parking_lot::Mutex<Box<dyn portable_pty::ChildKiller + Send + Sync>>>,
+    pub(crate) closer: Closer,
+    /// SSH sessions keep their shared connection alive until closed.
+    pub(crate) connection: parking_lot::Mutex<Option<Arc<ssh::pool::Connection>>>,
 }
 
 impl SessionHandle {
@@ -84,12 +90,15 @@ impl SessionHandle {
         let _ = self.commands.send(Command::Resize(size));
     }
 
-    /// Kill the session and stop its threads. Safe to call repeatedly.
+    /// Kill the session and stop its threads or tasks. Safe to call repeatedly.
     ///
-    /// The child is killed directly, so this works even if the writer is blocked.
+    /// The child (or channel) is stopped directly, so this works even if the writer is
+    /// blocked. An SSH session also lets go of its connection, which closes once its last
+    /// session has.
     pub fn close(&self) {
-        let _ = self.killer.lock().kill();
+        (self.closer)();
         let _ = self.commands.send(Command::Close);
+        self.connection.lock().take();
     }
 
     /// Re-arm redraw notifications; returns whether a `Dirty` was pending.
@@ -105,5 +114,79 @@ impl SessionHandle {
 impl Drop for SessionHandle {
     fn drop(&mut self) {
         self.close();
+    }
+}
+
+/// Feeds program output into a session's terminal and raises the coalesced events, the same
+/// way for every kind of session.
+pub(crate) struct Feeder {
+    pub id: SessionId,
+    pub terminal: SharedTerminal,
+    pub events: EventSink,
+    pub dirty_pending: Arc<AtomicBool>,
+    pub bell_pending: Arc<AtomicBool>,
+    last_title: Option<String>,
+}
+
+impl Feeder {
+    pub fn new(
+        id: SessionId,
+        terminal: SharedTerminal,
+        events: EventSink,
+        dirty_pending: Arc<AtomicBool>,
+        bell_pending: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            id,
+            terminal,
+            events,
+            dirty_pending,
+            bell_pending,
+            last_title: None,
+        }
+    }
+
+    /// Feed output; returns the replies the terminal wants written back to the program.
+    ///
+    /// `Dirty` and `Bell` are raised at most once until [`SessionHandle::take_dirty`] re-arms
+    /// them; a title is reported only when it changes.
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+        let term_events = {
+            let mut term = self.terminal.lock();
+            term.feed(bytes);
+            term.take_events()
+        };
+        let mut replies = Vec::new();
+        for ev in term_events {
+            match ev {
+                TermEvent::PtyWrite(bytes) => replies.push(bytes),
+                TermEvent::Title(t) => {
+                    if self.last_title.as_deref() != Some(t.as_str()) {
+                        self.last_title = Some(t.clone());
+                        self.send(SessionEvent::Title(t));
+                    }
+                }
+                TermEvent::Bell => {
+                    if !self.bell_pending.swap(true, Ordering::AcqRel) {
+                        self.send(SessionEvent::Bell);
+                    }
+                }
+                TermEvent::ClipboardStore(s) => self.send(SessionEvent::ClipboardStore(s)),
+                TermEvent::Exit => {}
+            }
+        }
+        self.mark_dirty();
+        replies
+    }
+
+    /// Raise `Dirty` unless one is already pending.
+    pub fn mark_dirty(&self) {
+        if !self.dirty_pending.swap(true, Ordering::AcqRel) {
+            self.send(SessionEvent::Dirty);
+        }
+    }
+
+    pub fn send(&self, event: SessionEvent) {
+        let _ = self.events.send((self.id, event));
     }
 }
