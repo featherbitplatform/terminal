@@ -9,6 +9,7 @@ use iced::{Alignment, Border, Color, Element, Length, Padding};
 use super::view::{detail, input, msg};
 use super::{AuthChoice, EditorMsg, EditorState, SshDraft};
 use crate::app::Message;
+use crate::redact::Redacted;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -71,7 +72,7 @@ pub(super) fn auth<'a>(
                 placeholder,
                 &s.secret,
                 false,
-                editable.then_some(EditorMsg::Secret as fn(String) -> EditorMsg)
+                editable.then_some(secret_msg as fn(String) -> EditorMsg)
             )
             .secure(true),
         ]
@@ -265,4 +266,8 @@ pub(super) fn jumps<'a>(
         );
     }
     col.into()
+}
+
+fn secret_msg(v: String) -> EditorMsg {
+    EditorMsg::Secret(Redacted(v))
 }

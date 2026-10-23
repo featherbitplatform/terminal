@@ -24,6 +24,7 @@ mod keys;
 mod palette;
 mod prompt_view;
 mod prompts;
+mod redact;
 mod sessions;
 mod tabs;
 mod theme;

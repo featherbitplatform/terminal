@@ -72,8 +72,9 @@ pub fn primary(t: &Tokens, status: button::Status) -> button::Style {
         })),
         text_color: if disabled { t.text_muted } else { Color::WHITE },
         border: Border {
+            color: t.border,
+            width: if disabled { 1.0 } else { 0.0 },
             radius: 6.0.into(),
-            ..Border::default()
         },
         ..button::Style::default()
     }

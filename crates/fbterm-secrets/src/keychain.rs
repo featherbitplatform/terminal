@@ -127,4 +127,20 @@ impl SecretStore for KeychainStore {
         }
         self.commit(&mut guard, map)
     }
+
+    fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+        let mut guard = self.loaded()?;
+        let mut map = guard.clone().unwrap_or_default();
+        let key = id.to_string();
+        let Some(secrets) = map.get_mut(&key) else {
+            return Ok(());
+        };
+        if !secrets.clear(kind) {
+            return Ok(());
+        }
+        if secrets.is_empty() {
+            map.remove(&key);
+        }
+        self.commit(&mut guard, map)
+    }
 }

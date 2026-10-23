@@ -19,6 +19,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::app::Delivered;
+use crate::redact::Redacted;
 
 /// Identifies one question for the lifetime of the process.
 pub type PromptId = u64;
@@ -157,7 +158,7 @@ pub enum PromptMsg {
     Trust(window::Id),
     /// Cancel (or close) this window's dialog.
     Cancel(window::Id),
-    Input(window::Id, String),
+    Input(window::Id, Redacted),
     Remember(window::Id, bool),
     /// Enter: submit a secret (ignored by the other dialogs).
     Submit(window::Id),
@@ -214,6 +215,11 @@ impl Dialog {
                 input: iced::widget::Id::unique(),
             },
         }
+    }
+
+    /// Whether Enter / Connect answers: a secret prompt needs something typed.
+    pub fn can_submit(&self) -> bool {
+        matches!(self, Self::Secret { value, .. } if !value.is_empty())
     }
 
     /// The field to focus when this dialog is shown.
@@ -322,9 +328,9 @@ impl PromptQueues {
         }
     }
 
-    /// Submit the shown secret prompt. Other dialogs are left alone.
+    /// Submit the shown secret prompt, if something was typed. Other dialogs are left alone.
     pub fn submit(&mut self, window: window::Id) {
-        if matches!(self.front(window), Some(Dialog::Secret { .. }))
+        if self.front(window).is_some_and(Dialog::can_submit)
             && let Some(Dialog::Secret {
                 value,
                 remember,
@@ -493,6 +499,39 @@ mod tests {
         }
         assert_eq!(q.withdraw(id), Some(w));
         assert!(q.is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_secret_is_not_submitted() {
+        let (tx, mut rx) = unbounded_channel();
+        let p = UiPrompter::new(None, tx);
+        let w = wid();
+        let mut q = PromptQueues::default();
+        let (answer, ()) = tokio::join!(p.ask_secret("web", SecretKind::Password, false), async {
+            queue(&mut rx, &mut q, w).await;
+            q.submit(w);
+            assert!(
+                matches!(q.front(w), Some(Dialog::Secret { .. })),
+                "Enter on an empty field keeps the dialog"
+            );
+            assert!(!q.front(w).unwrap().can_submit());
+            if let Some(Dialog::Secret { value, .. }) = q.front_mut(w) {
+                value.push_str("pw");
+            }
+            assert!(q.front(w).unwrap().can_submit());
+            q.submit(w);
+        });
+        assert_eq!(answer.unwrap().value, "pw");
+    }
+
+    #[test]
+    fn typed_secret_is_redacted_in_debug() {
+        let msg = PromptMsg::Input(wid(), Redacted("hunter2-secret".into()));
+        let app = crate::app::Message::Prompt(msg.clone());
+        for shown in [format!("{msg:?}"), format!("{app:?}")] {
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(shown.contains("<redacted>"), "{shown}");
+        }
     }
 
     #[test]

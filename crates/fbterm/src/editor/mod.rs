@@ -2,11 +2,12 @@
 //! testable without a GUI. The window itself is drawn by [`view`].
 //!
 //! The editor works on drafts of every profile and touches the real store only in
-//! [`EditorState::apply`], which validates first and never hands back an invalid store. Typed
-//! passwords and passphrases go to the [`SecretStore`] there, never into a profile.
+//! [`EditorState::save`]: it validates, writes `profiles.toml` atomically and only then changes
+//! the [`SecretStore`] (typed passwords and passphrases are stored there, never in a profile;
+//! secrets of deleted profiles and of auth methods no longer used are removed).
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::{
@@ -14,6 +15,8 @@ use fbterm_config::{
     SshProfile, ValidationError,
 };
 use fbterm_secrets::{SecretKind, SecretStore};
+
+use crate::redact::Redacted;
 
 mod ssh_view;
 pub mod view;
@@ -71,7 +74,7 @@ pub enum EditorMsg {
     User(String),
     Auth(AuthChoice),
     /// The typed password or key passphrase (stored in the keychain on save).
-    Secret(String),
+    Secret(Redacted),
     KeyPath(String),
     KeyPassphrase(bool),
     JumpAdd(ProfileId),
@@ -463,39 +466,158 @@ impl EditorState {
         }
     }
 
-    /// Validate the drafts and, if valid, replace `store` with them, store typed secrets and
-    /// forget the secrets of deleted profiles. Invalid drafts leave everything untouched.
-    pub fn apply(&mut self, store: &mut ProfileStore) -> Result<(), Vec<ValidationError>> {
-        let candidate = ProfileStore {
+    /// Validate the drafts against the saved `current` store. Returns the store to write and
+    /// the secret changes to make once it is written; nothing is changed yet.
+    pub fn prepare(&mut self, current: &ProfileStore) -> Result<Prepared, Vec<ValidationError>> {
+        let store = ProfileStore {
             profiles: self.drafts.iter().map(Draft::to_profile).collect(),
         };
-        let errors = candidate.validate();
+        let errors = store.validate();
         if !errors.is_empty() {
             self.errors = errors.clone();
             return Err(errors);
         }
+        let mut sets = Vec::new();
+        let mut removes = Vec::new();
         for d in &self.drafts {
-            if let Some((kind, value)) = d.typed_secret()
-                && let Err(e) = self.secrets.set(&d.id, kind, value)
-            {
-                tracing::warn!(profile = %d.name, error = %e, "could not store secret");
+            if let Some((kind, value)) = d.typed_secret() {
+                sets.push(SecretOp::Set {
+                    id: d.id,
+                    kind,
+                    value: Redacted(value.to_owned()),
+                });
+            }
+            let (Some(old), DraftKind::Ssh(new)) = (current.get(d.id), &d.kind) else {
+                continue;
+            };
+            let ProfileKind::Ssh(old) = &old.kind else {
+                continue;
+            };
+            let had_password = old.auth == AuthMethod::Password;
+            let had_passphrase = matches!(
+                old.auth,
+                AuthMethod::Key {
+                    passphrase: true,
+                    ..
+                }
+            );
+            if had_password && new.auth != AuthChoice::Password {
+                removes.push(SecretOp::RemoveKind {
+                    id: d.id,
+                    kind: SecretKind::Password,
+                });
+            }
+            if had_passphrase && !(new.auth == AuthChoice::Key && new.key_passphrase) {
+                removes.push(SecretOp::RemoveKind {
+                    id: d.id,
+                    kind: SecretKind::KeyPassphrase,
+                });
             }
         }
-        for id in self.removed.drain(..) {
-            if let Err(e) = self.secrets.remove(&id) {
-                tracing::warn!(profile = %id, error = %e, "could not remove secrets");
-            }
-        }
-        for d in &mut self.drafts {
-            if let DraftKind::Ssh(s) = &mut d.kind {
-                s.secret.clear();
-            }
-        }
-        *store = candidate;
-        self.errors.clear();
-        self.dirty = false;
-        Ok(())
+        removes.extend(self.removed.iter().map(|&id| SecretOp::Remove(id)));
+        sets.extend(removes);
+        Ok(Prepared { store, ops: sets })
     }
+
+    /// Save: validate, write `path` atomically, then replace `store` and apply the secret
+    /// changes (stores first, then removals). A refused or failed write changes nothing: the
+    /// drafts keep their typed secrets. A secret the store refuses stays typed in its draft and
+    /// the editor stays dirty.
+    pub fn save(&mut self, store: &mut ProfileStore, path: &Path) -> Result<(), SaveError> {
+        let prepared = self.prepare(store).map_err(SaveError::Invalid)?;
+        prepared.store.save(path).map_err(SaveError::Write)?;
+        *store = prepared.store;
+        self.errors.clear();
+        self.removed.clear();
+        let mut failures = Vec::new();
+        for op in prepared.ops {
+            let name = |id: ProfileId| {
+                self.draft(id)
+                    .map_or_else(|| id.to_string(), |d| d.name.clone())
+            };
+            let (result, what) = match &op {
+                SecretOp::Set { id, kind, value } => (
+                    self.secrets.set(id, *kind, &value.0),
+                    format!("store the {} of {}", kind_name(*kind), name(*id)),
+                ),
+                SecretOp::RemoveKind { id, kind } => (
+                    self.secrets.remove_kind(id, *kind),
+                    format!("remove the old {} of {}", kind_name(*kind), name(*id)),
+                ),
+                SecretOp::Remove(id) => (
+                    self.secrets.remove(id),
+                    format!("remove the secrets of a deleted profile ({id})"),
+                ),
+            };
+            match result {
+                Ok(()) => {
+                    if let SecretOp::Set { id, .. } = op
+                        && let Some(DraftKind::Ssh(s)) = self
+                            .drafts
+                            .iter_mut()
+                            .find(|d| d.id == id)
+                            .map(|d| &mut d.kind)
+                    {
+                        s.secret.clear();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "keychain change failed after saving profiles");
+                    if let SecretOp::Remove(id) = op {
+                        // Retried on the next save.
+                        self.removed.push(id);
+                    }
+                    failures.push(format!("could not {what}: {e}"));
+                }
+            }
+        }
+        if failures.is_empty() {
+            self.dirty = false;
+            Ok(())
+        } else {
+            self.dirty = true;
+            Err(SaveError::Secrets(failures))
+        }
+    }
+}
+
+fn kind_name(kind: SecretKind) -> &'static str {
+    match kind {
+        SecretKind::Password => "password",
+        SecretKind::KeyPassphrase => "key passphrase",
+    }
+}
+
+/// A secret-store change a save makes once `profiles.toml` is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretOp {
+    Set {
+        id: ProfileId,
+        kind: SecretKind,
+        value: Redacted,
+    },
+    /// The profile no longer uses this kind (auth changed, passphrase unchecked).
+    RemoveKind { id: ProfileId, kind: SecretKind },
+    /// The profile was deleted.
+    Remove(ProfileId),
+}
+
+/// A validated store, ready to write, and the secret changes that follow the write.
+#[derive(Debug)]
+pub struct Prepared {
+    pub store: ProfileStore,
+    pub ops: Vec<SecretOp>,
+}
+
+/// Why a save did not fully happen.
+#[derive(Debug)]
+pub enum SaveError {
+    /// Nothing was written; the problems are in `EditorState::errors`.
+    Invalid(Vec<ValidationError>),
+    /// `profiles.toml` could not be written; nothing changed.
+    Write(ConfigError),
+    /// The profiles were saved, but these secret changes failed.
+    Secrets(Vec<String>),
 }
 
 /// Apply one field edit to a draft; returns whether it changed anything.
@@ -519,7 +641,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
             }
             s.auth = v;
         }
-        (EditorMsg::Secret(v), DraftKind::Ssh(s)) => s.secret = v,
+        (EditorMsg::Secret(v), DraftKind::Ssh(s)) => s.secret = v.0,
         (EditorMsg::KeyPath(v), DraftKind::Ssh(s)) => s.key_path = v,
         (EditorMsg::KeyPicked(Some(p)), DraftKind::Ssh(s)) => {
             s.key_path = p.display().to_string();

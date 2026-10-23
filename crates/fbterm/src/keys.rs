@@ -14,7 +14,8 @@ pub enum Action {
     Palette,
     NewWindow,
     Settings,
-    /// The profile editor: Cmd+Shift+, on macOS, otherwise from the palette.
+    /// The profile editor: Cmd+, or Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere (the Settings
+    /// chord until settings have a window).
     EditProfiles,
 }
 
@@ -51,8 +52,8 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
         't' if plain => Some(Action::NewTab),
         'w' if plain => Some(Action::CloseTab),
         'n' if plain => Some(Action::NewWindow),
-        ',' | '<' if mac && shifted => Some(Action::EditProfiles),
-        ',' | '<' if plain => Some(Action::Settings),
+        // Settings has no window yet; its chord opens the profile editor for now.
+        ',' | '<' => Some(Action::EditProfiles),
         'p' if shifted => Some(Action::Palette),
         ']' | '}' if shifted => Some(Action::NextTab),
         '[' | '{' if shifted => Some(Action::PrevTab),
@@ -92,7 +93,8 @@ mod tests {
         assert_eq!(m("p", cmd_shift()), Some(Action::Palette));
         assert_eq!(m("P", cmd_shift()), Some(Action::Palette));
         assert_eq!(m("n", CMD), Some(Action::NewWindow));
-        assert_eq!(m(",", CMD), Some(Action::Settings));
+        // Settings has no window yet: both chords open the profile editor.
+        assert_eq!(m(",", CMD), Some(Action::EditProfiles));
         assert_eq!(m(",", cmd_shift()), Some(Action::EditProfiles));
         assert_eq!(m("<", cmd_shift()), Some(Action::EditProfiles));
     }
@@ -127,7 +129,7 @@ mod tests {
         }
         assert_eq!(m("p", ctrl_shift()), Some(Action::Palette));
         assert_eq!(m("n", ctrl_shift()), Some(Action::NewWindow));
-        assert_eq!(m(",", ctrl_shift()), Some(Action::Settings));
+        assert_eq!(m(",", ctrl_shift()), Some(Action::EditProfiles));
         // Plain Ctrl chords belong to the shell (Ctrl+T, Ctrl+W, Ctrl+P ...).
         assert_eq!(m("t", Modifiers::CTRL), None);
         assert_eq!(m("w", Modifiers::CTRL), None);
