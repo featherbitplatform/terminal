@@ -244,7 +244,7 @@ async fn respawn_ignores_output_from_old_sessions_orphans() {
     let old = spawn_local_into(
         &profile(
             "sh",
-            &["-c", "(trap '' HUP; sleep 0.3; echo ORPHAN) & exit 0"],
+            &["-c", "(trap '' HUP; sleep 1.5; echo ORPHAN) & exit 0"],
         ),
         term.clone(),
         tx,
@@ -252,12 +252,14 @@ async fn respawn_ignores_output_from_old_sessions_orphans() {
     .expect("spawn");
     assert_eq!(wait_exit(&mut rx).await, Some(0));
     // What the app does on Enter: close the old session, then continue in the same terminal.
+    // The orphan writes at ~1.5 s, well after the 500 ms drain window that runs before Exited,
+    // so its output lands after the old session is closed and after the respawn.
     drop(old);
     let (tx2, _rx2): (EventSink, _) = unbounded_channel();
     let new =
-        spawn_local_into(&profile("sh", &["-c", "echo NEW; sleep 2"]), term, tx2).expect("respawn");
+        spawn_local_into(&profile("sh", &["-c", "echo NEW; sleep 5"]), term, tx2).expect("respawn");
     wait_for_text(&new, "NEW", 1).await;
-    tokio::time::sleep(Duration::from_millis(1000)).await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
     assert!(
         !grid_text(&new).contains("ORPHAN"),
         "orphan output reached the reused terminal:\n{}",
