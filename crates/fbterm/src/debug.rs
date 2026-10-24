@@ -67,6 +67,48 @@ impl App {
         self.open_settings()
     }
 
+    /// `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (debug aids): the find bar of the first
+    /// window's active tab, or the find-in-all-tabs box, open with that query once the tabs
+    /// have had a second to print something.
+    pub(crate) fn open_debug_find(&mut self) -> Task<Message> {
+        let tasks = [("FBTERM_FIND", false), ("FBTERM_FIND_ALL", true)]
+            .into_iter()
+            .filter_map(|(name, all)| {
+                let query = debug_env(name)?.to_string_lossy().into_owned();
+                Some(Task::perform(
+                    async { tokio::time::sleep(std::time::Duration::from_millis(900)).await },
+                    move |()| Message::DebugFind {
+                        all,
+                        query: query.clone(),
+                    },
+                ))
+            });
+        Task::batch(tasks)
+    }
+
+    pub(crate) fn debug_find(&mut self, all: bool, query: String) -> Task<Message> {
+        let Some(&wid) = self.windows.keys().next() else {
+            return Task::none();
+        };
+        if all {
+            return self.open_find_all(wid, query);
+        }
+        // Open, then type: the field ends with the cursor after the query.
+        let _ = self.find(wid, crate::find::FindMsg::Open);
+        let search = self.find(wid, crate::find::FindMsg::Query(query));
+        let input = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.active_tab())
+            .and_then(|t| t.find.as_ref())
+            .map(|bar| bar.input.clone());
+        let focus = input.map_or(Task::none(), |id| {
+            iced::widget::operation::focus(id.clone())
+                .chain(iced::widget::operation::move_cursor_to_end(id))
+        });
+        Task::batch([search, focus])
+    }
+
     /// `FBTERM_DEMO_PROMPT=hostkey|password|changed` (debug aid): show a sample dialog in the
     /// first window. Nothing waits for its answer.
     pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {

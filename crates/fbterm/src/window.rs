@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use fbterm_term::terminal_view;
+use fbterm_term::highlighted_terminal_view;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Operation, Tree, Widget};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
@@ -61,7 +61,9 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };
-    let style = if app.app_active && app.focused == Some(id) {
+    // With the find bar open, keys go to the bar: the terminal is drawn (and acts) unfocused.
+    let find = win.active_tab().and_then(|t| t.find.as_ref());
+    let style = if app.app_active && app.focused == Some(id) && find.is_none() {
         &app.style
     } else {
         &app.style_unfocused
@@ -73,13 +75,15 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let term_bg = to_color(style.scheme.background).scale_alpha(opacity);
     let bar_bg = t.surface.scale_alpha(opacity);
     let palette = app.palettes.get(&id);
+    let find_box = app.find_box.as_ref().filter(|f| f.window == id);
     let dialog = app.prompts.front(id);
+    let modal = palette.is_some() || find_box.is_some() || dialog.is_some();
     let bar = TabBar {
         window: id,
         bar_bg,
         active_bg: term_bg,
         fullscreen: app.fullscreen.contains(&id),
-        modal: palette.is_some() || dialog.is_some(),
+        modal,
         demo_tip: app.demo_tip,
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
@@ -89,7 +93,16 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     }
     // Only the active tab builds a terminal view; background tabs render nothing.
     let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
-        Some(term) => terminal_view(term, style, move |o| Message::Terminal(id, o)),
+        Some(term) => {
+            let highlight = find.and_then(|bar| app.highlight(bar));
+            let view = highlighted_terminal_view(term, style, highlight, move |o| {
+                Message::Terminal(id, o)
+            });
+            match find {
+                Some(bar) => stack![view, crate::find::bar_view::view(t, id, bar)].into(),
+                None => view,
+            }
+        }
         None if win.tabs.is_empty() => container(
             text("No shells found. Add a profile in profiles.toml.")
                 .font(UI_FONT)
@@ -110,22 +123,18 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 ..container::Style::default()
             }),
     );
-    // Under an overlay nothing reaches the terminal; only the palette toggle still works,
-    // and not while a dialog waits for an answer.
-    let covered = if dialog.is_some() {
-        Mode::Blocked {
-            palette_toggle: false,
-        }
-    } else {
-        Mode::Blocked {
-            palette_toggle: true,
-        }
+    // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
+    // toggles still work, and not while a dialog waits for an answer.
+    let covered = Mode::Blocked {
+        toggles: dialog.is_none(),
     };
     let base = Element::new(Shortcuts {
         content: body.into(),
         window: id,
-        mode: if palette.is_some() || dialog.is_some() {
+        mode: if modal {
             covered
+        } else if find.is_some() {
+            Mode::Find
         } else {
             Mode::Normal
         },
@@ -139,6 +148,17 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 covered
             } else {
                 Mode::Palette
+            },
+        }));
+    }
+    if let Some(state) = find_box {
+        layers = layers.push(Element::new(Shortcuts {
+            content: crate::find::all_view::view(t, id, state),
+            window: id,
+            mode: if dialog.is_some() {
+                covered
+            } else {
+                Mode::FindAll
             },
         }));
     }

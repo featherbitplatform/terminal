@@ -1,4 +1,5 @@
-//! Application keyboard shortcuts: Cmd on macOS, Ctrl+Shift elsewhere (Settings is Ctrl+,).
+//! Application keyboard shortcuts: Cmd on macOS, Ctrl+Shift elsewhere (Settings is Ctrl+,, find
+//! in all tabs Ctrl+Alt+F).
 
 use iced::keyboard::{Key, Modifiers};
 
@@ -23,6 +24,16 @@ pub enum Action {
     OpenSettingsFile,
     /// Show the config folder in the file manager (palette only).
     RevealConfigFolder,
+    /// The active tab's find bar: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
+    Find,
+    /// The search over every tab: Cmd+Shift+F on macOS, Ctrl+Alt+F elsewhere.
+    FindAll,
+    /// Next match up the scrollback (older), while the find bar is open: Cmd+G on macOS,
+    /// Ctrl+G elsewhere (see [`find_key`]).
+    FindNext,
+    /// Next match down the scrollback (newer), while the find bar is open: Cmd+Shift+G on
+    /// macOS, Ctrl+Shift+G elsewhere.
+    FindPrevious,
 }
 
 /// The shortcut for `key` (as pressed, without modifiers applied) on this platform.
@@ -48,6 +59,9 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
     if !mac && c == ',' && mods.control() && !shift && !mods.alt() && !mods.logo() {
         return Some(Action::Settings);
     }
+    if !mac && c == 'f' && mods.control() && mods.alt() && !shift && !mods.logo() {
+        return Some(Action::FindAll);
+    }
     if mac {
         if !mods.logo() || mods.control() || mods.alt() {
             return None;
@@ -66,9 +80,32 @@ pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
         ',' if mac && !shift => Some(Action::Settings),
         ',' | '<' if shifted => Some(Action::EditProfiles),
         'p' if shifted => Some(Action::Palette),
+        'f' if plain => Some(Action::Find),
+        'f' if mac && shifted => Some(Action::FindAll),
         ']' | '}' if shifted => Some(Action::NextTab),
         '[' | '{' if shifted => Some(Action::PrevTab),
         '1'..='9' if plain => Some(Action::SelectTab(c as u8 - b'0')),
+        _ => None,
+    }
+}
+
+/// Find-bar navigation keys (only while the bar is open, so plain Ctrl+G still reaches the
+/// shell otherwise): Cmd+G / Cmd+Shift+G on macOS, Ctrl+G / Ctrl+Shift+G elsewhere.
+pub fn find_key(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
+    let Key::Character(s) = key else {
+        return None;
+    };
+    if !s.eq_ignore_ascii_case("g") || mods.alt() {
+        return None;
+    }
+    let held = if mac {
+        mods.logo() && !mods.control()
+    } else {
+        mods.control() && !mods.logo()
+    };
+    match (held, mods.shift()) {
+        (true, false) => Some(Action::FindNext),
+        (true, true) => Some(Action::FindPrevious),
         _ => None,
     }
 }
@@ -79,6 +116,8 @@ pub struct Chord {
     /// The key, lowercase for letters.
     pub key: char,
     pub ctrl: bool,
+    /// Option on macOS.
+    pub alt: bool,
     pub shift: bool,
     /// Cmd on macOS.
     pub cmd: bool,
@@ -101,11 +140,33 @@ pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
             return Some(Chord {
                 key: ',',
                 ctrl: true,
+                alt: false,
                 shift: false,
                 cmd: false,
             });
         }
         Action::Settings => (',', false),
+        Action::Find => ('f', false),
+        Action::FindAll if !mac => {
+            return Some(Chord {
+                key: 'f',
+                ctrl: true,
+                alt: true,
+                shift: false,
+                cmd: false,
+            });
+        }
+        Action::FindAll => ('f', true),
+        Action::FindNext | Action::FindPrevious => {
+            let shift = action == Action::FindPrevious;
+            return Some(Chord {
+                key: 'g',
+                ctrl: !mac,
+                alt: false,
+                shift,
+                cmd: mac,
+            });
+        }
         Action::SelectTab(_) | Action::OpenSettingsFile | Action::RevealConfigFolder => {
             return None;
         }
@@ -114,6 +175,7 @@ pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
         Chord {
             key,
             ctrl: false,
+            alt: false,
             shift: mac_shift,
             cmd: true,
         }
@@ -121,6 +183,7 @@ pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
         Chord {
             key,
             ctrl: true,
+            alt: false,
             shift: true,
             cmd: false,
         }
@@ -136,6 +199,9 @@ impl Chord {
             if self.ctrl {
                 s.push('⌃');
             }
+            if self.alt {
+                s.push('⌥');
+            }
             if self.shift {
                 s.push('⇧');
             }
@@ -148,6 +214,9 @@ impl Chord {
             let mut parts: Vec<String> = Vec::new();
             if self.ctrl {
                 parts.push("Ctrl".into());
+            }
+            if self.alt {
+                parts.push("Alt".into());
             }
             if self.shift {
                 parts.push("Shift".into());
@@ -167,6 +236,9 @@ impl Chord {
         if self.ctrl {
             m |= Modifiers::CTRL;
         }
+        if self.alt {
+            m |= Modifiers::ALT;
+        }
         if self.shift {
             m |= Modifiers::SHIFT;
         }
@@ -181,7 +253,7 @@ impl Chord {
 mod tests {
     use super::*;
 
-    const ALL: [Action; 20] = [
+    const ALL: [Action; 24] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -202,6 +274,10 @@ mod tests {
         Action::Settings,
         Action::OpenSettingsFile,
         Action::RevealConfigFolder,
+        Action::Find,
+        Action::FindAll,
+        Action::FindNext,
+        Action::FindPrevious,
     ];
 
     #[test]
@@ -212,12 +288,11 @@ mod tests {
                     continue;
                 };
                 let key = Key::Character(c.key.to_string().into());
-                assert_eq!(
-                    shortcut_for(mac, &key, c.modifiers()),
-                    Some(action),
-                    "{} (mac: {mac})",
-                    c.label(mac)
-                );
+                let found = match action {
+                    Action::FindNext | Action::FindPrevious => find_key(mac, &key, c.modifiers()),
+                    _ => shortcut_for(mac, &key, c.modifiers()),
+                };
+                assert_eq!(found, Some(action), "{} (mac: {mac})", c.label(mac));
             }
         }
     }
@@ -237,6 +312,17 @@ mod tests {
         );
         assert_eq!(l(true, Action::Settings).as_deref(), Some("⌘,"));
         assert_eq!(l(false, Action::Settings).as_deref(), Some("Ctrl+,"));
+        assert_eq!(l(true, Action::Find).as_deref(), Some("⌘F"));
+        assert_eq!(l(true, Action::FindAll).as_deref(), Some("⇧⌘F"));
+        assert_eq!(l(true, Action::FindNext).as_deref(), Some("⌘G"));
+        assert_eq!(l(true, Action::FindPrevious).as_deref(), Some("⇧⌘G"));
+        assert_eq!(l(false, Action::Find).as_deref(), Some("Ctrl+Shift+F"));
+        assert_eq!(l(false, Action::FindAll).as_deref(), Some("Ctrl+Alt+F"));
+        assert_eq!(l(false, Action::FindNext).as_deref(), Some("Ctrl+G"));
+        assert_eq!(
+            l(false, Action::FindPrevious).as_deref(),
+            Some("Ctrl+Shift+G")
+        );
         assert_eq!(l(true, Action::OpenSettingsFile), None);
         assert_eq!(l(false, Action::RevealConfigFolder), None);
     }
@@ -317,6 +403,49 @@ mod tests {
         assert_eq!(m("w", Modifiers::CTRL), None);
         assert_eq!(m("t", CMD), None);
         assert_eq!(m("t", ctrl_shift() | Modifiers::ALT), None);
+    }
+
+    #[test]
+    fn find_chords_do_not_collide() {
+        let m = |key: &str, mods| shortcut_for(true, &k(key), mods);
+        assert_eq!(m("f", CMD), Some(Action::Find));
+        assert_eq!(m("F", cmd_shift()), Some(Action::FindAll));
+        assert_eq!(m("f", CMD | Modifiers::ALT), None);
+        let o = |key: &str, mods| shortcut_for(false, &k(key), mods);
+        assert_eq!(o("f", ctrl_shift()), Some(Action::Find));
+        assert_eq!(o("F", ctrl_shift()), Some(Action::Find));
+        assert_eq!(
+            o("f", Modifiers::CTRL | Modifiers::ALT),
+            Some(Action::FindAll)
+        );
+        assert_eq!(o("f", ctrl_shift() | Modifiers::ALT), None);
+        // Plain Ctrl+F (forward a character) and Ctrl+G stay with the shell.
+        assert_eq!(o("f", Modifiers::CTRL), None);
+        assert_eq!(o("g", Modifiers::CTRL), None);
+        assert_eq!(o("g", ctrl_shift()), None);
+        // Every chord in the table is distinct.
+        for mac in [true, false] {
+            let chords: Vec<Chord> = ALL.iter().filter_map(|a| chord_for(mac, *a)).collect();
+            for (i, a) in chords.iter().enumerate() {
+                assert!(!chords[i + 1..].contains(a), "{} twice", a.label(mac));
+            }
+        }
+        // Find navigation only answers its own chords.
+        assert_eq!(find_key(true, &k("g"), CMD), Some(Action::FindNext));
+        assert_eq!(
+            find_key(true, &k("G"), cmd_shift()),
+            Some(Action::FindPrevious)
+        );
+        assert_eq!(find_key(true, &k("g"), Modifiers::CTRL), None);
+        assert_eq!(
+            find_key(false, &k("g"), Modifiers::CTRL),
+            Some(Action::FindNext)
+        );
+        assert_eq!(
+            find_key(false, &k("G"), ctrl_shift()),
+            Some(Action::FindPrevious)
+        );
+        assert_eq!(find_key(false, &k("h"), Modifiers::CTRL), None);
     }
 
     #[test]

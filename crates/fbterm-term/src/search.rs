@@ -28,6 +28,9 @@ pub const CHUNK_ROWS: usize = 1000;
 
 /// Characters of context kept before a match in a [`Snippet`].
 const SNIPPET_BEFORE: usize = 32;
+/// A match ending within this many characters of the line start keeps the line from its
+/// start (it fits a results row as it is).
+const SNIPPET_FITS: usize = 96;
 /// Most characters in a [`Snippet`].
 const SNIPPET_LEN: usize = 120;
 /// Most rows one wrapped line is followed for while finding the matches on screen.
@@ -223,13 +226,18 @@ impl LineText {
 pub fn snippet(text: &str, range: Range<usize>) -> Snippet {
     let lead = text.len() - text.trim_start().len();
     let start = range.start.max(lead);
-    // Context before the match, at most SNIPPET_BEFORE characters.
+    // Context before the match: the whole line when the match ends early enough to fit,
+    // otherwise SNIPPET_BEFORE characters.
     let mut from = start;
-    for (n, (i, _)) in text[lead..start].char_indices().rev().enumerate() {
-        if n == SNIPPET_BEFORE {
-            break;
+    if text[lead..range.end.max(lead)].chars().count() <= SNIPPET_FITS {
+        from = lead;
+    } else {
+        for (n, (i, _)) in text[lead..start].char_indices().rev().enumerate() {
+            if n == SNIPPET_BEFORE {
+                break;
+            }
+            from = lead + i;
         }
-        from = lead + i;
     }
     let mut out = String::new();
     if from > lead {
@@ -730,6 +738,11 @@ mod tests {
         let s = snippet("   hello world", 9..14);
         assert_eq!(s.text, "hello world");
         assert_eq!(&s.text[s.highlight.clone()], "world");
+        // Early in a long line: from the start.
+        let line = format!("ab needle {}", "c".repeat(200));
+        let s = snippet(&line, 3..9);
+        assert!(s.text.starts_with("ab needle"));
+        assert_eq!(&s.text[s.highlight.clone()], "needle");
         let long = format!("{}needle{}", "a".repeat(100), "b".repeat(200));
         let s = snippet(&long, 100..106);
         assert!(s.text.starts_with('\u{2026}'));

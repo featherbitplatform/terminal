@@ -35,7 +35,10 @@ impl App {
                 Some(wid) if self.palettes.contains_key(&wid) => {
                     self.palette(wid, PaletteMsg::Close)
                 }
-                Some(wid) => self.palette(wid, PaletteMsg::Open),
+                Some(wid) => {
+                    self.close_find_all();
+                    self.palette(wid, PaletteMsg::Open)
+                }
                 None => Task::none(),
             },
             Action::NewWindow => self.open_window(self.default_profile()),
@@ -50,6 +53,22 @@ impl App {
                 Task::none()
             }
             Action::Quit => self.quit(),
+            Action::Find => match wid {
+                Some(wid) => self.find(wid, crate::find::FindMsg::Open),
+                None => Task::none(),
+            },
+            Action::FindAll => match wid {
+                Some(wid) => self.find_all(wid, crate::find::all::FindAllMsg::Open),
+                None => Task::none(),
+            },
+            Action::FindNext => match wid {
+                Some(wid) => self.find(wid, crate::find::FindMsg::Next),
+                None => Task::none(),
+            },
+            Action::FindPrevious => match wid {
+                Some(wid) => self.find(wid, crate::find::FindMsg::Previous),
+                None => Task::none(),
+            },
         }
     }
 
