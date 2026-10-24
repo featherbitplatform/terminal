@@ -6,8 +6,8 @@
 
 use std::time::Duration;
 
-use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE};
-use fbterm_config::{ConfigError, SettingChange, Settings, ThemeMode};
+use fbterm_config::settings::{DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE};
+use fbterm_config::{ConfigError, MaxFps, SettingChange, Settings, ThemeMode};
 
 mod fonts;
 mod glue;
@@ -45,6 +45,28 @@ pub enum SettingsMsg {
     ScrollbackText(String),
     ScrollbackSubmit,
     Kitty(bool),
+    MaxFps(MaxFps),
+}
+
+/// Fixed redraw rates offered in the list.
+pub const RATE_PRESETS: [u16; 3] = [30, 60, 120];
+
+/// The redraw-rate row's hint when the rate in force is above the default.
+pub const RATE_CPU_HINT: &str = "Higher rates use more CPU while output is streaming.";
+/// The redraw-rate row's hint otherwise.
+pub const RATE_HINT: &str = "Caps redraws from program output. Typing always redraws at once";
+
+/// One option of the redraw-rate list.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateChoice {
+    pub value: MaxFps,
+    pub label: String,
+}
+
+impl std::fmt::Display for RateChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label)
+    }
 }
 
 /// When the pending changes go to disk.
@@ -84,6 +106,8 @@ pub struct SettingsState {
     pub read_only: Option<ConfigError>,
     /// Why the last write failed, until the next one works.
     pub write_error: Option<String>,
+    /// The refresh rate `max_fps = "display"` follows, if detected (set by the app).
+    pub display_hz: Option<u32>,
     /// Changes applied but not yet written, one per key, oldest first.
     pending: Vec<SettingChange>,
     /// Counts debounced changes, so only the last of a burst writes.
@@ -114,6 +138,7 @@ impl SettingsState {
             fonts,
             read_only,
             write_error: None,
+            display_hz: None,
             pending: Vec::new(),
             generation: 0,
         };
@@ -166,6 +191,53 @@ impl SettingsState {
             .find(|f| f.family == self.values.font_family)
     }
 
+    /// The redraw-rate options: the presets, the file's own number if it is none of them, and
+    /// following the display.
+    pub fn rate_choices(&self) -> Vec<RateChoice> {
+        let mut fixed: Vec<(u16, bool)> = RATE_PRESETS.iter().map(|n| (*n, false)).collect();
+        if let MaxFps::Fixed(n) = self.values.max_fps
+            && !RATE_PRESETS.contains(&n)
+        {
+            fixed.push((n, true));
+            fixed.sort_unstable();
+        }
+        let mut choices: Vec<RateChoice> = fixed
+            .into_iter()
+            .map(|(n, custom)| RateChoice {
+                value: MaxFps::Fixed(n),
+                label: if custom {
+                    format!("{n} (custom)")
+                } else {
+                    n.to_string()
+                },
+            })
+            .collect();
+        choices.push(RateChoice {
+            value: MaxFps::Display,
+            label: match self.display_hz {
+                Some(hz) => format!("Match display ({hz} Hz)"),
+                None => "Match display".into(),
+            },
+        });
+        choices
+    }
+
+    /// The option the redraw-rate list shows as chosen.
+    pub fn selected_rate(&self) -> Option<RateChoice> {
+        self.rate_choices()
+            .into_iter()
+            .find(|c| c.value == self.values.max_fps)
+    }
+
+    /// The redraw-rate row's hint: a CPU note once the rate in force is above the default.
+    pub fn rate_hint(&self) -> &'static str {
+        if self.values.max_fps.effective(self.display_hz) > DEFAULT_MAX_FPS {
+            RATE_CPU_HINT
+        } else {
+            RATE_HINT
+        }
+    }
+
     pub fn update(&mut self, msg: SettingsMsg) -> Effect {
         if self.read_only.is_some() {
             return Effect::NONE;
@@ -195,6 +267,7 @@ impl SettingsState {
             SettingsMsg::Font(f) => self.change(SettingChange::FontFamily(f.family), false),
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
+            SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),
             SettingsMsg::FontSize(v) => {
                 let v = snap(v, 2.0).clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1);
                 self.font_size_text = size_text(v);

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Value};
 
-use crate::settings::{Settings, ThemeMode};
+use crate::settings::{DEFAULT_MAX_FPS, MaxFps, Settings, ThemeMode};
 use crate::store::{ConfigError, atomic_write, line_of};
 
 /// One setting with its new value.
@@ -18,6 +18,7 @@ pub enum SettingChange {
     KittyKeyboard(bool),
     BackgroundOpacity(f32),
     BackgroundBlur(bool),
+    MaxFps(MaxFps),
 }
 
 impl SettingChange {
@@ -31,6 +32,7 @@ impl SettingChange {
             Self::KittyKeyboard(_) => "kitty_keyboard",
             Self::BackgroundOpacity(_) => "background_opacity",
             Self::BackgroundBlur(_) => "background_blur",
+            Self::MaxFps(_) => "max_fps",
         }
     }
 
@@ -44,6 +46,7 @@ impl SettingChange {
             Self::KittyKeyboard(v) => settings.kitty_keyboard = *v,
             Self::BackgroundOpacity(v) => settings.background_opacity = *v,
             Self::BackgroundBlur(v) => settings.background_blur = *v,
+            Self::MaxFps(v) => settings.max_fps.clone_from(v),
         }
     }
 
@@ -55,6 +58,10 @@ impl SettingChange {
             Self::Theme(ThemeMode::Dark) => Value::from("dark"),
             Self::Theme(ThemeMode::Light) => Value::from("light"),
             Self::KittyKeyboard(v) | Self::BackgroundBlur(v) => Value::from(*v),
+            // A number for a fixed rate, the string for the display's.
+            Self::MaxFps(MaxFps::Fixed(n)) => Value::from(i64::from(*n)),
+            Self::MaxFps(MaxFps::Display) => Value::from("display"),
+            Self::MaxFps(MaxFps::Invalid(_)) => Value::from(i64::from(DEFAULT_MAX_FPS)),
         }
     }
 }
@@ -169,7 +176,45 @@ mod tests {
             SettingChange::KittyKeyboard(true),
             SettingChange::BackgroundOpacity(0.85),
             SettingChange::BackgroundBlur(true),
+            SettingChange::MaxFps(MaxFps::Fixed(120)),
+            SettingChange::MaxFps(MaxFps::Display),
         ]
+    }
+
+    #[test]
+    fn max_fps_is_written_as_a_number_or_as_display() {
+        let after = edit_text(
+            SETTINGS_TEMPLATE,
+            &SettingChange::MaxFps(MaxFps::Fixed(120)),
+        )
+        .unwrap();
+        assert!(after.contains("#max_fps = 60\nmax_fps = 120\n"), "{after}");
+        assert_eq!(
+            toml::from_str::<Settings>(&after).unwrap().max_fps,
+            MaxFps::Fixed(120)
+        );
+        let after = edit_text(&after, &SettingChange::MaxFps(MaxFps::Display)).unwrap();
+        assert!(
+            after.contains("#max_fps = 60\nmax_fps = \"display\"\n"),
+            "{after}"
+        );
+        assert_eq!(
+            toml::from_str::<Settings>(&after).unwrap().max_fps,
+            MaxFps::Display
+        );
+        // And back to a number: the type of the value changes, its place does not.
+        let after = edit_text(&after, &SettingChange::MaxFps(MaxFps::Fixed(30))).unwrap();
+        assert!(after.contains("#max_fps = 60\nmax_fps = 30\n"), "{after}");
+    }
+
+    #[test]
+    fn an_invalid_max_fps_does_not_block_writing_other_keys() {
+        // An unknown word is reported and replaced on load, so the file still loads and edits.
+        let text = "max_fps = \"fast\"\n";
+        let after = edit_text(text, &SettingChange::FontSize(15.0)).unwrap();
+        assert_eq!(after, "max_fps = \"fast\"\nfont_size = 15.0\n");
+        let after = edit_text(text, &SettingChange::MaxFps(MaxFps::Fixed(90))).unwrap();
+        assert_eq!(after, "max_fps = 90\n");
     }
 
     #[test]

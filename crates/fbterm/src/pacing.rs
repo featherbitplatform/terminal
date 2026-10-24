@@ -8,12 +8,41 @@
 //! delivered together. Input-driven redraws (keys, selection, scrolling, resizing, focus) are
 //! not session events and stay immediate; output right after a keypress (its echo) also skips
 //! the wait.
+//!
+//! The rate is the `max_fps` setting (default [`OUTPUT_FPS`]); `"display"` follows the fastest
+//! display a terminal window is on (see `display_rate.rs`). The app keeps the rate in force in
+//! an [`OutputRate`], which the pacing stream reads for every event, so a change applies at once.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-/// Most output-driven frames per second. Every message redraws every window, so this bounds
-/// each window too.
-pub const OUTPUT_FPS: u32 = 60;
+/// Default output-driven frames per second, and the rate for `"display"` when no display rate
+/// is known. Every message redraws every window, so the rate bounds each window too.
+pub const OUTPUT_FPS: u32 = fbterm_config::settings::DEFAULT_MAX_FPS as u32;
+
+/// The output redraw rate in force, shared by the app (which sets it from the settings and the
+/// displays) and the pacing stream (which reads it).
+#[derive(Clone, Debug)]
+pub(crate) struct OutputRate(Arc<AtomicU32>);
+
+impl OutputRate {
+    pub(crate) fn new(fps: u32) -> Self {
+        Self(Arc::new(AtomicU32::new(fps)))
+    }
+
+    pub(crate) fn get(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set(&self, fps: u32) {
+        self.0.store(fps, Ordering::Relaxed);
+    }
+}
+
+fn interval(fps: u32) -> Duration {
+    Duration::from_secs(1) / fps.max(1)
+}
 
 /// Decides when pending output is delivered. Pure logic: the caller passes the time.
 pub struct Pacer<T> {
@@ -29,11 +58,22 @@ pub struct Pacer<T> {
 impl<T: PartialEq> Pacer<T> {
     pub fn new(fps: u32) -> Self {
         Self {
-            interval: Duration::from_secs(1) / fps.max(1),
+            interval: interval(fps),
             last: None,
             pending: Vec::new(),
             deadline: None,
         }
+    }
+
+    /// Change the rate. Output already waiting keeps its slot; later slots use the new rate.
+    pub fn set_fps(&mut self, fps: u32) {
+        self.interval = interval(fps);
+    }
+
+    /// The time between deliveries.
+    #[cfg(test)]
+    pub fn interval(&self) -> Duration {
+        self.interval
     }
 
     /// Session `id` has new output at `now`; `after_input`: the user typed since the last
@@ -140,6 +180,60 @@ mod tests {
             now += ms(10);
         }
         assert!((50..=61).contains(&delivered), "{delivered} deliveries");
+    }
+
+    #[test]
+    fn the_interval_follows_the_cap() {
+        let mut p: Pacer<u32> = Pacer::new(OUTPUT_FPS);
+        assert_eq!(p.interval(), Duration::from_nanos(16_666_666));
+        p.set_fps(120);
+        assert_eq!(p.interval(), Duration::from_nanos(8_333_333));
+        p.set_fps(30);
+        assert_eq!(p.interval(), Duration::from_nanos(33_333_333));
+        // Never a zero rate.
+        p.set_fps(0);
+        assert_eq!(p.interval(), Duration::from_secs(1));
+    }
+
+    #[test]
+    fn a_rate_change_applies_from_the_next_slot() {
+        let t0 = Instant::now();
+        let mut p = Pacer::new(50); // 20 ms
+        p.dirty(1, t0, false);
+        assert!(p.dirty(1, t0 + ms(5), false).is_empty());
+        p.set_fps(100); // 10 ms
+        // The waiting output keeps its slot.
+        assert_eq!(p.deadline(), Some(t0 + ms(20)));
+        assert_eq!(p.fire(t0 + ms(20)), vec![1]);
+        assert!(p.dirty(1, t0 + ms(25), false).is_empty());
+        assert_eq!(p.deadline(), Some(t0 + ms(30)));
+    }
+
+    #[test]
+    fn a_stream_is_capped_at_a_higher_rate() {
+        // Output every 2 ms for one second (500 chunks/s) at a 120/s cap.
+        let t0 = Instant::now();
+        let mut p = Pacer::new(120);
+        let mut delivered = 0;
+        let mut now = t0;
+        while now < t0 + Duration::from_secs(1) {
+            if let Some(d) = p.deadline()
+                && d <= now
+            {
+                delivered += usize::from(!p.fire(d).is_empty());
+            }
+            delivered += usize::from(!p.dirty(1, now, false).is_empty());
+            now += ms(2);
+        }
+        assert!((100..=121).contains(&delivered), "{delivered} deliveries");
+    }
+
+    #[test]
+    fn the_shared_rate_is_read_live() {
+        let rate = OutputRate::new(OUTPUT_FPS);
+        let other = rate.clone();
+        other.set(144);
+        assert_eq!(rate.get(), 144);
     }
 
     #[test]

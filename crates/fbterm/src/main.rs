@@ -30,6 +30,7 @@ mod chrome;
 mod config_files;
 mod debug;
 mod dialogs;
+mod display_rate;
 mod editor;
 mod keys;
 mod pacing;

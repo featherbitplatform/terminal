@@ -158,3 +158,34 @@ fn closing_the_window_with_its_button_writes_what_is_still_waiting() {
     let _ = app.update(Message::CloseRequested(id));
     assert_eq!(Settings::load(&paths.settings()).unwrap().font_size, 17.0);
 }
+
+#[test]
+fn the_redraw_rate_applies_live_and_follows_the_display() {
+    use fbterm_config::MaxFps;
+    let (mut app, paths) = app();
+    assert_eq!(app.receiver.rate.get(), 60);
+    send(&mut app, SettingsMsg::MaxFps(MaxFps::Fixed(120)));
+    assert_eq!(app.receiver.rate.get(), 120);
+    assert!(read(&paths).unwrap().contains("\nmax_fps = 120\n"));
+    // "display" with no rate known: the default.
+    send(&mut app, SettingsMsg::MaxFps(MaxFps::Display));
+    assert_eq!(app.receiver.rate.get(), 60);
+    assert!(read(&paths).unwrap().contains("\nmax_fps = \"display\"\n"));
+    // Two terminal windows on different displays: the faster one sets the rate.
+    let (a, b) = (iced::window::Id::unique(), iced::window::Id::unique());
+    app.windows.insert(a, Default::default());
+    app.windows.insert(b, Default::default());
+    let _ = app.update(Message::DisplayRate(a, Some(60)));
+    let _ = app.update(Message::DisplayRate(b, Some(144)));
+    assert_eq!(app.receiver.rate.get(), 144);
+    let state = &app.settings_win.as_ref().unwrap().1;
+    assert_eq!(state.display_hz, Some(144));
+    assert_eq!(state.rate_hint(), super::RATE_CPU_HINT);
+    // Closing the fast window falls back to the other display.
+    let _ = app.update(Message::WindowClosed(b));
+    assert_eq!(app.receiver.rate.get(), 60);
+    // An edit on disk applies too.
+    std::fs::write(paths.settings(), "max_fps = 90\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert_eq!(app.receiver.rate.get(), 90);
+}

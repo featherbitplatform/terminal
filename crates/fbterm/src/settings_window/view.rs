@@ -300,6 +300,15 @@ fn terminal<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
+    let rate = pick_list(state.rate_choices(), state.selected_rate(), |c| {
+        msg(SettingsMsg::MaxFps(c.value))
+    })
+    .font(MONO)
+    .text_size(12.5)
+    .padding(Padding::from([6.0, 10.0]))
+    .width(200)
+    .style(move |_, status| pick_style(t, status))
+    .menu_style(move |_| menu_style(t));
     vec![
         setting(
             t,
@@ -321,6 +330,7 @@ fn terminal<'a>(
                 SettingsMsg::Kitty,
             ),
         ),
+        setting(t, "Redraw rate", Some(state.rate_hint()), false, rate),
     ]
 }
 

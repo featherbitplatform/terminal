@@ -12,6 +12,83 @@ pub enum ThemeMode {
     Light,
 }
 
+/// The most redraws per second caused by program output (`max_fps`). Typing, scrolling and
+/// resizing always redraw at once; this only caps how often streaming output is drawn.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MaxFps {
+    /// A fixed rate, within [`MAX_FPS_RANGE`] once loaded.
+    Fixed(u16),
+    /// Follow the refresh rate of the displays the windows are on (`"display"`).
+    Display,
+    /// A value from the file that is not allowed (out of range, or neither a whole number nor
+    /// `"display"`), as written. [`Settings::clamp`] replaces it, so loaded settings never
+    /// hold it.
+    Invalid(String),
+}
+
+impl Default for MaxFps {
+    fn default() -> Self {
+        Self::Fixed(DEFAULT_MAX_FPS)
+    }
+}
+
+/// Allowed range of a fixed `max_fps`.
+pub const MAX_FPS_RANGE: (u16, u16) = (30, 240);
+/// The default `max_fps`, also the rate used for `"display"` when it cannot be detected.
+pub const DEFAULT_MAX_FPS: u16 = 60;
+
+impl MaxFps {
+    /// The rate in force for this setting; `display`: the detected refresh rate, if known.
+    /// Always within [`MAX_FPS_RANGE`].
+    pub fn effective(&self, display: Option<u32>) -> u16 {
+        let (lo, hi) = MAX_FPS_RANGE;
+        match self {
+            Self::Fixed(n) => (*n).clamp(lo, hi),
+            Self::Display => display.filter(|hz| *hz > 0).map_or(DEFAULT_MAX_FPS, |hz| {
+                u16::try_from(hz.min(u32::from(hi)))
+                    .unwrap_or(hi)
+                    .clamp(lo, hi)
+            }),
+            Self::Invalid(_) => DEFAULT_MAX_FPS,
+        }
+    }
+}
+
+impl Serialize for MaxFps {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Fixed(n) => s.serialize_u16(*n),
+            Self::Display => s.serialize_str("display"),
+            Self::Invalid(_) => s.serialize_u16(DEFAULT_MAX_FPS),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for MaxFps {
+    /// Lenient: any number, string or boolean loads, and what is not allowed is kept as
+    /// [`MaxFps::Invalid`] for [`Settings::clamp`] to report (a table or array is still a
+    /// type error).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged, expecting = "a whole number from 30 to 240, or \"display\"")]
+        enum Raw {
+            Int(i64),
+            Float(f64),
+            Bool(bool),
+            Str(String),
+        }
+        Ok(match Raw::deserialize(d)? {
+            Raw::Int(n) => {
+                u16::try_from(n).map_or_else(|_| Self::Invalid(n.to_string()), Self::Fixed)
+            }
+            Raw::Str(s) if s == "display" => Self::Display,
+            Raw::Str(s) => Self::Invalid(format!("{s:?}")),
+            Raw::Float(f) => Self::Invalid(format!("{f:?}")),
+            Raw::Bool(b) => Self::Invalid(b.to_string()),
+        })
+    }
+}
+
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -28,6 +105,8 @@ pub struct Settings {
     pub background_opacity: f32,
     /// Blur what shows through a translucent background, where the platform supports it.
     pub background_blur: bool,
+    /// Most redraws per second caused by program output.
+    pub max_fps: MaxFps,
 }
 
 impl Default for Settings {
@@ -40,6 +119,7 @@ impl Default for Settings {
             kitty_keyboard: false,
             background_opacity: 1.0,
             background_blur: false,
+            max_fps: MaxFps::default(),
         }
     }
 }
@@ -140,6 +220,25 @@ impl Settings {
             ));
             self.background_opacity = used;
         }
+        let (lo, hi) = MAX_FPS_RANGE;
+        let fps_problem = match &self.max_fps {
+            MaxFps::Fixed(n) if !(lo..=hi).contains(n) => Some(n.to_string()),
+            MaxFps::Invalid(raw) => Some(raw.clone()),
+            _ => None,
+        };
+        if let Some(raw) = fps_problem {
+            // A whole number is clamped; anything else takes the default.
+            let used = raw.parse::<i64>().map_or(DEFAULT_MAX_FPS, |n| {
+                u16::try_from(n.clamp(i64::from(lo), i64::from(hi))).unwrap_or(DEFAULT_MAX_FPS)
+            });
+            let why = if raw.parse::<i64>().is_ok() {
+                format!("is out of range ({lo} to {hi})")
+            } else {
+                format!("is not a whole number from {lo} to {hi} or \"display\"")
+            };
+            problems.push(("max_fps", format!("max_fps {raw} {why}, using {used}")));
+            self.max_fps = MaxFps::Fixed(used);
+        }
         problems
     }
 
@@ -182,6 +281,12 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 
 # Blur what shows through a see-through background (true or false; macOS only for now).
 #background_blur = false
+
+# Most redraws per second caused by program output: a whole number from 30 to 240, or
+# "display" to follow the refresh rate of the screen (60 when it cannot be detected).
+# Caps redraws caused by program output; typing always redraws immediately. Higher values
+# use more CPU while output streams.
+#max_fps = 60
 "##;
 
 impl Settings {

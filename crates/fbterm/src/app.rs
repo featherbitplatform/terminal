@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::chrome::{self, BarAction};
+use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
 use crate::keys::Action;
 use crate::palette::{PaletteMsg, Palettes, Recency};
@@ -99,6 +100,8 @@ pub enum Message {
     WindowUnfocused(window::Id),
     /// A terminal window became visible (`true`) or stopped being visible.
     WindowVisible(window::Id, bool),
+    /// The refresh rate of the display a terminal window is on (`None`: unknown).
+    DisplayRate(window::Id, Option<u32>),
     WindowClosed(window::Id),
     /// A click in a window's tab bar; acts on that window whatever has focus.
     TabBar(window::Id, TabBarMsg),
@@ -159,6 +162,9 @@ pub struct App {
     pub(crate) visibility: visibility::Changes,
     /// Terminal windows that cannot be seen (see [`crate::visibility`]).
     pub(crate) occluded: std::collections::HashSet<window::Id>,
+    pub(crate) display: display_rate::Changes,
+    /// The refresh rate of the display each terminal window is on, where known.
+    pub(crate) display_rates: HashMap<window::Id, Option<u32>>,
     pub windows: BTreeMap<window::Id, WindowState>,
     pub(crate) grids: HashMap<window::Id, GridSize>,
     /// The window that last had focus: where unscoped actions go.
@@ -365,6 +371,8 @@ impl App {
             receiver: EventReceiver::new(rx),
             visibility: visibility::Changes::new(),
             occluded: Default::default(),
+            display: display_rate::Changes::new(),
+            display_rates: HashMap::new(),
             windows: BTreeMap::new(),
             grids: HashMap::new(),
             focused: None,
@@ -402,6 +410,7 @@ impl App {
             demo_tip: debug_env("FBTERM_DEMO_TOOLTIP")
                 .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
         };
+        app.update_output_rate();
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -485,6 +494,8 @@ impl App {
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
             Subscription::run_with(self.visibility.clone(), visibility::stream)
                 .map(|(id, visible)| Message::WindowVisible(id, visible)),
+            Subscription::run_with(self.display.clone(), display_rate::stream)
+                .map(|(id, hz)| Message::DisplayRate(id, hz)),
         ];
         if self.screenshot.is_some() && !self.shooting && self.first_window_ready() {
             // Give the renderer time to load fonts and present a few frames.
@@ -551,7 +562,10 @@ impl App {
             Message::WindowOpened(id) => {
                 self.focused.get_or_insert(id);
                 if self.windows.contains_key(&id) {
-                    visibility::watch(id, &self.visibility)
+                    Task::batch([
+                        visibility::watch(id, &self.visibility),
+                        display_rate::watch(id, &self.display),
+                    ])
                 } else {
                     Task::none()
                 }
@@ -567,10 +581,22 @@ impl App {
                 }
                 Task::none()
             }
+            Message::DisplayRate(id, hz) => {
+                if self.windows.contains_key(&id) {
+                    self.display_rates.insert(id, hz);
+                    self.update_output_rate();
+                }
+                Task::none()
+            }
             Message::WindowFocused(id) => {
                 self.focused = Some(id);
                 self.app_active = true;
-                self.shown(id)
+                let detect = if self.windows.contains_key(&id) {
+                    display_rate::detect(id, &self.display)
+                } else {
+                    Task::none()
+                };
+                Task::batch([self.shown(id), detect])
             }
             Message::WindowUnfocused(id) => {
                 // Focus moving to another of our windows reports Focused for it right after.
@@ -608,6 +634,10 @@ impl App {
                 // its dialogs answer "no".
                 let was_terminal = self.windows.remove(&id).is_some();
                 visibility::unwatch(id);
+                display_rate::unwatch(id);
+                if self.display_rates.remove(&id).is_some() {
+                    self.update_output_rate();
+                }
                 self.occluded.remove(&id);
                 self.sizes.remove(&id);
                 self.fullscreen.remove(&id);

@@ -203,3 +203,63 @@ fn blur_says_when_it_has_no_effect() {
     );
     assert_eq!(view::blur_hint(false, 0.8), ("macOS only for now", true));
 }
+
+fn labels(s: &SettingsState) -> Vec<String> {
+    s.rate_choices().into_iter().map(|c| c.label).collect()
+}
+
+#[test]
+fn the_rate_list_offers_presets_and_the_display() {
+    let mut s = state();
+    assert_eq!(labels(&s), ["30", "60", "120", "Match display"]);
+    assert_eq!(s.selected_rate().unwrap().value, MaxFps::Fixed(60));
+    s.display_hz = Some(120);
+    assert_eq!(labels(&s), ["30", "60", "120", "Match display (120 Hz)"]);
+}
+
+#[test]
+fn a_custom_rate_from_the_file_is_listed_and_chosen() {
+    let values = Settings {
+        max_fps: MaxFps::Fixed(90),
+        ..Settings::default()
+    };
+    let mut s = SettingsState::new(&values, Vec::new(), None);
+    assert_eq!(
+        labels(&s),
+        ["30", "60", "90 (custom)", "120", "Match display"]
+    );
+    assert_eq!(s.selected_rate().unwrap().label, "90 (custom)");
+    s.sync(&Settings {
+        max_fps: MaxFps::Fixed(240),
+        ..Settings::default()
+    });
+    assert_eq!(labels(&s)[3], "240 (custom)");
+}
+
+#[test]
+fn choosing_a_rate_applies_and_writes_at_once() {
+    let mut s = state();
+    let e = s.update(SettingsMsg::MaxFps(MaxFps::Display));
+    assert_eq!(e.apply, Some(SettingChange::MaxFps(MaxFps::Display)));
+    assert_eq!(e.write, Write::Now);
+    assert_eq!(s.selected_rate().unwrap().value, MaxFps::Display);
+    let e = s.update(SettingsMsg::MaxFps(MaxFps::Fixed(120)));
+    assert_eq!(e.apply, Some(SettingChange::MaxFps(MaxFps::Fixed(120))));
+}
+
+#[test]
+fn the_cpu_hint_shows_above_60() {
+    let mut s = state();
+    assert_eq!(s.rate_hint(), RATE_HINT);
+    s.update(SettingsMsg::MaxFps(MaxFps::Fixed(120)));
+    assert_eq!(s.rate_hint(), RATE_CPU_HINT);
+    s.update(SettingsMsg::MaxFps(MaxFps::Fixed(30)));
+    assert_eq!(s.rate_hint(), RATE_HINT);
+    // Following the display: only when the display is faster than 60 Hz.
+    s.update(SettingsMsg::MaxFps(MaxFps::Display));
+    assert_eq!(s.rate_hint(), RATE_HINT, "unknown display: 60");
+    s.display_hz = Some(60);
+    assert_eq!(s.rate_hint(), RATE_HINT);
+    s.display_hz = Some(120);
+    assert_eq!(s.rate_hint(), RATE_CPU_HINT);
+}
