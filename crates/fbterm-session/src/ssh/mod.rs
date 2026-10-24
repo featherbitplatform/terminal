@@ -767,6 +767,7 @@ mod tests {
             name: "silent".into(),
             group: None,
             accent: None,
+            accent_style: Default::default(),
             kind: ProfileKind::Ssh(SshProfile {
                 host: "127.0.0.1".into(),
                 port: addr.port(),
@@ -818,6 +819,7 @@ mod tests {
             name: "bastion-1".into(),
             group: None,
             accent: None,
+            accent_style: Default::default(),
             kind: ProfileKind::Ssh(SshProfile {
                 host: "10.0.0.5".into(),
                 port: 22,

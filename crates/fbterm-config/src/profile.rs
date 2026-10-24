@@ -75,6 +75,23 @@ impl<'de> Deserialize<'de> for Rgb {
     }
 }
 
+/// How a profile's accent colour shows on its tabs.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AccentStyle {
+    /// A thin stripe at the tab's left edge.
+    #[default]
+    Stripe,
+    /// The whole tab tinted with the accent.
+    Tab,
+}
+
+impl AccentStyle {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Profile {
     pub id: ProfileId,
@@ -83,6 +100,9 @@ pub struct Profile {
     pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accent: Option<Rgb>,
+    /// How the accent shows on tabs (`"stripe"` or `"tab"`); written only when not the default.
+    #[serde(default, skip_serializing_if = "AccentStyle::is_default")]
+    pub accent_style: AccentStyle,
     #[serde(flatten)]
     pub kind: ProfileKind,
 }

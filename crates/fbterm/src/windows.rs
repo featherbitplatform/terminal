@@ -44,9 +44,7 @@ impl App {
             let window = self.windows.get_mut(&wid).expect("just inserted");
             for &profile in &saved.tabs {
                 if let Some(p) = self.profiles.get(profile) {
-                    window
-                        .tabs
-                        .push(Tab::new(profile, p.name.clone(), p.accent));
+                    window.tabs.push(Tab::for_profile(p));
                 }
             }
             window.active = saved.active.min(window.tabs.len().saturating_sub(1));
@@ -74,7 +72,7 @@ impl App {
         let Some(p) = self.profiles.get(profile) else {
             return Task::none();
         };
-        let tab = Tab::new(profile, p.name.clone(), p.accent);
+        let tab = Tab::for_profile(p);
         self.recency.bump(profile, unix_now());
         let id = tab.id;
         let Some(window) = self.windows.get_mut(&wid) else {

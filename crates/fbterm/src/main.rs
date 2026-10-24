@@ -50,6 +50,7 @@ mod restore_tests;
 mod sessions;
 mod settings_window;
 mod shortcuts;
+mod tab_look;
 mod tabs;
 mod theme;
 mod tooltip;

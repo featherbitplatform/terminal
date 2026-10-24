@@ -95,6 +95,7 @@ impl App {
                 name: format!("perf-{}", i + 1),
                 group: None,
                 accent: None,
+                accent_style: Default::default(),
                 kind: ProfileKind::Local(LocalProfile {
                     program: shell.clone().into(),
                     args: vec!["-c".into(), o.cmd.clone()],

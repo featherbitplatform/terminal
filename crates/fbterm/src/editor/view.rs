@@ -1,6 +1,6 @@
 //! The profile editor window: profiles by group on the left, the selected one's form on the right.
 
-use fbterm_config::Rgb;
+use fbterm_config::{AccentStyle, Rgb};
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
@@ -306,7 +306,15 @@ fn form<'a>(
             .width(Length::FillPortion(2)),
         ]
         .spacing(12),
-        column![ui::label(t, "Accent"), accents(t, d.accent, editable)].spacing(6),
+        row![
+            column![ui::label(t, "Accent"), accents(t, d.accent, editable)].spacing(6),
+            column![
+                ui::label(t, "Color as"),
+                color_as(t, d.accent_style, editable && d.accent.is_some())
+            ]
+            .spacing(6),
+        ]
+        .spacing(24),
     ]
     .spacing(14)
     .width(Length::Fill);
@@ -366,6 +374,26 @@ fn form<'a>(
         }
     }
     col.into()
+}
+
+/// How the accent shows on tabs: a stripe or the whole tab (only with an accent set).
+fn color_as<'a>(t: &'static Tokens, current: AccentStyle, editable: bool) -> Element<'a, Message> {
+    let choice = |caption: &'a str, value: AccentStyle| {
+        super::ssh_view::segment(
+            t,
+            caption,
+            current == value,
+            editable.then(|| msg(EditorMsg::AccentStyle(value))),
+        )
+    };
+    super::ssh_view::segmented(
+        t,
+        row![
+            choice("Stripe", AccentStyle::Stripe),
+            choice("Whole tab", AccentStyle::Tab),
+        ],
+    )
+    .into()
 }
 
 fn accents<'a>(t: &'static Tokens, current: Option<Rgb>, editable: bool) -> Element<'a, Message> {

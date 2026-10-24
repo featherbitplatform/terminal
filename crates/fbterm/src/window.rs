@@ -18,6 +18,7 @@ use crate::chrome::{self, Chrome};
 use crate::keys::{Action, Bindings};
 use crate::palette;
 use crate::shortcuts::{Mode, Shortcuts};
+use crate::tab_look::{Surroundings, look};
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
@@ -87,7 +88,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let bar = TabBar {
         window: id,
         bar_bg,
-        active_bg: term_bg,
+        around: Surroundings {
+            terminal: to_color(style.scheme.background),
+            bar: t.surface,
+            opacity,
+        },
         fullscreen: app.fullscreen.contains(&id),
         modal,
         demo_tip: app.demo_tip,
@@ -224,8 +229,8 @@ fn dot<'a>(color: Color) -> Element<'a, Message> {
 struct TabBar<'b> {
     window: window::Id,
     bar_bg: Color,
-    /// The active tab's background (the terminal's).
-    active_bg: Color,
+    /// What the tabs are painted against.
+    around: Surroundings,
     /// The window is in full screen: no room needed for the window buttons.
     fullscreen: bool,
     /// The palette or a dialog covers the window.
@@ -245,11 +250,11 @@ fn tab_bar<'a>(
     let TabBar {
         window,
         bar_bg,
-        active_bg,
         fullscreen,
         modal,
         demo_tip,
         bindings,
+        ..
     } = bar;
     let tabs_bar = bar;
     let chrome = Chrome::current();
@@ -262,7 +267,7 @@ fn tab_bar<'a>(
             tabs_bar,
             tab,
             i,
-            (i == active).then_some(active_bg),
+            i == active,
             height - TAB_TOP_GAP,
         ));
     }
@@ -582,24 +587,25 @@ fn ghost(t: &Tokens, status: button::Status) -> button::Style {
     }
 }
 
-/// A tab; `active_bg` is set for the active tab, which takes the terminal's background so the
-/// two read as one surface.
+/// A tab; the active one takes the terminal's background so the two read as one surface,
+/// and the profile accent shows as a stripe or tints the whole tab (`tab_look`).
 fn tab_button<'a>(
     t: &'static Tokens,
     bar: TabBar<'_>,
     tab: &'a Tab,
     index: usize,
-    active_bg: Option<Color>,
+    active: bool,
     height: f32,
 ) -> Element<'a, Message> {
     let window = bar.window;
     let demo_tip = index == 0 && bar.demo_tip == Some(DemoTip::Close);
-    let active = active_bg.is_some();
+    let (accent, accent_style, around) = (tab.accent, tab.accent_style, bar.around);
+    let idle = look(t, accent, accent_style, active, false, around);
     let stripe = container(text(""))
         .width(3)
         .height(14)
         .style(move |_| container::Style {
-            background: tab.accent.map(|a| to_color(a).into()),
+            background: idle.stripe.map(Background::Color),
             border: Border {
                 radius: 1.5.into(),
                 ..Border::default()
@@ -610,8 +616,8 @@ fn tab_button<'a>(
         .font(UI_FONT)
         .size(12.5)
         .wrapping(text::Wrapping::None)
-        .color(if active { t.text } else { t.text_secondary });
-    let close = button(icon(ICON_X, 12.0, t.text_muted))
+        .color(idle.label);
+    let close = button(icon(ICON_X, 12.0, idle.icon))
         .on_press(Message::TabBar(window, TabBarMsg::Close(index)))
         .padding(3)
         .style(move |_, status| ghost(t, status));
@@ -635,7 +641,6 @@ fn tab_button<'a>(
     .spacing(8)
     .height(Length::Fill)
     .align_y(Alignment::Center);
-    let surface_bg = active_bg.map(Background::Color);
     button(inner)
         .on_press(Message::TabBar(window, TabBarMsg::Select(index)))
         .width(Length::Fixed(196.0))
@@ -651,7 +656,7 @@ fn tab_button<'a>(
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
             button::Style {
-                background: surface_bg.or(hovered.then_some(Background::Color(t.hover))),
+                background: look(t, accent, accent_style, active, hovered, around).background,
                 text_color: t.text,
                 border: Border {
                     radius: iced::border::Radius::default().top(TAB_RADIUS),

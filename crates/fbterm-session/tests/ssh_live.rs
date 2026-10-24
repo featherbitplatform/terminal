@@ -44,6 +44,7 @@ fn profile(auth: AuthMethod) -> Profile {
         name: "bastion".into(),
         group: None,
         accent: None,
+        accent_style: Default::default(),
         kind: ProfileKind::Ssh(SshProfile {
             host: HOST.into(),
             port: PORT,
@@ -595,6 +596,7 @@ mod pool {
             name: name.into(),
             group: None,
             accent: None,
+            accent_style: Default::default(),
             kind: ProfileKind::Ssh(SshProfile {
                 host: host.into(),
                 port: PORT,

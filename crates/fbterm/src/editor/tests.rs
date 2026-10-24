@@ -75,6 +75,7 @@ fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
         name: name.into(),
         group: None,
         accent: None,
+        accent_style: Default::default(),
         kind: ProfileKind::Ssh(SshProfile {
             host: host.into(),
             port: 22,
@@ -91,6 +92,7 @@ fn local(name: &str) -> Profile {
         name: name.into(),
         group: None,
         accent: None,
+        accent_style: Default::default(),
         kind: ProfileKind::Local(LocalProfile {
             program: "/bin/zsh".into(),
             args: vec!["-l".into()],
@@ -541,4 +543,30 @@ fn rsa_warning_does_not_outlive_the_selected_profile() {
     assert!(!ed.selected_key_is_rsa());
     ed.update(EditorMsg::NewSsh);
     assert!(!ed.selected_key_is_rsa());
+}
+
+#[test]
+fn color_as_is_saved_with_the_profile_and_kept_untouched() {
+    let shell = local("zsh");
+    let other = local("other");
+    let mut store = ProfileStore {
+        profiles: vec![shell.clone(), other.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(shell.id));
+    ed.update(EditorMsg::Accent(Some(Rgb {
+        r: 0xed,
+        g: 0x4a,
+        b: 0x49,
+    })));
+    ed.update(EditorMsg::AccentStyle(AccentStyle::Tab));
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(store.get(shell.id).unwrap().accent_style, AccentStyle::Tab);
+    assert_eq!(
+        store.get(other.id).unwrap().accent_style,
+        AccentStyle::Stripe
+    );
+    // Reopened, the editor shows the saved style.
+    let (ed, _) = editor(&store);
+    assert_eq!(ed.draft(shell.id).unwrap().accent_style, AccentStyle::Tab);
 }

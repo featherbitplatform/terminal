@@ -24,6 +24,7 @@ fn profile(name: &str) -> Profile {
         name: name.into(),
         group: None,
         accent: None,
+        accent_style: Default::default(),
         kind: ProfileKind::Local(LocalProfile {
             program: "/nonexistent/fbterm-test-shell".into(),
             args: vec![],
