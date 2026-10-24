@@ -612,6 +612,7 @@ impl App {
             }
             Message::DisplayRate(id, hz) => {
                 if self.windows.contains_key(&id) {
+                    let hz = display_rate::merge(self.display_rates.get(&id).copied(), hz);
                     self.display_rates.insert(id, hz);
                     self.update_output_rate();
                 }

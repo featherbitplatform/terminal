@@ -62,17 +62,13 @@ pub(crate) fn watch<M: Send + 'static>(id: window::Id, changes: &Changes) -> Tas
     }
 }
 
-/// Report the display rate of window `id` again (cheap; on focus).
+/// Report the display rate of window `id` again (cheap; on focus). A window whose AppKit
+/// window was not there yet when it opened starts being watched here.
 pub(crate) fn detect<M: Send + 'static>(id: window::Id, changes: &Changes) -> Task<M> {
     #[cfg(target_os = "macos")]
     {
         let tx = changes.tx.clone();
-        window::run(id, move |w| {
-            if let Some(ns_window) = mac::ns_window(w) {
-                let _ = tx.send((id, mac::rate(&ns_window)));
-            }
-        })
-        .discard()
+        window::run(id, move |w| mac::detect(id, w, tx)).discard()
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -87,6 +83,12 @@ pub(crate) fn unwatch(id: window::Id) {
     mac::unwatch(id);
     #[cfg(not(target_os = "macos"))]
     let _ = id;
+}
+
+/// The rate to keep for a window after a report of `reported`: an unknown rate (a window
+/// briefly without a screen) never replaces a known one.
+pub(crate) fn merge(known: Option<Option<u32>>, reported: Option<u32>) -> Option<u32> {
+    reported.or(known.flatten())
 }
 
 /// The rate `"display"` follows: the fastest display any terminal window is on, if known.
@@ -174,6 +176,18 @@ mod mac {
         let _ = tx.send((id, rate(&ns_window)));
     }
 
+    /// Report the rate of `w` again, and start watching it if [`watch`] could not (its
+    /// AppKit window did not exist yet when it opened).
+    pub(super) fn detect(id: window::Id, w: &dyn window::Window, tx: UnboundedSender<Change>) {
+        if !OBSERVERS.with(|o| o.borrow().contains_key(&id)) {
+            watch(id, w, tx);
+            return;
+        }
+        if let Some(ns_window) = ns_window(w) {
+            let _ = tx.send((id, rate(&ns_window)));
+        }
+    }
+
     pub(super) fn unwatch(id: window::Id) {
         if let Some(observer) = OBSERVERS.with(|o| o.borrow_mut().remove(&id)) {
             debug_assert!(MainThreadMarker::new().is_some());
@@ -188,6 +202,14 @@ mod mac {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unknown_rate_never_replaces_a_known_one() {
+        assert_eq!(merge(Some(Some(120)), None), Some(120));
+        assert_eq!(merge(Some(Some(120)), Some(60)), Some(60));
+        assert_eq!(merge(None, None), None);
+        assert_eq!(merge(Some(None), Some(60)), Some(60));
+    }
 
     #[test]
     fn the_fastest_known_display_wins() {
