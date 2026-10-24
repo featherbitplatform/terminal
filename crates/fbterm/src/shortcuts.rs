@@ -144,7 +144,11 @@ fn key_message(
             _ => shortcut.map(|_| None),
         },
         Mode::Editor => {
-            if mods.command() && matches!(key, keyboard::Key::Character(c) if c.as_str() == "s") {
+            // Exactly Cmd+S (Ctrl+S elsewhere), the chord `keys::reserved` keeps for Save: with
+            // Shift or Alt added it is a chord like any other, free to be bound.
+            if mods == keyboard::Modifiers::COMMAND
+                && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("s"))
+            {
                 return Some((!repeat).then_some(Message::Editor(EditorMsg::Save)));
             }
             shortcut.map(|action| match action {
@@ -655,6 +659,38 @@ mod tests {
             ),
             Some(Some(Message::Shortcut(_, Action::Settings)))
         ));
+    }
+
+    #[test]
+    fn the_editor_saves_on_exactly_cmd_s() {
+        use keyboard::Modifiers as M;
+        let w = window::Id::unique();
+        let s = keyboard::Key::Character("s".into());
+        let save = |b: &Bindings, mods: M| {
+            matches!(
+                key_message(b, Mode::Editor, w, &s, mods, false, None),
+                Some(Some(Message::Editor(EditorMsg::Save)))
+            )
+        };
+        let b = defaults();
+        assert!(save(&b, M::COMMAND));
+        assert!(!save(&b, M::COMMAND | M::SHIFT));
+        assert!(!save(&b, M::COMMAND | M::ALT));
+        assert!(!save(&b, M::empty()));
+        // A chord bound to Cmd+Shift+S (Ctrl+Shift+S elsewhere) is not taken for Save.
+        let mut overrides = fbterm_config::keys::Overrides::new();
+        let chord = if cfg!(target_os = "macos") {
+            "cmd+shift+s"
+        } else {
+            "ctrl+shift+s"
+        };
+        overrides.insert(Action::Settings, Some(parse_chord(chord)));
+        let b = Bindings::current(&overrides);
+        assert!(matches!(
+            key_message(&b, Mode::Editor, w, &s, M::COMMAND | M::SHIFT, false, None),
+            Some(Some(Message::Shortcut(_, Action::Settings)))
+        ));
+        assert!(save(&b, M::COMMAND));
     }
 
     fn parse_chord(s: &str) -> keys::Chord {
