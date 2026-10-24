@@ -19,7 +19,7 @@ The directory is created the first time the app writes a file. All files are TOM
 | File | Written by | Purpose |
 | --- | --- | --- |
 | `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles. See [Profiles and jump hosts](profiles). |
-| `settings.toml` | you (and the Settings window) | Font, scrollback, theme, background and keyboard protocol. |
+| `settings.toml` | you (and the Settings window) | Font, scrollback, theme, background, keyboard protocol and changed keyboard shortcuts. |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
 
 `profiles.toml` and `settings.toml` are reloaded while the app runs. If a file has a syntax error, the app reports the file and line, keeps what it had loaded, and never overwrites the broken file.
@@ -59,6 +59,10 @@ max_fps = 60
 When a program prints a lot (a log stream, a build), the terminal does not redraw for every piece of output: it draws at most `max_fps` times per second and shows everything that arrived in between. What you type is different: a keypress, and the echo that comes back from it, are drawn right away whatever the setting. The default of `60` is smooth on most screens and keeps CPU use low. On a 120 Hz screen, `max_fps = 120` or `max_fps = "display"` makes fast-scrolling output smoother, at the cost of more CPU while output is streaming (no extra cost while nothing prints). In the Settings window this is **Redraw rate** under Terminal: 30, 60, 120 or **Match display**, plus your own number if `settings.toml` has another one.
 
 A value outside its range does not reject the file: the app uses the nearest allowed value (for example `font_size = 100` gives `72`; a `max_fps` that is neither a whole number nor `"display"` gives `60`) and reports the field, the file and the line the same way it reports a syntax error. The file itself is left as you wrote it.
+
+### Keyboard shortcuts
+
+Shortcuts you change are kept in a `[keys]` table at the end of `settings.toml`; only the changes are stored, so a missing table means every shortcut has its default. The format and the action names are in [Keyboard shortcuts](keyboard-shortcuts#the-keys-table).
 
 ## state.toml
 

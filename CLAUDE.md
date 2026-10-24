@@ -26,6 +26,7 @@ Binding design: `docs/superpowers/specs/2026-10-23-featherbit-terminal-design.md
 - **Jump hosts:** a profile's jump chain references other saved profiles; each hop is SSH over a `direct-tcpip` channel from the previous hop, authenticated with that hop's own profile.
 - **Runtime:** one process, tokio for I/O, one task per session feeding its terminal; background sessions keep parsing but never render. Multi-window (iced daemon mode); windows, tabs and pane layout restore on relaunch, reconnecting lazily on first focus.
 - **Palette:** Cmd+Shift+P (Ctrl+Shift+P elsewhere), application-scoped, fuzzy (`nucleo`) over profiles first, then app actions.
+- **Shortcuts:** actions, chords, per-platform defaults and the binding table are data in `fbterm-config/src/keys.rs`; the user's overrides are the `[keys]` table of `settings.toml`. The app keeps one `Bindings` (`App::bindings`, rebuilt when settings apply) and matches presses against it in `keys.rs`/`shortcuts.rs`; tooltips, the palette and the Settings window's Keyboard section read the same table, so never hardcode a chord label.
 
 ## Conventions
 
@@ -63,7 +64,7 @@ cd website && npm start                  # docs dev server; `npm run build` buil
 ### Debug aids (environment variables)
 
 - Always available: `FBTERM_CONFIG_DIR=<dir>` (use this directory instead of the real config), `FBTERM_SECRETS=memory` (never touch the OS keychain), and the release-build measurement flags `--perf-tabs <N> --perf-cmd <cmd> [--perf-exit-after <secs>]`.
-- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor|settings`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_OPEN_SETTINGS=1`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`, `FBTERM_DEMO_TOOLTIP=new|profiles|close` (keep that tab-bar tooltip showing), `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (open the active tab's find bar or the find-in-all-tabs box with that query, about a second after startup). Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
+- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor|settings`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_OPEN_SETTINGS=1`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`, `FBTERM_DEMO_TOOLTIP=new|profiles|settings|close` (keep that tab-bar tooltip showing), `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (open the active tab's find bar or the find-in-all-tabs box with that query, about a second after startup). Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
 - Rule for agents: look at the app only through its own-window screenshots (`FBTERM_SCREENSHOT`), never full-screen capture. Combine with `FBTERM_CONFIG_DIR` and `FBTERM_SECRETS=memory` so a run cannot touch real profiles or secrets.
 
 ## Gotchas learned

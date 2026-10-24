@@ -264,10 +264,47 @@ Jump-chain references are exported together with the profiles they point to.
 
 Cmd on macOS, Ctrl+Shift elsewhere: new tab (opens the palette), close, next/prev tab, tab 1..9,
 palette (Cmd+Shift+P), split right/down, focus pane by direction, toggle file panel, find in
-scrollback. All rebindable via config later. *(Owner's decision, 2026-10-24)* Settings is Cmd+,
+scrollback. All rebindable (see 5.11.1). *(Owner's decision, 2026-10-24)* Settings is Cmd+,
 on macOS and Ctrl+, elsewhere (the one Ctrl chord without Shift); the profile editor is
 Cmd+Shift+, (Ctrl+Shift+, elsewhere). Tab-bar buttons show their action and chord in a tooltip,
 derived from the same table.
+
+### 5.11.1 Rebinding shortcuts *(owner's decisions, 2026-10-24; done)*
+
+- **Gear button** in the tab bar after "+" and the profiles button (Lucide `settings`), tooltip
+  "Settings (chord)"; it opens or focuses the Settings window like the shortcut and never drags
+  or zooms the window.
+- **Keyboard section** in the Settings window, first of all to see every shortcut in one place,
+  then to rebind ones that clash with programs (tmux, vim, emacs): every action with its chord,
+  grouped Tabs / Windows / Search / App; actions without a default (open settings file, reveal
+  config folder) show "Not set" and can be bound. Click a chord to record; while recording no key
+  reaches a terminal or runs a shortcut, and Escape cancels. A changed row has a reset to its
+  default, any row can be cleared (unbound), and "Restore defaults" resets all. The palette and
+  the tooltips show the chords in force.
+- **Conflicts:** a chord another action has names that action and offers "take over" (the other
+  becomes unbound) or cancel; two actions never share a chord.
+- **Risky chords** (a program in the terminal would normally get them) are allowed with an
+  inline warning naming what is lost where known ("Ctrl+R is reverse search in bash and zsh"):
+  on macOS any chord without Cmd; elsewhere Ctrl+letter without Shift and Alt+letter.
+- **Not allowed:** chords without a modifier, except F1 to F12 (so plain letters, Enter, Escape
+  and Tab cannot be bound).
+- **Fixed keys:** Enter, Shift+Enter, Escape, Up/Down and Ctrl+P/N inside the find bar, the
+  palette and the find-in-all-tabs box; Cmd+S in the profile editor. Find next/previous are
+  rebindable like the rest (still acting only while the bar is open).
+- **Storage:** only overrides, in a `[keys]` table of `settings.toml` (`new_tab = "cmd+t"`,
+  `"ctrl+shift+t"`, `"none"`), edited in place so comments survive; platform defaults stay in
+  code and do not change. Hand edits apply live; unknown actions, unreadable chords and
+  duplicates are reported like other bad settings and the action keeps its default.
+- Builder's notes: actions, chords, defaults, the binding table and the risk rules are data in
+  `fbterm-config` (`keys.rs`); the app matches presses against the table (`keys.rs`,
+  `shortcuts.rs`). Also flagged as risky elsewhere: Ctrl with `[ ] \ / @ ^ _`, Space, arrows
+  and editing keys, and F keys alone; Ctrl+Alt chords are not (AltGr typing is let through on
+  Windows), nor chords with Super. The find-bar keys never show a warning, since they act only
+  while the bar has the keys. Escape is never bindable, even with modifiers (it cancels
+  recording). With Shift, a shifted symbol is stored as its key (`shift+}` is `shift+]`).
+  Entries that conflict fall back to their default one by one until no chord is shared; the
+  Settings window writes only the actions it changes, so a bad entry stays until the user fixes
+  or rebinds it. Recording also stops when the Settings window loses focus.
 
 ### 5.12 Search *(owner's decisions, 2026-10-24; done)*
 
