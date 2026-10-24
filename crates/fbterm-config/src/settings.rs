@@ -2,6 +2,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::keys::KeyOverrides;
 use crate::store::{ConfigError, atomic_write, line_of};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
@@ -107,6 +108,8 @@ pub struct Settings {
     pub background_blur: bool,
     /// Most redraws per second caused by program output.
     pub max_fps: MaxFps,
+    /// Keyboard shortcuts changed from their defaults (the `[keys]` table).
+    pub keys: KeyOverrides,
 }
 
 impl Default for Settings {
@@ -120,6 +123,7 @@ impl Default for Settings {
             background_opacity: 1.0,
             background_blur: false,
             max_fps: MaxFps::default(),
+            keys: KeyOverrides::default(),
         }
     }
 }
@@ -162,7 +166,7 @@ impl Settings {
         let warning = (!problems.is_empty()).then(|| {
             let line = problems
                 .iter()
-                .find_map(|(field, _)| key_line(&text, field));
+                .find_map(|(field, _)| key_line(&text, field.as_str()));
             let message = problems
                 .iter()
                 .map(|(_, m)| m.as_str())
@@ -174,8 +178,11 @@ impl Settings {
     }
 
     /// Bring every field into its allowed range; returns `(field, message)` for each change.
-    pub fn clamp(&mut self) -> Vec<(&'static str, String)> {
-        let mut problems = Vec::new();
+    /// `[keys]` entries that are not taken (an unknown action, a chord that does not parse or
+    /// may not be bound, or one another action already has) are dropped, so those actions keep
+    /// their default; the field is then the entry's name.
+    pub fn clamp(&mut self) -> Vec<(String, String)> {
+        let mut problems: Vec<(String, String)> = Vec::new();
         let (lo, hi) = FONT_SIZE_RANGE;
         if !(lo..=hi).contains(&self.font_size) {
             let used = if self.font_size.is_finite() {
@@ -184,7 +191,7 @@ impl Settings {
                 Self::default().font_size
             };
             problems.push((
-                "font_size",
+                "font_size".into(),
                 format!(
                     "font_size {} is out of range ({lo} to {hi}), using {used}",
                     self.font_size
@@ -196,7 +203,7 @@ impl Settings {
         if !(lo..=hi).contains(&self.scrollback_lines) {
             let used = self.scrollback_lines.clamp(lo, hi);
             problems.push((
-                "scrollback_lines",
+                "scrollback_lines".into(),
                 format!(
                     "scrollback_lines {} is out of range ({lo} to {hi}), using {used}",
                     self.scrollback_lines
@@ -212,7 +219,7 @@ impl Settings {
                 Self::default().background_opacity
             };
             problems.push((
-                "background_opacity",
+                "background_opacity".into(),
                 format!(
                     "background_opacity {} is out of range ({lo} to {hi}), using {used}",
                     self.background_opacity
@@ -236,8 +243,27 @@ impl Settings {
             } else {
                 format!("is not a whole number from {lo} to {hi} or \"display\"")
             };
-            problems.push(("max_fps", format!("max_fps {raw} {why}, using {used}")));
+            problems.push((
+                "max_fps".into(),
+                format!("max_fps {raw} {why}, using {used}"),
+            ));
             self.max_fps = MaxFps::Fixed(used);
+        }
+        for (name, why) in std::mem::take(&mut self.keys.invalid) {
+            let message = format!("keys.{name} {why}");
+            problems.push((name, message));
+        }
+        let mac = cfg!(target_os = "macos");
+        for (action, chord, other) in self.keys.resolve_conflicts(mac) {
+            problems.push((
+                action.name().to_owned(),
+                format!(
+                    "keys.{} {:?} is already used by {}, using the default",
+                    action.name(),
+                    chord.to_config(mac),
+                    other.name()
+                ),
+            ));
         }
         problems
     }
@@ -287,6 +313,15 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Caps redraws caused by program output; typing always redraws immediately. Higher values
 # use more CPU while output streams.
 #max_fps = 60
+
+# Keyboard shortcuts changed from their defaults, by action. The Keyboard section of the
+# Settings window lists every action with its chord and changes them for you.
+# A chord is modifiers and a key joined by "+": ctrl, alt, shift and cmd (written super
+# outside macOS), then a key such as t, 1, ",", f5, up, pageup, space or plus.
+# "none" leaves an action without a chord. For example:
+#   new_tab = "ctrl+shift+t"
+#   close_tab = "none"
+#[keys]
 "##;
 
 impl Settings {

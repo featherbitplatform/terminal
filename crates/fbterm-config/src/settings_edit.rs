@@ -5,6 +5,7 @@ use std::path::Path;
 
 use toml_edit::{DocumentMut, Item, Value};
 
+use crate::keys::{Action, Overrides};
 use crate::settings::{DEFAULT_MAX_FPS, MaxFps, Settings, ThemeMode};
 use crate::store::{ConfigError, atomic_write, line_of};
 
@@ -19,6 +20,11 @@ pub enum SettingChange {
     BackgroundOpacity(f32),
     BackgroundBlur(bool),
     MaxFps(MaxFps),
+    /// Every keyboard shortcut override (the whole `[keys]` table as the app sees it). Only
+    /// the actions whose chord differs from what the file gives are written, so entries the
+    /// app could not take (and other text in the table) stay as they are unless that action
+    /// is changed.
+    Keys(Overrides),
 }
 
 impl SettingChange {
@@ -33,6 +39,7 @@ impl SettingChange {
             Self::BackgroundOpacity(_) => "background_opacity",
             Self::BackgroundBlur(_) => "background_blur",
             Self::MaxFps(_) => "max_fps",
+            Self::Keys(_) => "keys",
         }
     }
 
@@ -47,6 +54,10 @@ impl SettingChange {
             Self::BackgroundOpacity(v) => settings.background_opacity = *v,
             Self::BackgroundBlur(v) => settings.background_blur = *v,
             Self::MaxFps(v) => settings.max_fps.clone_from(v),
+            Self::Keys(v) => {
+                settings.keys.map.clone_from(v);
+                settings.keys.invalid.clear();
+            }
         }
     }
 
@@ -62,6 +73,8 @@ impl SettingChange {
             Self::MaxFps(MaxFps::Fixed(n)) => Value::from(i64::from(*n)),
             Self::MaxFps(MaxFps::Display) => Value::from("display"),
             Self::MaxFps(MaxFps::Invalid(_)) => Value::from(i64::from(DEFAULT_MAX_FPS)),
+            // Written per action by `edit_keys`.
+            Self::Keys(_) => Value::from(""),
         }
     }
 }
@@ -104,10 +117,14 @@ pub fn edit_text(text: &str, change: &SettingChange) -> Result<String, (Option<u
         (line, e.message().to_string())
     })?;
     // The file must load as settings too: a value of the wrong type is as broken as bad syntax.
-    toml::from_str::<Settings>(text).map_err(|e| {
+    let mut loaded = toml::from_str::<Settings>(text).map_err(|e| {
         let line = e.span().map(|s| line_of(text, s.start));
         (line, e.message().to_string())
     })?;
+    if let SettingChange::Keys(wanted) = change {
+        loaded.clamp();
+        return Ok(edit_keys(text, doc, &loaded.keys.map, wanted));
+    }
     let key = change.key();
     let mut value = change.value();
     if let Some(Item::Value(old)) = doc.get_mut(key) {
@@ -138,6 +155,92 @@ pub fn edit_text(text: &str, change: &SettingChange) -> Result<String, (Option<u
     }
     doc.insert(key, Item::Value(value));
     Ok(doc.to_string())
+}
+
+/// `text` (parsed as `doc`) with the `[keys]` table changed from `have` (what the file gives
+/// now) to `wanted`. Entries of actions whose chord does not change are left alone. A missing
+/// table is added at the end of the file.
+fn edit_keys(text: &str, mut doc: DocumentMut, have: &Overrides, wanted: &Overrides) -> String {
+    let mac = cfg!(target_os = "macos");
+    let value = |chord: &Option<crate::keys::Chord>| {
+        chord.map_or_else(|| "none".to_owned(), |c| c.to_config(mac))
+    };
+    let changed: Vec<(Action, Option<&Option<crate::keys::Chord>>)> = Action::ALL
+        .into_iter()
+        .filter(|a| have.get(a) != wanted.get(a))
+        .map(|a| (a, wanted.get(&a)))
+        .collect();
+    if changed.is_empty() {
+        return text.to_owned();
+    }
+    let Some(table) = doc.get_mut("keys").and_then(Item::as_table_like_mut) else {
+        let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+        let mut table = format!("[keys]{newline}");
+        for (action, chord) in changed {
+            if let Some(chord) = chord {
+                let v = Value::from(value(chord));
+                table.push_str(&format!(
+                    "{} = {}{newline}",
+                    action.name(),
+                    v.to_string().trim()
+                ));
+            }
+        }
+        // Right after a commented-out `#[keys]` (as in the template) when only comments follow
+        // it, else at the end.
+        if let Some(after) = commented_table(text) {
+            let (head, tail) = text.split_at(after);
+            let sep = if head.ends_with('\n') { "" } else { newline };
+            return format!("{head}{sep}{table}{tail}");
+        }
+        let mut out = text.to_owned();
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push_str(newline);
+        }
+        if !out.trim().is_empty() {
+            out.push_str(newline);
+        }
+        out.push_str(&table);
+        return out;
+    };
+    for (action, chord) in changed {
+        match chord {
+            None => {
+                table.remove(action.name());
+            }
+            Some(chord) => {
+                let mut v = Value::from(value(chord));
+                match table.get_mut(action.name()) {
+                    Some(Item::Value(old)) => {
+                        *v.decor_mut() = old.decor().clone();
+                        *old = v;
+                    }
+                    _ => {
+                        table.insert(action.name(), Item::Value(v));
+                    }
+                }
+            }
+        }
+    }
+    doc.to_string()
+}
+
+/// The byte offset just past a `#[keys]` line, if only comments and blank lines follow it.
+fn commented_table(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut found = None;
+    for line in text.split_inclusive('\n') {
+        offset += line.len();
+        let trimmed = line.trim();
+        if found.is_none() {
+            if trimmed.strip_prefix('#').map(str::trim) == Some("[keys]") {
+                found = Some(offset);
+            }
+        } else if !trimmed.is_empty() && !trimmed.starts_with('#') {
+            return None;
+        }
+    }
+    found
 }
 
 /// The byte offset just past the line `#key = ...` (with its line break), if such a comment
@@ -178,7 +281,111 @@ mod tests {
             SettingChange::BackgroundBlur(true),
             SettingChange::MaxFps(MaxFps::Fixed(120)),
             SettingChange::MaxFps(MaxFps::Display),
+            keys(&[(Action::Palette, "ctrl+alt+p")]),
         ]
+    }
+
+    fn chord(s: &str) -> Option<crate::keys::Chord> {
+        crate::keys::Chord::parse(s).unwrap()
+    }
+
+    fn keys(entries: &[(Action, &str)]) -> SettingChange {
+        SettingChange::Keys(entries.iter().map(|(a, s)| (*a, chord(s))).collect())
+    }
+
+    #[test]
+    fn key_overrides_go_in_a_keys_table_under_its_comment() {
+        let after = edit_text(
+            SETTINGS_TEMPLATE,
+            &keys(&[
+                (Action::NewTab, "ctrl+shift+y"),
+                (Action::OpenSettingsFile, "none"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            after,
+            format!(
+                "{SETTINGS_TEMPLATE}[keys]\nnew_tab = \"ctrl+shift+y\"\nopen_settings_file = \"none\"\n"
+            )
+        );
+        // Without the template's `#[keys]`, the table is added after a blank line.
+        let after = edit_text("theme = \"dark\"", &keys(&[(Action::Quit, "ctrl+shift+k")]));
+        assert_eq!(
+            after.unwrap(),
+            "theme = \"dark\"\n\n[keys]\nquit = \"ctrl+shift+k\"\n"
+        );
+        let after = edit_text(
+            SETTINGS_TEMPLATE,
+            &keys(&[
+                (Action::NewTab, "ctrl+shift+y"),
+                (Action::OpenSettingsFile, "none"),
+            ]),
+        )
+        .unwrap();
+        let s: Settings = toml::from_str(&after).unwrap();
+        assert_eq!(
+            s.keys.map.get(&Action::NewTab),
+            Some(&chord("ctrl+shift+y"))
+        );
+        assert_eq!(s.keys.map.get(&Action::OpenSettingsFile), Some(&None));
+        // A top-level setting written afterwards still goes next to its comment.
+        let after = edit_text(&after, &SettingChange::FontSize(15.0)).unwrap();
+        assert!(
+            after.contains("#font_size = 13.0\nfont_size = 15.0\n"),
+            "{after}"
+        );
+        assert_eq!(
+            toml::from_str::<Settings>(&after).unwrap().keys.map.len(),
+            2
+        );
+    }
+
+    #[test]
+    fn key_edits_keep_comments_and_untouched_entries() {
+        let before = "theme = \"dark\"\n\
+                      \n\
+                      # My shortcuts.\n\
+                      [keys]\n\
+                      # tmux owns Ctrl+B.\n\
+                      new_tab = \"ctrl+shift+y\"   # muscle memory\n\
+                      close_tab = \"none\"\n\
+                      nope = \"ctrl+shift+u\"\n\
+                      find = \"ctrl+shift+f+x\"\n";
+        // Rebind new_tab, reset close_tab, add quit; the unknown and the broken entry stay.
+        let after = edit_text(
+            before,
+            &keys(&[
+                (Action::NewTab, "ctrl+shift+j"),
+                (Action::Quit, "ctrl+shift+k"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            after,
+            "theme = \"dark\"\n\
+             \n\
+             # My shortcuts.\n\
+             [keys]\n\
+             # tmux owns Ctrl+B.\n\
+             new_tab = \"ctrl+shift+j\"   # muscle memory\n\
+             nope = \"ctrl+shift+u\"\n\
+             find = \"ctrl+shift+f+x\"\n\
+             quit = \"ctrl+shift+k\"\n"
+        );
+        // Restoring every default removes the entries the app took, nothing else.
+        let after = edit_text(&after, &keys(&[])).unwrap();
+        assert_eq!(
+            after,
+            "theme = \"dark\"\n\
+             \n\
+             # My shortcuts.\n\
+             [keys]\n\
+             nope = \"ctrl+shift+u\"\n\
+             find = \"ctrl+shift+f+x\"\n"
+        );
+        // Nothing to change: the text stays byte for byte.
+        assert_eq!(edit_text(&after, &keys(&[])).unwrap(), after);
     }
 
     #[test]
