@@ -98,6 +98,67 @@ The script snapshots each run's process tree, stops fbterm (bounded wait, then S
 the descendants, removes the temp dir (also on INT/TERM/EXIT via a trap) and exits non-zero if
 any process of the run survives (`stragglers` is that count; always 0).
 
+## 2026-10-24: footprint, redraw pacing, icon font
+
+Same machine, macOS 27.0.1. Each run used a temporary `FBTERM_CONFIG_DIR`, `FBTERM_SECRETS=memory`
+and `--perf-tabs 1 --perf-cmd <cmd>`, and killed fbterm and its children afterwards. Frames per
+second came from a temporary, uncommitted draw counter (the median of the per-second counts in
+the CPU window); CPU is the process CPU-time delta over 10 s after a 10 s warm-up, as above.
+
+### RSS vs footprint
+
+Activity Monitor's "Memory" column is the phys_footprint (`footprint <pid>`), not RSS
+(`ps -o rss=`). The two count different things:
+
+- RSS also counts clean file-backed pages (the binary's code, mapped system files), which
+  footprint leaves out.
+- RSS does **not** count GPU memory the process owns; footprint does. While any frames are being
+  rendered, the Metal driver holds about 300 MB of it (a minimal iced app with no fbterm code
+  shows the same), released 10-20 s after rendering stops. So a visible stream shows about
+  390-430 MB in Activity Monitor while RSS is about 120 MB.
+
+The table above is RSS. For memory as users see it, read `footprint <pid>` too, and measure idle
+footprint at least 20 s after the last frame.
+
+### Output redraws paced to 60 per second
+
+Every message redraws every window, so before this change a visible stream drew one frame per
+output chunk. Output `Dirty` is now paced (`crates/fbterm/src/pacing.rs`, `OUTPUT_FPS = 60`), the
+echo of typed input skips the wait, and a window that cannot be seen (AppKit occlusion state:
+minimized, covered, locked screen, sleeping display) takes no output redraws.
+
+1 visible tab, `perl dev/perf/loggen.pl 1 100` (one ~110-character log line, 100 times per second; about
+84 chunks per second arrive), window visible:
+
+| Build | Frames/s | CPU, 3 runs | Load (1 min) |
+|---|---|---|---|
+| before | 84 / 84 / 84 | 14.1 / 13.9 / 14.5% (median 14.1) | 3.4-4.6 |
+| after | 54 / 54 / 54 | 10.3 / 10.2 / 10.1% (median 10.2) | 3.1-4.7 |
+
+The same stream with the screen locked (display awake, window on screen behind the lock):
+
+| Build | Frames/s | CPU, 3 runs | Footprint |
+|---|---|---|---|
+| before | 77 / 74 / 74 | 11.5 / 11.3 / 10.7% | 390 MB |
+| after | 0 | 0.2 / 0.1 / 0.1% | 88 MB |
+
+A minimized window behaves the same: 0 frames while minimized, back to 54 frames per second on
+restore. The runaway seen earlier with the display asleep (about 3,000 frames per second, 2-3 GB
+footprint) is bounded by the same two rules.
+
+### Icons from a font
+
+The eight Lucide icons were SVGs, which made iced create a 2048x2048 RGBA image atlas (16 MB of
+GPU memory) per window. They are now glyphs of a bundled, subset Lucide icon font, and iced's
+`svg` feature is off.
+
+1 idle tab (`sleep`), footprint 25 s after launch, 3 runs each (screen locked, load 2.1-5.4):
+
+| Build | Footprint |
+|---|---|
+| before (SVG icons) | 77 / 76 / 76 MB |
+| after (icon font) | 60 / 60 / 60 MB |
+
 ## Re-running
 
 ```
