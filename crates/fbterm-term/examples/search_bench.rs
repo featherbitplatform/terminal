@@ -73,7 +73,7 @@ fn main() {
     let lines = {
         let t = one.lock();
         let g = t.term().grid();
-        alacritty_terminal::grid::Dimensions::total_lines(g)
+        feathercritty::grid::Dimensions::total_lines(g)
     };
     println!("one tab: {lines} lines of 160 columns");
     let no = AtomicBool::new(false);

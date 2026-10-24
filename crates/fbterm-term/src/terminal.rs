@@ -1,20 +1,20 @@
-//! Wrapper around the `alacritty_terminal` emulator grid.
+//! Wrapper around the `feathercritty` emulator grid.
 
 use std::sync::Arc;
 
-use alacritty_terminal::event::WindowSize;
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Processor, Rgb as VteRgb};
 use fbterm_config::Rgb;
+use feathercritty::event::WindowSize;
+use feathercritty::event::{Event, EventListener};
+use feathercritty::grid::{Dimensions, Scroll};
+use feathercritty::term::{Config, Term};
+use feathercritty::vte::ansi::{Processor, Rgb as VteRgb};
 use parking_lot::Mutex;
 
 use crate::Selection;
-use alacritty_terminal::index::Side;
-use alacritty_terminal::selection::{Selection as EmuSelection, SelectionType};
+use feathercritty::index::Side;
+use feathercritty::selection::{Selection as EmuSelection, SelectionType};
 
-pub use alacritty_terminal::term::TermMode;
+pub use feathercritty::term::TermMode;
 
 /// Terminal size in cells plus the pixel size of one cell.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -188,7 +188,7 @@ impl Terminal {
         };
         let config = Config {
             scrolling_history: scrollback,
-            osc52: alacritty_terminal::term::Osc52::OnlyPaste,
+            osc52: feathercritty::term::Osc52::OnlyPaste,
             ..Config::default()
         };
         let term = Term::new(config.clone(), &dims(size), proxy);
@@ -315,9 +315,9 @@ impl Terminal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::index::{Column, Line};
-    use alacritty_terminal::term::cell::Flags;
-    use alacritty_terminal::vte::ansi::{Color, Rgb};
+    use feathercritty::index::{Column, Line};
+    use feathercritty::term::cell::Flags;
+    use feathercritty::vte::ansi::{Color, Rgb};
 
     fn size(cols: u16, rows: u16) -> GridSize {
         GridSize {
@@ -443,7 +443,7 @@ mod tests {
     }
 
     fn select_word_and_scroll(prefill: usize) -> (String, String) {
-        use alacritty_terminal::index::Point;
+        use feathercritty::index::Point;
         let mut t = Terminal::new(size(20, 5), 100);
         for i in 0..prefill {
             t.feed(format!("old {i}\r\n").as_bytes());
@@ -567,7 +567,7 @@ mod tests {
         b"\x1b[>1u".repeat(n)
     }
 
-    /// Regression test for the vendored alacritty_terminal fix (FBTERM_PATCHES.md): a full
+    /// Regression test for the feathercritty fix (its README, change 1): a full
     /// flag stack evicts its oldest entry instead of panicking.
     #[test]
     fn flag_stack_floods_do_not_crash_and_stay_capped() {

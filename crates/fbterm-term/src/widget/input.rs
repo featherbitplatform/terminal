@@ -2,8 +2,8 @@
 
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::index::{Column, Point};
-use alacritty_terminal::term::cell::Hyperlink;
+use feathercritty::index::{Column, Point};
+use feathercritty::term::cell::Hyperlink;
 use iced::advanced::Clipboard;
 use iced::advanced::clipboard::Kind;
 use iced::keyboard::{self, Key, Modifiers};
@@ -667,7 +667,7 @@ mod tests {
     #[test]
     fn top_and_bottom_chords() {
         let mut t = filled(24);
-        let history = alacritty_terminal::grid::Dimensions::history_size(t.term().grid());
+        let history = feathercritty::grid::Dimensions::history_size(t.term().grid());
         assert!(history > 100);
         assert!(keyboard_scroll(&mut t, &HOME, Modifiers::SHIFT, false));
         assert_eq!(offset(&t), history);

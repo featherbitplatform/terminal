@@ -99,7 +99,7 @@ Success: the owner uses it as their only terminal for full working days, startin
 
 | Concern | Choice | Why |
 |---|---|---|
-| Terminal emulation (VT parser, grid, scrollback) | `alacritty_terminal` crate | Battle-tested with full-screen TUIs; avoids writing a parser. |
+| Terminal emulation (VT parser, grid, scrollback) | `feathercritty`, our fork of the upstream emulation crate (see below) | Battle-tested with full-screen TUIs; avoids writing a parser. |
 | Local shells | `portable-pty` | Cross-platform PTY incl. ConPTY on Windows. |
 | SSH | `russh` (pure Rust, in-process) | One connection carries shell, jump hops, forwards and SFTP; identical on every OS; no dependency on the system `ssh` binary. |
 | File transfer | SFTP over the session's existing connection (`russh-sftp`) | Works through jump hosts without a second login. "SCP" in UI wording is fine; the protocol is SFTP. |
@@ -108,9 +108,16 @@ Success: the owner uses it as their only terminal for full working days, startin
 | Fuzzy search | `nucleo` (or equivalent) | Fast fuzzy matching for the palette. |
 | Export archive | `age` with a passphrase recipient (scrypt) wrapping a TOML payload, file extension `.fbprofiles` | Standard, audited format; no home-grown crypto. |
 
+Emulation library, owner decision 2026-10-24: fbterm uses its own fork,
+[feathercritty](https://github.com/featherbitplatform/feathercritty), instead of a vendored,
+patched copy of the upstream crate. The upstream project does not accept contributions
+generated with AI tools, so our changes (a crash fix, the scroll counter for search, the
+inactive-grid getter, and later compact scrollback) live in the fork rather than upstream.
+The fork is Apache-2.0 only, like the upstream crate; fbterm pins it by git commit.
+
 ### 5.2 Rendering
 
-iced renders through wgpu. The terminal grid is a custom iced widget fed by `alacritty_terminal`'s
+iced renders through wgpu. The terminal grid is a custom iced widget fed by `feathercritty`'s
 grid snapshot. Drawing each cell as an individual iced text primitive will not meet the performance
 goal; the widget should draw from a glyph atlas (custom shader/primitive), redraw only damaged
 regions, and do no work at all for tabs that are not visible. **Highest technical risk of the
@@ -122,7 +129,7 @@ the grid embedded in the iced window (iced shader widget or equivalent), iced fo
 Requirements: truecolor, bold/italic/underline variants, wide characters and emoji, ligature-free
 monospace by default (Geist Mono bundled, user-selectable font and size), cursor shapes, mouse
 reporting, bracketed paste, OSC 8 hyperlinks, selection + copy/paste, scrollback (default 10,000
-lines, configurable), the kitty keyboard protocol where `alacritty_terminal` provides it (used by
+lines, configurable), the kitty keyboard protocol where `feathercritty` provides it (used by
 modern TUIs and AI agents). Inline images (sixel/kitty graphics) are out of scope for now.
 The kitty keyboard protocol is optional and off by default (`kitty_keyboard` in `settings.toml`). (Owner decision, 2026-10-23.)
 Programs cannot read or write the clipboard (OSC 52 ignored for writes, reads answered empty); only the user's own copy and paste commands touch it. (Owner decision, 2026-10-23.)
@@ -130,7 +137,7 @@ Programs cannot read or write the clipboard (OSC 52 ignored for writes, reads an
 ### 5.3 Process model
 
 One process, an async runtime (tokio) for I/O. Each session (local PTY or SSH channel) has its own
-task reading output into its `alacritty_terminal` instance. Background sessions keep parsing (so
+task reading output into its `feathercritty` instance. Background sessions keep parsing (so
 scrollback is complete) but never render. The UI thread only renders the visible panes.
 
 **Connection model** *(builder's call made at design time)*: one SSH connection per profile,
@@ -336,7 +343,7 @@ derived from the same table.
   (rows joined across soft wraps), walking the scrollback newest first in 1000-row chunks with
   the terminal locked one chunk at a time (about 0.5 ms), on tokio's blocking pool, cancellable
   between chunks; a chunk also gives the lock back after 3 ms at a line boundary. Positions are
-  stable line numbers from a scroll counter added to the vendored grid (kept across output
+  stable line numbers from a scroll counter added to feathercritty's grid (kept across output
   scrolling and row resizes; a column change reflows and starts the search over), so matches
   stay put while output scrolls; the bar searches again at most every 400 ms while output
   arrives, keeping its current match and the older matches it already loaded. At most 10,000
@@ -409,9 +416,9 @@ derived from the same table.
   resize ends the export with a message. No copy of the scrollback is made. The file is
   written under a temporary name in the same folder and renamed over the target when
   complete. File names keep at most 200 bytes of the title. "Show in Finder" selects the file
-  (`open -R`; `explorer /select,` on Windows; the folder on Linux). The vendored
-  `alacritty_terminal` gains a read-only `Term::inactive_grid()` for the alternate-screen
-  case (patch 3 in `FBTERM_PATCHES.md`). Hidden (SGR 8) text is exported as spaces.
+  (`open -R`; `explorer /select,` on Windows; the folder on Linux). feathercritty
+  gains a read-only `Term::inactive_grid()` for the alternate-screen case (change 3 in its
+  README). Hidden (SGR 8) text is exported as spaces.
 
 ## 6. Milestones
 
@@ -455,7 +462,7 @@ Performance follow-up (measured 2026-10-24, `dev/perf/README.md`):
 - Compact scrollback, owner decision 2026-10-24: a follow-up, not in milestone 1. First step:
   trim history rows to their used length when they scroll off (about -25% at 126 columns, -50%
   or more in wide windows). Full: compress older history (text plus attribute runs), about
-  24-33 MB down to 1.5-2.5 MB per full tab. Both change the vendored `alacritty_terminal` grid.
+  24-33 MB down to 1.5-2.5 MB per full tab. Both change feathercritty's grid.
 - Still open: per-frame cost (one instanced glyph-atlas primitive and damage tracking, as in
   5.2), batching PTY reads under floods, and a smaller font database at startup.
 

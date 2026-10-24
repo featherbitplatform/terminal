@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alacritty_terminal::index::{Column, Line};
 use fbterm_config::LocalProfile;
 #[cfg(unix)]
 use fbterm_session::spawn_local_into;
@@ -10,6 +9,7 @@ use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId, spawn_lo
 use fbterm_term::GridSize;
 #[cfg(unix)]
 use fbterm_term::Terminal;
+use feathercritty::index::{Column, Line};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tokio::time::timeout;
 

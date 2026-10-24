@@ -1,9 +1,9 @@
 //! Cell colors: palette lookup with OSC overrides, then inverse, dim, hidden and selection.
 
-use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
 use fbterm_config::Rgb;
+use feathercritty::term::cell::{Cell, Flags};
+use feathercritty::term::color::Colors;
+use feathercritty::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
 
 use crate::palette::{ColorScheme, blend};
 
@@ -71,8 +71,8 @@ pub fn cell_colors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::term::cell::Flags;
-    use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
+    use feathercritty::term::cell::Flags;
+    use feathercritty::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
 
     fn scheme() -> ColorScheme {
         ColorScheme::graphite()

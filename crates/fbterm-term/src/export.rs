@@ -14,10 +14,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use alacritty_terminal::grid::{Dimensions, Grid, Row};
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::vte::ansi::{Color, NamedColor};
+use feathercritty::grid::{Dimensions, Grid, Row};
+use feathercritty::index::{Column, Line};
+use feathercritty::term::cell::{Cell, Flags};
+use feathercritty::vte::ansi::{Color, NamedColor};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 

@@ -27,7 +27,7 @@ tracing-subscriber = { workspace = true }
 png = { workspace = true }
 
 [dev-dependencies]
-alacritty_terminal = { workspace = true }
+feathercritty = { workspace = true }
 toml = { workspace = true }
 read-fonts = "=0.41.0"
 

@@ -30,3 +30,9 @@ ignore = [
 
 [bans]
 multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# feathercritty, our terminal emulation library, comes from its git repository (see LICENSES.md).
+allow-org = { github = ["featherbitplatform"] }

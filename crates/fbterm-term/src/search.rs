@@ -14,9 +14,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Flags;
+use feathercritty::grid::{Dimensions, Scroll};
+use feathercritty::index::{Column, Line};
+use feathercritty::term::cell::Flags;
 use regex::{Regex, RegexBuilder};
 
 use crate::{SharedTerminal, Terminal};

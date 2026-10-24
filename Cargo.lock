@@ -84,29 +84,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alacritty_terminal"
-version = "0.26.0"
-dependencies = [
- "base64",
- "bitflags 2.13.2",
- "home",
- "libc",
- "log",
- "miow",
- "parking_lot",
- "piper",
- "polling",
- "regex-automata",
- "rustix 1.1.5",
- "rustix-openpty",
- "serde",
- "signal-hook",
- "unicode-width",
- "vte",
- "windows-sys 0.59.0",
-]
-
-[[package]]
 name = "android-activity"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1268,7 +1245,6 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 name = "fbterm"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "async-trait",
  "block2 0.6.2",
  "chrono",
@@ -1277,6 +1253,7 @@ dependencies = [
  "fbterm-secrets",
  "fbterm-session",
  "fbterm-term",
+ "feathercritty",
  "iced",
  "notify",
  "nucleo-matcher",
@@ -1322,13 +1299,13 @@ dependencies = [
 name = "fbterm-session"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "async-trait",
  "data-encoding",
  "directories",
  "fbterm-config",
  "fbterm-secrets",
  "fbterm-term",
+ "feathercritty",
  "futures-util",
  "hmac",
  "parking_lot",
@@ -1345,8 +1322,8 @@ dependencies = [
 name = "fbterm-term"
 version = "0.1.0"
 dependencies = [
- "alacritty_terminal",
  "fbterm-config",
+ "feathercritty",
  "flate2",
  "iced",
  "parking_lot",
@@ -1362,6 +1339,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
 dependencies = [
  "simd-adler32",
+]
+
+[[package]]
+name = "feathercritty"
+version = "0.26.0+fbterm.1"
+source = "git+https://github.com/featherbitplatform/feathercritty?rev=b79117337fe7a342cee3f16a99e610961d0c8639#b79117337fe7a342cee3f16a99e610961d0c8639"
+dependencies = [
+ "base64",
+ "bitflags 2.13.2",
+ "home",
+ "libc",
+ "log",
+ "miow",
+ "parking_lot",
+ "piper",
+ "polling",
+ "regex-automata",
+ "rustix 1.1.5",
+ "rustix-openpty",
+ "serde",
+ "signal-hook",
+ "unicode-width",
+ "vte",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
