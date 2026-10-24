@@ -93,6 +93,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             bar: t.surface,
             opacity,
         },
+        scale: app.physical_scale(id),
         fullscreen: app.fullscreen.contains(&id),
         modal,
         demo_tip: app.demo_tip,
@@ -234,6 +235,8 @@ struct TabBar<'b> {
     bar_bg: Color,
     /// What the tabs are painted against.
     around: Surroundings,
+    /// Physical pixels per logical pixel: tab corners are whole physical pixels.
+    scale: f32,
     /// The window is in full screen: no room needed for the window buttons.
     fullscreen: bool,
     /// The palette or a dialog covers the window.
@@ -325,23 +328,52 @@ fn tab_bar<'a>(
         content: bar.into(),
         color: bar_bg,
         hole: (active < tabs.len()).then_some(active),
+        tokens: t,
+        around: tabs_bar.around,
+        tabs: tabs.iter().map(|t| (t.accent, t.accent_style)).collect(),
+        scale: tabs_bar.scale,
     });
     chrome::title_bar(bar, modal, move |a| Message::TitleBar(window, a))
 }
 
-/// Top corner radius of a tab (the active one, a hovered one and a tinted one).
+/// Top corner radius of a tab (the active one, a hovered one and a tinted one), and of the
+/// flares at the active tab's bottom; rounded to whole physical pixels by [`tab_radius`].
 const TAB_RADIUS: f32 = 6.0;
 
-/// How far a concave corner piece reaches under the tab's antialiased edge (logical px).
-const CORNER_OVERLAP: f32 = 0.07;
+/// `v` logical pixels moved to the nearest whole physical pixel, as the renderer snaps quads.
+fn whole_px(v: f32, scale: f32) -> f32 {
+    (v * scale + 0.001).round() / scale
+}
 
-/// The pieces of `outer` that cover everything but `hole`. The active tab draws its own
-/// background there; with a translucent background nothing may lie under it, or the two
-/// alphas would add up.
-fn around(outer: Rectangle, hole: Rectangle) -> Vec<Rectangle> {
-    let hole = match outer.intersection(&hole) {
-        Some(h) => h,
-        None => return vec![outer],
+/// `r` with its edges on whole physical pixels, where the renderer draws a snapped quad.
+fn snap_rect(r: Rectangle, scale: f32) -> Rectangle {
+    let (x, y) = (whole_px(r.x, scale), whole_px(r.y, scale));
+    Rectangle {
+        x,
+        y,
+        width: whole_px(r.x + r.width, scale) - x,
+        height: whole_px(r.y + r.height, scale) - y,
+    }
+}
+
+/// The tab corner radius in window scale `scale`: a whole number of physical pixels, so the
+/// tab's rounded corners, the bar's corner pieces and the flares stay concentric at any
+/// scale (1.25 and 1.75 included).
+fn tab_radius(scale: f32) -> f32 {
+    whole_px(TAB_RADIUS, scale).max(1.0 / scale)
+}
+
+/// How far a concave corner piece or flare reaches under the antialiased edge it meets, in
+/// physical pixels.
+const CORNER_OVERLAP_PX: f32 = 0.14;
+
+/// The pieces of `rect` that `hole` does not cover (at most four, disjoint).
+fn subtract(rect: Rectangle, hole: Rectangle) -> Vec<Rectangle> {
+    let Some(hole) = rect
+        .intersection(&hole)
+        .filter(|h| h.width > 0.0 && h.height > 0.0)
+    else {
+        return vec![rect];
     };
     let mut out = Vec::with_capacity(4);
     let mut push = |x: f32, y: f32, w: f32, h: f32| {
@@ -355,16 +387,80 @@ fn around(outer: Rectangle, hole: Rectangle) -> Vec<Rectangle> {
         }
     };
     let (right, bottom) = (hole.x + hole.width, hole.y + hole.height);
-    push(outer.x, outer.y, outer.width, hole.y - outer.y);
-    push(
-        outer.x,
-        bottom,
-        outer.width,
-        outer.y + outer.height - bottom,
-    );
-    push(outer.x, hole.y, hole.x - outer.x, hole.height);
-    push(right, hole.y, outer.x + outer.width - right, hole.height);
+    push(rect.x, rect.y, rect.width, hole.y - rect.y);
+    push(rect.x, bottom, rect.width, rect.y + rect.height - bottom);
+    push(rect.x, hole.y, hole.x - rect.x, hole.height);
+    push(right, hole.y, rect.x + rect.width - right, hole.height);
     out
+}
+
+/// The pieces of `outer` that none of `holes` cover, disjoint. The active tab and its flares
+/// draw their own background there; with a translucent background nothing may lie under
+/// them, or the two alphas would add up.
+fn around(outer: Rectangle, holes: &[Rectangle]) -> Vec<Rectangle> {
+    holes.iter().fold(vec![outer], |pieces, &hole| {
+        pieces.into_iter().flat_map(|p| subtract(p, hole)).collect()
+    })
+}
+
+/// A flare: the square beside a bottom corner of the active tab, split by a circle of
+/// `radius` around `center` (the square's outer top corner). Outside the circle (toward the
+/// tab) it takes the tab's surface, the terminal's background; inside it, the bar's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Flare {
+    /// The square, cut to the bar (clip bounds).
+    square: Rectangle,
+    center: iced::Point,
+    radius: f32,
+}
+
+impl Flare {
+    /// The disc quad (the bar's part).
+    fn disc(&self) -> Rectangle {
+        let r = self.radius;
+        Rectangle::new(
+            iced::Point::new(self.center.x - r, self.center.y - r),
+            Size::new(2.0 * r, 2.0 * r),
+        )
+    }
+
+    /// The ring quad (the tab's part): its border, as wide as the radius, starts at the circle.
+    fn ring(&self) -> Rectangle {
+        let r = self.radius;
+        Rectangle::new(
+            iced::Point::new(self.center.x - 2.0 * r, self.center.y - 2.0 * r),
+            Size::new(4.0 * r, 4.0 * r),
+        )
+    }
+}
+
+/// The flares beside the bottom corners of `hole`, cut to `outer` (none where no room is left).
+fn flares(outer: Rectangle, hole: Rectangle, radius: f32) -> Vec<Flare> {
+    let r = radius.min(hole.height);
+    let bottom = hole.y + hole.height;
+    let right = hole.x + hole.width;
+    [
+        (
+            Rectangle::new(iced::Point::new(hole.x - r, bottom - r), Size::new(r, r)),
+            hole.x - r,
+        ),
+        (
+            Rectangle::new(iced::Point::new(right, bottom - r), Size::new(r, r)),
+            right + r,
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(square, cx)| {
+        let square = outer
+            .intersection(&square)
+            .filter(|s| s.width > 0.0 && s.height > 0.0)?;
+        Some(Flare {
+            square,
+            center: iced::Point::new(cx, bottom - r),
+            radius: r,
+        })
+    })
+    .collect()
 }
 
 /// One concave corner piece: the part of a `radius` square in a top corner of the hole that
@@ -409,11 +505,18 @@ fn corners(hole: Rectangle, radius: f32) -> [Corner; 2] {
 }
 
 /// Paints the tab bar's background everywhere except under the active tab (child `hole` of
-/// the bar's row), which draws its own.
+/// the bar's row), which draws its own, and its flares; and the inactive tabs' backgrounds
+/// (hover, tint), kept off the flares.
 struct BarBackground<'a> {
     content: Element<'a, Message>,
     color: Color,
     hole: Option<usize>,
+    tokens: &'static Tokens,
+    around: Surroundings,
+    /// Each tab's accent and how it shows, in row order.
+    tabs: Vec<(Option<fbterm_config::Rgb>, fbterm_config::AccentStyle)>,
+    /// Physical pixels per logical pixel.
+    scale: f32,
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
@@ -504,48 +607,119 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
     ) {
         use iced::advanced::Renderer as _;
         let bounds = layout.bounds();
-        // container -> row -> tab
-        let hole = self.hole.and_then(|i| {
-            layout
-                .children()
-                .next()
-                .and_then(|row| row.children().nth(i))
-                .map(|tab| tab.bounds())
-        });
-        let pieces = match hole {
-            Some(h) => around(bounds, h),
-            None => vec![bounds],
+        // container -> row -> tabs
+        let tab_bounds: Vec<Rectangle> = layout
+            .children()
+            .next()
+            .map(|row| {
+                row.children()
+                    .take(self.tabs.len())
+                    .map(|tab| snap_rect(tab.bounds(), self.scale))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let hole = self
+            .hole
+            .and_then(|i| tab_bounds.get(i).copied())
+            .filter(|h| h.width > 0.0 && h.height > 0.0);
+        let radius = tab_radius(self.scale);
+        let flares = hole.map_or_else(Vec::new, |h| flares(bounds, h, radius));
+        let mut holes: Vec<Rectangle> = hole.into_iter().collect();
+        holes.extend(flares.iter().map(|f| f.square));
+        let quad = |bounds: Rectangle, border: Border| renderer::Quad {
+            bounds,
+            border,
+            snap: true,
+            ..renderer::Quad::default()
         };
-        for piece in pieces {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: piece,
-                    snap: true,
-                    ..renderer::Quad::default()
-                },
-                self.color,
-            );
+        for piece in around(bounds, &holes) {
+            renderer.fill_quad(quad(piece, Border::default()), self.color);
         }
-        if let Some(h) = hole.filter(|h| h.width > 0.0 && h.height > 0.0) {
-            for c in corners(h, TAB_RADIUS) {
-                renderer.with_layer(c.clip, |renderer| {
-                    renderer.fill_quad(
-                        renderer::Quad {
-                            bounds: c.ring,
-                            border: Border {
-                                color: self.color,
-                                // A hair wider than the radius: two translucent
-                                // antialiased edges would otherwise leave a faint
-                                // lighter arc (measured: alpha within 5% along it).
-                                width: c.radius + CORNER_OVERLAP,
-                                radius: (2.0 * c.radius).into(),
-                            },
-                            snap: true,
-                            ..renderer::Quad::default()
+        // A ring quad with a transparent inside: its border, as wide as `width`, starts at
+        // the circle of `ring.width / 4` around the ring's center. A hair wider than the
+        // radius, so two translucent antialiased edges leave no faint lighter arc (measured:
+        // alpha within 5% along it).
+        let scale = self.scale;
+        let ring = |renderer: &mut iced::Renderer, clip: Rectangle, ring: Rectangle, color| {
+            let r = ring.width / 4.0;
+            renderer.with_layer(clip, |renderer| {
+                renderer.fill_quad(
+                    quad(
+                        ring,
+                        Border {
+                            color,
+                            width: r + CORNER_OVERLAP_PX / scale,
+                            radius: (2.0 * r).into(),
                         },
-                        Color::TRANSPARENT,
-                    );
-                });
+                    ),
+                    Color::TRANSPARENT,
+                );
+            });
+        };
+        let terminal = self.around.terminal.scale_alpha(self.around.opacity);
+        if let Some(h) = hole {
+            for c in corners(h, radius) {
+                ring(renderer, c.clip, c.ring, self.color);
+            }
+        }
+        for f in &flares {
+            let disc = quad(
+                f.disc(),
+                Border {
+                    radius: f.radius.into(),
+                    ..Border::default()
+                },
+            );
+            renderer.with_layer(f.square, |renderer| {
+                renderer.fill_quad(disc, self.color);
+            });
+            ring(renderer, f.square, f.ring(), terminal);
+        }
+        // Inactive tabs: hover and tint, never over a flare's tab-colored part (a neighbour
+        // of the active tab only reaches into the flare's disc).
+        for (i, (&tab, &(accent, style))) in tab_bounds.iter().zip(&self.tabs).enumerate() {
+            if Some(i) == self.hole {
+                continue;
+            }
+            let hovered = cursor.is_over(tab);
+            let Some(background) =
+                look(self.tokens, accent, style, false, hovered, self.around).background
+            else {
+                continue;
+            };
+            let shape = renderer::Quad {
+                bounds: tab,
+                border: Border {
+                    radius: iced::border::Radius::default().top(radius),
+                    ..Border::default()
+                },
+                snap: true,
+                ..renderer::Quad::default()
+            };
+            let touching: Vec<&Flare> = flares
+                .iter()
+                .filter(|f| f.square.intersection(&tab).is_some_and(|s| s.width > 0.0))
+                .collect();
+            if touching.is_empty() {
+                renderer.fill_quad(shape, background);
+                continue;
+            }
+            let squares: Vec<Rectangle> = touching.iter().map(|f| f.square).collect();
+            for piece in around(tab, &squares) {
+                renderer.with_layer(piece, |renderer| renderer.fill_quad(shape, background));
+            }
+            for f in touching {
+                let Some(clip) = f.square.intersection(&tab) else {
+                    continue;
+                };
+                let disc = quad(
+                    f.disc(),
+                    Border {
+                        radius: f.radius.into(),
+                        ..Border::default()
+                    },
+                );
+                renderer.with_layer(clip, |renderer| renderer.fill_quad(disc, background));
             }
         }
         self.content.as_widget().draw(
@@ -603,6 +777,7 @@ fn tab_button<'a>(
     let window = bar.window;
     let demo_tip = index == 0 && bar.demo_tip == Some(DemoTip::Close);
     let (accent, accent_style, around) = (tab.accent, tab.accent_style, bar.around);
+    let radius = tab_radius(bar.scale);
     let idle = look(t, accent, accent_style, active, false, around);
     let stripe = container(text(""))
         .width(3)
@@ -657,12 +832,14 @@ fn tab_button<'a>(
             left: 8.0,
         })
         .style(move |_, status| {
-            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            // Inactive tabs' hover and tint are painted by the bar (`BarBackground`), which
+            // keeps them off the active tab's flares.
+            let _ = status;
             button::Style {
-                background: look(t, accent, accent_style, active, hovered, around).background,
+                background: if active { idle.background } else { None },
                 text_color: t.text,
                 border: Border {
-                    radius: iced::border::Radius::default().top(TAB_RADIUS),
+                    radius: iced::border::Radius::default().top(radius),
                     ..Border::default()
                 },
                 // Snapped like the bar's pieces and corners, so their edges meet exactly.
@@ -743,7 +920,7 @@ mod tests {
 
     #[test]
     fn the_bar_background_leaves_the_active_tab_to_itself() {
-        let pieces = around(OUTER, TAB);
+        let pieces = around(OUTER, &[TAB]);
         let area = |r: &Rectangle| r.width * r.height;
         let covered: f32 = pieces.iter().map(area).sum();
         // Everything but the tab, with nothing behind its corners.
@@ -757,7 +934,112 @@ mod tests {
         }
         // With no overlap the whole bar is painted.
         let away = Rectangle { x: 900.0, ..TAB };
-        assert_eq!(around(OUTER, away), vec![OUTER]);
+        assert_eq!(around(OUTER, &[away]), vec![OUTER]);
+    }
+
+    fn area(rects: &[Rectangle]) -> f32 {
+        rects.iter().map(|r| r.width * r.height).sum()
+    }
+
+    #[test]
+    fn flares_sit_beside_the_tabs_bottom_corners_and_leave_the_bar_disjoint() {
+        let r = TAB_RADIUS;
+        let fl = flares(OUTER, TAB, r);
+        assert_eq!(fl.len(), 2);
+        let (left, right) = (fl[0], fl[1]);
+        assert_eq!(
+            left.square,
+            Rectangle::new((94.0, 26.0).into(), Size::new(r, r))
+        );
+        assert_eq!(
+            right.square,
+            Rectangle::new((296.0, 26.0).into(), Size::new(r, r))
+        );
+        // The circle's center is each square's outer top corner, so the part outside the
+        // circle is the corner that touches the tab and the terminal below.
+        assert_eq!(left.center, iced::Point::new(94.0, 26.0));
+        assert_eq!(right.center, iced::Point::new(302.0, 26.0));
+        assert_eq!(left.disc().center(), left.center);
+        assert_eq!(left.ring().center(), left.center);
+        assert_eq!(
+            left.ring().width / 4.0,
+            r,
+            "the ring's border starts at the circle"
+        );
+        // The bar's pieces, the tab and the flare squares tile the bar exactly once.
+        let holes = [TAB, left.square, right.square];
+        let pieces = around(OUTER, &holes);
+        assert!((area(&pieces) + area(&holes) - area(&[OUTER])).abs() < 1e-3);
+        for (i, a) in pieces.iter().enumerate() {
+            for b in &pieces[i + 1..] {
+                assert!(a.intersection(b).is_none_or(|x| x.width * x.height == 0.0));
+            }
+            for h in holes {
+                assert!(a.intersection(&h).is_none_or(|x| x.width * x.height == 0.0));
+            }
+        }
+    }
+
+    #[test]
+    fn flares_are_cut_at_the_bars_edges() {
+        // The first tab against the bar's left edge (full screen, no window buttons): no
+        // room for its left flare.
+        let first = Rectangle { x: 0.0, ..TAB };
+        let fl = flares(OUTER, first, TAB_RADIUS);
+        assert_eq!(fl.len(), 1);
+        assert_eq!(fl[0].square.x, 196.0);
+        // Partly out of the bar: the square is cut, the circle stays where it was.
+        let near = Rectangle { x: 3.0, ..TAB };
+        let fl = flares(OUTER, near, TAB_RADIUS);
+        assert_eq!(
+            fl[0].square,
+            Rectangle::new((0.0, 26.0).into(), Size::new(3.0, 6.0))
+        );
+        assert_eq!(fl[0].center, iced::Point::new(-3.0, 26.0));
+    }
+
+    #[test]
+    fn at_fractional_scales_corners_and_flares_are_whole_physical_pixels() {
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let whole = |v: f32| ((v * scale) - (v * scale).round()).abs() < 1e-3;
+            let r = tab_radius(scale);
+            assert!(whole(r), "radius at {scale}");
+            assert!(
+                (r - TAB_RADIUS).abs() <= 0.5 / scale + 1e-4,
+                "close to 6 at {scale}"
+            );
+            // A tab laid out at fractional logical positions, as the renderer snaps it.
+            let tab = snap_rect(
+                Rectangle {
+                    x: 100.3,
+                    y: 4.0,
+                    width: 196.0,
+                    height: 27.6,
+                },
+                scale,
+            );
+            for v in [tab.x, tab.y, tab.x + tab.width, tab.y + tab.height] {
+                assert!(whole(v), "tab edge {v} at {scale}");
+            }
+            for c in corners(tab, r) {
+                for v in [c.clip.x, c.clip.y, c.ring.x, c.ring.y, c.ring.width] {
+                    assert!(whole(v), "corner {v} at {scale}");
+                }
+                // Concentric with the tab's own corner: ring center = tab corner +/- r.
+                let center = c.ring.center();
+                assert!((center.y - (tab.y + r)).abs() < 1e-3);
+                assert!(
+                    (center.x - (tab.x + r)).abs() < 1e-3
+                        || (center.x - (tab.x + tab.width - r)).abs() < 1e-3
+                );
+            }
+            for f in flares(OUTER, tab, r) {
+                for v in [f.square.x, f.square.y, f.center.x, f.center.y, f.ring().x] {
+                    assert!(whole(v), "flare {v} at {scale}");
+                }
+                assert!((f.square.y + f.square.height - (tab.y + tab.height)).abs() < 1e-3);
+            }
+        }
     }
 
     #[test]

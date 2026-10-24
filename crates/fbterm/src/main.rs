@@ -81,6 +81,7 @@ fn main() -> iced::Result {
         .title(App::title)
         .theme(|app: &App, _| app.theme.clone())
         .style(App::style)
+        .scale_factor(|app: &App, _| app.ui_scale)
         .subscription(App::subscription)
         .default_font(theme::UI_FONT);
     for font in FONTS {

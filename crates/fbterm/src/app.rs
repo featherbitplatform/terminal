@@ -148,6 +148,8 @@ pub enum Message {
     CloseRequested(window::Id),
     /// A window was resized (or has just reported its size).
     WindowResized(window::Id, iced::Size),
+    /// The OS scale factor of a window (asked when it opens, and on a change).
+    WindowScale(window::Id, f32),
     /// A window's mode, asked after a resize (entering or leaving full screen resizes).
     WindowMode(window::Id, window::Mode),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
@@ -247,6 +249,11 @@ pub struct App {
     /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
     /// shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
+    /// `FBTERM_SCALE` (debug aid): extra UI scale on top of the OS's, e.g. 0.625 on a 2x
+    /// screen for a fractional 1.25 physical scale. 1.0 otherwise.
+    pub(crate) ui_scale: f32,
+    /// The OS scale factor of each window, where known.
+    pub(crate) os_scales: HashMap<window::Id, f32>,
     /// A tab export is under way (its Save dialog open or its file being written).
     pub(crate) exporting: bool,
     /// The last export's outcome, shown in the window it ran in until dismissed.
@@ -449,6 +456,11 @@ impl App {
                 .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
             exporting: false,
             export_notice: None,
+            ui_scale: debug_env("FBTERM_SCALE")
+                .and_then(|v| v.to_string_lossy().parse::<f32>().ok())
+                .filter(|s| s.is_finite() && (0.25..=4.0).contains(s))
+                .unwrap_or(1.0),
+            os_scales: HashMap::new(),
         };
         app.update_output_rate();
         let mut task = match crate::perf::opts() {
@@ -528,6 +540,7 @@ impl App {
             iced::event::listen_with(|event, _, id| match event {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
+                Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
@@ -606,6 +619,7 @@ impl App {
                     Task::batch([
                         visibility::watch(id, &self.visibility),
                         display_rate::watch(id, &self.display),
+                        window::scale_factor(id).map(move |s| Message::WindowScale(id, s)),
                     ])
                 } else {
                     Task::none()
@@ -690,6 +704,7 @@ impl App {
                 }
                 self.occluded.remove(&id);
                 self.sizes.remove(&id);
+                self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
                 if self.find_box.as_ref().is_some_and(|f| f.window == id) {
@@ -732,6 +747,12 @@ impl App {
             Message::Export(msg) => self.export_msg(msg),
             Message::Settings(msg) => self.settings_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
+            Message::WindowScale(id, s) => {
+                if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
+                    self.os_scales.insert(id, s);
+                }
+                Task::none()
+            }
             Message::WindowResized(id, size) => {
                 Task::batch([self.window_resized(id, size), query_mode(id)])
             }
@@ -783,6 +804,11 @@ impl App {
             t.state = TabState::Disconnected(reason);
             write_notice(t, &text, false);
         }
+    }
+
+    /// Physical pixels per logical pixel in window `id` (the OS's scale times `ui_scale`).
+    pub(crate) fn physical_scale(&self, id: window::Id) -> f32 {
+        self.os_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale
     }
 
     pub(crate) fn focused_window(&self) -> Option<window::Id> {
