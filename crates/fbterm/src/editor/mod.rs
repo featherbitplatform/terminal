@@ -217,7 +217,13 @@ impl Draft {
                 .filter(|g| !g.is_empty())
                 .map(str::to_owned),
             accent: self.accent,
-            accent_style: self.accent_style,
+            // Without an accent there is nothing to show, so the style goes back to the
+            // default (and is not written to the file).
+            accent_style: if self.accent.is_some() {
+                self.accent_style
+            } else {
+                AccentStyle::default()
+            },
             kind,
         }
     }
