@@ -280,10 +280,30 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVisualEffectView
 (follows Reduce transparency, native vibrancy).
 
-Performance follow-up, before or within milestone 2: compact scrollback storage; investigate CPU
-use while streaming output; break down the ~100 MB base memory (RSS vs footprint; GPU/wgpu, font
-database and glyph caches, heap, shared libraries) and try cheap levers (bundled fonts plus a
-small fallback list instead of the full system font database; wgpu memory hints).
+Performance follow-up (measured 2026-10-24, `dev/perf/README.md`):
+
+- Done in milestone 1: output-driven redraws are paced to at most 60 per second (a named
+  constant, not a setting), with the echo of typed input and all input-driven redraws
+  immediate; a window that cannot be seen (minimized, covered, locked screen, sleeping display;
+  AppKit's occlusion state on macOS) takes no output redraws until it is visible again. One
+  visible 100-lines/s stream went from 84 to 54 frames per second and from 14.1% to 10.2% of a
+  core; the same stream on a locked screen from 74-77 frames per second, 11% CPU and 390 MB
+  footprint to no frames, 0.1% CPU and 88 MB. This also bounds the runaway seen with the display
+  asleep (about 3,000 frames per second and 2-3 GB footprint). The tab-bar and dialog icons are
+  glyphs of a bundled Lucide icon font instead of SVGs, so the 2048x2048 image atlas (16 MB of
+  GPU memory per window) is never created: idle footprint with one tab went from about 76 MB to
+  60 MB.
+- Measured facts: Activity Monitor's "Memory" is the phys_footprint (`footprint <pid>`), not
+  RSS. It counts GPU memory the process owns, which RSS does not. While any frames are being
+  rendered, the Metal driver holds about 300 MB more (a minimal iced app shows the same); it is
+  released 10-20 s after rendering stops. So a visible stream shows about 390-430 MB in
+  Activity Monitor while RSS is about 120 MB.
+- Compact scrollback, owner decision 2026-10-24: a follow-up, not in milestone 1. First step:
+  trim history rows to their used length when they scroll off (about -25% at 126 columns, -50%
+  or more in wide windows). Full: compress older history (text plus attribute runs), about
+  24-33 MB down to 1.5-2.5 MB per full tab. Both change the vendored `alacritty_terminal` grid.
+- Still open: per-frame cost (one instanced glyph-atlas primitive and damage tracking, as in
+  5.2), batching PTY reads under floods, and a smaller font database at startup.
 
 ## 7. Performance targets *(builder's call; to be measured, not guessed)*
 
@@ -299,6 +319,9 @@ tab; about 0.2 MB per idle tab; about 21 MB per tab with the full 10,000-line sc
 tabs about 528 MB, over the ~300 MB target. The owner chose to keep the 10,000-line default and
 accept this worst case. One visible log stream costs about 22% of a core; a `yes` flood about one
 core. Follow-up work is listed in section 6.
+
+*Measured 2026-10-24 (same machine):* idle footprint with one tab 60 MB after the icon font
+(76 MB before); output redraws capped at 60 per second; numbers in section 6.
 
 ## 8. Repo and release
 
