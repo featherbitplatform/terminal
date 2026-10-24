@@ -1350,6 +1350,7 @@ dependencies = [
  "parking_lot",
  "png",
  "portable-pty",
+ "regex",
 ]
 
 [[package]]

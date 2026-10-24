@@ -3,6 +3,7 @@
 //! The widget is drawn with iced's own primitives (quads and text runs, see `draw`). Input handling
 //! lives in `input`. The terminal is locked only while building the draw list or handling an event.
 
+mod colors;
 mod draw;
 mod geometry;
 mod input;
@@ -19,9 +20,9 @@ use iced::advanced::{Clipboard, Shell, renderer};
 use iced::{Element, Event, Font, Length, Pixels, Rectangle, Size, mouse};
 
 use crate::palette::ColorScheme;
-use crate::{GridSize, SharedTerminal};
+use crate::{GridSize, SearchMatch, SearchPattern, SharedTerminal};
 
-pub use draw::cell_colors;
+pub use colors::cell_colors;
 pub use geometry::{grid_size_from_bounds, pixel_to_cell, pixel_to_point};
 
 /// How a terminal is drawn.
@@ -38,6 +39,17 @@ pub struct TerminalStyle {
     /// selection, the cursor and text stay opaque. At `0.0` the default background is not drawn
     /// at all, for a host that paints it behind the widget.
     pub background_opacity: f32,
+}
+
+/// Search matches to show: every match of `pattern` in view tinted with `match_bg`, the
+/// `current` one drawn in `current_fg` on `current_bg`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Highlight {
+    pub pattern: SearchPattern,
+    pub current: Option<SearchMatch>,
+    pub match_bg: Rgb,
+    pub current_bg: Rgb,
+    pub current_fg: Rgb,
 }
 
 /// What the widget asks of its host.
@@ -59,9 +71,20 @@ pub fn terminal_view<'a, Message: 'a>(
     style: &'a TerminalStyle,
     on_event: impl Fn(TerminalOutput) -> Message + 'a,
 ) -> Element<'a, Message> {
+    highlighted_terminal_view(term, style, None, on_event)
+}
+
+/// A terminal view showing search matches (see [`Highlight`]).
+pub fn highlighted_terminal_view<'a, Message: 'a>(
+    term: &'a SharedTerminal,
+    style: &'a TerminalStyle,
+    highlight: Option<Highlight>,
+    on_event: impl Fn(TerminalOutput) -> Message + 'a,
+) -> Element<'a, Message> {
     Element::new(TerminalView {
         term,
         style,
+        highlight,
         on_event: Box::new(on_event),
     })
 }
@@ -69,6 +92,7 @@ pub fn terminal_view<'a, Message: 'a>(
 struct TerminalView<'a, Message> {
     term: &'a SharedTerminal,
     style: &'a TerminalStyle,
+    highlight: Option<Highlight>,
     on_event: Box<dyn Fn(TerminalOutput) -> Message + 'a>,
 }
 
@@ -80,6 +104,7 @@ struct CacheKey {
     focused: bool,
     scheme: ColorScheme,
     hover: Option<Hyperlink>,
+    highlight: Option<Highlight>,
 }
 
 /// Cell size measured for a font and size.
@@ -262,9 +287,16 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                 focused: self.style.focused,
                 scheme: self.style.scheme,
                 hover: state.input.hover().cloned(),
+                highlight: self.highlight.clone(),
             };
             if cache.as_ref().is_none_or(|(k, _)| *k != key) {
-                let list = draw::build(&term, &self.style.scheme, key.focused, key.hover.as_ref());
+                let list = draw::build(
+                    &term,
+                    &self.style.scheme,
+                    key.focused,
+                    key.hover.as_ref(),
+                    key.highlight.as_ref(),
+                );
                 *cache = Some((key, list));
             }
         }

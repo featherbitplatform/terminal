@@ -164,11 +164,11 @@ fn dims(size: GridSize) -> Dims {
 
 /// An emulated terminal: grid, parser and pending events.
 pub struct Terminal {
-    term: Term<EventProxy>,
+    pub(crate) term: Term<EventProxy>,
     config: Config,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
-    generation: u64,
+    pub(crate) generation: u64,
 }
 
 pub type SharedTerminal = Arc<Mutex<Terminal>>;

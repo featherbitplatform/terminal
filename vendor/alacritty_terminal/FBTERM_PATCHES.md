@@ -15,6 +15,10 @@ let removed = self.keyboard_mode_stack.remove(0);
 
 With an empty title stack the original line panics (`Vec::remove(0)` on an empty vector), so any program or remote host that sends `CSI > flags u` 4097 times crashes the terminal's parser while the protocol is enabled.
 
+## 2. Scroll counter on the grid (scrollback search)
+
+`src/grid/mod.rs`: `Grid` gains a `scrolled_lines: u64` field (skipped by serde), incremented by `positions` where `Grid::scroll_up` rotates the whole buffer into history, and a getter `Grid::scrolled_lines()`. `scrolled_lines() as i64 + line` is a line number that stays the same while output scrolls the line upward, which the find bar uses to keep its matches and current match in place as new output arrives. Nothing upstream reads the field.
+
 ## Packaging
 
 - `tests/` (reference test data, about 46 MB) and the `[[test]] ref` target in `Cargo.toml` were removed. Nothing else in the manifest was changed.

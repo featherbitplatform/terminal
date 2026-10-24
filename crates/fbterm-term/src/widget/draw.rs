@@ -1,4 +1,4 @@
-//! Color resolution and the draw list built from the terminal grid.
+//! The draw list built from the terminal grid, and drawing it.
 //!
 //! The draw list is built under the terminal lock (cheap: cells to runs) and drawn afterwards
 //! without it. Cells are batched into runs: one quad per run of equal background, one text
@@ -7,77 +7,17 @@
 
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::{Cell, Flags, Hyperlink};
-use alacritty_terminal::term::color::Colors;
-use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor, Rgb as VteRgb};
+use alacritty_terminal::term::cell::{Flags, Hyperlink};
+use alacritty_terminal::vte::ansi::CursorShape;
 use fbterm_config::Rgb;
 use iced::advanced::renderer::{Quad, Renderer as _};
 use iced::advanced::text::{self, Renderer as _};
 use iced::{Border, Font, Pixels, Rectangle, Size};
 
-use crate::Terminal;
-use crate::palette::{ColorScheme, blend};
-
-/// How much of the foreground survives `DIM` (the rest is background).
-const DIM_ALPHA: f32 = 0.66;
-
-fn from_vte(c: VteRgb) -> Rgb {
-    Rgb {
-        r: c.r,
-        g: c.g,
-        b: c.b,
-    }
-}
-
-fn named(n: NamedColor, scheme: &ColorScheme) -> Rgb {
-    let idx = n as usize;
-    match n {
-        NamedColor::Foreground | NamedColor::BrightForeground => scheme.foreground,
-        NamedColor::Background => scheme.background,
-        NamedColor::Cursor => scheme.cursor,
-        NamedColor::DimForeground => blend(scheme.foreground, scheme.background, DIM_ALPHA),
-        _ if idx < 16 => scheme.ansi[idx],
-        _ => {
-            // DimBlack..=DimWhite
-            let base = idx.saturating_sub(NamedColor::DimBlack as usize).min(7);
-            blend(scheme.ansi[base], scheme.background, DIM_ALPHA)
-        }
-    }
-}
-
-fn resolve(color: Color, colors: &Colors, scheme: &ColorScheme) -> Rgb {
-    match color {
-        Color::Spec(c) => from_vte(c),
-        Color::Indexed(i) => colors[i as usize]
-            .map(from_vte)
-            .unwrap_or_else(|| scheme.indexed(i as usize)),
-        Color::Named(n) => colors[n].map(from_vte).unwrap_or_else(|| named(n, scheme)),
-    }
-}
-
-/// Foreground and background of a cell after inverse, dim, hidden and selection.
-pub fn cell_colors(
-    cell: &Cell,
-    colors: &Colors,
-    scheme: &ColorScheme,
-    selected: bool,
-) -> (Rgb, Rgb) {
-    let mut fg = resolve(cell.fg, colors, scheme);
-    let mut bg = resolve(cell.bg, colors, scheme);
-    if cell.flags.contains(Flags::DIM) {
-        fg = blend(fg, bg, DIM_ALPHA);
-    }
-    if cell.flags.contains(Flags::INVERSE) {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-    if cell.flags.contains(Flags::HIDDEN) {
-        fg = bg;
-    }
-    if selected {
-        bg = scheme.selection;
-    }
-    (fg, bg)
-}
+use super::Highlight;
+use super::colors::{cell_colors, resolve};
+use crate::palette::ColorScheme;
+use crate::{SearchMatch, Terminal};
 
 /// A horizontal span of cells in one viewport row.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -142,12 +82,56 @@ fn standalone(c: char) -> bool {
     !c.is_ascii() && !('\u{2500}'..='\u{259f}').contains(&c)
 }
 
+/// A search match on one row of the view: columns `from..=to`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mark {
+    from: usize,
+    to: usize,
+    current: bool,
+}
+
+/// The search matches in view, per row of the view: every match of the pattern on the visible
+/// lines, plus the current match.
+fn marks(term: &Terminal, highlight: &Highlight, rows: usize, cols: usize) -> Vec<Vec<Mark>> {
+    let mut out = vec![Vec::new(); rows];
+    let grid = term.term().grid();
+    let offset = grid.display_offset() as i64;
+    let first = term.stable_line(Line(-(offset as i32)));
+    let mut add = |m: &SearchMatch, current: bool| {
+        for stable in m.start.line..=m.end.line {
+            let row = stable - first;
+            if row < 0 || row >= rows as i64 {
+                continue;
+            }
+            let from = if stable == m.start.line {
+                usize::from(m.start.col)
+            } else {
+                0
+            };
+            let to = if stable == m.end.line {
+                usize::from(m.end.col).min(cols - 1)
+            } else {
+                cols - 1
+            };
+            out[row as usize].push(Mark { from, to, current });
+        }
+    };
+    for m in term.visible_matches(&highlight.pattern) {
+        add(&m, false);
+    }
+    if let Some(m) = &highlight.current {
+        add(m, true);
+    }
+    out
+}
+
 /// Builds the draw list. Call with the terminal locked; it only reads.
 pub fn build(
     term: &Terminal,
     scheme: &ColorScheme,
     focused: bool,
     hover: Option<&Hyperlink>,
+    highlight: Option<&Highlight>,
 ) -> DrawList {
     let t = term.term();
     let grid = t.grid();
@@ -170,6 +154,7 @@ pub fn build(
     let mut quads: Vec<(Span, Rgb)> = Vec::new();
     let mut lines: Vec<(Span, (Rgb, LineKind))> = Vec::new();
     let mut strikes: Vec<(Span, (Rgb, LineKind))> = Vec::new();
+    let marks = highlight.map(|h| (h, marks(term, h, rows, cols)));
     for y in 0..rows {
         let row_u16 = y as u16;
         let line = Line(y as i32 - offset as i32);
@@ -191,6 +176,17 @@ pub fn build(
             let col = x as u16;
             let selected = selection.is_some_and(|s| s.contains(Point::new(line, Column(x))));
             let (mut fg, mut bg) = cell_colors(cell, colors, scheme, selected);
+            // Search matches: the current one strongest, then the selection, then the others.
+            if let Some((h, marks)) = &marks {
+                let mut hit = marks[y].iter().filter(|m| (m.from..=m.to).contains(&x));
+                let current = hit.clone().any(|m| m.current);
+                if current {
+                    bg = h.current_bg;
+                    fg = h.current_fg;
+                } else if hit.next().is_some() && !selected {
+                    bg = h.match_bg;
+                }
+            }
             let is_cursor_cell = cursor_visible
                 && y as i32 == cursor_row
                 && (x == cursor.point.column.0
@@ -491,81 +487,9 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alacritty_terminal::term::cell::Flags;
-    use alacritty_terminal::vte::ansi::{Color, NamedColor, Rgb as VteRgb};
 
     fn scheme() -> ColorScheme {
         ColorScheme::graphite()
-    }
-
-    fn red_on_green() -> Cell {
-        Cell {
-            fg: Color::Named(NamedColor::Red),
-            bg: Color::Named(NamedColor::Green),
-            ..Cell::default()
-        }
-    }
-
-    #[test]
-    fn cell_colors_default_cell_uses_scheme() {
-        let s = scheme();
-        let (fg, bg) = cell_colors(&Cell::default(), &Colors::default(), &s, false);
-        assert_eq!((fg, bg), (s.foreground, s.background));
-    }
-
-    #[test]
-    fn cell_colors_resolves_named_indexed_and_truecolor() {
-        let s = scheme();
-        let cell = Cell {
-            fg: Color::Indexed(196),
-            bg: Color::Spec(VteRgb { r: 1, g: 2, b: 3 }),
-            ..Cell::default()
-        };
-        let (fg, bg) = cell_colors(&cell, &Colors::default(), &s, false);
-        assert_eq!(fg, s.indexed(196));
-        assert_eq!(bg, Rgb { r: 1, g: 2, b: 3 });
-        let (fg, bg) = cell_colors(&red_on_green(), &Colors::default(), &s, false);
-        assert_eq!((fg, bg), (s.ansi[1], s.ansi[2]));
-    }
-
-    #[test]
-    fn cell_colors_honors_osc_overrides() {
-        let s = scheme();
-        let mut colors = Colors::default();
-        colors[NamedColor::Red] = Some(VteRgb { r: 9, g: 9, b: 9 });
-        let (fg, _) = cell_colors(&red_on_green(), &colors, &s, false);
-        assert_eq!(fg, Rgb { r: 9, g: 9, b: 9 });
-    }
-
-    #[test]
-    fn cell_colors_inverse_swaps_fg_and_bg() {
-        let s = scheme();
-        let mut cell = red_on_green();
-        cell.flags = Flags::INVERSE;
-        let (fg, bg) = cell_colors(&cell, &Colors::default(), &s, false);
-        assert_eq!((fg, bg), (s.ansi[2], s.ansi[1]));
-    }
-
-    #[test]
-    fn cell_colors_dim_moves_fg_towards_bg() {
-        let s = scheme();
-        let cell = Cell {
-            flags: Flags::DIM,
-            ..Cell::default()
-        };
-        let (fg, bg) = cell_colors(&cell, &Colors::default(), &s, false);
-        assert_eq!(bg, s.background);
-        assert_ne!(fg, s.foreground);
-        assert!(fg.r < s.foreground.r && fg.r > s.background.r);
-    }
-
-    #[test]
-    fn cell_colors_hidden_draws_fg_as_bg() {
-        let s = scheme();
-        let mut cell = red_on_green();
-        cell.flags = Flags::HIDDEN;
-        let (fg, bg) = cell_colors(&cell, &Colors::default(), &s, false);
-        assert_eq!(fg, bg);
     }
 
     fn term_with(bytes: &[u8]) -> Terminal {
@@ -585,7 +509,7 @@ mod tests {
     #[test]
     fn build_batches_runs_by_style() {
         let t = term_with(b"ab \x1b[31mcd\x1b[0m  \x1b[1mef");
-        let list = build(&t, &scheme(), true, None);
+        let list = build(&t, &scheme(), true, None, None);
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -607,7 +531,7 @@ mod tests {
     fn only_the_default_background_is_translucent() {
         // Green background on "ab", then default cells.
         let t = term_with(b"\x1b[42mab\x1b[0m cd");
-        let list = build(&t, &scheme(), true, None);
+        let list = build(&t, &scheme(), true, None, None);
         let bg = background_fill(&list, 0.85).expect("drawn");
         assert!((bg.a - 0.85).abs() < f32::EPSILON);
         assert_eq!(
@@ -633,7 +557,7 @@ mod tests {
     #[test]
     fn build_unfocused_cursor_is_hollow() {
         let t = term_with(b"x");
-        let list = build(&t, &scheme(), false, None);
+        let list = build(&t, &scheme(), false, None, None);
         assert_eq!(list.cursor.map(|c| c.2), Some(CursorMark::Hollow));
         assert!(list.quads.is_empty());
     }
@@ -641,7 +565,7 @@ mod tests {
     #[test]
     fn build_draws_wide_chars_on_their_own() {
         let t = term_with("a日b".as_bytes());
-        let list = build(&t, &scheme(), true, None);
+        let list = build(&t, &scheme(), true, None, None);
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -653,7 +577,7 @@ mod tests {
     #[test]
     fn non_ascii_narrow_char_breaks_run() {
         let t = term_with("a❯b █▓─x".as_bytes());
-        let list = build(&t, &scheme(), true, None);
+        let list = build(&t, &scheme(), true, None, None);
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -665,10 +589,10 @@ mod tests {
     #[test]
     fn build_underlines_hovered_link_only() {
         let t = term_with(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ x");
-        let none = build(&t, &scheme(), true, None);
+        let none = build(&t, &scheme(), true, None, None);
         assert!(none.lines.is_empty());
         let link = t.term().grid()[Line(0)][Column(0)].hyperlink().unwrap();
-        let hovered = build(&t, &scheme(), true, Some(&link));
+        let hovered = build(&t, &scheme(), true, Some(&link), None);
         assert_eq!(hovered.lines.len(), 1);
         assert_eq!(hovered.lines[0].0.cells, 4);
     }
@@ -679,7 +603,7 @@ mod tests {
         let mut sel = crate::Selection::start(Point::new(Line(0), Column(1)));
         sel.update(Point::new(Line(0), Column(3)));
         t.set_selection(Some(sel));
-        let list = build(&t, &scheme(), false, None);
+        let list = build(&t, &scheme(), false, None, None);
         assert!(list.quads.contains(&(
             Span {
                 row: 0,
@@ -691,13 +615,41 @@ mod tests {
     }
 
     #[test]
-    fn cell_colors_selected_cell_uses_selection_color() {
-        let s = scheme();
-        let (fg, bg) = cell_colors(&red_on_green(), &Colors::default(), &s, true);
-        assert_eq!((fg, bg), (s.ansi[1], s.selection));
-        let mut inv = red_on_green();
-        inv.flags = Flags::INVERSE;
-        let (_, bg) = cell_colors(&inv, &Colors::default(), &s, true);
-        assert_eq!(bg, s.selection);
+    fn build_tints_matches_and_marks_the_current_one() {
+        let t = term_with(b"ab ab\r\nab");
+        let pattern = crate::SearchPattern::new(&crate::SearchQuery::new("ab", false))
+            .unwrap()
+            .unwrap();
+        let all = t.visible_matches(&pattern);
+        assert_eq!(all.len(), 3);
+        let (tint, strong, text) = (
+            Rgb { r: 1, g: 1, b: 1 },
+            Rgb { r: 2, g: 2, b: 2 },
+            Rgb { r: 3, g: 3, b: 3 },
+        );
+        let h = Highlight {
+            pattern,
+            current: Some(all[1]),
+            match_bg: tint,
+            current_bg: strong,
+            current_fg: text,
+        };
+        let list = build(&t, &scheme(), false, None, Some(&h));
+        let quads: Vec<_> = list
+            .quads
+            .iter()
+            .map(|(s, c)| (s.row, s.col, s.cells, *c))
+            .collect();
+        assert!(quads.contains(&(0, 0, 2, tint)));
+        assert!(quads.contains(&(0, 3, 2, strong)));
+        assert!(quads.contains(&(1, 0, 2, tint)));
+        let current_text = list
+            .texts
+            .iter()
+            .find(|r| r.span.row == 0 && r.span.col == 3);
+        assert_eq!(current_text.map(|r| r.fg), Some(text));
+        // Without a highlight nothing is tinted.
+        let plain = build(&t, &scheme(), false, None, None);
+        assert!(plain.quads.iter().all(|(_, c)| *c != tint && *c != strong));
     }
 }
