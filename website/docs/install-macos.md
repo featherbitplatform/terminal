@@ -33,9 +33,9 @@ The command prints `fbterm-0.1.0-macos-universal.dmg: OK` when the file is intac
 
 ## First launch
 
-The app carries an ad-hoc signature, which Apple silicon requires, but it is not signed with a Developer ID and is not notarized. The first time you open it, macOS Gatekeeper warns about an unidentified developer. You only need to approve it once.
+The app carries an ad-hoc signature, which Apple silicon requires, but it is not signed with a Developer ID and is not notarized. The first time you open it, macOS says it cannot verify the app and offers only **Done** or **Move to Trash**. Choose **Done**, then approve the app once in one of these ways.
 
-**Option 1: right-click.** In Finder, open Applications, right-click **featherbit terminal**, choose **Open**, then confirm **Open** in the dialog.
+**Option 1: System Settings.** Open **System Settings**, then **Privacy & Security**, scroll down to the message about featherbit terminal and click **Open Anyway**. Confirm with your password or Touch ID, then click **Open Anyway** again in the dialog that follows.
 
 **Option 2: clear the quarantine flag.** Run this once in another terminal:
 
@@ -43,7 +43,7 @@ The app carries an ad-hoc signature, which Apple silicon requires, but it is not
 xattr -dr com.apple.quarantine "/Applications/featherbit terminal.app"
 ```
 
-After either option the app opens normally from then on.
+After either option the app opens normally from then on. On macOS 15 and later, right-clicking the app and choosing **Open** no longer skips this check; use one of the options above.
 
 ## Next steps
 

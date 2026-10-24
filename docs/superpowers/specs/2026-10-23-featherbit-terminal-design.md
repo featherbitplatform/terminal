@@ -277,7 +277,7 @@ derived from the same table.
 - **Keyboard section** in the Settings window, first of all to see every shortcut in one place,
   then to rebind ones that clash with programs (tmux, vim, emacs): every action with its chord,
   grouped Tabs / Windows / Search / App; actions without a default (open settings file, reveal
-  config folder) show "Not set" and can be bound. Click a chord to record; while recording no key
+  config folder, export tab) show "Not set" and can be bound. Click a chord to record; while recording no key
   reaches a terminal or runs a shortcut, and Escape cancels. A changed row has a reset to its
   default, any row can be cleared (unbound), and "Restore defaults" resets all. The palette and
   the tooltips show the chords in force.
@@ -343,6 +343,54 @@ derived from the same table.
   matches stay loaded per bar. On Windows a Ctrl+Alt press that types a character (AltGr) is
   never the find-in-all-tabs chord. Measured (release, Apple Silicon): a full 10,000-line tab 5 ms (plain
   text or regex), 20 full tabs in parallel 23 ms; see `crates/fbterm-term/examples/search_bench.rs`.
+
+### 5.13 Tab corners and tab colors *(owner's decisions, 2026-10-24; done)*
+
+- **Rounded tabs at any opacity:** the active tab keeps its 6 px top corners at every
+  background opacity, with no notch or doubled alpha at the corners; a hovered or tinted
+  inactive tab has the same corners. Tabs meet the terminal with square bottom corners.
+- **"Color as" per profile:** `accent_style` in `profiles.toml`, `"stripe"` (default, not
+  written) or `"tab"`, chosen in the profile editor next to the accent picker. With `"tab"`
+  the accent tints the tab: inactive tabs lightly, the active tab more strongly so it stays
+  obvious; hover still shows; label and icons pick a readable color on the tint. Without an
+  accent both styles look the same.
+- Builder's notes: the bar paints its background around the active tab only (four
+  rectangles plus two concave corner pieces). Each corner piece is a round quad with a border
+  as wide as the radius and a transparent inside, clipped to the corner square: the inner
+  edge of the border is the tab's own corner circle, so the two antialiased edges are
+  complementary (the piece reaches 0.07 px under the tab, which keeps the alpha along the
+  arc within 5% of the bar's). Inactive tints are see-through accent over the bar (13%, 20%
+  hovered); the active tint is 34% accent over the terminal's background at the top,
+  fading into the terminal's background from 30% of the height down (stops mixed in sRGB,
+  since the renderer interpolates in linear light), all at the background opacity. Text
+  takes the dark or light theme's text colors, whichever has the higher WCAG contrast on the
+  tint (`crates/fbterm/src/tab_look.rs`).
+
+### 5.14 Exporting a tab *(owner's decisions, 2026-10-24; done)*
+
+- **Triggers:** the palette's "Export tab to file…" and the `export_tab` action, which has no
+  default chord (shown as not set in Settings, Keyboard; bindable there or in `[keys]`). It
+  acts on the focused window's active tab and only ever starts from the user.
+- **Dialog:** native Save dialog (`rfd`, async, so the window keeps drawing; the XDG portal
+  on Linux). Default name `<tab title> YYYY-MM-DD HH.MM.txt` in local time, the title made
+  safe for file names.
+- **Formats** by the saved name's extension: `.txt`, `.txt.gz`, `.ansi` (SGR sequences that
+  `less -R` and `cat` replay: 16, 256 and true colors, bold, dim, italic, underline, inverse,
+  strikethrough; a reset at each line end) and `.ansi.gz`.
+- **Content:** the normal screen's whole history, scrollback then screen, soft-wrapped rows
+  joined, trailing spaces trimmed, UTF-8, wide characters once, combining characters kept,
+  trailing empty lines dropped. With the alternate screen up, the normal screen's history is
+  exported and the dialog title and the notice say so.
+- **Done:** a notice under the tab bar with the file name and a "Show in Finder" button
+  (Explorer, Files elsewhere); errors show in the same place.
+- Builder's notes: `rfd` cannot report which filter was chosen, and on macOS it merges all
+  filters into one list of allowed extensions (no type menu), so the extension decides the
+  format everywhere. The grid is cloned while the terminal is locked (on the blocking pool,
+  never the UI thread; about 4 ms for 10,000 rows of 200 columns in a release build), then
+  formatted, compressed (`flate2`) and written with the lock released (about 95 ms for that
+  tab, both formats). The vendored `alacritty_terminal` gains a read-only
+  `Term::inactive_grid()` for the alternate-screen case (patch 3 in `FBTERM_PATCHES.md`).
+  Hidden (SGR 8) text is exported as spaces.
 
 ## 6. Milestones
 

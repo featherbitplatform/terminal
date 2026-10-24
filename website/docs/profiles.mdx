@@ -26,6 +26,16 @@ The file is a list of `[[profiles]]` tables. Shells found in `/etc/shells` are o
 | `kind` | `"local"` or `"ssh"` | yes | Selects which of the fields below apply. |
 | `group` | string | no | Free-form group label. |
 | `accent` | string | no | Tab accent color as `"#rrggbb"` (six hex digits, with the leading `#`). |
+| `accent_style` | `"stripe"` or `"tab"` | no | How the accent shows on tabs (see [Tab colors](#tab-colors)). Default `"stripe"`, which is not written to the file. |
+
+### Tab colors
+
+A profile with an `accent` marks its tabs in one of two ways, chosen with **Color as** next to the accent picker in the profile editor:
+
+- **Stripe** (default): a thin bar of the accent at the left of the tab.
+- **Whole tab**: the tab is tinted with the accent. Tabs in the background get a light tint (a little stronger under the pointer); the active tab gets a stronger one that fades into the terminal's background, so it still reads as one surface with the terminal below it. The tab's text switches between light and dark to stay readable on the tint.
+
+Without an accent, both look the same: a plain tab. The tint follows the background opacity like the rest of the tab bar.
 
 ## Local profiles (`kind = "local"`)
 
