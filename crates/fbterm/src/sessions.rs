@@ -1,7 +1,10 @@
 //! Session lifecycle: starting local and SSH sessions, their events and terminal input.
 
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use fbterm_config::{Profile, ProfileKind};
 use fbterm_session::ssh::SshError;
@@ -14,6 +17,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{App, DEFAULT_GRID, Delivered, Message};
+use crate::pacing::{OUTPUT_FPS, Pacer};
 use crate::prompts::UiPrompter;
 use crate::tabs::{self, InputRoute, Tab, TabId, TabState, WindowState};
 
@@ -21,7 +25,25 @@ type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
 
 /// Session events from every session, delivered to the update loop by one subscription.
 #[derive(Clone)]
-pub(crate) struct EventReceiver(pub(crate) Arc<Mutex<Option<Events>>>);
+pub(crate) struct EventReceiver {
+    pub(crate) rx: Arc<Mutex<Option<Events>>>,
+    /// Set when the user types into a terminal: the next output (the echo) skips pacing.
+    typed: Arc<AtomicBool>,
+}
+
+impl EventReceiver {
+    pub(crate) fn new(rx: Events) -> Self {
+        Self {
+            rx: Arc::new(Mutex::new(Some(rx))),
+            typed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// The user sent input to a session; its echo should show on the next frame.
+    pub(crate) fn typed(&self) {
+        self.typed.store(true, Ordering::Relaxed);
+    }
+}
 
 impl Hash for EventReceiver {
     fn hash<H: Hasher>(&self, state: &mut H) {
@@ -29,14 +51,51 @@ impl Hash for EventReceiver {
     }
 }
 
+struct Paced {
+    rx: Events,
+    typed: Arc<AtomicBool>,
+    pacer: Pacer<SessionId>,
+    ready: VecDeque<(SessionId, SessionEvent)>,
+}
+
+/// Session events with `Dirty` paced (see [`crate::pacing`]); other events pass at once.
 pub(crate) fn session_stream(
     rx: &EventReceiver,
 ) -> impl Stream<Item = (SessionId, SessionEvent)> + use<> {
-    let rx = rx.0.lock().take();
-    iced::futures::stream::unfold(rx, |rx| async move {
-        let mut rx = rx?;
-        let event = rx.recv().await?;
-        Some((event, Some(rx)))
+    let state = rx.rx.lock().take().map(|events| Paced {
+        rx: events,
+        typed: rx.typed.clone(),
+        pacer: Pacer::new(OUTPUT_FPS),
+        ready: VecDeque::new(),
+    });
+    iced::futures::stream::unfold(state, |state| async move {
+        let mut s = state?;
+        loop {
+            if let Some(event) = s.ready.pop_front() {
+                return Some((event, Some(s)));
+            }
+            let received = match s.pacer.deadline() {
+                Some(due) => match tokio::time::timeout_at(due.into(), s.rx.recv()).await {
+                    Ok(received) => received,
+                    Err(_) => {
+                        let ids = s.pacer.fire(Instant::now());
+                        s.ready
+                            .extend(ids.into_iter().map(|id| (id, SessionEvent::Dirty)));
+                        continue;
+                    }
+                },
+                None => s.rx.recv().await,
+            };
+            let (id, event) = received?;
+            if event == SessionEvent::Dirty {
+                let typed = s.typed.swap(false, Ordering::Relaxed);
+                let ids = s.pacer.dirty(id, Instant::now(), typed);
+                s.ready
+                    .extend(ids.into_iter().map(|id| (id, SessionEvent::Dirty)));
+            } else {
+                s.ready.push_back((id, event));
+            }
+        }
     })
 }
 
@@ -158,9 +217,9 @@ impl App {
     pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle, requested: GridSize) {
         // A tab closed meanwhile drops the handle here, closing the shell. The session writes
         // into the tab's own terminal, which already carries the color scheme.
-        let Some((window, index)) = self.windows.values_mut().find_map(|w| {
+        let Some((wid, window, index)) = self.windows.iter_mut().find_map(|(wid, w)| {
             let i = w.find(id)?;
-            Some((w, i))
+            Some((*wid, w, i))
         }) else {
             return;
         };
@@ -181,25 +240,31 @@ impl App {
         }
         // The shell's reader started before the handle got here, so a `Dirty` it raised went
         // nowhere and is still pending: take it as a visible tab does (the redraw after this
-        // update shows the output); a hidden tab keeps it pending until it is shown.
-        tabs::on_dirty(window, index);
+        // update shows the output); a hidden tab, or a tab in a window that cannot be seen,
+        // keeps it pending until it is shown.
+        if !self.occluded.contains(&wid) {
+            tabs::on_dirty(window, index);
+        }
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {
-        let Some((window, index)) = self.windows.values_mut().find_map(|w| {
+        let Some((wid, window, index)) = self.windows.iter_mut().find_map(|(wid, w)| {
             let i = w
                 .tabs
                 .iter()
                 .position(|t| t.session.as_ref().is_some_and(|s| s.id == sid))?;
-            Some((w, i))
+            Some((*wid, w, i))
         }) else {
             return Task::none();
         };
         if event == SessionEvent::Dirty {
             // A visible tab re-arms here, before the redraw that follows this update locks
-            // the terminal. A hidden tab leaves the flag pending, so its session raises no
-            // further Dirty until the tab is shown (see `App::shown`).
-            tabs::on_dirty(window, index);
+            // the terminal. A hidden tab, or any tab of a window that cannot be seen (see
+            // `crate::visibility`), leaves the flag pending, so its session raises no further
+            // Dirty until it is shown (see `App::shown`).
+            if !self.occluded.contains(&wid) {
+                tabs::on_dirty(window, index);
+            }
             return Task::none();
         }
         let tab = &mut window.tabs[index];
@@ -231,6 +296,7 @@ impl App {
                 match tabs::route_input(&tab.state, &bytes) {
                     InputRoute::Send => {
                         if let Some(s) = &tab.session {
+                            self.receiver.typed();
                             s.send(bytes);
                         }
                         Task::none()

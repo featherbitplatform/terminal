@@ -29,6 +29,7 @@ use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::settings_window::{SettingsMsg, SettingsState};
 use crate::tabs::{Tab, TabId, TabState, WindowState};
 use crate::theme;
+use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
 
 /// What a tab bar asks of its own window.
@@ -96,6 +97,8 @@ pub enum Message {
     WindowOpened(window::Id),
     WindowFocused(window::Id),
     WindowUnfocused(window::Id),
+    /// A terminal window became visible (`true`) or stopped being visible.
+    WindowVisible(window::Id, bool),
     WindowClosed(window::Id),
     /// A click in a window's tab bar; acts on that window whatever has focus.
     TabBar(window::Id, TabBarMsg),
@@ -153,6 +156,9 @@ pub struct App {
     pub(crate) pool: Arc<SshPool>,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
+    pub(crate) visibility: visibility::Changes,
+    /// Terminal windows that cannot be seen (see [`crate::visibility`]).
+    pub(crate) occluded: std::collections::HashSet<window::Id>,
     pub windows: BTreeMap<window::Id, WindowState>,
     pub(crate) grids: HashMap<window::Id, GridSize>,
     /// The window that last had focus: where unscoped actions go.
@@ -356,7 +362,9 @@ impl App {
             fallback,
             pool,
             events,
-            receiver: EventReceiver(Arc::new(Mutex::new(Some(rx)))),
+            receiver: EventReceiver::new(rx),
+            visibility: visibility::Changes::new(),
+            occluded: Default::default(),
             windows: BTreeMap::new(),
             grids: HashMap::new(),
             focused: None,
@@ -475,6 +483,8 @@ impl App {
             window::close_events().map(Message::WindowClosed),
             window::close_requests().map(Message::CloseRequested),
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
+            Subscription::run_with(self.visibility.clone(), visibility::stream)
+                .map(|(id, visible)| Message::WindowVisible(id, visible)),
         ];
         if self.screenshot.is_some() && !self.shooting && self.first_window_ready() {
             // Give the renderer time to load fonts and present a few frames.
@@ -540,6 +550,21 @@ impl App {
             Message::NewWindow => self.action(None, Action::NewWindow),
             Message::WindowOpened(id) => {
                 self.focused.get_or_insert(id);
+                if self.windows.contains_key(&id) {
+                    visibility::watch(id, &self.visibility)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::WindowVisible(id, visible) => {
+                if visible {
+                    // Take the redraw the active tab left pending while the window was unseen.
+                    if self.occluded.remove(&id) {
+                        return self.shown(id);
+                    }
+                } else if self.windows.contains_key(&id) {
+                    self.occluded.insert(id);
+                }
                 Task::none()
             }
             Message::WindowFocused(id) => {
@@ -582,6 +607,8 @@ impl App {
                 // Dropping the window's tabs closes their sessions and abandons their dials;
                 // its dialogs answer "no".
                 let was_terminal = self.windows.remove(&id).is_some();
+                visibility::unwatch(id);
+                self.occluded.remove(&id);
                 self.sizes.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
