@@ -39,6 +39,8 @@ fn docs_profiles_example_shows_each_feature() {
         }
     ));
     assert_eq!(by_name("bastion").accent.unwrap().to_string(), "#e0a030");
+    assert_eq!(by_name("bastion").accent_style, AccentStyle::Tab);
+    assert_eq!(by_name("api-1").accent_style, AccentStyle::Stripe);
 
     let api = by_name("api-1");
     let ProfileKind::Ssh(ssh) = &api.kind else {

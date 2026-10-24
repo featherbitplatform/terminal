@@ -83,6 +83,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Settings | Open the Settings window. |
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
 | Reveal config folder | Show the config folder in your file manager, with `settings.toml` selected on macOS when it exists. The folder is created if it is missing. |
+| Export tab to file… | Save the active tab's text to a file; see [Exporting a tab](#exporting-a-tab). |
 | Quit | Save the layout and quit. |
 
 ## Inside the palette
@@ -105,7 +106,7 @@ Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear butt
 - **Change one:** click its shortcut, then press the new one. While you record, keys go to the recorder only: they never reach a terminal and never run a shortcut. `Escape` cancels and keeps the old shortcut.
 - **Already in use:** if another action has that shortcut, the row names it and offers **Take over** (the other action is then left without a shortcut) or **Cancel**. Two actions never share a shortcut.
 - **Not allowed:** a shortcut needs `Cmd`, `Ctrl` or `Alt` (`Option`), except `F1` to `F12`, which work alone. Plain letters, `Enter`, `Tab` and `Escape` cannot be shortcuts on their own, and `Escape` never can.
-- **Reserved:** keys that already do something outside this list cannot be taken: copy and paste in the terminal (`Cmd+C` and `Cmd+V` on macOS, `Ctrl+Shift+C` and `Ctrl+Shift+V` elsewhere), the scrollback keys (`Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, `Shift+End`, and `Cmd+Home`, `Cmd+End` on macOS), Save in the profile editor (`Cmd+S`, `Ctrl+S` elsewhere) and, on macOS, the app menu's `Cmd+Q` (Quit), `Cmd+H` (Hide) and `Cmd+Option+H` (Hide Others). The row says what uses the key.
+- **Reserved:** keys that already do something outside this list cannot be taken: copy and paste in the terminal (`Cmd+C` and `Cmd+V` on macOS, `Ctrl+Shift+C` and `Ctrl+Shift+V` elsewhere), the scrollback keys (`Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, `Shift+End`, and `Cmd+Home`, `Cmd+End` on macOS), Save in the profile editor (exactly `Cmd+S`, `Ctrl+S` elsewhere; with `Shift` or `Alt` added it is free to use) and, on macOS, the app menu's `Cmd+Q` (Quit), `Cmd+H` (Hide) and `Cmd+Option+H` (Hide Others). The row says what uses the key.
 - **Quit on macOS** is always `Cmd+Q`: the app menu handles it before any window sees the key, so its row is fixed.
 - **Taken from programs:** a shortcut that programs in the terminal would normally receive works, but its row shows a warning saying what is lost when that is known (for example ``Ctrl+R is reverse search in bash and zsh``). On macOS that is any shortcut without `Cmd`. On Linux and Windows it is `Ctrl` with a letter (without `Shift`), `Ctrl` with a few symbols, arrows and editing keys, any `Alt` shortcut (Meta in bash, zsh and emacs) and `F` keys on their own.
 - **Remove one:** the `x` that appears when you point at a row leaves the action without a shortcut (it stays in the palette).
@@ -130,6 +131,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | Name | Action |
 | --- | --- |
 | `new_tab`, `close_tab`, `next_tab`, `previous_tab` | Tabs |
+| `export_tab` | Export tab to file (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
 | `new_window`, `edit_profiles`, `settings` | New window, the profile editor, Settings |
 | `find`, `find_all`, `find_next`, `find_previous` | Find in tab, find in all tabs, older and newer match in the find bar |
@@ -147,3 +149,22 @@ Edits to the table apply while the app runs, like every setting. An entry that n
 - While the bar is open, keys go to the bar and never to the program in the tab. The tab keeps running; new output is searched too, and the count follows it.
 
 **Find in all tabs** opens a box in the middle of the window, like the palette. It searches every tab of every window, including tabs that are not shown and tabs that are disconnected (they keep their history). Results appear tab by tab as each tab's search finishes, grouped under the tab's name and accent (and its window, when several are open), one row per match with the line around it. Each tab lists up to 50 matches and the box up to 500 in all, with a note when there are more. `Enter` (or a click) on a match brings its window forward, selects the tab, closes the box and opens that tab's find bar on the same query with that match current.
+
+## Exporting a tab
+
+**Export tab to file…** in the palette saves the active tab's text: its whole history, scrollback and screen, oldest line first. It has no shortcut by default; give it one in Settings, **Keyboard** (Tabs group), or with `export_tab` in the [`[keys]` table](#the-keys-table).
+
+A Save dialog opens with a name like `zsh 2026-10-24 15.30.txt` (the tab's title and the local time). The extension you save with picks the format:
+
+| Extension | Format |
+| --- | --- |
+| `.txt` | Plain text (UTF-8). |
+| `.txt.gz` | Plain text, gzip-compressed. |
+| `.ansi` | With colors: colors (including 256-color and true color) and bold, dim, italic, underline, inverse and strikethrough as escape sequences that `less -R` and `cat` show in a terminal. |
+| `.ansi.gz` | With colors, gzip-compressed (`zless -R` reads it). |
+
+Lines the terminal wrapped to fit the window are joined back into one line, and spaces at the end of a line are dropped. On Linux and Windows the dialog also lists the four formats; on macOS type the extension.
+
+When the tab is showing a full-screen program (vim, less, top), the file holds the shell's history behind it, not the program's screen; the dialog title and the notice say so. Nothing a program prints can start an export.
+
+When the file is written, a notice under the tab bar names it, with a button that shows it in Finder (Explorer on Windows, your file manager on Linux). An error, such as a folder you cannot write to or a full disk, shows in the same place. The window stays responsive while a long history is written.
