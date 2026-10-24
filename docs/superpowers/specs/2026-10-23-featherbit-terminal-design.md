@@ -396,14 +396,22 @@ derived from the same table.
   exported and the dialog title and the notice say so.
 - **Done:** a notice under the tab bar with the file name and a "Show in Finder" button
   (Explorer, Files elsewhere); errors show in the same place.
-- Builder's notes: `rfd` cannot report which filter was chosen, and on macOS it merges all
-  filters into one list of allowed extensions (no type menu), so the extension decides the
-  format everywhere. The grid is cloned while the terminal is locked (on the blocking pool,
-  never the UI thread; about 4 ms for 10,000 rows of 200 columns in a release build), then
-  formatted, compressed (`flate2`) and written with the lock released (about 95 ms for that
-  tab, both formats). The vendored `alacritty_terminal` gains a read-only
-  `Term::inactive_grid()` for the alternate-screen case (patch 3 in `FBTERM_PATCHES.md`).
-  Hidden (SGR 8) text is exported as spaces.
+- Builder's notes: `rfd` cannot report which filter was chosen, merges all filters into one
+  list on macOS, and the Linux and Windows dialogs do not rename the file when another filter
+  is picked, so the dialog offers one filter ("Text (.txt, .txt.gz, .ansi, .ansi.gz)") and
+  the extension decides the format. The dialog is parented to the window (a sheet on macOS);
+  one export runs at a time, and a second request or a tab with nothing to export yet gets a
+  short notice instead of nothing. On tokio's blocking pool the history is read in 1000-row
+  chunks, the terminal locked one chunk at a time and each chunk formatted while locked
+  (release, Apple Silicon, 10,000 rows of 200 columns: under 0.7 ms per chunk, 3 ms plain and
+  6.5 ms with colors in all), then streamed through `flate2` to the file. Rows are addressed
+  by stable line number, so output arriving meanwhile neither repeats nor skips a line, and a
+  resize ends the export with a message. No copy of the scrollback is made. The file is
+  written under a temporary name in the same folder and renamed over the target when
+  complete. File names keep at most 200 bytes of the title. "Show in Finder" selects the file
+  (`open -R`; `explorer /select,` on Windows; the folder on Linux). The vendored
+  `alacritty_terminal` gains a read-only `Term::inactive_grid()` for the alternate-screen
+  case (patch 3 in `FBTERM_PATCHES.md`). Hidden (SGR 8) text is exported as spaces.
 
 ## 6. Milestones
 

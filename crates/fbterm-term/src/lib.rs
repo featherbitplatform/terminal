@@ -9,7 +9,7 @@ mod selection;
 mod terminal;
 mod widget;
 
-pub use export::{ExportFormat, Snapshot, write_file};
+pub use export::{ExportError, ExportFormat, ExportSummary, export, write_file};
 pub use input::{
     KeyAction, KeyInput, MouseButton, MouseKind, MouseReport, encode_key, encode_key_input,
     encode_mouse, encode_paste,
