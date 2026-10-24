@@ -244,12 +244,21 @@ Jump-chain references are exported together with the profiles they point to.
 - *(Owner's decision, 2026-10-24)* **Settings window.** A separate window (unified title bar on
   macOS, like the profile editor) with a control for every `settings.toml` option: theme, font
   family (installed monospace families, the bundled Geist Mono first), font size, background
-  opacity and blur, scrollback lines, kitty keyboard protocol. Changes apply live, with no Save
+  opacity and blur, scrollback lines, kitty keyboard protocol, redraw rate. Changes apply live, with no Save
   button, and are written to `settings.toml` in place: only the changed key, keeping comments,
   order and other keys (builder's notes: `toml_edit`; slider drags and typing are written after a
   300 ms pause or when the slider is let go; our own writes do not trigger a reload). A file
   that does not load is never written: the window is read-only until it is fixed, and edits on
   disk show in the window. Opened with Cmd+, (Ctrl+, elsewhere) or the palette's **Settings**.
+- *(Owner's decision, 2026-10-24)* **Configurable redraw rate.** `settings.toml` `max_fps`
+  caps output-driven redraws: a whole number from 30 to 240 (out of range is clamped and
+  reported) or `"display"` to follow the screen's refresh rate; default 60. Typing and its echo
+  always redraw at once. The Settings window offers 30, 60, 120 and "Match display (N Hz)" (plus
+  a custom number from the file) and warns that rates above 60 use more CPU while output
+  streams. Builder's notes: pacing is shared by all windows, so `"display"` follows the fastest
+  screen a terminal window is on; on macOS that is `NSScreen.maximumFramesPerSecond`, read when
+  a window opens, moves to another screen or gains focus (iced 0.14 exposes no monitor refresh
+  rate). Elsewhere the rate is unknown and `"display"` means 60.
 
 ### 5.11 Keyboard defaults *(builder's call)*
 
@@ -282,8 +291,8 @@ Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVi
 
 Performance follow-up (measured 2026-10-24, `dev/perf/README.md`):
 
-- Done in milestone 1: output-driven redraws are paced to at most 60 per second (a named
-  constant, not a setting), with the echo of typed input and all input-driven redraws
+- Done in milestone 1: output-driven redraws are paced to at most 60 per second (by default;
+  the `max_fps` setting since 2026-10-24, see 5.10), with the echo of typed input and all input-driven redraws
   immediate; a window that cannot be seen (minimized, covered, locked screen, sleeping display;
   AppKit's occlusion state on macOS) takes no output redraws until it is visible again. One
   visible 100-lines/s stream went from 84 to 54 frames per second and from 14.1% to 10.2% of a
@@ -321,7 +330,11 @@ accept this worst case. One visible log stream costs about 22% of a core; a `yes
 core. Follow-up work is listed in section 6.
 
 *Measured 2026-10-24 (same machine):* idle footprint with one tab 60 MB after the icon font
-(76 MB before); output redraws capped at 60 per second; numbers in section 6.
+(76 MB before); output redraws capped at 60 per second; numbers in section 6. The cap is the
+`max_fps` setting (owner decision 2026-10-24: configurable, default 60, a `"display"` option, a
+CPU warning above 60 in the Settings window). With one visible 100-lines/s stream on a 120 Hz
+display, `"display"` drew 83-84 frames per second (every chunk) at 10-13% of a core against 54
+frames per second and 8-9% at 60 (`dev/perf/README.md`).
 
 ## 8. Repo and release
 

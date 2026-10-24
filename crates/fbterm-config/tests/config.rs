@@ -372,6 +372,89 @@ fn out_of_range_opacity_is_clamped_and_reported() {
 }
 
 #[test]
+fn max_fps_defaults_to_60_and_takes_a_number_or_display() {
+    assert_eq!(Settings::default().max_fps, MaxFps::Fixed(60));
+    let path = tmp("settings.toml");
+    for (text, want) in [
+        ("max_fps = 120\n", MaxFps::Fixed(120)),
+        ("max_fps = 30\n", MaxFps::Fixed(30)),
+        ("max_fps = 240\n", MaxFps::Fixed(240)),
+        ("max_fps = \"display\"\n", MaxFps::Display),
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let (s, warning) = Settings::load_checked(&path).unwrap();
+        assert_eq!(s.max_fps, want, "{text}");
+        assert!(warning.is_none(), "{text}");
+    }
+    // Saved settings read back the same, in both forms.
+    for v in [MaxFps::Fixed(90), MaxFps::Display] {
+        let s = Settings {
+            max_fps: v.clone(),
+            ..Settings::default()
+        };
+        s.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), s, "{text}");
+    }
+}
+
+#[test]
+fn out_of_range_max_fps_is_clamped_and_reported() {
+    let path = tmp("settings.toml");
+    for (value, used) in [
+        ("10", 30),
+        ("0", 30),
+        ("-5", 30),
+        ("241", 240),
+        ("100000", 240),
+    ] {
+        std::fs::write(&path, format!("theme = \"dark\"\nmax_fps = {value}\n")).unwrap();
+        let (s, warning) = Settings::load_checked(&path).unwrap();
+        assert_eq!(s.max_fps, MaxFps::Fixed(used), "{value}");
+        let w = warning.expect(value);
+        assert_eq!(w.line, Some(2));
+        assert!(
+            w.message.contains(&format!(
+                "max_fps {value} is out of range (30 to 240), using {used}"
+            )),
+            "{}",
+            w.message
+        );
+    }
+}
+
+#[test]
+fn invalid_max_fps_is_reported_and_the_default_used() {
+    let path = tmp("settings.toml");
+    for value in ["\"fast\"", "\"Display\"", "59.5", "true"] {
+        std::fs::write(&path, format!("font_size = 14.0\nmax_fps = {value}\n")).unwrap();
+        let (s, warning) = Settings::load_checked(&path).unwrap();
+        assert_eq!(s.max_fps, MaxFps::Fixed(60), "{value}");
+        // The rest of the file still applies.
+        assert_eq!(s.font_size, 14.0);
+        let w = warning.expect(value);
+        assert_eq!(w.line, Some(2));
+        assert!(w.message.contains("max_fps"), "{}", w.message);
+        assert!(w.message.contains("using 60"), "{}", w.message);
+    }
+    // A table is the wrong type altogether: the file does not load.
+    std::fs::write(&path, "max_fps = [60]\n").unwrap();
+    assert!(Settings::load_checked(&path).is_err());
+}
+
+#[test]
+fn effective_max_fps_follows_the_display_within_the_range() {
+    assert_eq!(MaxFps::Fixed(90).effective(Some(144)), 90);
+    assert_eq!(MaxFps::Fixed(10).effective(None), 30);
+    assert_eq!(MaxFps::Display.effective(Some(120)), 120);
+    assert_eq!(MaxFps::Display.effective(Some(500)), 240);
+    assert_eq!(MaxFps::Display.effective(Some(24)), 30);
+    // Unknown (or reported as 0): the default.
+    assert_eq!(MaxFps::Display.effective(None), 60);
+    assert_eq!(MaxFps::Display.effective(Some(0)), 60);
+}
+
+#[test]
 fn settings_template_parses_to_defaults_as_is() {
     let path = tmp("settings.toml");
     std::fs::write(&path, SETTINGS_TEMPLATE).unwrap();

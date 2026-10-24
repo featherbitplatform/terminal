@@ -159,6 +159,22 @@ GPU memory) per window. They are now glyphs of a bundled, subset Lucide icon fon
 | before (SVG icons) | 77 / 76 / 76 MB |
 | after (icon font) | 60 / 60 / 60 MB |
 
+### Configurable redraw rate
+
+The cap is now the `max_fps` setting (default 60; a whole number from 30 to 240, or `"display"`
+to follow the screen's refresh rate, `NSScreen.maximumFramesPerSecond` on macOS). Measured as
+above (temporary draw counter, 10 s warm-up, CPU over 10 s), 1 visible tab running
+`perl dev/perf/loggen.pl 1 100`, on a 120 Hz display (detected as 120), window visible:
+
+| `max_fps` | Frames/s | CPU, 3 runs | Load (1 min) |
+|---|---|---|---|
+| `60` | 54 / 54 / 54 | 9.3 / 8.3 / 9.1% (median 9.1) | 4.9-8.1 |
+| `"display"` (120) | 84 / 83 / 83 | 12.9 / 10.2 / 12.7% (median 12.7) | 4.4-6.7 |
+
+At 120 the cap is above the arrival rate (about 84 chunks per second), so every chunk is drawn,
+as before pacing; the extra frames cost about 3.5 points of a core. A faster stream would draw up
+to 120 frames per second. Footprint was the same (371-375 MB) in both.
+
 ## Re-running
 
 ```

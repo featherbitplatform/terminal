@@ -101,7 +101,8 @@ impl App {
             ..window::Settings::default()
         }));
         let read_only = Settings::load(&self.paths.settings()).err();
-        let state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
+        let mut state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
+        state.display_hz = self.display_hz();
         self.settings_win = Some((id, state));
         open.discard()
     }
@@ -254,7 +255,31 @@ impl App {
                 );
             }
         }
+        let rate_changed = new.max_fps != self.settings.max_fps;
         self.settings = new;
+        if rate_changed {
+            self.update_output_rate();
+        }
+    }
+
+    /// The refresh rate `max_fps = "display"` follows: the fastest display a terminal window is
+    /// on, if any is known.
+    pub(crate) fn display_hz(&self) -> Option<u32> {
+        crate::display_rate::fastest(self.display_rates.values().copied())
+    }
+
+    /// Set the output redraw rate from `max_fps` and the displays; pacing picks it up with the
+    /// next output. The Settings window shows the detected display rate.
+    pub(crate) fn update_output_rate(&mut self) {
+        let hz = self.display_hz();
+        let fps = u32::from(self.settings.max_fps.effective(hz));
+        if fps != self.receiver.rate.get() {
+            tracing::info!(fps, display_hz = ?hz, "output redraw rate");
+            self.receiver.rate.set(fps);
+        }
+        if let Some((_, state)) = &mut self.settings_win {
+            state.display_hz = hz;
+        }
     }
 }
 

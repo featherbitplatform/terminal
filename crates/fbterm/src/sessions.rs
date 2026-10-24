@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{App, DEFAULT_GRID, Delivered, Message};
-use crate::pacing::{OUTPUT_FPS, Pacer};
+use crate::pacing::{OUTPUT_FPS, OutputRate, Pacer};
 use crate::prompts::UiPrompter;
 use crate::tabs::{self, InputRoute, Tab, TabId, TabState, WindowState};
 
@@ -28,6 +28,8 @@ pub(crate) struct EventReceiver {
     pub(crate) rx: Arc<Mutex<Option<Events>>>,
     /// The session the user last typed into: its next output (the echo) skips pacing.
     typed: Arc<Mutex<Option<SessionId>>>,
+    /// Most output-driven deliveries per second, read for every event.
+    pub(crate) rate: OutputRate,
 }
 
 impl EventReceiver {
@@ -35,6 +37,7 @@ impl EventReceiver {
         Self {
             rx: Arc::new(Mutex::new(Some(rx))),
             typed: Arc::new(Mutex::new(None)),
+            rate: OutputRate::new(OUTPUT_FPS),
         }
     }
 
@@ -65,6 +68,7 @@ struct Paced {
     rx: Events,
     typed: Arc<Mutex<Option<SessionId>>>,
     pacer: Pacer<SessionId>,
+    rate: OutputRate,
     ready: VecDeque<(SessionId, SessionEvent)>,
 }
 
@@ -75,7 +79,8 @@ pub(crate) fn session_stream(
     let state = rx.rx.lock().take().map(|events| Paced {
         rx: events,
         typed: rx.typed.clone(),
-        pacer: Pacer::new(OUTPUT_FPS),
+        pacer: Pacer::new(rx.rate.get()),
+        rate: rx.rate.clone(),
         ready: VecDeque::new(),
     });
     iced::futures::stream::unfold(state, |state| async move {
@@ -98,6 +103,8 @@ pub(crate) fn session_stream(
             };
             let (id, event) = received?;
             if event == SessionEvent::Dirty {
+                // The cap may have changed (settings, or the display a window is on).
+                s.pacer.set_fps(s.rate.get());
                 let typed = take_typed(&s.typed, id);
                 let ids = s.pacer.dirty(id, Instant::now(), typed);
                 s.ready
