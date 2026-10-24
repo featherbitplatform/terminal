@@ -201,7 +201,7 @@ pub(super) fn jumps<'a>(
                 .color(t.text_muted),
         );
     }
-    let tool = |glyph: &'static [u8], m: Option<EditorMsg>| {
+    let tool = |glyph: &'static str, m: Option<EditorMsg>| {
         let m = m.filter(|_| editable);
         let tint = if m.is_some() {
             t.text_secondary

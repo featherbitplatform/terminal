@@ -12,7 +12,7 @@ fbterm-config = { path = "../fbterm-config" }
 fbterm-secrets = { path = "../fbterm-secrets" }
 fbterm-session = { path = "../fbterm-session" }
 fbterm-term = { path = "../fbterm-term" }
-iced = { workspace = true, features = ["tokio", "advanced", "svg"] }
+iced = { workspace = true, features = ["tokio", "advanced"] }
 nucleo-matcher = { workspace = true }
 tokio = { workspace = true }
 parking_lot = { workspace = true }

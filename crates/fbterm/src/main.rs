@@ -55,11 +55,12 @@ mod windows;
 
 use app::App;
 
-const FONTS: [&[u8]; 4] = [
+const FONTS: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/GeistMono-Regular.ttf"),
     include_bytes!("../assets/fonts/GeistMono-Bold.ttf"),
     include_bytes!("../assets/fonts/Geist-Regular.ttf"),
     include_bytes!("../assets/fonts/Geist-Medium.ttf"),
+    include_bytes!("../assets/fonts/lucide-icons.ttf"),
 ];
 
 fn main() -> iced::Result {
