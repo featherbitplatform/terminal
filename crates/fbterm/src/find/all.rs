@@ -86,7 +86,7 @@ pub struct FindAll {
     pub query: String,
     pub regex: bool,
     pub input: iced::widget::Id,
-    pub invalid: bool,
+    pub invalid: Option<fbterm_term::PatternError>,
     seq: u64,
     cancel: Arc<AtomicBool>,
     /// Tabs still being searched, with how to label their results.
@@ -104,7 +104,7 @@ impl FindAll {
             query: query.into(),
             regex,
             input: iced::widget::Id::unique(),
-            invalid: false,
+            invalid: None,
             seq: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             pending: HashMap::new(),
@@ -118,17 +118,17 @@ impl FindAll {
     pub fn search(&mut self, targets: Vec<Target>) -> Vec<TabSearch> {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
-        self.seq += 1;
+        self.seq = super::next_seq();
         self.pending.clear();
         self.groups.clear();
         self.selected = None;
         let pattern = match SearchPattern::new(&SearchQuery::new(self.query.clone(), self.regex)) {
             Ok(p) => {
-                self.invalid = false;
+                self.invalid = None;
                 p
             }
-            Err(_) => {
-                self.invalid = true;
+            Err(e) => {
+                self.invalid = Some(e);
                 None
             }
         };
@@ -200,6 +200,12 @@ impl FindAll {
                 .copied()
                 .map(|(g, h)| (self.groups[g].tab, h));
         }
+    }
+
+    /// The number of the current search (see [`super::next_seq`]).
+    #[cfg(test)]
+    pub fn seq(&self) -> u64 {
+        self.seq
     }
 
     /// Whether any tab is still being searched.
@@ -277,8 +283,8 @@ impl FindAll {
 
     /// The status line under the field, if any: errors, progress and empty results.
     pub fn status(&self) -> Option<String> {
-        if self.invalid {
-            return Some("Invalid pattern".into());
+        if let Some(e) = self.invalid {
+            return Some(e.to_string());
         }
         if self.query.is_empty() {
             return Some("Type to search every tab".into());

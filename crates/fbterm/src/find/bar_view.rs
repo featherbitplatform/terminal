@@ -1,5 +1,6 @@
 //! The find bar: a slim floating bar at the top right of the tab's terminal.
 
+use fbterm_term::{Cover, GridSize};
 use iced::widget::{button, container, opaque, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Vector};
 
@@ -11,6 +12,27 @@ use crate::tooltip::tip;
 use crate::ui::{ICON_DOWN, ICON_UP, ICON_X, MONO, icon};
 
 const BAR_WIDTH: f32 = 460.0;
+/// Space between the bar and the terminal's top and right edges.
+const TOP: f32 = 6.0;
+const RIGHT: f32 = 10.0;
+/// Height of the bar (its field plus padding and border).
+const BAR_HEIGHT: f32 = 36.0;
+
+/// The bar's width over a terminal `width` wide: narrower on narrow windows.
+fn bar_width(width: f32) -> f32 {
+    BAR_WIDTH.min(width - 2.0 * RIGHT).max(0.0)
+}
+
+/// The cells of a terminal of `size` the bar is drawn over.
+pub fn cover(size: GridSize) -> Cover {
+    let (cw, ch) = (size.cell_width.max(1.0), size.cell_height.max(1.0));
+    let width = f32::from(size.cols) * cw;
+    let left = width - RIGHT - bar_width(width);
+    Cover {
+        rows: ((TOP + BAR_HEIGHT) / ch).ceil() as usize,
+        from_col: (left / cw).floor().max(0.0) as usize,
+    }
+}
 
 fn ghost(t: &Tokens, status: button::Status) -> button::Style {
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
@@ -71,7 +93,11 @@ pub fn view<'a>(
             selection: t.accent_soft,
         });
     let counter = bar.counter();
-    let counter_color = if bar.invalid { t.danger } else { t.text_muted };
+    let counter_color = if bar.invalid.is_some() {
+        t.danger
+    } else {
+        t.text_muted
+    };
     let counter = container(
         text(counter)
             .font(MONO)
@@ -108,7 +134,8 @@ pub fn view<'a>(
         .spacing(4)
         .align_y(Alignment::Center);
     let card = container(content)
-        .width(BAR_WIDTH)
+        .width(Length::Fill)
+        .max_width(BAR_WIDTH)
         .padding(Padding {
             top: 3.0,
             right: 4.0,
@@ -133,10 +160,32 @@ pub fn view<'a>(
         .width(Length::Fill)
         .align_x(Alignment::End)
         .padding(Padding {
-            top: 6.0,
-            right: 10.0,
+            top: TOP,
+            right: RIGHT,
             bottom: 0.0,
-            left: 10.0,
+            left: RIGHT,
         })
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_bar_covers_the_top_right_cells_and_narrows_on_small_windows() {
+        let size = GridSize {
+            cols: 100,
+            rows: 40,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        };
+        let c = cover(size);
+        assert_eq!(c.rows, 3);
+        // 800 px wide: the bar spans 330..790.
+        assert_eq!(c.from_col, 41);
+        let narrow = GridSize { cols: 30, ..size };
+        assert_eq!(bar_width(240.0), 220.0);
+        assert_eq!(cover(narrow).from_col, 1);
+    }
 }

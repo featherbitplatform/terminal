@@ -238,7 +238,7 @@ pub fn view<'a>(
     }
     let mut body = column![list];
     if let Some(status) = state.status() {
-        let color = if state.invalid {
+        let color = if state.invalid.is_some() {
             t.danger
         } else {
             t.text_muted

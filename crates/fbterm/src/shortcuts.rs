@@ -104,9 +104,10 @@ fn key_message(
     key: &keyboard::Key,
     mods: keyboard::Modifiers,
     repeat: bool,
+    text: Option<&str>,
 ) -> Option<Option<Message>> {
     use keyboard::key::Named;
-    let shortcut = keys::shortcut(key, mods);
+    let shortcut = keys::shortcut(key, mods, text);
     match mode {
         Mode::Normal => shortcut.map(|action| {
             // Holding a key repeats tab switching only.
@@ -122,7 +123,7 @@ fn key_message(
         Mode::FindAll => find_all_key(key, mods).map(|m| Some(Message::FindAll(w, m))),
         Mode::Find => match find_bar_key(key, mods) {
             Some(m) => Some(Some(Message::Find(w, m))),
-            None => key_message(Mode::Normal, w, key, mods, repeat),
+            None => key_message(Mode::Normal, w, key, mods, repeat, text),
         },
         Mode::Prompt => match key {
             keyboard::Key::Named(Named::Escape) => {
@@ -220,9 +221,17 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
             key,
             modifiers,
             repeat,
+            text,
             ..
         }) = event
-            && let Some(msg) = key_message(self.mode, self.window, key, *modifiers, *repeat)
+            && let Some(msg) = key_message(
+                self.mode,
+                self.window,
+                key,
+                *modifiers,
+                *repeat,
+                text.as_deref(),
+            )
         {
             if let Some(msg) = msg {
                 shell.publish(msg);
@@ -328,7 +337,7 @@ mod tests {
 
     fn press(mode: Mode, c: &str, shift: bool) -> Option<Option<Message>> {
         let (key, mods) = chord(c, shift);
-        key_message(mode, window::Id::unique(), &key, mods, false)
+        key_message(mode, window::Id::unique(), &key, mods, false, None)
     }
 
     #[test]
@@ -362,7 +371,8 @@ mod tests {
                 window::Id::unique(),
                 &esc,
                 keyboard::Modifiers::empty(),
-                false
+                false,
+                None
             ),
             Some(Some(Message::Prompt(PromptMsg::Cancel(_))))
         ));
@@ -374,7 +384,8 @@ mod tests {
                 window::Id::unique(),
                 &a,
                 keyboard::Modifiers::empty(),
-                false
+                false,
+                None
             )
             .is_none()
         );
@@ -391,6 +402,7 @@ mod tests {
             &keyboard::Key::Named(named),
             mods,
             false,
+            None,
         )
     }
 
@@ -417,7 +429,7 @@ mod tests {
         };
         let g = keyboard::Key::Character(g.into());
         assert!(matches!(
-            key_message(Mode::Find, window::Id::unique(), &g, mods, true),
+            key_message(Mode::Find, window::Id::unique(), &g, mods, true, None),
             Some(Some(Message::Find(_, FindMsg::Next)))
         ));
         assert!(matches!(
@@ -426,13 +438,16 @@ mod tests {
                 window::Id::unique(),
                 &g,
                 mods | keyboard::Modifiers::SHIFT,
-                false
+                false,
+                None
             ),
             Some(Some(Message::Find(_, FindMsg::Previous)))
         ));
         // Outside the bar, Ctrl+G is the shell's.
         if !cfg!(target_os = "macos") {
-            assert!(key_message(Mode::Normal, window::Id::unique(), &g, mods, false).is_none());
+            assert!(
+                key_message(Mode::Normal, window::Id::unique(), &g, mods, false, None).is_none()
+            );
         }
         // Application shortcuts still act; plain typing goes on to the bar's field.
         assert!(matches!(
@@ -440,7 +455,7 @@ mod tests {
             Some(Some(Message::Shortcut(_, Action::NewTab)))
         ));
         let a = keyboard::Key::Character("a".into());
-        assert!(key_message(Mode::Find, window::Id::unique(), &a, none, false).is_none());
+        assert!(key_message(Mode::Find, window::Id::unique(), &a, none, false, None).is_none());
         // Typed text is recognised for the bar; chords are not.
         let typed = |text: &str, modifiers| {
             typed_text(&Event::Keyboard(keyboard::Event::KeyPressed {
@@ -486,7 +501,8 @@ mod tests {
                 window::Id::unique(),
                 &f,
                 mods,
-                false
+                false,
+                None
             ),
             Some(Some(Message::Shortcut(_, Action::FindAll)))
         ));
@@ -496,10 +512,27 @@ mod tests {
                 window::Id::unique(),
                 &f,
                 mods,
-                false
+                false,
+                None
             ),
             Some(None)
         ));
+    }
+
+    #[test]
+    fn altgr_typing_a_character_reaches_the_terminal() {
+        let altgr = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT;
+        let f = keyboard::Key::Character("f".into());
+        let w = window::Id::unique();
+        // AltGr+F types "[": nothing intercepts it, so the terminal gets the character.
+        assert!(key_message(Mode::Normal, w, &f, altgr, false, Some("[")).is_none());
+        assert!(key_message(Mode::Find, w, &f, altgr, false, Some("[")).is_none());
+        if !cfg!(target_os = "macos") {
+            assert!(matches!(
+                key_message(Mode::Normal, w, &f, altgr, false, None),
+                Some(Some(Message::Shortcut(_, Action::FindAll)))
+            ));
+        }
     }
 
     #[test]
@@ -525,11 +558,11 @@ mod tests {
             )
         };
         assert!(matches!(
-            key_message(Mode::Editor, window::Id::unique(), &key, mods, false),
+            key_message(Mode::Editor, window::Id::unique(), &key, mods, false, None),
             Some(Some(Message::Shortcut(_, Action::Settings)))
         ));
         assert!(matches!(
-            key_message(Mode::Normal, window::Id::unique(), &key, mods, false),
+            key_message(Mode::Normal, window::Id::unique(), &key, mods, false, None),
             Some(Some(Message::Shortcut(_, Action::Settings)))
         ));
     }

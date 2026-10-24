@@ -94,7 +94,13 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     // Only the active tab builds a terminal view; background tabs render nothing.
     let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
         Some(term) => {
-            let highlight = find.and_then(|bar| app.highlight(bar));
+            let highlight = find.and_then(|bar| {
+                let alt = term
+                    .lock()
+                    .mode()
+                    .contains(fbterm_term::TermMode::ALT_SCREEN);
+                app.highlight(bar, alt)
+            });
             let view = highlighted_terminal_view(term, style, highlight, move |o| {
                 Message::Terminal(id, o)
             });
