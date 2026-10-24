@@ -365,6 +365,19 @@ derived from the same table.
   since the renderer interpolates in linear light), all at the background opacity. Text
   takes the dark or light theme's text colors, whichever has the higher WCAG contrast on the
   tint (`crates/fbterm/src/tab_look.rs`).
+- *(Owner's decision, 2026-10-24)* **Flared active tab:** the active tab's bottom corners
+  curve outward into the terminal (concave fillets, the same radius as the top corners), at
+  every opacity and with a whole-tab tint. Builder's notes: each flare is a radius square
+  beside a bottom corner, split by a circle centered on its outer top corner: a disc in the
+  bar's color and a ring (as for the top corners) in the terminal's, so the bar paints around
+  the tab and both flares and nothing is covered twice. A neighbour's hover or tint is painted
+  by the bar too, clipped so it only reaches the flare's disc; the first tab's left flare is
+  cut where the bar ends (full screen), and there is none without an active tab. Every
+  radius is a whole number of physical pixels (6 px rounded at the window's scale) and the
+  geometry is snapped like the renderer snaps quads, so the tab, its corner pieces and its
+  flares stay concentric at fractional scales (1.25, 1.75); the overlap under an antialiased
+  edge is 0.14 physical pixels. A plain active tab's text takes its color by contrast with
+  the terminal's background, which may be dark under the light theme.
 
 ### 5.14 Exporting a tab *(owner's decisions, 2026-10-24; done)*
 

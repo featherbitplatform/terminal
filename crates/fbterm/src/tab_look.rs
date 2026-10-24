@@ -126,13 +126,17 @@ pub fn look(
                 }
             }
         }
+        // The active tab is the terminal's surface, which need not follow the app theme
+        // (a dark scheme under the light theme): its text follows its own contrast.
+        (accent, _) if active => TabLook {
+            background: Some(Background::Color(terminal.scale_alpha(opacity))),
+            label: ink(terminal).text,
+            icon: ink(terminal).text_muted,
+            stripe: accent,
+        },
         (accent, _) => TabLook {
-            background: if active {
-                Some(Background::Color(terminal.scale_alpha(opacity)))
-            } else {
-                hovered.then_some(Background::Color(t.hover))
-            },
-            label: if active { t.text } else { t.text_secondary },
+            background: hovered.then_some(Background::Color(t.hover)),
+            label: t.text_secondary,
             icon: t.text_muted,
             stripe: accent,
         },
@@ -207,6 +211,20 @@ mod tests {
             let hover = look(&DARK, accent, style, false, true, dark());
             assert_eq!(hover.background, Some(Background::Color(DARK.hover)));
         }
+    }
+
+    #[test]
+    fn a_plain_active_tab_reads_on_the_terminal_not_the_theme() {
+        // Light app theme over a dark terminal scheme.
+        let around = Surroundings {
+            terminal: DARK.app,
+            bar: LIGHT.surface,
+            opacity: 1.0,
+        };
+        let active = look(&LIGHT, None, AccentStyle::Stripe, true, false, around);
+        assert_eq!(active.label, DARK.text);
+        let idle = look(&LIGHT, None, AccentStyle::Stripe, false, false, around);
+        assert_eq!(idle.label, LIGHT.text_secondary);
     }
 
     #[test]
