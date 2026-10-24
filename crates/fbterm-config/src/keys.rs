@@ -167,6 +167,12 @@ impl Action {
         }
     }
 
+    /// Whether the action's chord cannot be changed on this platform: on macOS Quit stays Cmd+Q,
+    /// which the app menu owns (it acts before any window sees the key).
+    pub fn is_fixed(self, mac: bool) -> bool {
+        mac && self == Self::Quit
+    }
+
     /// Moving between find-bar matches: these chords act only while the find bar is open, so
     /// at other times the key still reaches the terminal.
     pub fn is_find_navigation(self) -> bool {
@@ -216,31 +222,11 @@ const NAMED: [(ChordKey, &str); 15] = [
     (ChordKey::Escape, "escape"),
 ];
 
-/// Shifted symbols of a US layout and their unshifted keys: with Shift held, a press may
-/// report either, so chords keep the unshifted one.
-const SHIFTED: [(char, char); 21] = [
-    ('!', '1'),
-    ('@', '2'),
-    ('#', '3'),
-    ('$', '4'),
-    ('%', '5'),
-    ('^', '6'),
-    ('&', '7'),
-    ('*', '8'),
-    ('(', '9'),
-    (')', '0'),
-    ('_', '-'),
-    ('+', '='),
-    ('{', '['),
-    ('}', ']'),
-    ('|', '\\'),
-    (':', ';'),
-    ('"', '\''),
-    ('<', ','),
-    ('>', '.'),
-    ('?', '/'),
-    ('~', '`'),
-];
+/// The symbols a press with Shift held may report instead of their key on some platforms:
+/// `}` for `]`, `{` for `[` and `<` for `,`. Only these fold, as they always have: the key a
+/// press reports is the layout's own unshifted key, so folding other symbols would make, for
+/// example, `&` (the 1 key on AZERTY) count as `7`.
+const SHIFTED: [(char, char); 3] = [('{', '['), ('}', ']'), ('<', ',')];
 
 impl ChordKey {
     /// A character key, lowercase; `None` for whitespace and control characters.
@@ -340,9 +326,8 @@ impl Chord {
         }
     }
 
-    /// A pressed key, with Shift folded in: a shifted symbol (`}` with Shift) is its unshifted
-    /// key (`]`), so the chord does not depend on whether the platform reports the key with
-    /// or without Shift applied.
+    /// A pressed key, with Shift folded in for the few symbols a platform may report shifted
+    /// (`}` with Shift is `]`, see [`SHIFTED`]), so those chords do not depend on it.
     pub fn pressed(key: ChordKey, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> Self {
         let key = match key {
             ChordKey::Char(c) if shift => SHIFTED
@@ -495,6 +480,60 @@ fn ctrl_chord(key: char, shift: bool, alt: bool) -> Chord {
     }
 }
 
+/// What already owns `chord` outside the binding table, so it cannot be bound: the terminal's
+/// copy, paste and scroll keys, Save in the profile editor, and on macOS the app menu's Quit,
+/// Hide and Hide Others (which act before any window sees the key).
+pub fn reserved(mac: bool, chord: Chord) -> Option<&'static str> {
+    let Chord {
+        key,
+        ctrl,
+        alt,
+        shift,
+        cmd,
+    } = chord;
+    let ch = |c: char| key == ChordKey::Char(c);
+    // Copy and paste: Cmd (Shift optional) on macOS, Ctrl+Shift (Super optional) elsewhere.
+    let clipboard = if mac {
+        cmd && !ctrl && !alt
+    } else {
+        ctrl && shift && !alt
+    };
+    if clipboard && ch('c') {
+        return Some("Copy");
+    }
+    if clipboard && ch('v') {
+        return Some("Paste");
+    }
+    let scroll_key = matches!(
+        key,
+        ChordKey::PageUp | ChordKey::PageDown | ChordKey::Home | ChordKey::End
+    );
+    let shift_only = shift && !ctrl && !alt && !cmd;
+    let cmd_only = cmd && !shift && !ctrl && !alt;
+    if scroll_key && shift_only || mac && cmd_only && matches!(key, ChordKey::Home | ChordKey::End)
+    {
+        return Some("Scroll");
+    }
+    let save = if mac {
+        cmd_only
+    } else {
+        ctrl && !shift && !alt && !cmd
+    };
+    if save && ch('s') {
+        return Some("Save in the profile editor");
+    }
+    if mac && cmd_only && ch('q') {
+        return Some("Quit (system)");
+    }
+    if mac && cmd_only && ch('h') {
+        return Some("Hide (system)");
+    }
+    if mac && cmd && alt && !ctrl && !shift && ch('h') {
+        return Some("Hide Others (system)");
+    }
+    None
+}
+
 /// The built-in chord for `action` on macOS (`mac`) or the other platforms, if it has one.
 ///
 /// macOS chords use Cmd (with Shift where noted) and never Ctrl or Option. Elsewhere chords
@@ -551,6 +590,26 @@ pub struct KeyOverrides {
 }
 
 impl KeyOverrides {
+    /// Drop overrides of actions that cannot change ([`Action::is_fixed`]) and of chords
+    /// something else owns ([`reserved`]). Returns `(action, why)` for each override dropped.
+    pub fn drop_reserved(&mut self, mac: bool) -> Vec<(Action, String)> {
+        let mut dropped = Vec::new();
+        self.map.retain(|action, chord| {
+            if action.is_fixed(mac) {
+                dropped.push((*action, "cannot be changed on macOS".to_owned()));
+                return false;
+            }
+            match chord.and_then(|c| reserved(mac, c).map(|what| (c, what))) {
+                Some((c, what)) => {
+                    dropped.push((*action, format!("{:?} is used by {what}", c.to_config(mac))));
+                    false
+                }
+                None => true,
+            }
+        });
+        dropped
+    }
+
     /// Drop overrides that give a chord to two actions. Each overridden action that shares its
     /// chord falls back to its default, until no chord is shared (the defaults never share
     /// one). Returns `(action, chord, the other action)` for each override dropped.
@@ -877,7 +936,22 @@ mod tests {
     fn shifted_symbols_fold_to_their_key_only_with_shift() {
         assert_eq!(c("cmd+shift+}"), c("cmd+shift+]"));
         assert_eq!(c("ctrl+shift+<"), c("ctrl+shift+,"));
-        assert_eq!(c("ctrl+shift+!"), c("ctrl+shift+1"));
+        assert_eq!(c("ctrl+shift+{"), c("ctrl+shift+["));
+        // Other symbols are keys of their own: on AZERTY `&`, `(` and `!` are unshifted keys,
+        // German has `#`; they never stand for a digit.
+        for (sym, digit) in [
+            ('&', '7'),
+            ('!', '1'),
+            ('(', '9'),
+            ('*', '8'),
+            ('$', '4'),
+            ('#', '3'),
+        ] {
+            let pressed = Chord::pressed(ChordKey::Char(sym), true, false, true, false);
+            assert_eq!(pressed.key, ChordKey::Char(sym));
+            assert_ne!(pressed, c(&format!("ctrl+shift+{digit}")));
+        }
+        assert_eq!(c("ctrl+shift+!").key, ChordKey::Char('!'));
         // Without Shift a symbol is its own key (on some layouts `<` has a key of its own).
         assert_eq!(c("ctrl+<").key, ChordKey::Char('<'));
         assert_eq!(
@@ -1056,5 +1130,55 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn copy_paste_scroll_save_and_the_app_menu_are_reserved() {
+        let r = |mac, s: &str| reserved(mac, c(s));
+        assert_eq!(r(true, "cmd+c"), Some("Copy"));
+        assert_eq!(r(true, "cmd+shift+v"), Some("Paste"));
+        assert_eq!(r(false, "ctrl+shift+c"), Some("Copy"));
+        assert_eq!(r(false, "ctrl+shift+super+v"), Some("Paste"));
+        assert_eq!(r(true, "cmd+home"), Some("Scroll"));
+        assert_eq!(r(false, "shift+pageup"), Some("Scroll"));
+        assert_eq!(r(true, "cmd+s"), Some("Save in the profile editor"));
+        assert_eq!(r(false, "ctrl+s"), Some("Save in the profile editor"));
+        assert_eq!(r(true, "cmd+q"), Some("Quit (system)"));
+        assert_eq!(r(true, "cmd+h"), Some("Hide (system)"));
+        assert_eq!(r(true, "alt+cmd+h"), Some("Hide Others (system)"));
+        assert_eq!(r(false, "ctrl+c"), None);
+        assert_eq!(r(false, "super+h"), None);
+        assert_eq!(r(true, "cmd+shift+h"), None);
+        assert_eq!(r(false, "ctrl+home"), None);
+        // No default is reserved, except Quit's own Cmd+Q on macOS.
+        for mac in [true, false] {
+            for a in Action::ALL {
+                if let Some(chord) = default_chord(mac, a) {
+                    assert_eq!(
+                        reserved(mac, chord).is_some(),
+                        mac && a == Action::Quit,
+                        "{}",
+                        a.name()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_chords_and_fixed_actions_are_dropped_from_overrides() {
+        let mut k = KeyOverrides::default();
+        k.map.insert(Action::NewTab, Some(c("cmd+c")));
+        k.map.insert(Action::Quit, Some(c("cmd+shift+q")));
+        k.map.insert(Action::Find, None);
+        let dropped = k.drop_reserved(true);
+        assert_eq!(dropped.len(), 2, "{dropped:?}");
+        assert_eq!(k.map.len(), 1);
+        assert!(Action::Quit.is_fixed(true));
+        assert!(!Action::Quit.is_fixed(false));
+        // Off macOS Quit may change.
+        let mut k = KeyOverrides::default();
+        k.map.insert(Action::Quit, None);
+        assert!(k.drop_reserved(false).is_empty());
     }
 }

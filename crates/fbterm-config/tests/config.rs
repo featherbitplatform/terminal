@@ -582,3 +582,21 @@ fn a_key_override_on_another_actions_chord_falls_back_with_a_notice() {
     );
     assert_eq!(w.line, Some(2));
 }
+
+#[test]
+fn a_key_override_on_a_reserved_chord_falls_back_with_a_notice() {
+    use fbterm_config::keys::Action;
+    let mac = cfg!(target_os = "macos");
+    let copy = if mac { "cmd+c" } else { "ctrl+shift+c" };
+    let path = tmp("settings.toml");
+    std::fs::write(&path, format!("[keys]\nfind = \"{copy}\"\n")).unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert!(!s.keys.map.contains_key(&Action::Find));
+    let w = warning.unwrap();
+    assert!(
+        w.message.contains("is used by Copy, using the default"),
+        "{}",
+        w.message
+    );
+    assert_eq!(w.line, Some(2));
+}

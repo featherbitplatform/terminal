@@ -254,6 +254,12 @@ impl Settings {
             problems.push((name, message));
         }
         let mac = cfg!(target_os = "macos");
+        for (action, why) in self.keys.drop_reserved(mac) {
+            problems.push((
+                action.name().to_owned(),
+                format!("keys.{} {why}, using the default", action.name()),
+            ));
+        }
         for (action, chord, other) in self.keys.resolve_conflicts(mac) {
             problems.push((
                 action.name().to_owned(),

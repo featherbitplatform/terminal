@@ -117,12 +117,13 @@ pub fn edit_text(text: &str, change: &SettingChange) -> Result<String, (Option<u
         (line, e.message().to_string())
     })?;
     // The file must load as settings too: a value of the wrong type is as broken as bad syntax.
-    let mut loaded = toml::from_str::<Settings>(text).map_err(|e| {
+    let loaded = toml::from_str::<Settings>(text).map_err(|e| {
         let line = e.span().map(|s| line_of(text, s.start));
         (line, e.message().to_string())
     })?;
     if let SettingChange::Keys(wanted) = change {
-        loaded.clamp();
+        // Compare with the entries as written (before load drops conflicting or reserved
+        // ones), so an entry the app ignored is not left behind to apply on the next load.
         return Ok(edit_keys(text, doc, &loaded.keys.map, wanted));
     }
     let key = change.key();
@@ -203,10 +204,42 @@ fn edit_keys(text: &str, mut doc: DocumentMut, have: &Overrides, wanted: &Overri
         out.push_str(&table);
         return out;
     };
+    // Comments above a removed entry, for the entry after it (or after the table).
+    let mut orphaned = String::new();
     for (action, chord) in changed {
         match chord {
             None => {
+                let names: Vec<String> = table.iter().map(|(k, _)| k.to_owned()).collect();
+                let comments = table
+                    .get_key_value_mut(action.name())
+                    .and_then(|(k, _)| {
+                        k.leaf_decor()
+                            .prefix()
+                            .and_then(|p| p.as_str())
+                            .map(str::to_owned)
+                    })
+                    .filter(|p| p.contains('#'));
                 table.remove(action.name());
+                let Some(comments) = comments else {
+                    continue;
+                };
+                let next = names
+                    .iter()
+                    .skip_while(|n| *n != action.name())
+                    .nth(1)
+                    .cloned();
+                match next.and_then(|n| table.get_key_value_mut(&n).map(|(k, _)| k)) {
+                    Some(mut key) => {
+                        let old = key
+                            .leaf_decor()
+                            .prefix()
+                            .and_then(|p| p.as_str())
+                            .unwrap_or("")
+                            .to_owned();
+                        key.leaf_decor_mut().set_prefix(format!("{comments}{old}"));
+                    }
+                    None => orphaned.push_str(&comments),
+                }
             }
             Some(chord) => {
                 let mut v = Value::from(value(chord));
@@ -222,7 +255,39 @@ fn edit_keys(text: &str, mut doc: DocumentMut, have: &Overrides, wanted: &Overri
             }
         }
     }
+    if !orphaned.is_empty() {
+        keep_after_keys_table(&mut doc, &orphaned);
+    }
     doc.to_string()
+}
+
+/// Put `comments` right after the `[keys]` table: before the next table's header, or at the
+/// end of the file.
+fn keep_after_keys_table(doc: &mut DocumentMut, comments: &str) {
+    let keys_at = doc
+        .get("keys")
+        .and_then(Item::as_table)
+        .and_then(toml_edit::Table::position);
+    let next = keys_at.and_then(|at| {
+        doc.as_table_mut()
+            .iter_mut()
+            .filter_map(|(_, item)| item.as_table_mut())
+            .filter(|t| t.position().is_some_and(|p| p > at))
+            .min_by_key(|t| t.position())
+            .map(|t| {
+                let old = t
+                    .decor()
+                    .prefix()
+                    .and_then(|p| p.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                t.decor_mut().set_prefix(format!("{comments}{old}"));
+            })
+    });
+    if next.is_none() {
+        let trailing = doc.trailing().as_str().unwrap_or("").to_owned();
+        doc.set_trailing(format!("{comments}{trailing}"));
+    }
 }
 
 /// The byte offset just past a `#[keys]` line, if only comments and blank lines follow it.
@@ -381,11 +446,40 @@ mod tests {
              \n\
              # My shortcuts.\n\
              [keys]\n\
+             # tmux owns Ctrl+B.\n\
              nope = \"ctrl+shift+u\"\n\
              find = \"ctrl+shift+f+x\"\n"
         );
         // Nothing to change: the text stays byte for byte.
         assert_eq!(edit_text(&after, &keys(&[])).unwrap(), after);
+    }
+
+    #[test]
+    fn an_entry_load_dropped_for_a_conflict_does_not_come_back() {
+        // new_tab takes Close tab's chord: load drops it with a notice. Clearing Close tab in
+        // the window must not leave new_tab behind to apply on the next load.
+        let before = "[keys]\nnew_tab = \"ctrl+alt+shift+w\"\nclose_tab = \"ctrl+alt+shift+w\"\n";
+        let mut loaded: Settings = toml::from_str(before).unwrap();
+        loaded.clamp();
+        let mut wanted = loaded.keys.map.clone();
+        wanted.insert(Action::CloseTab, None);
+        let after = edit_text(before, &SettingChange::Keys(wanted.clone())).unwrap();
+        let mut reloaded: Settings = toml::from_str(&after).unwrap();
+        assert!(reloaded.clamp().is_empty(), "{after}");
+        assert_eq!(reloaded.keys.map, wanted, "{after}");
+    }
+
+    #[test]
+    fn comments_of_removed_entries_stay() {
+        let before = "[keys]\n# first\nnew_tab = \"ctrl+shift+y\"\n# last\nquit = \"ctrl+shift+k\"\n\n# Other.\n[extra]\na = 1\n";
+        let after = edit_text(before, &keys(&[])).unwrap();
+        assert_eq!(
+            after,
+            "[keys]\n# first\n# last\n\n# Other.\n[extra]\na = 1\n"
+        );
+        let before = "[keys]\nnew_tab = \"ctrl+shift+y\"\n# last one\nquit = \"ctrl+shift+k\"\n";
+        let after = edit_text(before, &keys(&[(Action::NewTab, "ctrl+shift+y")])).unwrap();
+        assert_eq!(after, "[keys]\nnew_tab = \"ctrl+shift+y\"\n# last one\n");
     }
 
     #[test]
