@@ -1,0 +1,153 @@
+//! Debug-build aids that set up a scene at startup (see the list in `main.rs`).
+
+use fbterm_config::ProfileId;
+use fbterm_secrets::SecretKind;
+use iced::Task;
+
+use crate::app::{App, Message, debug_env};
+use crate::editor::EditorMsg;
+use crate::prompts::{Ask, Dialog};
+
+impl App {
+    /// `FBTERM_OPEN_TABS=name,name` (debug aid): extra tabs opened in the first window at
+    /// startup, by profile name. Such runs do not save the session (`state_saving_enabled`).
+    pub(crate) fn open_debug_tabs(&mut self) -> Task<Message> {
+        let Some(list) = debug_env("FBTERM_OPEN_TABS") else {
+            return Task::none();
+        };
+        let list = list.to_string_lossy().into_owned();
+        let Some(&wid) = self.windows.keys().next() else {
+            return Task::none();
+        };
+        let ids: Vec<ProfileId> = list
+            .split(',')
+            .filter_map(|n| self.profiles.profiles.iter().find(|p| p.name == n.trim()))
+            .map(|p| p.id)
+            .collect();
+        let tasks: Vec<_> = ids.into_iter().map(|id| self.open_tab(wid, id)).collect();
+        // They open in the background; the first tab stays active.
+        if let Some(w) = self.windows.get_mut(&wid) {
+            w.active = 0;
+        }
+        Task::batch(tasks)
+    }
+
+    /// `FBTERM_PALETTE_QUERY=text` (debug aid): the palette open and pre-filled in the first window.
+    pub(crate) fn open_debug_palette(&mut self) -> Task<Message> {
+        let Some(query) = debug_env("FBTERM_PALETTE_QUERY") else {
+            return Task::none();
+        };
+        match self.windows.keys().next().copied() {
+            Some(wid) => self.open_palette(wid, query.to_string_lossy().into_owned()),
+            None => Task::none(),
+        }
+    }
+
+    /// `FBTERM_OPEN_EDITOR=<profile name>` (debug aid): open the editor at startup with that
+    /// profile selected (any other value selects the first).
+    pub(crate) fn open_debug_editor(&mut self) -> Task<Message> {
+        let Some(name) = debug_env("FBTERM_OPEN_EDITOR") else {
+            return Task::none();
+        };
+        let task = self.open_editor();
+        let name = name.to_string_lossy().into_owned();
+        if let Some(p) = self.profiles.profiles.iter().find(|p| p.name == name)
+            && let Some((_, ed)) = &mut self.editor
+        {
+            ed.update(EditorMsg::Select(p.id));
+        }
+        task
+    }
+
+    /// `FBTERM_OPEN_SETTINGS=1` (debug aid): open the Settings window at startup.
+    pub(crate) fn open_debug_settings(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_OPEN_SETTINGS").is_none() {
+            return Task::none();
+        }
+        self.open_settings()
+    }
+
+    /// `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (debug aids): the find bar of the first
+    /// window's active tab, or the find-in-all-tabs box, open with that query once the tabs
+    /// have had a second to print something.
+    pub(crate) fn open_debug_find(&mut self) -> Task<Message> {
+        let tasks = [("FBTERM_FIND", false), ("FBTERM_FIND_ALL", true)]
+            .into_iter()
+            .filter_map(|(name, all)| {
+                let query = debug_env(name)?.to_string_lossy().into_owned();
+                Some(Task::perform(
+                    async { tokio::time::sleep(std::time::Duration::from_millis(900)).await },
+                    move |()| Message::DebugFind {
+                        all,
+                        query: query.clone(),
+                    },
+                ))
+            });
+        Task::batch(tasks)
+    }
+
+    pub(crate) fn debug_find(&mut self, all: bool, query: String) -> Task<Message> {
+        let Some(&wid) = self.windows.keys().next() else {
+            return Task::none();
+        };
+        if all {
+            return self.open_find_all(wid, query);
+        }
+        // Open, then type: the field ends with the cursor after the query.
+        let _ = self.find(wid, crate::find::FindMsg::Open);
+        let search = self.find(wid, crate::find::FindMsg::Query(query));
+        let input = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.active_tab())
+            .and_then(|t| t.find.as_ref())
+            .map(|bar| bar.input.clone());
+        let focus = input.map_or(Task::none(), |id| {
+            iced::widget::operation::focus(id.clone())
+                .chain(iced::widget::operation::move_cursor_to_end(id))
+        });
+        Task::batch([search, focus])
+    }
+
+    /// `FBTERM_DEMO_PROMPT=hostkey|password|changed` (debug aid): show a sample dialog in the
+    /// first window. Nothing waits for its answer.
+    pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {
+        let Some(kind) = debug_env("FBTERM_DEMO_PROMPT") else {
+            return Task::none();
+        };
+        let Some(&w) = self.windows.keys().next() else {
+            return Task::none();
+        };
+        let dialog = match kind.to_string_lossy().as_ref() {
+            "hostkey" => Ask::HostKey {
+                host: "127.0.0.1".into(),
+                port: 2222,
+                fingerprint: "SHA256:uNiVztksCsDhcc0u9e8BujQXVUpKZIDTMczCvj3tD2s".into(),
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            "password" => Ask::Secret {
+                profile: "bastion".into(),
+                kind: SecretKind::Password,
+                retry: true,
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            "changed" => {
+                self.prompts.push(
+                    w,
+                    None,
+                    Dialog::Changed {
+                        host: "127.0.0.1".into(),
+                        port: 2222,
+                    },
+                );
+                return Task::none();
+            }
+            other => {
+                tracing::warn!(%other, "unknown FBTERM_DEMO_PROMPT");
+                return Task::none();
+            }
+        };
+        self.prompts.ask(w, u64::MAX, dialog);
+        self.focus_prompt(w)
+    }
+}

@@ -1,0 +1,292 @@
+//! The Settings window against a temporary config directory: live apply, in-place writes,
+//! own-write suppression and edits on disk.
+
+use fbterm_config::{Paths, ProfileId, SETTINGS_TEMPLATE, Settings, ThemeMode};
+
+use super::SettingsMsg;
+use crate::app::{App, Message};
+use crate::watch::Changed;
+
+const SETTINGS_CHANGED: Changed = Changed {
+    profiles: false,
+    settings: true,
+};
+
+fn app() -> (App, Paths) {
+    let dir = std::env::temp_dir().join(format!("fbterm-settings-test-{}", ProfileId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let paths = Paths { config_dir: dir };
+    let (mut app, _) = App::build(paths.clone(), true);
+    let _ = app.update(Message::Settings(SettingsMsg::Open));
+    assert!(app.settings_window().is_some());
+    (app, paths)
+}
+
+fn send(app: &mut App, m: SettingsMsg) {
+    let _ = app.update(Message::Settings(m));
+}
+
+fn read(paths: &Paths) -> Option<String> {
+    std::fs::read_to_string(paths.settings()).ok()
+}
+
+#[test]
+fn a_click_applies_live_and_writes_the_template_with_the_key_set() {
+    let (mut app, paths) = app();
+    assert_eq!(read(&paths), None);
+    send(&mut app, SettingsMsg::Theme(ThemeMode::Light));
+    assert_eq!(app.settings.theme, ThemeMode::Light);
+    assert_eq!(app.tokens, crate::theme::tokens(ThemeMode::Light));
+    let text = read(&paths).unwrap();
+    assert_eq!(
+        text,
+        SETTINGS_TEMPLATE.replace(
+            "#theme = \"dark\"\n",
+            "#theme = \"dark\"\ntheme = \"light\"\n"
+        )
+    );
+    // The watcher's report of our own write changes nothing.
+    // (Startup may already carry environment notices, so compare rather than expect none.)
+    let before = app.notices.clone();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert_eq!(app.notices, before);
+    assert_eq!(app.settings.theme, ThemeMode::Light);
+}
+
+#[test]
+fn a_drag_applies_at_once_and_writes_when_let_go_or_closed() {
+    let (mut app, paths) = app();
+    send(&mut app, SettingsMsg::Opacity(0.8));
+    assert_eq!(app.settings.background_opacity, 0.8);
+    assert_eq!(read(&paths), None, "no write while dragging");
+    send(&mut app, SettingsMsg::Release);
+    assert_eq!(
+        Settings::load(&paths.settings())
+            .unwrap()
+            .background_opacity,
+        0.8
+    );
+    // A change still waiting is written when the window closes.
+    send(&mut app, SettingsMsg::FontSize(16.0));
+    assert_eq!(app.style.font_size, 16.0);
+    let id = app.settings_window().unwrap();
+    let _ = app.update(Message::WindowClosed(id));
+    assert!(app.settings_window().is_none());
+    assert_eq!(Settings::load(&paths.settings()).unwrap().font_size, 16.0);
+}
+
+#[test]
+fn an_edit_on_disk_moves_the_controls() {
+    let (mut app, paths) = app();
+    std::fs::write(
+        paths.settings(),
+        "font_size = 20.0\nkitty_keyboard = true\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    let (_, state) = app.settings_win.as_ref().unwrap();
+    assert_eq!(state.values.font_size, 20.0);
+    assert!(state.values.kitty_keyboard);
+    assert_eq!(state.font_size_text, "20");
+}
+
+#[test]
+fn a_broken_file_makes_the_window_read_only_and_is_never_written() {
+    let (mut app, paths) = app();
+    std::fs::write(paths.settings(), "font_size = = 3\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert!(app.settings_win.as_ref().unwrap().1.read_only.is_some());
+    send(&mut app, SettingsMsg::Kitty(true));
+    assert!(!app.settings.kitty_keyboard);
+    assert_eq!(read(&paths).as_deref(), Some("font_size = = 3\n"));
+    // Fixed on disk: editable again.
+    std::fs::write(paths.settings(), "font_size = 15.0\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert!(app.settings_win.as_ref().unwrap().1.read_only.is_none());
+    send(&mut app, SettingsMsg::Kitty(true));
+    assert_eq!(
+        read(&paths).as_deref(),
+        Some("font_size = 15.0\nkitty_keyboard = true\n")
+    );
+}
+
+#[test]
+fn an_edit_on_disk_not_yet_reported_is_applied_not_hidden_by_our_write() {
+    let (mut app, paths) = app();
+    // The user saves the file; the watcher has not reported it yet.
+    std::fs::write(paths.settings(), "# mine\nfont_size = 20.0\n").unwrap();
+    send(&mut app, SettingsMsg::Kitty(true));
+    assert_eq!(
+        read(&paths).as_deref(),
+        Some("# mine\nfont_size = 20.0\nkitty_keyboard = true\n")
+    );
+    assert_eq!(app.settings.font_size, 20.0, "the edit on disk applies");
+    assert!(app.settings.kitty_keyboard);
+    assert_eq!(app.settings_win.as_ref().unwrap().1.values.font_size, 20.0);
+    // The late watcher report changes nothing more.
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert_eq!(app.settings.font_size, 20.0);
+    // A broken save that our write cannot merge turns the window read-only.
+    std::fs::write(paths.settings(), "font_size = = 1\n").unwrap();
+    send(&mut app, SettingsMsg::Theme(ThemeMode::Light));
+    assert_eq!(read(&paths).as_deref(), Some("font_size = = 1\n"));
+    assert!(app.settings_win.as_ref().unwrap().1.read_only.is_some());
+}
+
+#[test]
+fn quit_writes_what_is_still_waiting() {
+    let (mut app, paths) = app();
+    send(&mut app, SettingsMsg::Opacity(0.7));
+    assert_eq!(read(&paths), None);
+    let _ = app.update(Message::Shortcut(
+        app.settings_window().unwrap(),
+        crate::keys::Action::Quit,
+    ));
+    assert_eq!(
+        Settings::load(&paths.settings())
+            .unwrap()
+            .background_opacity,
+        0.7
+    );
+}
+
+#[test]
+fn closing_the_window_with_its_button_writes_what_is_still_waiting() {
+    let (mut app, paths) = app();
+    send(&mut app, SettingsMsg::FontSize(17.0));
+    let id = app.settings_window().unwrap();
+    let _ = app.update(Message::CloseRequested(id));
+    assert_eq!(Settings::load(&paths.settings()).unwrap().font_size, 17.0);
+}
+
+#[test]
+fn the_redraw_rate_applies_live_and_follows_the_display() {
+    use fbterm_config::MaxFps;
+    let (mut app, paths) = app();
+    assert_eq!(app.receiver.rate.get(), 60);
+    send(&mut app, SettingsMsg::MaxFps(MaxFps::Fixed(120)));
+    assert_eq!(app.receiver.rate.get(), 120);
+    assert!(read(&paths).unwrap().contains("\nmax_fps = 120\n"));
+    // "display" with no rate known: the default.
+    send(&mut app, SettingsMsg::MaxFps(MaxFps::Display));
+    assert_eq!(app.receiver.rate.get(), 60);
+    assert!(read(&paths).unwrap().contains("\nmax_fps = \"display\"\n"));
+    // Two terminal windows on different displays: the faster one sets the rate.
+    let (a, b) = (iced::window::Id::unique(), iced::window::Id::unique());
+    app.windows.insert(a, Default::default());
+    app.windows.insert(b, Default::default());
+    let _ = app.update(Message::DisplayRate(a, Some(60)));
+    let _ = app.update(Message::DisplayRate(b, Some(144)));
+    assert_eq!(app.receiver.rate.get(), 144);
+    let state = &app.settings_win.as_ref().unwrap().1;
+    assert_eq!(state.display_hz, Some(144));
+    assert_eq!(state.rate_hint(), super::RATE_CPU_HINT);
+    // Closing the fast window falls back to the other display.
+    let _ = app.update(Message::WindowClosed(b));
+    assert_eq!(app.receiver.rate.get(), 60);
+    // An edit on disk applies too.
+    std::fs::write(paths.settings(), "max_fps = 90\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert_eq!(app.receiver.rate.get(), 90);
+}
+
+#[test]
+fn a_rebound_chord_applies_live_and_is_written_under_the_keys_comment() {
+    use fbterm_config::keys::{Action, Chord};
+    let (mut app, paths) = app();
+    let chord = Chord::parse("ctrl+alt+shift+k").unwrap().unwrap();
+    send(&mut app, SettingsMsg::Record(Action::Palette));
+    send(&mut app, SettingsMsg::Pressed(Some(chord)));
+    assert_eq!(app.bindings.chord(Action::Palette), Some(chord));
+    assert_eq!(app.bindings.action(chord), Some(Action::Palette));
+    assert_eq!(
+        read(&paths).unwrap(),
+        format!("{SETTINGS_TEMPLATE}[keys]\npalette = \"ctrl+alt+shift+k\"\n")
+    );
+    // Restore defaults removes the entry and keeps the template's comments.
+    send(&mut app, SettingsMsg::ResetKeys);
+    assert!(app.bindings.is_default(Action::Palette));
+    assert_eq!(
+        read(&paths).unwrap(),
+        format!("{SETTINGS_TEMPLATE}[keys]\n")
+    );
+}
+
+#[test]
+fn hand_edited_keys_apply_live_and_bad_entries_show_a_notice() {
+    use fbterm_config::keys::{Action, Chord};
+    let (mut app, paths) = app();
+    std::fs::write(
+        paths.settings(),
+        "[keys]\nnew_window = \"ctrl+alt+shift+n\"\nquit = \"x\"\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    let n = Chord::parse("ctrl+alt+shift+n").unwrap().unwrap();
+    assert_eq!(app.bindings.chord(Action::NewWindow), Some(n));
+    assert!(app.bindings.is_default(Action::Quit));
+    let notice = app
+        .settings_notice
+        .clone()
+        .expect("the bad entry is reported");
+    assert!(notice.contains("keys.quit"), "{notice}");
+    assert!(app.notices.contains(&notice));
+    // The window shows the file's chords and stays editable.
+    let (_, state) = app.settings_win.as_ref().unwrap();
+    assert!(state.read_only.is_none());
+    assert_eq!(state.bindings().chord(Action::NewWindow), Some(n));
+    // A change from the window leaves the bad entry for the user to fix.
+    send(&mut app, SettingsMsg::ClearKey(Action::NewWindow));
+    assert_eq!(
+        read(&paths).unwrap(),
+        "[keys]\nnew_window = \"none\"\nquit = \"x\"\n"
+    );
+    send(&mut app, SettingsMsg::ResetKey(Action::NewWindow));
+    assert_eq!(read(&paths).unwrap(), "[keys]\nquit = \"x\"\n");
+    assert!(app.settings_notice.is_some());
+}
+
+#[test]
+fn leaving_the_settings_window_stops_recording() {
+    use fbterm_config::keys::Action;
+    let (mut app, _) = app();
+    send(&mut app, SettingsMsg::Record(Action::NewTab));
+    assert!(app.settings_win.as_ref().unwrap().1.recording.is_some());
+    let id = app.settings_window().unwrap();
+    let _ = app.update(Message::WindowUnfocused(id));
+    assert!(app.settings_win.as_ref().unwrap().1.recording.is_none());
+}
+
+#[test]
+fn the_gear_button_opens_the_settings_window() {
+    let dir = std::env::temp_dir().join(format!("fbterm-settings-test-{}", ProfileId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut app, _) = App::build(Paths { config_dir: dir }, true);
+    let w = iced::window::Id::unique();
+    app.windows.insert(w, Default::default());
+    let _ = app.update(Message::TabBar(w, crate::app::TabBarMsg::Settings));
+    assert!(app.settings_window().is_some());
+}
+
+#[test]
+fn clearing_a_chord_does_not_bring_back_an_entry_load_dropped() {
+    use fbterm_config::keys::{Action, Bindings};
+    let (mut app, paths) = app();
+    let mac = app.bindings.mac();
+    let close = app.bindings.chord(Action::CloseTab).unwrap();
+    std::fs::write(
+        paths.settings(),
+        format!("[keys]\nnew_tab = \"{}\"\n", close.to_config(mac)),
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert!(app.settings_notice.is_some(), "the conflict is reported");
+    assert!(app.bindings.is_default(Action::NewTab));
+    send(&mut app, SettingsMsg::ClearKey(Action::CloseTab));
+    // What runs now is what the file gives on the next launch.
+    let reloaded = Settings::load_checked(&paths.settings()).unwrap();
+    assert!(reloaded.1.is_none(), "{:?}", read(&paths));
+    assert_eq!(Bindings::current(&reloaded.0.keys.map), app.bindings);
+    assert_eq!(app.bindings.action(close), None);
+    assert!(app.settings_notice.is_none());
+}

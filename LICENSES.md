@@ -1,0 +1,36 @@
+# Licenses
+
+fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
+
+## Third-party licenses
+
+`deny.toml` accepts only the licenses below; `cargo deny check` fails on anything else. Crates with several license options (for example MIT or Apache-2.0) only need one of them to be on this list.
+
+| License | Where it appears |
+| --- | --- |
+| Apache-2.0 | Most of the dependency tree, including `russh`, `feathercritty`, `iced` support crates and `wgpu`. |
+| MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also the Lucide icons derived from Feather (see below). |
+| BSD-2-Clause | `arrayref`, `serial2`, `zerocopy`. |
+| BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `subtle`, `tiny-skia`, `num_enum`. |
+| ISC | `ring`, `untrusted`, `libloading`, `inotify`, and the bundled Lucide icon font (see below). |
+| Unicode-3.0 | `unicode-ident` (Unicode data tables). |
+| Zlib | `bytemuck`, `foldhash`, `slotmap`, `tinyvec`, the `objc2-*` bindings, `raw-window-handle`. |
+| MPL-2.0 | `nucleo-matcher` (palette fuzzy search) and `option-ext`; used unmodified. |
+| OFL-1.1 | The bundled fonts, see below. |
+| BSL-1.0 | Windows builds only, see below. |
+| CC0-1.0 | `hexf-parse` and `notify`, see below. |
+
+### BSL-1.0 and CC0-1.0
+
+- BSL-1.0 is used only by Windows builds, through `clipboard-win` and `error-code`, which `iced_winit` pulls in for Windows clipboard support (`iced_winit` > `window_clipboard` > `clipboard-win` > `error-code`).
+- CC0-1.0 comes from `hexf-parse`, used by the `naga` shader compiler that `wgpu` depends on, and from `notify`, the file-watching crate fbterm uses directly.
+
+## feathercritty
+
+The terminal emulation library, [feathercritty](https://github.com/featherbitplatform/feathercritty), is our fork of [`alacritty_terminal`](https://github.com/alacritty/alacritty/tree/master/alacritty_terminal) 0.26.0 by the Alacritty authors (Apache-2.0, license in the fork's `LICENSE-APACHE`; attribution required). It is used as a git dependency pinned by commit. The fork's changes (a bug fix, a scroll counter, a read-only getter and the rename) are listed in its README, and the files it modifies say so in their first line.
+
+## Bundled fonts
+
+Geist and Geist Mono are bundled under the SIL Open Font License 1.1. The license text is in `crates/fbterm/assets/fonts/LICENSE`.
+
+The icons are glyphs of the Lucide icon font (`lucide.ttf` from `lucide-static` 1.54.0), subset to the icons the app uses by `dev/subset-icons.sh` into `crates/fbterm/assets/fonts/lucide-icons.ttf`. Lucide is under the ISC License; the icons it derives from Feather (among those bundled: `x`, `plus`, `chevron-up`, `chevron-down`, `lock`) are under the MIT License. Both texts are in `crates/fbterm/assets/fonts/LICENSE-lucide`.
