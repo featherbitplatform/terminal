@@ -103,6 +103,9 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     if !notices.is_empty() {
         body = body.push(notice_banner(t, bar_bg, notices));
     }
+    if let Some(n) = app.export_notice.as_ref().filter(|n| n.window == id) {
+        body = body.push(crate::export::notice_view(t, bar_bg, n));
+    }
     // Only the active tab builds a terminal view; background tabs render nothing.
     let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
         Some(term) => {

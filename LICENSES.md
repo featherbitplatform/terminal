@@ -27,7 +27,7 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 ## Vendored code
 
-`vendor/alacritty_terminal/` is a copy of `alacritty_terminal` 0.26.0 (Apache-2.0, license in `vendor/alacritty_terminal/LICENSE-APACHE`) with one bug fix, described in `vendor/alacritty_terminal/FBTERM_PATCHES.md`.
+`vendor/alacritty_terminal/` is a copy of `alacritty_terminal` 0.26.0 (Apache-2.0, license in `vendor/alacritty_terminal/LICENSE-APACHE`) with small patches (a bug fix, a scroll counter and a read-only getter), described in `vendor/alacritty_terminal/FBTERM_PATCHES.md`.
 
 ## Bundled fonts
 

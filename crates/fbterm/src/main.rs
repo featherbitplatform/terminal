@@ -36,6 +36,7 @@ mod debug;
 mod dialogs;
 mod display_rate;
 mod editor;
+mod export;
 mod find;
 mod keys;
 mod pacing;
