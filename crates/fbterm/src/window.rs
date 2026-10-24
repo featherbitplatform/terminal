@@ -6,7 +6,7 @@ use fbterm_term::terminal_view;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{Operation, Tree, Widget};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
-use iced::widget::{button, column, container, row, scrollable, stack, svg, text};
+use iced::widget::{button, column, container, row, scrollable, stack, text};
 use iced::window::{self, Screenshot};
 use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Padding, Rectangle, Size, Vector,
@@ -21,22 +21,10 @@ use crate::shortcuts::{Mode, Shortcuts};
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip};
+use crate::ui::{ICON_PLUS, ICON_USERS, ICON_X, icon};
 
 /// Gap between the top of the tab bar and the top of a tab.
 const TAB_TOP_GAP: f32 = 4.0;
-
-// Lucide icons (ISC License, Copyright (c) Lucide Contributors): "x", "plus" and "users".
-const ICON_X: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
-const ICON_USERS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/></svg>"#;
-const ICON_PLUS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>"#;
-
-fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Message> {
-    svg(svg::Handle::from_memory(bytes))
-        .width(size)
-        .height(size)
-        .style(move |_, _| svg::Style { color: Some(color) })
-        .into()
-}
 
 pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let t = app.tokens;

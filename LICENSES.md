@@ -9,10 +9,10 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 | License | Where it appears |
 | --- | --- |
 | Apache-2.0 | Most of the dependency tree, including `russh`, `alacritty_terminal`, `iced` support crates and `wgpu`. |
-| MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`. |
+| MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also the Lucide icons derived from Feather (see below). |
 | BSD-2-Clause | `arrayref`, `serial2`, `zerocopy`. |
 | BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `subtle`, `tiny-skia`, `num_enum`. |
-| ISC | `ring`, `untrusted`, `libloading`, `inotify`. |
+| ISC | `ring`, `untrusted`, `libloading`, `inotify`, and the bundled Lucide icon font (see below). |
 | Unicode-3.0 | `unicode-ident` (Unicode data tables). |
 | Zlib | `bytemuck`, `foldhash`, `slotmap`, `tinyvec`, the `objc2-*` bindings, `raw-window-handle`. |
 | MPL-2.0 | `nucleo-matcher` (palette fuzzy search) and `option-ext`; used unmodified. |
@@ -32,3 +32,5 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 ## Bundled fonts
 
 Geist and Geist Mono are bundled under the SIL Open Font License 1.1. The license text is in `crates/fbterm/assets/fonts/LICENSE`.
+
+The icons are glyphs of the Lucide icon font (`lucide.ttf` from `lucide-static` 1.54.0), subset to the icons the app uses by `dev/subset-icons.sh` into `crates/fbterm/assets/fonts/lucide-icons.ttf`. Lucide is under the ISC License; the icons it derives from Feather (among those bundled: `x`, `plus`, `chevron-up`, `chevron-down`, `lock`) are under the MIT License. Both texts are in `crates/fbterm/assets/fonts/LICENSE-lucide`.

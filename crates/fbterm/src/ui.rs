@@ -1,7 +1,7 @@
 //! Shared chrome pieces for the editor and the dialogs: Graphite controls (radius 6), cards
 //! (radius 8), overlays (radius 12), Lucide icons.
 
-use iced::widget::{button, column, container, svg, text, text_input};
+use iced::widget::{button, column, container, text, text_input};
 use iced::{Background, Border, Color, Element, Font, Length, Padding, Shadow, Vector, window};
 
 use crate::app::Message;
@@ -10,20 +10,33 @@ use crate::theme::{Tokens, UI_FONT};
 /// Real values (hosts, ports, paths, fingerprints) are set in Geist Mono.
 pub const MONO: Font = Font::with_name("Geist Mono");
 
-// Lucide icons (ISC License, Copyright (c) Lucide Contributors).
-pub const ICON_X: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>"#;
-pub const ICON_PLUS: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>"#;
-pub const ICON_UP: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m18 15-6-6-6 6"/></svg>"#;
-pub const ICON_DOWN: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>"#;
-pub const ICON_COPY: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>"#;
-pub const ICON_SHIELD_ALERT: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg>"#;
-pub const ICON_LOCK: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>"#;
+/// The bundled Lucide icon font (ISC License, Copyright (c) Lucide Contributors), subset to
+/// the icons below by `dev/subset-icons.sh`. Icons are glyphs, so they come from the glyph
+/// atlas that text already uses, not from an image atlas.
+pub const ICONS: Font = Font::with_name("lucide");
 
-pub fn icon<'a>(bytes: &'static [u8], size: f32, color: Color) -> Element<'a, Message> {
-    svg(svg::Handle::from_memory(bytes))
+// Glyphs of the icon font, by Lucide icon name.
+pub const ICON_X: &str = "\u{e1b2}";
+pub const ICON_PLUS: &str = "\u{e13d}";
+pub const ICON_USERS: &str = "\u{e1a4}";
+pub const ICON_UP: &str = "\u{e070}"; // chevron-up
+pub const ICON_DOWN: &str = "\u{e06d}"; // chevron-down
+pub const ICON_COPY: &str = "\u{e09e}";
+pub const ICON_SHIELD_ALERT: &str = "\u{e1fe}";
+pub const ICON_LOCK: &str = "\u{e10b}";
+
+/// An icon `size` pixels square. The font draws each icon on the full em square (the 24-unit
+/// SVG grid scaled to the em, baseline at the bottom), so a one-em line holds it exactly.
+pub fn icon<'a>(glyph: &'static str, size: f32, color: Color) -> Element<'a, Message> {
+    text(glyph)
+        .font(ICONS)
+        .size(size)
+        .line_height(text::LineHeight::Absolute(size.into()))
+        .shaping(text::Shaping::Basic)
+        .wrapping(text::Wrapping::None)
+        .color(color)
         .width(size)
         .height(size)
-        .style(move |_, _| svg::Style { color: Some(color) })
         .into()
 }
 

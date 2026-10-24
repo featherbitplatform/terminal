@@ -199,7 +199,7 @@ pub fn view<'a>(
 
 fn header<'a>(
     t: &'static Tokens,
-    glyph: &'static [u8],
+    glyph: &'static str,
     tint: Color,
     title: &'a str,
 ) -> Element<'a, Message> {
