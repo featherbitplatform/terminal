@@ -183,6 +183,7 @@ impl App {
                     }
                     tab.name = p.name.clone();
                     tab.accent = p.accent;
+                    tab.accent_style = p.accent_style;
                 }
             }
         }

@@ -651,6 +651,7 @@ mod tests {
             name: name.into(),
             group: None,
             accent: None,
+            accent_style: Default::default(),
             kind: ProfileKind::Ssh(SshProfile {
                 host: host.into(),
                 port: 22,

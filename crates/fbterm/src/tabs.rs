@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fbterm_config::{ProfileId, Rgb};
+use fbterm_config::{AccentStyle, Profile, ProfileId, Rgb};
 use fbterm_session::{SessionEvent, SessionHandle};
 use fbterm_term::SharedTerminal;
 
@@ -34,6 +34,8 @@ pub struct Tab {
     pub name: String,
     pub title: String,
     pub accent: Option<Rgb>,
+    /// How the accent shows on the tab.
+    pub accent_style: AccentStyle,
     pub state: TabState,
     pub session: Option<SessionHandle>,
     /// Shown while there is no session (connecting, or a connect that failed), so notices
@@ -54,11 +56,20 @@ impl Tab {
             title: name.clone(),
             name,
             accent,
+            accent_style: AccentStyle::default(),
             state: TabState::NotConnected,
             session: None,
             placeholder: None,
             connecting: None,
             find: None,
+        }
+    }
+
+    /// A tab for a saved profile: its name, accent and accent style.
+    pub fn for_profile(p: &Profile) -> Self {
+        Self {
+            accent_style: p.accent_style,
+            ..Self::new(p.id, p.name.clone(), p.accent)
         }
     }
 

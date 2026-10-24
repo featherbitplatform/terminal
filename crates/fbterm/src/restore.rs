@@ -83,6 +83,7 @@ mod tests {
                     name: id.to_string(),
                     group: None,
                     accent: None,
+                    accent_style: Default::default(),
                     kind: ProfileKind::Local(LocalProfile {
                         program: "/bin/sh".into(),
                         args: vec![],

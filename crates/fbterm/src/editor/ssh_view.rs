@@ -13,6 +13,57 @@ use crate::redact::Redacted;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
+/// One choice of a segmented control.
+pub(super) fn segment<'a>(
+    t: &'static Tokens,
+    caption: &'a str,
+    selected: bool,
+    on_press: Option<Message>,
+) -> button::Button<'a, Message> {
+    button(text(caption).font(UI_FONT).size(12.5))
+        .on_press_maybe(on_press)
+        .padding(Padding::from([6.0, 14.0]))
+        .style(move |_, status| {
+            let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+            button::Style {
+                background: if selected {
+                    Some(t.raised.into())
+                } else {
+                    hovered.then(|| t.hover.into())
+                },
+                text_color: if selected { t.text } else { t.text_secondary },
+                border: Border {
+                    color: if selected {
+                        t.border
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: 1.0,
+                    radius: 5.0.into(),
+                },
+                ..button::Style::default()
+            }
+        })
+}
+
+/// A segmented control around `choices` (a row of [`segment`]s).
+pub(super) fn segmented<'a>(
+    t: &'static Tokens,
+    choices: iced::widget::Row<'a, Message>,
+) -> container::Container<'a, Message> {
+    container(choices.spacing(2))
+        .padding(2)
+        .style(move |_| container::Style {
+            background: Some(t.surface.into()),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..container::Style::default()
+        })
+}
+
 pub(super) fn auth<'a>(
     t: &'static Tokens,
     s: &'a SshDraft,
@@ -21,50 +72,21 @@ pub(super) fn auth<'a>(
     rsa_key: bool,
 ) -> Element<'a, Message> {
     let segment = |caption: &'a str, choice: AuthChoice| {
-        let selected = s.auth == choice;
-        button(text(caption).font(UI_FONT).size(12.5))
-            .on_press_maybe(editable.then(|| msg(EditorMsg::Auth(choice))))
-            .padding(Padding::from([6.0, 14.0]))
-            .style(move |_, status| {
-                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
-                button::Style {
-                    background: if selected {
-                        Some(t.raised.into())
-                    } else {
-                        hovered.then(|| t.hover.into())
-                    },
-                    text_color: if selected { t.text } else { t.text_secondary },
-                    border: Border {
-                        color: if selected {
-                            t.border
-                        } else {
-                            Color::TRANSPARENT
-                        },
-                        width: 1.0,
-                        radius: 5.0.into(),
-                    },
-                    ..button::Style::default()
-                }
-            })
+        segment(
+            t,
+            caption,
+            s.auth == choice,
+            editable.then(|| msg(EditorMsg::Auth(choice))),
+        )
     };
-    let segments = container(
+    let segments = segmented(
+        t,
         row![
             segment("Password", AuthChoice::Password),
             segment("Key file", AuthChoice::Key),
             segment("Agent", AuthChoice::Agent),
-        ]
-        .spacing(2),
-    )
-    .padding(2)
-    .style(move |_| container::Style {
-        background: Some(t.surface.into()),
-        border: Border {
-            color: t.border,
-            width: 1.0,
-            radius: 6.0.into(),
-        },
-        ..container::Style::default()
-    });
+        ],
+    );
     let secret = |caption: &'a str, placeholder: &'a str| -> Element<'a, Message> {
         column![
             ui::label(t, caption),

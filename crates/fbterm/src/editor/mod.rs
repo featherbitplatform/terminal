@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::{
-    AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind, ProfileStore, Rgb,
-    SshProfile, ValidationError,
+    AccentStyle, AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind,
+    ProfileStore, Rgb, SshProfile, ValidationError,
 };
 use fbterm_secrets::{SecretKind, SecretStore};
 
@@ -69,6 +69,7 @@ pub enum EditorMsg {
     Name(String),
     Group(String),
     Accent(Option<Rgb>),
+    AccentStyle(AccentStyle),
     Host(String),
     Port(String),
     User(String),
@@ -135,6 +136,7 @@ pub struct Draft {
     pub name: String,
     pub group: String,
     pub accent: Option<Rgb>,
+    pub accent_style: AccentStyle,
     pub kind: DraftKind,
 }
 
@@ -177,6 +179,7 @@ impl Draft {
             name: p.name.clone(),
             group: p.group.clone().unwrap_or_default(),
             accent: p.accent,
+            accent_style: p.accent_style,
             kind,
         }
     }
@@ -214,6 +217,7 @@ impl Draft {
                 .filter(|g| !g.is_empty())
                 .map(str::to_owned),
             accent: self.accent,
+            accent_style: self.accent_style,
             kind,
         }
     }
@@ -432,6 +436,7 @@ impl EditorState {
             name: self.unique_name(name),
             group: String::new(),
             accent: None,
+            accent_style: AccentStyle::default(),
             kind,
         };
         let id = draft.id;
@@ -696,6 +701,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::Name(v), _) => d.name = v,
         (EditorMsg::Group(v), _) => d.group = v,
         (EditorMsg::Accent(v), _) => d.accent = v,
+        (EditorMsg::AccentStyle(v), _) => d.accent_style = v,
         (EditorMsg::Host(v), DraftKind::Ssh(s)) => s.host = v,
         (EditorMsg::Port(v), DraftKind::Ssh(s)) => {
             // Digits only, a valid port or empty while typing.

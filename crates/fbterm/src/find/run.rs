@@ -402,6 +402,7 @@ mod tests {
             name: "sh".into(),
             group: None,
             accent: None,
+            accent_style: Default::default(),
             kind: ProfileKind::Local(LocalProfile {
                 program: "/bin/sh".into(),
                 args: vec![],

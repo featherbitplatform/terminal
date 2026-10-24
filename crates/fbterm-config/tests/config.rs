@@ -15,6 +15,7 @@ fn ssh(name: &str, jump: Vec<ProfileId>) -> Profile {
         name: name.into(),
         group: None,
         accent: None,
+        accent_style: Default::default(),
         kind: ProfileKind::Ssh(SshProfile {
             host: format!("{name}.example.com"),
             port: 22,
@@ -35,6 +36,7 @@ fn local(name: &str) -> Profile {
             g: 0x0C,
             b: 0xff,
         }),
+        accent_style: Default::default(),
         kind: ProfileKind::Local(LocalProfile {
             program: "/bin/zsh".into(),
             args: vec!["-l".into()],
@@ -62,6 +64,37 @@ fn round_trip_profiles_toml() {
     assert!(!text.contains("password"));
     assert!(text.contains("#ab0cff"));
     assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn accent_style_defaults_to_stripe_and_is_written_only_when_set() {
+    let path = tmp("profiles.toml");
+    let mut tinted = local("tinted");
+    tinted.accent_style = AccentStyle::Tab;
+    let store = ProfileStore {
+        profiles: vec![local("plain"), tinted],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("accent_style").count(), 1, "{text}");
+    assert!(text.contains("accent_style = \"tab\""));
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+
+    // Files written before the setting existed load with the stripe.
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\naccent = \"#ed4a49\"\nkind = \"local\"\nprogram = \"/bin/sh\"\n",
+    )
+    .unwrap();
+    let old = ProfileStore::load(&path).unwrap();
+    assert_eq!(old.profiles[0].accent_style, AccentStyle::Stripe);
+    // An unknown style is an error, not silently the stripe.
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\naccent_style = \"border\"\nkind = \"local\"\nprogram = \"/bin/sh\"\n",
+    )
+    .unwrap();
+    assert!(ProfileStore::load(&path).is_err());
 }
 
 #[test]
