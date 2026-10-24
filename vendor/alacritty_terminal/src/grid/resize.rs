@@ -60,6 +60,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.scroll_up(&(Line(0)..Line(target as i32)), delta);
         }
 
+        // fbterm patch: existing lines move down by `from_history` rows; `scroll_up` above
+        // counted `delta` rotations that only undo the growth, so take back all `lines_added`.
+        self.scrolled_lines = self.scrolled_lines.wrapping_sub(lines_added as i64);
+
         // Move cursor down for every line pulled from history.
         self.saved_cursor.point.line += from_history;
         self.cursor.point.line += from_history;
