@@ -264,7 +264,6 @@ fn tab_bar<'a>(
             i,
             (i == active).then_some(active_bg),
             height - TAB_TOP_GAP,
-            tab_radius(bar_bg),
         ));
     }
     let new_tab = button(icon(ICON_PLUS, 14.0, t.text_muted))
@@ -318,29 +317,25 @@ fn tab_bar<'a>(
         content: bar.into(),
         color: bar_bg,
         hole: (active < tabs.len()).then_some(active),
-        corner: tab_radius(bar_bg),
     });
     chrome::title_bar(bar, modal, move |a| Message::TitleBar(window, a))
 }
 
-/// Top corner radius of a tab.
+/// Top corner radius of a tab (the active one, a hovered one and a tinted one).
 const TAB_RADIUS: f32 = 6.0;
 
-/// The tabs' top corner radius at `bar_bg`: square on a translucent bar, where the bar's
-/// background behind a rounded corner would add to the tab's own alpha and show as a notch.
-fn tab_radius(bar_bg: Color) -> f32 {
-    if bar_bg.a < 1.0 { 0.0 } else { TAB_RADIUS }
-}
+/// How far a concave corner piece reaches under the tab's antialiased edge (logical px).
+const CORNER_OVERLAP: f32 = 0.07;
 
-/// The pieces of `outer` that cover everything but `hole`, plus the hole's top corner squares
-/// (behind its rounded corners). With a translucent background the active tab must not be
-/// drawn over the bar's background, or the two alphas would add up there.
-fn around(outer: Rectangle, hole: Rectangle, corner: f32) -> Vec<Rectangle> {
+/// The pieces of `outer` that cover everything but `hole`. The active tab draws its own
+/// background there; with a translucent background nothing may lie under it, or the two
+/// alphas would add up.
+fn around(outer: Rectangle, hole: Rectangle) -> Vec<Rectangle> {
     let hole = match outer.intersection(&hole) {
         Some(h) => h,
         None => return vec![outer],
     };
-    let mut out = Vec::with_capacity(6);
+    let mut out = Vec::with_capacity(4);
     let mut push = |x: f32, y: f32, w: f32, h: f32| {
         if w > 0.0 && h > 0.0 {
             out.push(Rectangle {
@@ -361,10 +356,48 @@ fn around(outer: Rectangle, hole: Rectangle, corner: f32) -> Vec<Rectangle> {
     );
     push(outer.x, hole.y, hole.x - outer.x, hole.height);
     push(right, hole.y, outer.x + outer.width - right, hole.height);
-    let r = corner.min(hole.width / 2.0).min(hole.height);
-    push(hole.x, hole.y, r, r);
-    push(right - r, hole.y, r, r);
     out
+}
+
+/// One concave corner piece: the part of a `radius` square in a top corner of the hole that
+/// lies outside the tab's rounded corner, filled with the bar's background.
+///
+/// Drawn as a ring (a round quad whose border is as wide as `radius`, transparent inside)
+/// clipped to the corner square: the inner edge of the border is a circle of `radius` around
+/// the same center as the tab's corner, and the two antialiased edges are complementary, so
+/// nothing is covered twice and no notch shows at any opacity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Corner {
+    /// The corner square (clip bounds).
+    clip: Rectangle,
+    /// The ring quad's bounds: a circle of `2 * radius` around the corner's center.
+    ring: Rectangle,
+    /// Border width (and inner radius) of the ring.
+    radius: f32,
+}
+
+/// The two concave corner pieces beside a hole with top corner radius `radius`.
+fn corners(hole: Rectangle, radius: f32) -> [Corner; 2] {
+    let r = radius.min(hole.width / 2.0).min(hole.height);
+    let piece = |corner_x: f32, center_x: f32| Corner {
+        clip: Rectangle {
+            x: corner_x,
+            y: hole.y,
+            width: r,
+            height: r,
+        },
+        ring: Rectangle {
+            x: center_x - 2.0 * r,
+            y: hole.y + r - 2.0 * r,
+            width: 4.0 * r,
+            height: 4.0 * r,
+        },
+        radius: r,
+    };
+    [
+        piece(hole.x, hole.x + r),
+        piece(hole.x + hole.width - r, hole.x + hole.width - r),
+    ]
 }
 
 /// Paints the tab bar's background everywhere except under the active tab (child `hole` of
@@ -373,8 +406,6 @@ struct BarBackground<'a> {
     content: Element<'a, Message>,
     color: Color,
     hole: Option<usize>,
-    /// Top corner radius of the tab in the hole.
-    corner: f32,
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
@@ -474,7 +505,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
                 .map(|tab| tab.bounds())
         });
         let pieces = match hole {
-            Some(h) => around(bounds, h, self.corner),
+            Some(h) => around(bounds, h),
             None => vec![bounds],
         };
         for piece in pieces {
@@ -486,6 +517,28 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
                 },
                 self.color,
             );
+        }
+        if let Some(h) = hole.filter(|h| h.width > 0.0 && h.height > 0.0) {
+            for c in corners(h, TAB_RADIUS) {
+                renderer.with_layer(c.clip, |renderer| {
+                    renderer.fill_quad(
+                        renderer::Quad {
+                            bounds: c.ring,
+                            border: Border {
+                                color: self.color,
+                                // A hair wider than the radius: two translucent
+                                // antialiased edges would otherwise leave a faint
+                                // lighter arc (measured: alpha within 5% along it).
+                                width: c.radius + CORNER_OVERLAP,
+                                radius: (2.0 * c.radius).into(),
+                            },
+                            snap: true,
+                            ..renderer::Quad::default()
+                        },
+                        Color::TRANSPARENT,
+                    );
+                });
+            }
         }
         self.content.as_widget().draw(
             &tree.children[0],
@@ -538,7 +591,6 @@ fn tab_button<'a>(
     index: usize,
     active_bg: Option<Color>,
     height: f32,
-    radius: f32,
 ) -> Element<'a, Message> {
     let window = bar.window;
     let demo_tip = index == 0 && bar.demo_tip == Some(DemoTip::Close);
@@ -602,9 +654,11 @@ fn tab_button<'a>(
                 background: surface_bg.or(hovered.then_some(Background::Color(t.hover))),
                 text_color: t.text,
                 border: Border {
-                    radius: iced::border::Radius::default().top(radius),
+                    radius: iced::border::Radius::default().top(TAB_RADIUS),
                     ..Border::default()
                 },
+                // Snapped like the bar's pieces and corners, so their edges meet exactly.
+                snap: true,
                 ..button::Style::default()
             }
         })
@@ -666,35 +720,67 @@ pub fn save_png(path: &Path, shot: &Screenshot) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    const OUTER: Rectangle = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 600.0,
+        height: 32.0,
+    };
+    const TAB: Rectangle = Rectangle {
+        x: 100.0,
+        y: 4.0,
+        width: 196.0,
+        height: 28.0,
+    };
+
     #[test]
     fn the_bar_background_leaves_the_active_tab_to_itself() {
-        let outer = Rectangle {
-            x: 0.0,
-            y: 0.0,
-            width: 600.0,
-            height: 32.0,
-        };
-        let tab = Rectangle {
-            x: 100.0,
-            y: 4.0,
-            width: 196.0,
-            height: 28.0,
-        };
-        let pieces = around(outer, tab, 6.0);
+        let pieces = around(OUTER, TAB);
         let area = |r: &Rectangle| r.width * r.height;
         let covered: f32 = pieces.iter().map(area).sum();
-        // Everything but the tab, plus its two 6x6 corner squares.
-        assert_eq!(covered, area(&outer) - area(&tab) + 2.0 * 36.0);
-        // Nothing covers the middle of the tab.
-        let inside = iced::Point::new(198.0, 20.0);
-        assert!(pieces.iter().all(|r| !r.contains(inside)));
-        // Square tabs (translucent bar) get no corner squares.
-        let covered: f32 = around(outer, tab, 0.0).iter().map(area).sum();
-        assert_eq!(covered, area(&outer) - area(&tab));
-        assert_eq!(tab_radius(Color::WHITE), TAB_RADIUS);
-        assert_eq!(tab_radius(Color::WHITE.scale_alpha(0.85)), 0.0);
+        // Everything but the tab, with nothing behind its corners.
+        assert_eq!(covered, area(&OUTER) - area(&TAB));
+        for p in [
+            iced::Point::new(198.0, 20.0),
+            iced::Point::new(101.0, 5.0),
+            iced::Point::new(295.0, 5.0),
+        ] {
+            assert!(pieces.iter().all(|r| !r.contains(p)), "{p:?} covered");
+        }
         // With no overlap the whole bar is painted.
-        let away = Rectangle { x: 900.0, ..tab };
-        assert_eq!(around(outer, away, 6.0), vec![outer]);
+        let away = Rectangle { x: 900.0, ..TAB };
+        assert_eq!(around(OUTER, away), vec![OUTER]);
+    }
+
+    #[test]
+    fn concave_corners_fill_exactly_outside_the_tabs_rounding() {
+        let [left, right] = corners(TAB, TAB_RADIUS);
+        let r = TAB_RADIUS;
+        assert_eq!(
+            left.clip,
+            Rectangle::new((100.0, 4.0).into(), Size::new(r, r))
+        );
+        assert_eq!(
+            right.clip,
+            Rectangle::new((290.0, 4.0).into(), Size::new(r, r))
+        );
+        for (c, center) in [(left, (106.0, 10.0)), (right, (290.0, 10.0))] {
+            // The ring is centered on the tab corner's circle ...
+            assert_eq!(c.ring.center(), iced::Point::new(center.0, center.1));
+            // ... its inner edge (outer radius minus border) is that circle ...
+            assert_eq!(c.ring.width / 2.0 - c.radius, r);
+            // ... and its outer edge covers the whole corner square.
+            let far = [c.clip.x, c.clip.x + c.clip.width]
+                .iter()
+                .flat_map(|&x| [(x, c.clip.y), (x, c.clip.y + c.clip.height)])
+                .map(|(x, y)| ((x - center.0).powi(2) + (y - center.1).powi(2)).sqrt())
+                .fold(0.0_f32, f32::max);
+            assert!(far <= c.ring.width / 2.0);
+        }
+        // A tab narrower than two radii keeps its corners inside itself.
+        let thin = Rectangle { width: 8.0, ..TAB };
+        let [l, r] = corners(thin, TAB_RADIUS);
+        assert_eq!(l.radius, 4.0);
+        assert!(l.clip.x + l.clip.width <= r.clip.x);
     }
 }
