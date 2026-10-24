@@ -1,0 +1,1060 @@
+//! Keyboard shortcuts as data: the application actions, chords, the platform defaults, the
+//! user's overrides (the `[keys]` table of `settings.toml`) and the rules for them (which chords
+//! may be bound, which ones programs in the terminal would miss).
+//!
+//! In the file a chord is written as lowercase modifiers and a key joined by `+`, modifiers in
+//! the order `ctrl`, `alt`, `shift`, `cmd`: `"cmd+t"`, `"ctrl+shift+t"`, `"ctrl+alt+f"`,
+//! `"f5"`. `"none"` leaves an action without a chord. Only overrides are stored; the defaults
+//! live here, per platform.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// What an application shortcut asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Action {
+    NewTab,
+    CloseTab,
+    NextTab,
+    PrevTab,
+    /// Select tab `n` (1-based, 1..=9).
+    SelectTab(u8),
+    Palette,
+    NewWindow,
+    /// Save the layout and exit: Cmd+Q on macOS, Ctrl+Shift+Q elsewhere.
+    Quit,
+    /// The profile editor: Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere.
+    EditProfiles,
+    /// The Settings window: Cmd+, on macOS, Ctrl+, elsewhere.
+    Settings,
+    /// Create `settings.toml` if missing and open it with the system's default app (no chord
+    /// by default).
+    OpenSettingsFile,
+    /// Show the config folder in the file manager (no chord by default).
+    RevealConfigFolder,
+    /// The active tab's find bar: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
+    Find,
+    /// The search over every tab: Cmd+Shift+F on macOS, Ctrl+Alt+F elsewhere.
+    FindAll,
+    /// Next match up the scrollback (older), only while the find bar is open: Cmd+G on macOS,
+    /// Ctrl+G elsewhere.
+    FindNext,
+    /// Next match down the scrollback (newer), only while the find bar is open: Cmd+Shift+G on
+    /// macOS, Ctrl+Shift+G elsewhere.
+    FindPrevious,
+}
+
+/// The groups the Settings window lists actions in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionGroup {
+    Tabs,
+    Windows,
+    Search,
+    App,
+}
+
+impl ActionGroup {
+    pub const ALL: [ActionGroup; 4] = [Self::Tabs, Self::Windows, Self::Search, Self::App];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Tabs => "Tabs",
+            Self::Windows => "Windows",
+            Self::Search => "Search",
+            Self::App => "App",
+        }
+    }
+}
+
+impl Action {
+    /// Every action, in the order the Settings window lists them.
+    pub const ALL: [Action; 24] = [
+        Action::NewTab,
+        Action::CloseTab,
+        Action::NextTab,
+        Action::PrevTab,
+        Action::SelectTab(1),
+        Action::SelectTab(2),
+        Action::SelectTab(3),
+        Action::SelectTab(4),
+        Action::SelectTab(5),
+        Action::SelectTab(6),
+        Action::SelectTab(7),
+        Action::SelectTab(8),
+        Action::SelectTab(9),
+        Action::NewWindow,
+        Action::EditProfiles,
+        Action::Settings,
+        Action::Find,
+        Action::FindAll,
+        Action::FindNext,
+        Action::FindPrevious,
+        Action::Palette,
+        Action::OpenSettingsFile,
+        Action::RevealConfigFolder,
+        Action::Quit,
+    ];
+
+    /// The action's name in the `[keys]` table.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::NewTab => "new_tab",
+            Self::CloseTab => "close_tab",
+            Self::NextTab => "next_tab",
+            Self::PrevTab => "previous_tab",
+            Self::SelectTab(1) => "select_tab_1",
+            Self::SelectTab(2) => "select_tab_2",
+            Self::SelectTab(3) => "select_tab_3",
+            Self::SelectTab(4) => "select_tab_4",
+            Self::SelectTab(5) => "select_tab_5",
+            Self::SelectTab(6) => "select_tab_6",
+            Self::SelectTab(7) => "select_tab_7",
+            Self::SelectTab(8) => "select_tab_8",
+            Self::SelectTab(_) => "select_tab_9",
+            Self::Palette => "palette",
+            Self::NewWindow => "new_window",
+            Self::Quit => "quit",
+            Self::EditProfiles => "edit_profiles",
+            Self::Settings => "settings",
+            Self::OpenSettingsFile => "open_settings_file",
+            Self::RevealConfigFolder => "reveal_config_folder",
+            Self::Find => "find",
+            Self::FindAll => "find_all",
+            Self::FindNext => "find_next",
+            Self::FindPrevious => "find_previous",
+        }
+    }
+
+    /// The action named `name` in the `[keys]` table.
+    pub fn from_name(name: &str) -> Option<Action> {
+        Self::ALL.into_iter().find(|a| a.name() == name)
+    }
+
+    /// What the action is called in the app.
+    pub fn title(self) -> String {
+        match self {
+            Self::NewTab => "New tab".into(),
+            Self::CloseTab => "Close tab".into(),
+            Self::NextTab => "Next tab".into(),
+            Self::PrevTab => "Previous tab".into(),
+            Self::SelectTab(n) => format!("Tab {n}"),
+            Self::Palette => "Command palette".into(),
+            Self::NewWindow => "New window".into(),
+            Self::Quit => "Quit".into(),
+            Self::EditProfiles => "Edit profiles".into(),
+            Self::Settings => "Settings".into(),
+            Self::OpenSettingsFile => "Open settings file".into(),
+            Self::RevealConfigFolder => "Reveal config folder".into(),
+            Self::Find => "Find in tab".into(),
+            Self::FindAll => "Find in all tabs".into(),
+            Self::FindNext => "Older match".into(),
+            Self::FindPrevious => "Newer match".into(),
+        }
+    }
+
+    pub fn group(self) -> ActionGroup {
+        match self {
+            Self::NewTab | Self::CloseTab | Self::NextTab | Self::PrevTab | Self::SelectTab(_) => {
+                ActionGroup::Tabs
+            }
+            Self::NewWindow | Self::EditProfiles | Self::Settings => ActionGroup::Windows,
+            Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious => ActionGroup::Search,
+            Self::Palette | Self::OpenSettingsFile | Self::RevealConfigFolder | Self::Quit => {
+                ActionGroup::App
+            }
+        }
+    }
+
+    /// Moving between find-bar matches: these chords act only while the find bar is open, so
+    /// at other times the key still reaches the terminal.
+    pub fn is_find_navigation(self) -> bool {
+        matches!(self, Self::FindNext | Self::FindPrevious)
+    }
+}
+
+/// The key of a chord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChordKey {
+    /// A character key, lowercase for letters.
+    Char(char),
+    /// F1 to F24.
+    F(u8),
+    Up,
+    Down,
+    Left,
+    Right,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Insert,
+    Delete,
+    Backspace,
+    Space,
+    Tab,
+    Enter,
+    Escape,
+}
+
+const NAMED: [(ChordKey, &str); 15] = [
+    (ChordKey::Up, "up"),
+    (ChordKey::Down, "down"),
+    (ChordKey::Left, "left"),
+    (ChordKey::Right, "right"),
+    (ChordKey::PageUp, "pageup"),
+    (ChordKey::PageDown, "pagedown"),
+    (ChordKey::Home, "home"),
+    (ChordKey::End, "end"),
+    (ChordKey::Insert, "insert"),
+    (ChordKey::Delete, "delete"),
+    (ChordKey::Backspace, "backspace"),
+    (ChordKey::Space, "space"),
+    (ChordKey::Tab, "tab"),
+    (ChordKey::Enter, "enter"),
+    (ChordKey::Escape, "escape"),
+];
+
+/// Shifted symbols of a US layout and their unshifted keys: with Shift held, a press may
+/// report either, so chords keep the unshifted one.
+const SHIFTED: [(char, char); 21] = [
+    ('!', '1'),
+    ('@', '2'),
+    ('#', '3'),
+    ('$', '4'),
+    ('%', '5'),
+    ('^', '6'),
+    ('&', '7'),
+    ('*', '8'),
+    ('(', '9'),
+    (')', '0'),
+    ('_', '-'),
+    ('+', '='),
+    ('{', '['),
+    ('}', ']'),
+    ('|', '\\'),
+    (':', ';'),
+    ('"', '\''),
+    ('<', ','),
+    ('>', '.'),
+    ('?', '/'),
+    ('~', '`'),
+];
+
+impl ChordKey {
+    /// A character key, lowercase; `None` for whitespace and control characters.
+    pub fn from_char(c: char) -> Option<Self> {
+        if c == ' ' {
+            return Some(Self::Space);
+        }
+        if c.is_control() || c.is_whitespace() {
+            return None;
+        }
+        let mut lower = c.to_lowercase();
+        let l = lower.next()?;
+        Some(Self::Char(if lower.next().is_none() { l } else { c }))
+    }
+
+    /// The key as written in `settings.toml`.
+    fn config_name(self) -> String {
+        match self {
+            Self::Char('+') => "plus".into(),
+            Self::Char(c) => c.to_string(),
+            Self::F(n) => format!("f{n}"),
+            named => NAMED
+                .iter()
+                .find(|(k, _)| *k == named)
+                .map_or_else(String::new, |(_, n)| (*n).to_owned()),
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        if s == "plus" {
+            return Some(Self::Char('+'));
+        }
+        if let Some((k, _)) = NAMED.iter().find(|(_, n)| *n == s) {
+            return Some(*k);
+        }
+        if let Some(n) = s.strip_prefix('f').and_then(|d| d.parse::<u8>().ok())
+            && (1..=24).contains(&n)
+        {
+            return Some(Self::F(n));
+        }
+        let mut chars = s.chars();
+        let c = chars.next()?;
+        if chars.next().is_some() {
+            return None;
+        }
+        Self::from_char(c)
+    }
+
+    fn label(self, mac: bool) -> String {
+        match self {
+            Self::Char(c) => c.to_uppercase().collect(),
+            Self::F(n) => format!("F{n}"),
+            Self::Up => "↑".into(),
+            Self::Down => "↓".into(),
+            Self::Left => "←".into(),
+            Self::Right => "→".into(),
+            Self::PageUp => "PageUp".into(),
+            Self::PageDown => "PageDown".into(),
+            Self::Home => "Home".into(),
+            Self::End => "End".into(),
+            Self::Insert => "Insert".into(),
+            Self::Delete if mac => "⌦".into(),
+            Self::Delete => "Delete".into(),
+            Self::Backspace if mac => "⌫".into(),
+            Self::Backspace => "Backspace".into(),
+            Self::Space => "Space".into(),
+            Self::Tab if mac => "⇥".into(),
+            Self::Tab => "Tab".into(),
+            Self::Enter if mac => "↩".into(),
+            Self::Enter => "Enter".into(),
+            Self::Escape => "Esc".into(),
+        }
+    }
+}
+
+/// A chord: a key plus the modifiers held with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Chord {
+    pub key: ChordKey,
+    pub ctrl: bool,
+    /// Option on macOS.
+    pub alt: bool,
+    pub shift: bool,
+    /// Cmd on macOS, Super (the Windows key) elsewhere.
+    pub cmd: bool,
+}
+
+impl Chord {
+    /// `key` with no modifiers.
+    pub const fn key(key: ChordKey) -> Self {
+        Self {
+            key,
+            ctrl: false,
+            alt: false,
+            shift: false,
+            cmd: false,
+        }
+    }
+
+    /// A pressed key, with Shift folded in: a shifted symbol (`}` with Shift) is its unshifted
+    /// key (`]`), so the chord does not depend on whether the platform reports the key with
+    /// or without Shift applied.
+    pub fn pressed(key: ChordKey, ctrl: bool, alt: bool, shift: bool, cmd: bool) -> Self {
+        let key = match key {
+            ChordKey::Char(c) if shift => SHIFTED
+                .iter()
+                .find(|(s, _)| *s == c)
+                .map_or(key, |(_, base)| ChordKey::Char(*base)),
+            other => other,
+        };
+        Self {
+            key,
+            ctrl,
+            alt,
+            shift,
+            cmd,
+        }
+    }
+
+    /// Read a chord as written in `settings.toml`: `Ok(None)` for `"none"` (unbound).
+    /// Case and spaces around the parts do not matter; `control`, `option`/`opt`, and
+    /// `command`/`super`/`win` are accepted for `ctrl`, `alt` and `cmd`.
+    pub fn parse(s: &str) -> Result<Option<Chord>, String> {
+        let lower = s.trim().to_lowercase();
+        if lower == "none" {
+            return Ok(None);
+        }
+        if lower.is_empty() {
+            return Err("is empty".into());
+        }
+        let parts: Vec<&str> = lower.split('+').map(str::trim).collect();
+        let Some((key, mods)) = parts.split_last() else {
+            return Err("is empty".into());
+        };
+        let (mut ctrl, mut alt, mut shift, mut cmd) = (false, false, false, false);
+        for m in mods {
+            match *m {
+                "ctrl" | "control" => ctrl = true,
+                "alt" | "opt" | "option" => alt = true,
+                "shift" => shift = true,
+                "cmd" | "command" | "super" | "win" => cmd = true,
+                "" => return Err("has an empty part (write + as \"plus\")".into()),
+                other => return Err(format!("has an unknown modifier {other:?}")),
+            }
+        }
+        if key.is_empty() {
+            return Err("has no key (write + as \"plus\")".into());
+        }
+        let Some(key) = ChordKey::parse(key) else {
+            return Err(format!("has an unknown key {key:?}"));
+        };
+        Ok(Some(Self::pressed(key, ctrl, alt, shift, cmd)))
+    }
+
+    /// The chord as written in `settings.toml`: `cmd` is written `super` off macOS.
+    pub fn to_config(self, mac: bool) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.ctrl {
+            parts.push("ctrl".into());
+        }
+        if self.alt {
+            parts.push("alt".into());
+        }
+        if self.shift {
+            parts.push("shift".into());
+        }
+        if self.cmd {
+            parts.push(if mac { "cmd" } else { "super" }.into());
+        }
+        parts.push(self.key.config_name());
+        parts.join("+")
+    }
+
+    /// How the chord is shown: `⇧⌘,` on macOS, `Ctrl+Shift+T` elsewhere.
+    pub fn label(self, mac: bool) -> String {
+        let key = self.key.label(mac);
+        if mac {
+            let mut s = String::new();
+            if self.ctrl {
+                s.push('⌃');
+            }
+            if self.alt {
+                s.push('⌥');
+            }
+            if self.shift {
+                s.push('⇧');
+            }
+            if self.cmd {
+                s.push('⌘');
+            }
+            s.push_str(&key);
+            s
+        } else {
+            let mut parts: Vec<String> = Vec::new();
+            if self.ctrl {
+                parts.push("Ctrl".into());
+            }
+            if self.alt {
+                parts.push("Alt".into());
+            }
+            if self.shift {
+                parts.push("Shift".into());
+            }
+            if self.cmd {
+                parts.push("Super".into());
+            }
+            parts.push(key);
+            parts.join("+")
+        }
+    }
+
+    /// Whether the chord may be bound: it needs Ctrl, Alt or Cmd (Super), except F1 to F12,
+    /// and Escape is never a shortcut (it cancels recording, closes bars and dialogs).
+    pub fn allowed(self) -> Result<(), &'static str> {
+        if self.key == ChordKey::Escape {
+            return Err("Escape cannot be a shortcut");
+        }
+        if self.ctrl || self.alt || self.cmd {
+            return Ok(());
+        }
+        match self.key {
+            ChordKey::F(n) if n <= 12 => Ok(()),
+            _ => Err("needs Ctrl, Alt or Cmd (only F1 to F12 work alone)"),
+        }
+    }
+}
+
+impl fmt::Display for Chord {
+    /// The `settings.toml` form for this platform.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_config(cfg!(target_os = "macos")))
+    }
+}
+
+fn mac_chord(key: char, shift: bool) -> Chord {
+    Chord {
+        key: ChordKey::Char(key),
+        ctrl: false,
+        alt: false,
+        shift,
+        cmd: true,
+    }
+}
+
+fn ctrl_chord(key: char, shift: bool, alt: bool) -> Chord {
+    Chord {
+        key: ChordKey::Char(key),
+        ctrl: true,
+        alt,
+        shift,
+        cmd: false,
+    }
+}
+
+/// The built-in chord for `action` on macOS (`mac`) or the other platforms, if it has one.
+///
+/// macOS chords use Cmd (with Shift where noted) and never Ctrl or Option. Elsewhere chords
+/// are Ctrl+Shift, so plain Ctrl keys keep reaching the terminal; the exceptions are Ctrl+,
+/// for Settings (the comma has no control code of its own), Ctrl+Alt+F for find in all tabs,
+/// and Ctrl+G / Ctrl+Shift+G, which only act while the find bar is open.
+pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
+    let (key, mac_shift) = match action {
+        Action::NewTab => ('t', false),
+        Action::CloseTab => ('w', false),
+        Action::NewWindow => ('n', false),
+        Action::Quit => ('q', false),
+        Action::NextTab => (']', true),
+        Action::PrevTab => ('[', true),
+        Action::Palette => ('p', true),
+        Action::SelectTab(n @ 1..=9) => (char::from(b'0' + n), false),
+        Action::EditProfiles => (',', true),
+        Action::Settings if !mac => return Some(ctrl_chord(',', false, false)),
+        Action::Settings => (',', false),
+        Action::Find => ('f', false),
+        Action::FindAll if !mac => return Some(ctrl_chord('f', false, true)),
+        Action::FindAll => ('f', true),
+        Action::FindNext | Action::FindPrevious => {
+            let shift = action == Action::FindPrevious;
+            return Some(if mac {
+                mac_chord('g', shift)
+            } else {
+                ctrl_chord('g', shift, false)
+            });
+        }
+        Action::SelectTab(_) | Action::OpenSettingsFile | Action::RevealConfigFolder => {
+            return None;
+        }
+    };
+    Some(if mac {
+        mac_chord(key, mac_shift)
+    } else {
+        ctrl_chord(key, true, false)
+    })
+}
+
+/// The user's changes to the default chords: an action mapped to `Some(chord)` or to `None`
+/// (unbound). Actions not listed keep their default.
+pub type Overrides = BTreeMap<Action, Option<Chord>>;
+
+/// The `[keys]` table of `settings.toml`. Loading is lenient: entries that do not name an
+/// action or a chord that may be bound are kept aside as problems for
+/// [`crate::Settings::clamp`] to report, and those actions keep their default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KeyOverrides {
+    pub map: Overrides,
+    /// `(name as written, what is wrong)` for entries not taken.
+    pub invalid: Vec<(String, String)>,
+}
+
+impl KeyOverrides {
+    /// Drop overrides that give a chord to two actions. Each overridden action that shares its
+    /// chord falls back to its default, until no chord is shared (the defaults never share
+    /// one). Returns `(action, chord, the other action)` for each override dropped.
+    pub fn resolve_conflicts(&mut self, mac: bool) -> Vec<(Action, Chord, Action)> {
+        let mut dropped = Vec::new();
+        loop {
+            let bindings = Bindings::new(mac, &self.map);
+            let clash = self.map.iter().find_map(|(action, chord)| {
+                let chord = (*chord)?;
+                let other = Action::ALL
+                    .into_iter()
+                    .find(|a| a != action && bindings.chord(*a) == Some(chord))?;
+                Some((*action, chord, other))
+            });
+            let Some((action, chord, other)) = clash else {
+                return dropped;
+            };
+            self.map.remove(&action);
+            dropped.push((action, chord, other));
+        }
+    }
+}
+
+impl Serialize for KeyOverrides {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mac = cfg!(target_os = "macos");
+        let mut m = s.serialize_map(Some(self.map.len()))?;
+        for (action, chord) in &self.map {
+            let value = chord.map_or_else(|| "none".to_owned(), |c| c.to_config(mac));
+            m.serialize_entry(action.name(), &value)?;
+        }
+        m.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyOverrides {
+    /// Lenient: any table loads; what is not a known action with a chord that may be bound is
+    /// listed in [`KeyOverrides::invalid`] (a value that is not a table is still a type error).
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Str(String),
+            Other(toml::Value),
+        }
+        let raw = BTreeMap::<String, Raw>::deserialize(d)?;
+        let mut out = Self::default();
+        for (name, value) in raw {
+            let Some(action) = Action::from_name(&name) else {
+                out.invalid
+                    .push((name, "is not an action, ignored".to_owned()));
+                continue;
+            };
+            let text = match value {
+                Raw::Str(s) => s,
+                Raw::Other(v) => {
+                    out.invalid.push((
+                        name,
+                        format!("{v} is not a chord in quotes, using the default"),
+                    ));
+                    continue;
+                }
+            };
+            match Chord::parse(&text) {
+                Ok(Some(chord)) => match chord.allowed() {
+                    Ok(()) => {
+                        out.map.insert(action, Some(chord));
+                    }
+                    Err(why) => out
+                        .invalid
+                        .push((name, format!("{text:?}: {why}, using the default"))),
+                },
+                Ok(None) => {
+                    out.map.insert(action, None);
+                }
+                Err(why) => out
+                    .invalid
+                    .push((name, format!("{text:?} {why}, using the default"))),
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The chord of every action: the platform defaults with the overrides applied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Bindings {
+    mac: bool,
+    overrides: Overrides,
+}
+
+impl Bindings {
+    /// The bindings for macOS (`mac`) or the other platforms with `overrides` applied.
+    pub fn new(mac: bool, overrides: &Overrides) -> Self {
+        Self {
+            mac,
+            overrides: overrides.clone(),
+        }
+    }
+
+    /// The built-in bindings.
+    pub fn defaults(mac: bool) -> Self {
+        Self::new(mac, &Overrides::new())
+    }
+
+    /// The bindings of this platform with `overrides` applied.
+    pub fn current(overrides: &Overrides) -> Self {
+        Self::new(cfg!(target_os = "macos"), overrides)
+    }
+
+    pub fn mac(&self) -> bool {
+        self.mac
+    }
+
+    pub fn overrides(&self) -> &Overrides {
+        &self.overrides
+    }
+
+    /// The chord that triggers `action`, if it has one.
+    pub fn chord(&self, action: Action) -> Option<Chord> {
+        match self.overrides.get(&action) {
+            Some(chord) => *chord,
+            None => default_chord(self.mac, action),
+        }
+    }
+
+    /// The action `chord` triggers, if any.
+    pub fn action(&self, chord: Chord) -> Option<Action> {
+        Action::ALL
+            .into_iter()
+            .find(|a| self.chord(*a) == Some(chord))
+    }
+
+    /// Whether `action` has its default chord.
+    pub fn is_default(&self, action: Action) -> bool {
+        self.chord(action) == default_chord(self.mac, action)
+    }
+
+    /// The chord's label for `action`, if it has a chord.
+    pub fn label(&self, action: Action) -> Option<String> {
+        self.chord(action).map(|c| c.label(self.mac))
+    }
+}
+
+/// `overrides` with `action` set to `chord` (`None`: unbound): an override equal to the
+/// default is dropped, so only real changes are stored.
+pub fn set_override(mac: bool, overrides: &mut Overrides, action: Action, chord: Option<Chord>) {
+    if default_chord(mac, action) == chord {
+        overrides.remove(&action);
+    } else {
+        overrides.insert(action, chord);
+    }
+}
+
+/// What programs in the terminal use well-known Ctrl chords for (Ctrl plus the key, no other
+/// modifier).
+const CTRL_USES: [(char, &str); 27] = [
+    (
+        'a',
+        "moves to the start of the line in bash and zsh, and is a common tmux prefix",
+    ),
+    (
+        'b',
+        "is the default tmux prefix, and moves back a character in bash and zsh",
+    ),
+    ('c', "interrupts the running program"),
+    ('d', "ends input, which exits a shell"),
+    ('e', "moves to the end of the line in bash and zsh"),
+    (
+        'f',
+        "moves forward a character in bash and zsh, and scrolls a page in vim",
+    ),
+    ('g', "cancels a command in emacs"),
+    ('h', "is Backspace for many programs"),
+    ('i', "is Tab for programs in the terminal"),
+    ('j', "is a new line for programs in the terminal"),
+    ('k', "deletes to the end of the line in bash and zsh"),
+    ('l', "clears the screen in bash and zsh"),
+    ('m', "is Enter for programs in the terminal"),
+    (
+        'n',
+        "is the next history entry in bash and zsh, and the next line in emacs",
+    ),
+    ('o', "opens a line in emacs, and jumps back in vim"),
+    (
+        'p',
+        "is the previous history entry in bash and zsh, and the previous line in emacs",
+    ),
+    ('q', "resumes output paused with Ctrl+S"),
+    ('r', "is reverse search in bash and zsh"),
+    ('s', "pauses output, and searches forward in emacs"),
+    ('t', "swaps two characters in bash and zsh"),
+    ('u', "deletes to the start of the line in bash and zsh"),
+    (
+        'v',
+        "inserts the next key as typed in bash and zsh, and selects a block in vim",
+    ),
+    (
+        'w',
+        "deletes the previous word in bash and zsh, and starts window commands in vim",
+    ),
+    ('x', "starts most commands in emacs"),
+    ('y', "pastes the last deleted text in bash and zsh"),
+    ('z', "suspends the running program"),
+    ('\\', "quits the running program"),
+];
+
+/// What programs use well-known Alt (Meta) chords for.
+const ALT_USES: [(char, &str); 6] = [
+    ('b', "moves back a word in bash, zsh and emacs"),
+    ('f', "moves forward a word in bash, zsh and emacs"),
+    ('d', "deletes the next word in bash, zsh and emacs"),
+    (
+        '.',
+        "inserts the last argument of the previous command in bash and zsh",
+    ),
+    ('x', "runs a command by name in emacs"),
+    ('w', "copies the selection in emacs"),
+];
+
+/// Why binding `chord` would take a key from programs in the terminal, or `None` when they
+/// would not normally receive it. On macOS that is any chord without Cmd. Elsewhere: Alt
+/// chords (Meta in bash, zsh and emacs), Ctrl chords without Shift on letters, the control
+/// symbols, Space and the editing keys, and F keys without Ctrl, Alt or Super. Chords with Super
+/// stay with the app; Ctrl+Alt chords are not flagged (AltGr typing is let through).
+pub fn risk(mac: bool, chord: Chord) -> Option<String> {
+    let label = chord.label(mac);
+    let lost = "Programs in the terminal will no longer receive it.";
+    let ctrl_only = chord.ctrl && !chord.alt && !chord.shift && !chord.cmd;
+    let alt_only = chord.alt && !chord.ctrl && !chord.cmd;
+    let known = match chord.key {
+        ChordKey::Char(c) if ctrl_only => CTRL_USES.iter().find(|(k, _)| *k == c),
+        ChordKey::Char(c) if alt_only && !chord.shift && !mac => {
+            ALT_USES.iter().find(|(k, _)| *k == c)
+        }
+        _ => None,
+    };
+    if let Some((_, what)) = known {
+        return Some(format!("{label} {what}. {lost}"));
+    }
+    if chord.cmd {
+        return None;
+    }
+    if mac {
+        return Some(format!(
+            "{label} is a key programs in the terminal can use. {lost}"
+        ));
+    }
+    if alt_only {
+        return Some(format!(
+            "{label} is a Meta key in bash, zsh and emacs. {lost}"
+        ));
+    }
+    if ctrl_only {
+        let control_key = match chord.key {
+            ChordKey::Char(c) => c.is_ascii_alphabetic() || "[]\\/@^_2345678".contains(c),
+            ChordKey::Space
+            | ChordKey::Up
+            | ChordKey::Down
+            | ChordKey::Left
+            | ChordKey::Right
+            | ChordKey::Home
+            | ChordKey::End
+            | ChordKey::PageUp
+            | ChordKey::PageDown
+            | ChordKey::Backspace
+            | ChordKey::Delete
+            | ChordKey::Insert
+            | ChordKey::Tab
+            | ChordKey::Enter => true,
+            ChordKey::F(_) | ChordKey::Escape => false,
+        };
+        if control_key {
+            return Some(format!(
+                "{label} is a control key programs in the terminal use. {lost}"
+            ));
+        }
+    }
+    if !chord.ctrl && !chord.alt && matches!(chord.key, ChordKey::F(_)) {
+        return Some(format!(
+            "{label}: full-screen programs such as htop and mc use F keys. {lost}"
+        ));
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(s: &str) -> Chord {
+        Chord::parse(s).unwrap().unwrap()
+    }
+
+    #[test]
+    fn chords_parse_and_format_round_trip() {
+        for (text, mac) in [
+            ("cmd+t", true),
+            ("ctrl+shift+t", false),
+            ("ctrl+alt+f", false),
+            ("shift+cmd+]", true),
+            ("ctrl+alt+shift+super+f5", false),
+            ("ctrl+plus", false),
+            ("alt+space", false),
+            ("ctrl+pageup", false),
+            ("f12", true),
+            ("cmd+,", true),
+        ] {
+            let chord = c(text);
+            let written = chord.to_config(mac);
+            assert_eq!(c(&written), chord, "{text} -> {written}");
+        }
+        assert_eq!(c("Ctrl + Shift + T").to_config(false), "ctrl+shift+t");
+        assert_eq!(c("shift+ctrl+t").to_config(false), "ctrl+shift+t");
+        assert_eq!(c("command+option+t").to_config(true), "alt+cmd+t");
+        assert_eq!(c("super+t").to_config(true), "cmd+t");
+        assert_eq!(c("cmd+t").to_config(false), "super+t");
+        assert_eq!(Chord::parse("none"), Ok(None));
+        assert_eq!(Chord::parse(" None "), Ok(None));
+    }
+
+    #[test]
+    fn shifted_symbols_fold_to_their_key_only_with_shift() {
+        assert_eq!(c("cmd+shift+}"), c("cmd+shift+]"));
+        assert_eq!(c("ctrl+shift+<"), c("ctrl+shift+,"));
+        assert_eq!(c("ctrl+shift+!"), c("ctrl+shift+1"));
+        // Without Shift a symbol is its own key (on some layouts `<` has a key of its own).
+        assert_eq!(c("ctrl+<").key, ChordKey::Char('<'));
+        assert_eq!(
+            Chord::pressed(ChordKey::Char('}'), false, false, true, true),
+            c("cmd+shift+]")
+        );
+    }
+
+    #[test]
+    fn bad_chords_say_why() {
+        for (text, why) in [
+            ("", "is empty"),
+            ("ctrl+", "has no key"),
+            ("ctrl++", "empty part"),
+            ("hyper+t", "unknown modifier"),
+            ("ctrl+enterr", "unknown key"),
+            ("ctrl+f25", "unknown key"),
+        ] {
+            let err = Chord::parse(text).unwrap_err();
+            assert!(err.contains(why), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn only_chords_with_a_modifier_or_f_keys_may_be_bound() {
+        assert!(c("t").allowed().is_err());
+        assert!(c("shift+t").allowed().is_err());
+        assert!(c("enter").allowed().is_err());
+        assert!(c("tab").allowed().is_err());
+        assert!(c("ctrl+escape").allowed().is_err());
+        assert!(c("escape").allowed().is_err());
+        assert!(c("f13").allowed().is_err());
+        assert!(c("f1").allowed().is_ok());
+        assert!(c("shift+f12").allowed().is_ok());
+        assert!(c("ctrl+t").allowed().is_ok());
+        assert!(c("alt+t").allowed().is_ok());
+        assert!(c("cmd+t").allowed().is_ok());
+        assert!(c("ctrl+tab").allowed().is_ok());
+    }
+
+    #[test]
+    fn labels_per_platform() {
+        assert_eq!(c("shift+cmd+,").label(true), "⇧⌘,");
+        assert_eq!(c("ctrl+shift+t").label(false), "Ctrl+Shift+T");
+        assert_eq!(c("ctrl+alt+f").label(false), "Ctrl+Alt+F");
+        assert_eq!(c("ctrl+alt+f").label(true), "⌃⌥F");
+        assert_eq!(c("super+t").label(false), "Super+T");
+        assert_eq!(c("f5").label(false), "F5");
+        assert_eq!(c("cmd+up").label(true), "⌘↑");
+    }
+
+    #[test]
+    fn every_action_has_a_unique_name() {
+        for a in Action::ALL {
+            assert_eq!(Action::from_name(a.name()), Some(a));
+        }
+        let mut names: Vec<&str> = Action::ALL.iter().map(|a| a.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Action::ALL.len());
+        assert_eq!(Action::from_name("nope"), None);
+    }
+
+    #[test]
+    fn defaults_never_share_a_chord_and_may_all_be_bound() {
+        for mac in [true, false] {
+            let b = Bindings::defaults(mac);
+            let chords: Vec<Chord> = Action::ALL.iter().filter_map(|a| b.chord(*a)).collect();
+            for (i, a) in chords.iter().enumerate() {
+                assert!(!chords[i + 1..].contains(a), "{} twice", a.label(mac));
+                assert!(a.allowed().is_ok(), "{}", a.label(mac));
+            }
+        }
+    }
+
+    #[test]
+    fn overrides_replace_or_clear_a_default() {
+        let mut o = Overrides::new();
+        set_override(true, &mut o, Action::NewTab, Some(c("cmd+shift+t")));
+        set_override(true, &mut o, Action::CloseTab, None);
+        set_override(true, &mut o, Action::Quit, Some(c("cmd+q")));
+        assert!(!o.contains_key(&Action::Quit), "the default is not stored");
+        let b = Bindings::new(true, &o);
+        assert_eq!(b.chord(Action::NewTab), Some(c("cmd+shift+t")));
+        assert_eq!(b.action(c("cmd+shift+t")), Some(Action::NewTab));
+        assert_eq!(b.action(c("cmd+t")), None);
+        assert_eq!(b.chord(Action::CloseTab), None);
+        assert!(!b.is_default(Action::CloseTab));
+        assert!(b.is_default(Action::Quit));
+        // Unbinding an action that has no default stores nothing.
+        set_override(true, &mut o, Action::OpenSettingsFile, None);
+        assert!(!o.contains_key(&Action::OpenSettingsFile));
+    }
+
+    #[test]
+    fn conflicting_overrides_fall_back_to_their_default() {
+        let mut k = KeyOverrides::default();
+        // Takes Close tab's chord while Close tab keeps it.
+        k.map.insert(Action::NewTab, Some(c("cmd+w")));
+        // A swap is fine.
+        k.map.insert(Action::Find, Some(c("cmd+shift+g")));
+        k.map.insert(Action::FindPrevious, Some(c("cmd+f")));
+        let dropped = k.resolve_conflicts(true);
+        assert_eq!(dropped, [(Action::NewTab, c("cmd+w"), Action::CloseTab)]);
+        assert!(!k.map.contains_key(&Action::NewTab));
+        assert_eq!(k.map.len(), 2);
+        // Two overrides on one chord: both go, one by one.
+        let mut k = KeyOverrides::default();
+        k.map
+            .insert(Action::OpenSettingsFile, Some(c("cmd+shift+o")));
+        k.map
+            .insert(Action::RevealConfigFolder, Some(c("cmd+shift+o")));
+        let dropped = k.resolve_conflicts(true);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(k.map.len(), 1);
+        // Falling back can clash again: that override goes too.
+        let mut k = KeyOverrides::default();
+        k.map.insert(Action::NewTab, Some(c("cmd+w")));
+        k.map.insert(Action::CloseTab, Some(c("cmd+t")));
+        k.map.insert(Action::Quit, Some(c("cmd+t")));
+        k.resolve_conflicts(true);
+        let b = Bindings::new(true, &k.map);
+        let chords: Vec<Chord> = Action::ALL.iter().filter_map(|a| b.chord(*a)).collect();
+        for (i, a) in chords.iter().enumerate() {
+            assert!(!chords[i + 1..].contains(a), "{} twice", a.label(true));
+        }
+    }
+
+    #[test]
+    fn risky_chords_name_what_is_lost() {
+        let r = |mac, s: &str| risk(mac, c(s));
+        assert_eq!(
+            r(false, "ctrl+r").as_deref(),
+            Some(
+                "Ctrl+R is reverse search in bash and zsh. Programs in the terminal will no \
+                 longer receive it."
+            )
+        );
+        assert!(
+            r(true, "ctrl+r")
+                .unwrap()
+                .starts_with("⌃R is reverse search")
+        );
+        assert!(r(false, "ctrl+b").unwrap().contains("tmux"));
+        assert!(r(false, "ctrl+w").unwrap().contains("vim"));
+        assert!(r(false, "alt+f").unwrap().contains("emacs"));
+        assert!(r(false, "alt+q").unwrap().contains("Meta"));
+        assert!(r(false, "ctrl+[").unwrap().contains("control key"));
+        assert!(r(false, "f5").unwrap().contains("F keys"));
+        assert!(r(true, "f5").is_some());
+        assert!(r(true, "alt+t").is_some());
+        assert!(r(true, "ctrl+shift+t").is_some());
+        // Not risky: Cmd chords on macOS, Ctrl+Shift, Super and Ctrl+Alt elsewhere.
+        assert_eq!(r(true, "cmd+t"), None);
+        assert_eq!(r(true, "ctrl+cmd+t"), None);
+        assert_eq!(r(false, "ctrl+shift+t"), None);
+        assert_eq!(r(false, "super+t"), None);
+        assert_eq!(r(false, "ctrl+alt+f"), None);
+        assert_eq!(r(false, "ctrl+,"), None);
+        assert_eq!(r(false, "ctrl+f5"), None);
+    }
+
+    #[test]
+    fn no_default_is_risky_except_the_find_bar_keys() {
+        for mac in [true, false] {
+            for a in Action::ALL {
+                if let Some(chord) = default_chord(mac, a) {
+                    let risky = risk(mac, chord).is_some();
+                    assert_eq!(
+                        risky,
+                        !mac && a == Action::FindNext,
+                        "{} {}",
+                        a.name(),
+                        chord.label(mac)
+                    );
+                }
+            }
+        }
+    }
+}

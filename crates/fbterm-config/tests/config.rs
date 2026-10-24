@@ -468,9 +468,12 @@ fn settings_template_parses_to_defaults_with_every_setting_uncommented() {
     let uncommented: String = SETTINGS_TEMPLATE
         .lines()
         .map(|l| {
-            // Setting lines are `#name = value`; prose lines start with `# `.
+            // Setting lines are `#name = value` (and the `#[keys]` table); prose lines start
+            // with `# `.
             match l.strip_prefix('#') {
-                Some(rest) if rest.starts_with(|c: char| c.is_ascii_lowercase()) => rest,
+                Some(rest) if rest.starts_with(|c: char| c.is_ascii_lowercase() || c == '[') => {
+                    rest
+                }
                 _ => l,
             }
         })
@@ -514,4 +517,68 @@ fn writing_the_template_leaves_a_dangling_symlink_alone() {
     assert!(!Settings::write_template_if_missing(&path).unwrap());
     assert!(!target.exists());
     assert_eq!(std::fs::read_link(&path).unwrap(), target);
+}
+
+#[test]
+fn key_overrides_load_and_bad_entries_are_reported_and_use_the_default() {
+    use fbterm_config::keys::{Action, Bindings, Chord};
+    let path = tmp("settings.toml");
+    std::fs::write(
+        &path,
+        "font_size = 14.0\n\
+         \n\
+         [keys]\n\
+         new_tab = \"ctrl+alt+shift+t\"\n\
+         close_tab = \"none\"\n\
+         nwe_window = \"ctrl+alt+n\"\n\
+         quit = \"q\"\n\
+         find = \"ctrl+shift+f+g\"\n\
+         palette = 3\n",
+    )
+    .unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.font_size, 14.0, "the rest of the file still applies");
+    let chord = |t: &str| Chord::parse(t).unwrap();
+    assert_eq!(
+        s.keys.map.get(&Action::NewTab),
+        Some(&chord("ctrl+alt+shift+t"))
+    );
+    assert_eq!(s.keys.map.get(&Action::CloseTab), Some(&None));
+    assert_eq!(s.keys.map.len(), 2, "{:?}", s.keys.map);
+    assert!(s.keys.invalid.is_empty());
+    let b = Bindings::current(&s.keys.map);
+    assert!(
+        b.is_default(Action::Quit) && b.is_default(Action::Find) && b.is_default(Action::Palette)
+    );
+    let w = warning.expect("bad entries are reported");
+    for part in [
+        "keys.find \"ctrl+shift+f+g\" has an unknown modifier \"f\"",
+        "keys.nwe_window is not an action",
+        "keys.palette 3 is not a chord",
+        "keys.quit \"q\": needs Ctrl, Alt or Cmd",
+    ] {
+        assert!(w.message.contains(part), "{part}: {}", w.message);
+    }
+    // The line of the first problem (entries are checked by name).
+    assert_eq!(w.line, Some(8));
+}
+
+#[test]
+fn a_key_override_on_another_actions_chord_falls_back_with_a_notice() {
+    use fbterm_config::keys::{Action, Bindings, default_chord};
+    let mac = cfg!(target_os = "macos");
+    let close = default_chord(mac, Action::CloseTab).unwrap().to_config(mac);
+    let path = tmp("settings.toml");
+    std::fs::write(&path, format!("[keys]\nnew_tab = \"{close}\"\n")).unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert!(s.keys.map.is_empty());
+    assert!(Bindings::current(&s.keys.map).is_default(Action::NewTab));
+    let w = warning.unwrap();
+    assert!(
+        w.message
+            .contains("is already used by close_tab, using the default"),
+        "{}",
+        w.message
+    );
+    assert_eq!(w.line, Some(2));
 }
