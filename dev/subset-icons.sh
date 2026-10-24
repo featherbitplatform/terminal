@@ -8,7 +8,7 @@
 set -euo pipefail
 
 VERSION=1.54.0
-ICONS=(x plus users chevron-up chevron-down copy shield-alert lock)
+ICONS=(x plus users chevron-up chevron-down copy shield-alert lock settings rotate-ccw triangle-alert)
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)

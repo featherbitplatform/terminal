@@ -1,4 +1,5 @@
 use super::*;
+use fbterm_config::keys::{Action, Chord};
 
 fn state() -> SettingsState {
     SettingsState::new(
@@ -262,4 +263,135 @@ fn the_cpu_hint_shows_above_60() {
     assert_eq!(s.rate_hint(), RATE_HINT);
     s.display_hz = Some(120);
     assert_eq!(s.rate_hint(), RATE_CPU_HINT);
+}
+
+fn chord(s: &str) -> Chord {
+    Chord::parse(s).unwrap().unwrap()
+}
+
+/// A chord no action has by default on any platform.
+const FREE: &str = "ctrl+alt+shift+k";
+
+#[test]
+fn a_recorded_free_chord_is_applied_and_written_at_once() {
+    let mut s = state();
+    s.update(SettingsMsg::Record(Action::NewTab));
+    assert!(s.recording.is_some());
+    let e = s.update(SettingsMsg::Pressed(Some(chord(FREE))));
+    assert!(s.recording.is_none());
+    let Some(SettingChange::Keys(o)) = e.apply else {
+        panic!("{e:?}");
+    };
+    assert_eq!(o.get(&Action::NewTab), Some(&Some(chord(FREE))));
+    assert_eq!(e.write, Write::Now);
+    assert_eq!(s.bindings().chord(Action::NewTab), Some(chord(FREE)));
+    // Recording its own chord again changes nothing.
+    s.update(SettingsMsg::Record(Action::NewTab));
+    assert_eq!(
+        s.update(SettingsMsg::Pressed(Some(chord(FREE)))),
+        Effect::NONE
+    );
+    assert!(s.recording.is_none());
+}
+
+#[test]
+fn a_chord_that_cannot_be_bound_keeps_recording_and_says_why() {
+    let mut s = state();
+    s.update(SettingsMsg::Record(Action::Quit));
+    for pressed in [
+        Some(chord("q")),
+        Some(chord("shift+q")),
+        Some(chord("enter")),
+        None,
+    ] {
+        assert_eq!(s.update(SettingsMsg::Pressed(pressed)), Effect::NONE);
+        let r = s.recording.as_ref().expect("still recording");
+        assert!(
+            matches!(r.problem, Some(RecordProblem::NotAllowed(_))),
+            "{pressed:?}: {r:?}"
+        );
+    }
+    // F keys work alone.
+    s.update(SettingsMsg::Pressed(Some(chord("f9"))));
+    assert!(s.recording.is_none());
+    assert_eq!(s.bindings().chord(Action::Quit), Some(chord("f9")));
+}
+
+#[test]
+fn a_taken_chord_names_its_action_and_can_be_taken_over_or_left() {
+    let mut s = state();
+    let close = s.bindings().chord(Action::CloseTab).unwrap();
+    s.update(SettingsMsg::Record(Action::NewTab));
+    assert_eq!(s.update(SettingsMsg::Pressed(Some(close))), Effect::NONE);
+    assert_eq!(
+        s.recording.as_ref().unwrap().problem,
+        Some(RecordProblem::Taken {
+            chord: close,
+            other: Action::CloseTab
+        })
+    );
+    // Cancel: nothing changed.
+    s.update(SettingsMsg::CancelRecording);
+    assert!(s.recording.is_none());
+    assert!(s.values.keys.map.is_empty());
+    // Take over: the other action is left without a chord.
+    s.update(SettingsMsg::Record(Action::NewTab));
+    s.update(SettingsMsg::Pressed(Some(close)));
+    let e = s.update(SettingsMsg::TakeOver);
+    assert_eq!(e.write, Write::Now);
+    let b = s.bindings();
+    assert_eq!(b.chord(Action::NewTab), Some(close));
+    assert_eq!(b.chord(Action::CloseTab), None);
+    assert_eq!(b.action(close), Some(Action::NewTab));
+    // Take over with nothing taken does nothing.
+    assert_eq!(s.update(SettingsMsg::TakeOver), Effect::NONE);
+}
+
+#[test]
+fn rows_reset_and_clear_and_restore_defaults_resets_all() {
+    let mut s = state();
+    let defaults = s.bindings();
+    s.update(SettingsMsg::ClearKey(Action::Find));
+    assert_eq!(s.bindings().chord(Action::Find), None);
+    s.update(SettingsMsg::Record(Action::OpenSettingsFile));
+    s.update(SettingsMsg::Pressed(Some(chord(FREE))));
+    assert_eq!(s.values.keys.map.len(), 2);
+    // Reset one row.
+    s.update(SettingsMsg::ResetKey(Action::Find));
+    assert!(s.bindings().is_default(Action::Find));
+    // A row with no default chord resets to none.
+    s.update(SettingsMsg::ResetKey(Action::OpenSettingsFile));
+    assert!(s.values.keys.map.is_empty());
+    // Resetting a row whose default another action took asks first.
+    let quit = defaults.chord(Action::Quit).unwrap();
+    s.update(SettingsMsg::Record(Action::NewWindow));
+    s.update(SettingsMsg::Pressed(Some(quit)));
+    s.update(SettingsMsg::TakeOver);
+    assert_eq!(s.bindings().chord(Action::Quit), None);
+    s.update(SettingsMsg::ResetKey(Action::Quit));
+    assert!(matches!(
+        s.recording.as_ref().unwrap().problem,
+        Some(RecordProblem::Taken {
+            other: Action::NewWindow,
+            ..
+        })
+    ));
+    s.update(SettingsMsg::CancelRecording);
+    // Restore defaults.
+    let e = s.update(SettingsMsg::ResetKeys);
+    assert_eq!(e.apply, Some(SettingChange::Keys(Default::default())));
+    assert_eq!(s.bindings(), defaults);
+}
+
+#[test]
+fn a_read_only_window_records_nothing() {
+    let err = ConfigError {
+        path: "settings.toml".into(),
+        line: None,
+        message: "invalid".into(),
+    };
+    let mut s = SettingsState::new(&Settings::default(), Vec::new(), Some(err));
+    s.update(SettingsMsg::Record(Action::NewTab));
+    assert!(s.recording.is_none());
+    assert_eq!(s.update(SettingsMsg::ResetKeys), Effect::NONE);
 }

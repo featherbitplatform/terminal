@@ -1,14 +1,15 @@
-//! The Settings window: Appearance and Terminal cards of labelled controls, and a footer with
-//! the settings file actions.
+//! The Settings window: Appearance, Terminal and Keyboard cards of labelled controls, and a
+//! footer with the settings file actions.
 
 use fbterm_config::ThemeMode;
+use fbterm_config::keys::{Action, ActionGroup, Bindings, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, text, text_input, toggler,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::{SettingsMsg, SettingsState};
+use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
@@ -43,7 +44,8 @@ pub fn view<'a>(
     }
     body = body
         .push(section(t, "Appearance", appearance(t, state, editable)))
-        .push(section(t, "Terminal", terminal(t, state, editable)));
+        .push(section(t, "Terminal", terminal(t, state, editable)))
+        .push(keyboard(t, state, editable));
     let page = scrollable(
         container(container(body).max_width(CONTENT_WIDTH))
             .padding(Padding::from([24.0, 32.0]))
@@ -332,6 +334,226 @@ fn terminal<'a>(
         ),
         setting(t, "Redraw rate", Some(state.rate_hint()), false, rate),
     ]
+}
+
+/// The Keyboard card: every action with its chord, by group. A click on a chord records a new
+/// one; changed rows can go back to their default, any row can be left without a chord.
+fn keyboard<'a>(
+    t: &'static Tokens,
+    state: &'a SettingsState,
+    editable: bool,
+) -> Element<'a, Message> {
+    let bindings = state.bindings();
+    let changed = !state.values.keys.map.is_empty();
+    let header = row![
+        column![
+            text("Keyboard").font(UI_FONT).size(13.5).color(t.text),
+            text("Click a shortcut to record a new one.")
+                .font(UI_FONT)
+                .size(12)
+                .color(t.text_muted),
+        ]
+        .spacing(3)
+        .width(Length::Fill),
+        ui::text_button(
+            t,
+            "Restore defaults",
+            (editable && changed).then(|| msg(SettingsMsg::ResetKeys)),
+            ui::secondary
+        ),
+    ]
+    .spacing(12)
+    .align_y(Alignment::End);
+    let mut list = column![];
+    for (g, group) in ActionGroup::ALL.into_iter().enumerate() {
+        if g > 0 {
+            list = list.push(hairline(t));
+        }
+        list = list.push(
+            container(
+                text(group.title())
+                    .font(UI_FONT)
+                    .size(11.5)
+                    .color(t.text_muted),
+            )
+            .padding(Padding {
+                top: 12.0,
+                right: 16.0,
+                bottom: 2.0,
+                left: 16.0,
+            }),
+        );
+        for action in Action::ALL.into_iter().filter(|a| a.group() == group) {
+            let recording = state.recording.as_ref().filter(|r| r.action == action);
+            list = list.push(key_row(t, &bindings, action, recording, editable));
+        }
+    }
+    let list = container(list.padding(Padding {
+        top: 0.0,
+        right: 0.0,
+        bottom: 8.0,
+        left: 0.0,
+    }))
+    .width(Length::Fill)
+    .style(move |_| ui::card(t));
+    column![header, list].spacing(8).into()
+}
+
+/// One action: its name, then reset and clear buttons and its chord; below, what recording
+/// says or a warning when the chord takes a key from programs in the terminal.
+fn key_row<'a>(
+    t: &'static Tokens,
+    bindings: &Bindings,
+    action: Action,
+    recording: Option<&'a Recording>,
+    editable: bool,
+) -> Element<'a, Message> {
+    let mac = bindings.mac();
+    let chord = bindings.chord(action);
+    let small = |glyph, tip_text: &'static str, m: SettingsMsg| -> Element<'a, Message> {
+        let b = button(ui::icon(glyph, 13.0, t.text_muted))
+            .on_press_maybe(editable.then(|| msg(m)))
+            .padding(5)
+            .style(move |_, status| ui::ghost(t, status));
+        crate::tooltip::tip(t, b, tip_text, false)
+    };
+    let mut line = row![
+        text(action.title())
+            .font(UI_FONT)
+            .size(13)
+            .color(t.text)
+            .width(Length::Fill)
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    if !bindings.is_default(action) {
+        line = line.push(small(
+            ui::ICON_RESET,
+            "Reset to default",
+            SettingsMsg::ResetKey(action),
+        ));
+    }
+    if chord.is_some() {
+        line = line.push(small(
+            ui::ICON_X,
+            "Remove shortcut",
+            SettingsMsg::ClearKey(action),
+        ));
+    }
+    let (caption, color) = match (recording, chord) {
+        (Some(_), _) => ("Press a shortcut".to_owned(), t.accent),
+        (None, Some(c)) => (c.label(mac), t.text),
+        (None, None) => ("Not set".to_owned(), t.text_muted),
+    };
+    let active = recording.is_some();
+    let pill =
+        button(container(text(caption).font(MONO).size(12).color(color)).center_x(Length::Fill))
+            .on_press_maybe(editable.then(|| {
+                msg(if active {
+                    SettingsMsg::CancelRecording
+                } else {
+                    SettingsMsg::Record(action)
+                })
+            }))
+            .width(150)
+            .padding(Padding::from([4.0, 10.0]))
+            .style(move |_, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: Some(if hovered && !active { t.hover } else { t.app }.into()),
+                    text_color: t.text,
+                    border: Border {
+                        color: if active { t.accent_edge } else { t.border },
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            });
+    let line = line.push(Space::new().width(4)).push(pill);
+    let note: Option<Element<'a, Message>> = match recording {
+        Some(Recording { problem: None, .. }) => Some(
+            text("Press the new shortcut. Esc cancels.")
+                .font(UI_FONT)
+                .size(12)
+                .color(t.text_muted)
+                .into(),
+        ),
+        Some(Recording {
+            problem: Some(RecordProblem::NotAllowed(why)),
+            ..
+        }) => Some(
+            text(format!("{why}. Press another shortcut, or Esc to cancel."))
+                .font(UI_FONT)
+                .size(12)
+                .color(t.danger)
+                .into(),
+        ),
+        Some(Recording {
+            problem: Some(RecordProblem::Taken { chord, other }),
+            ..
+        }) => Some(
+            row![
+                text(format!(
+                    "{} is used by {}. Take it over? {} will have no shortcut.",
+                    chord.label(mac),
+                    other.title(),
+                    other.title()
+                ))
+                .font(UI_FONT)
+                .size(12)
+                .color(t.text_secondary)
+                .width(Length::Fill),
+                small_button(t, "Take over", msg(SettingsMsg::TakeOver), ui::primary),
+                small_button(
+                    t,
+                    "Cancel",
+                    msg(SettingsMsg::CancelRecording),
+                    ui::secondary
+                ),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into(),
+        ),
+        None => chord
+            .filter(|_| !action.is_find_navigation())
+            .and_then(|c| risk(mac, c))
+            .map(|why| {
+                row![
+                    ui::icon(ui::ICON_WARNING, 13.0, t.warning),
+                    text(why)
+                        .font(UI_FONT)
+                        .size(12)
+                        .color(t.text_secondary)
+                        .width(Length::Fill),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into()
+            }),
+    };
+    let mut body = column![line].spacing(6);
+    if let Some(n) = note {
+        body = body.push(n);
+    }
+    container(body)
+        .padding(Padding::from([5.0, 16.0]))
+        .width(Length::Fill)
+        .into()
+}
+
+fn small_button<'a>(
+    t: &'static Tokens,
+    caption: &'a str,
+    on_press: Message,
+    style: fn(&Tokens, button::Status) -> button::Style,
+) -> Element<'a, Message> {
+    button(text(caption).font(UI_FONT).size(12))
+        .on_press(on_press)
+        .padding(Padding::from([3.0, 10.0]))
+        .style(move |_, status| style(t, status))
+        .into()
 }
 
 fn footer<'a>(

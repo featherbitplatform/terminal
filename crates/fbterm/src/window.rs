@@ -15,13 +15,13 @@ use iced::{
 
 use crate::app::{App, Message, TabBarMsg};
 use crate::chrome::{self, Chrome};
-use crate::keys::Action;
+use crate::keys::{Action, Bindings};
 use crate::palette;
 use crate::shortcuts::{Mode, Shortcuts};
 use crate::tabs::{Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
-use crate::tooltip::{DemoTip, tip};
-use crate::ui::{ICON_PLUS, ICON_USERS, ICON_X, icon};
+use crate::tooltip::{DemoTip, tip, tooltip_text};
+use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_USERS, ICON_X, icon};
 
 /// Gap between the top of the tab bar and the top of a tab.
 const TAB_TOP_GAP: f32 = 4.0;
@@ -41,6 +41,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             content: content.into(),
             window: id,
             mode: Mode::Editor,
+            bindings: &app.bindings,
         });
     }
     if let Some((sid, state)) = &app.settings_win
@@ -55,7 +56,12 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
-            mode: Mode::Settings,
+            mode: if state.recording.is_some() {
+                Mode::Recording
+            } else {
+                Mode::Settings
+            },
+            bindings: &app.bindings,
         });
     }
     let Some(win) = app.windows.get(&id) else {
@@ -85,6 +91,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         fullscreen: app.fullscreen.contains(&id),
         modal,
         demo_tip: app.demo_tip,
+        bindings: &app.bindings,
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -105,7 +112,9 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 Message::Terminal(id, o)
             });
             match find {
-                Some(bar) => stack![view, crate::find::bar_view::view(t, id, bar)].into(),
+                Some(bar) => {
+                    stack![view, crate::find::bar_view::view(t, id, bar, &app.bindings)].into()
+                }
                 None => view,
             }
         }
@@ -144,17 +153,19 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         } else {
             Mode::Normal
         },
+        bindings: &app.bindings,
     });
     let mut layers = stack![base];
     if let Some(state) = palette {
         layers = layers.push(Element::new(Shortcuts {
-            content: palette::view(t, id, state),
+            content: palette::view(t, id, state, &app.bindings),
             window: id,
             mode: if dialog.is_some() {
                 covered
             } else {
                 Mode::Palette
             },
+            bindings: &app.bindings,
         }));
     }
     if let Some(state) = find_box {
@@ -166,6 +177,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             } else {
                 Mode::FindAll
             },
+            bindings: &app.bindings,
         }));
     }
     if let Some(d) = dialog {
@@ -173,6 +185,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             content: crate::prompt_view::view(t, id, d),
             window: id,
             mode: Mode::Prompt,
+            bindings: &app.bindings,
         }));
     }
     layers.into()
@@ -208,7 +221,7 @@ fn dot<'a>(color: Color) -> Element<'a, Message> {
 
 /// How a window's tab bar is drawn.
 #[derive(Clone, Copy)]
-struct TabBar {
+struct TabBar<'b> {
     window: window::Id,
     bar_bg: Color,
     /// The active tab's background (the terminal's).
@@ -219,11 +232,13 @@ struct TabBar {
     modal: bool,
     /// `FBTERM_DEMO_TOOLTIP` (debug aid): the button whose tooltip always shows.
     demo_tip: Option<DemoTip>,
+    /// The chords tooltips name.
+    bindings: &'b Bindings,
 }
 
 fn tab_bar<'a>(
     t: &'static Tokens,
-    bar: TabBar,
+    bar: TabBar<'_>,
     tabs: &'a [Tab],
     active: usize,
 ) -> Element<'a, Message> {
@@ -234,6 +249,7 @@ fn tab_bar<'a>(
         fullscreen,
         modal,
         demo_tip,
+        bindings,
     } = bar;
     let tabs_bar = bar;
     let chrome = Chrome::current();
@@ -259,19 +275,27 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::Profiles))
         .padding(7)
         .style(move |_, status| ghost(t, status));
+    let settings = button(icon(ICON_SETTINGS, 14.0, t.text_muted))
+        .on_press(msg(TabBarMsg::Settings))
+        .padding(7)
+        .style(move |_, status| ghost(t, status));
     let new_tab = tip(
         t,
         new_tab,
-        "New tab",
-        Some(Action::NewTab),
+        tooltip_text("New tab", Action::NewTab, bindings),
         demo_tip == Some(DemoTip::New),
     );
     let profiles = tip(
         t,
         profiles,
-        "Edit profiles",
-        Some(Action::EditProfiles),
+        tooltip_text("Edit profiles", Action::EditProfiles, bindings),
         demo_tip == Some(DemoTip::Profiles),
+    );
+    let settings = tip(
+        t,
+        settings,
+        tooltip_text("Settings", Action::Settings, bindings),
+        demo_tip == Some(DemoTip::Settings),
     );
     bar = bar.push(
         container(new_tab)
@@ -279,6 +303,7 @@ fn tab_bar<'a>(
             .center_y(height),
     );
     bar = bar.push(container(profiles).center_y(height));
+    bar = bar.push(container(settings).center_y(height));
     let bar = container(bar)
         .padding(Padding {
             top: 0.0,
@@ -508,7 +533,7 @@ fn ghost(t: &Tokens, status: button::Status) -> button::Style {
 /// two read as one surface.
 fn tab_button<'a>(
     t: &'static Tokens,
-    bar: TabBar,
+    bar: TabBar<'_>,
     tab: &'a Tab,
     index: usize,
     active_bg: Option<Color>,
@@ -542,8 +567,11 @@ fn tab_button<'a>(
     let close = tip(
         t,
         close,
-        "Close tab",
-        active.then_some(Action::CloseTab),
+        if active {
+            tooltip_text("Close tab", Action::CloseTab, bar.bindings)
+        } else {
+            "Close tab".to_owned()
+        },
         demo_tip,
     );
     let inner = row![

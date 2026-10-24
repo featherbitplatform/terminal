@@ -22,7 +22,7 @@ use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
 use crate::find::FindMsg;
 use crate::find::all::{FindAll, FindAllMsg};
-use crate::keys::Action;
+use crate::keys::{Action, Bindings};
 use crate::palette::{PaletteMsg, Palettes, Recency};
 use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
@@ -42,6 +42,7 @@ pub enum TabBarMsg {
     Close(usize),
     New,
     Profiles,
+    Settings,
 }
 
 /// A value handed through a (cloneable) message exactly once.
@@ -171,6 +172,8 @@ pub(crate) enum ShotWindow {
 
 pub struct App {
     pub settings: Settings,
+    /// Every action's chord: the platform defaults with `settings.keys` applied.
+    pub bindings: Bindings,
     pub profiles: ProfileStore,
     /// Config problems found at startup (path:line: message), shown until dismissed.
     pub notices: Vec<String>,
@@ -383,6 +386,7 @@ impl App {
         let style = crate::settings_window::terminal_style(&settings);
         let (events, rx) = unbounded_channel();
         let mut app = Self {
+            bindings: Bindings::current(&settings.keys.map),
             theme: theme::graphite_theme(settings.theme),
             tokens: theme::tokens(settings.theme),
             settings,
@@ -629,6 +633,13 @@ impl App {
                 Task::batch([self.shown(id), detect])
             }
             Message::WindowUnfocused(id) => {
+                // Recording a chord ends when the Settings window loses focus: the keys go
+                // elsewhere then.
+                if let Some((sid, state)) = &mut self.settings_win
+                    && *sid == id
+                {
+                    state.cancel_recording();
+                }
                 // Focus moving to another of our windows reports Focused for it right after.
                 if self.focused == Some(id) {
                     self.app_active = false;
@@ -642,6 +653,7 @@ impl App {
                     TabBarMsg::Close(i) => self.close_tab(wid, i),
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
+                    TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }
             Message::TitleBar(wid, action) => chrome::perform(wid, action),
