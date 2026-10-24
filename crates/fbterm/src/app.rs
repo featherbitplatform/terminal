@@ -254,8 +254,9 @@ pub struct App {
     pub(crate) ui_scale: f32,
     /// The OS scale factor of each window, where known.
     pub(crate) os_scales: HashMap<window::Id, f32>,
-    /// A tab export is under way (its Save dialog open or its file being written).
-    pub(crate) exporting: bool,
+    /// The window whose tab export is under way (its Save dialog open or its file being
+    /// written).
+    pub(crate) exporting: Option<window::Id>,
     /// The last export's outcome, shown in the window it ran in until dismissed.
     pub(crate) export_notice: Option<crate::export::ExportNotice>,
 }
@@ -454,7 +455,7 @@ impl App {
             shooting: false,
             demo_tip: debug_env("FBTERM_DEMO_TOOLTIP")
                 .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
-            exporting: false,
+            exporting: None,
             export_notice: None,
             ui_scale: debug_env("FBTERM_SCALE")
                 .and_then(|v| v.to_string_lossy().parse::<f32>().ok())
@@ -714,6 +715,11 @@ impl App {
                 self.grids.remove(&id);
                 if self.export_notice.as_ref().is_some_and(|n| n.window == id) {
                     self.export_notice = None;
+                }
+                // A dialog that never answers (its window went away) must not block exports;
+                // a write already running finishes and reports nowhere.
+                if self.exporting == Some(id) {
+                    self.exporting = None;
                 }
                 if self.focused == Some(id) {
                     self.focused = self.windows.keys().next().copied();

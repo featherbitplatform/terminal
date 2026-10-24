@@ -1,23 +1,30 @@
 //! Exporting a terminal's text: the normal screen's whole history (scrollback and screen) as
 //! plain text or with colors (SGR escape sequences), optionally gzip-compressed.
 //!
-//! [`Snapshot::take`] copies the grid while the terminal is locked (a clone of its rows, a
-//! few milliseconds for a full scrollback); formatting, compressing and writing then run on
-//! the copy with the lock released. Rows joined by a soft wrap become one line again; wide
+//! The history is read in chunks of [`CHUNK_ROWS`] rows with the terminal locked one chunk at
+//! a time, each chunk formatted while locked and written out after the lock is released, so
+//! output keeps flowing and no copy of the scrollback is ever made. Rows are addressed by
+//! stable line number (the grid's scroll counter), so output arriving between chunks neither
+//! repeats nor skips a line; a resize (which reflows the rows) ends the export with
+//! [`ExportError::Resized`]. Rows joined by a soft wrap become one line again; wide
 //! characters are written once (their spacer cells skipped) and combining characters follow
 //! the character they belong to.
 
-use std::io::{self, Write};
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use alacritty_terminal::grid::{Dimensions, Grid};
+use alacritty_terminal::grid::{Dimensions, Grid, Row};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::vte::ansi::{Color, NamedColor};
 use flate2::Compression;
 use flate2::write::GzEncoder;
 
-use crate::Terminal;
+use crate::{SharedTerminal, TermMode, Terminal};
+
+/// Rows formatted per lock of the terminal.
+pub const CHUNK_ROWS: i64 = 1000;
 
 /// What an export file holds, chosen by its name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,83 +90,244 @@ impl ExportFormat {
     }
 }
 
-/// A copy of a terminal's normal screen and scrollback.
-pub struct Snapshot {
-    grid: Grid<Cell>,
-    /// The alternate screen (vim, less, top) was up: the copy is of the normal screen behind
-    /// it, not of what was showing.
+/// What an export wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExportSummary {
+    /// The alternate screen (vim, less, top) was up when the export started: the file holds
+    /// the normal screen behind it, not what was showing.
     pub alt_screen: bool,
 }
 
-impl Snapshot {
-    /// Copy `term`'s normal screen and its history.
-    pub fn take(term: &Terminal) -> Self {
-        let alt_screen = term.mode().contains(crate::TermMode::ALT_SCREEN);
-        let grid = if alt_screen {
-            term.term.inactive_grid()
-        } else {
-            term.term.grid()
-        };
-        Self {
-            grid: grid.clone(),
-            alt_screen,
-        }
-    }
+#[derive(Debug)]
+pub enum ExportError {
+    Io(io::Error),
+    /// The terminal was resized while exporting (its rows reflowed).
+    Resized,
+}
 
-    /// The text in `format` (gzip aside).
-    pub fn render(&self, format: ExportFormat) -> String {
-        if format.colors() {
-            ansi(&self.grid)
-        } else {
-            plain(&self.grid)
+impl std::fmt::Display for ExportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => e.fmt(f),
+            Self::Resized => f.write_str("the tab was resized while exporting; try again"),
         }
-    }
-
-    /// Lines of history and screen.
-    pub fn rows(&self) -> usize {
-        self.grid.total_lines()
     }
 }
 
-/// Write `text` to `path` in `format` (gzip-compressed for the `.gz` formats).
-pub fn write_file(path: &Path, format: ExportFormat, text: &str) -> io::Result<()> {
-    let file = io::BufWriter::new(std::fs::File::create(path)?);
-    if format.gzip() {
-        let mut gz = GzEncoder::new(file, Compression::default());
-        gz.write_all(text.as_bytes())?;
-        gz.finish()?.flush()
+impl std::error::Error for ExportError {}
+
+impl From<io::Error> for ExportError {
+    fn from(e: io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// The normal screen's grid: the shown one, or the one behind the alternate screen.
+fn normal_grid(t: &Terminal) -> &Grid<Cell> {
+    if t.mode().contains(TermMode::ALT_SCREEN) {
+        t.term.inactive_grid()
     } else {
-        let mut file = file;
-        file.write_all(text.as_bytes())?;
-        file.flush()
+        t.term.grid()
     }
 }
 
-/// The cells of each logical line, oldest first: rows continued by a soft wrap joined, and
-/// the empty lines at the very end left out.
-fn logical_lines(grid: &Grid<Cell>) -> Vec<Vec<&Cell>> {
-    let cols = grid.columns();
-    let top = -(grid.history_size() as i32);
-    let bottom = grid.screen_lines() as i32;
-    let mut lines = Vec::new();
-    let mut current: Vec<&Cell> = Vec::new();
-    for l in top..bottom {
-        let row = &grid[Line(l)];
+/// Write `terminal`'s history as `format` (gzip aside) to `out`.
+pub fn export(
+    terminal: &SharedTerminal,
+    format: ExportFormat,
+    out: &mut dyn Write,
+) -> Result<ExportSummary, ExportError> {
+    export_chunked(terminal, format, out, CHUNK_ROWS, &mut || {})
+}
+
+/// [`export`] with the chunk size and a hook run between chunks (with the lock released).
+fn export_chunked(
+    terminal: &SharedTerminal,
+    format: ExportFormat,
+    out: &mut dyn Write,
+    chunk: i64,
+    between: &mut dyn FnMut(),
+) -> Result<ExportSummary, ExportError> {
+    let (alt_screen, cols, mut next, end) = {
+        let t = terminal.lock();
+        let g = normal_grid(&t);
+        let scrolled = g.scrolled_lines();
+        (
+            t.mode().contains(TermMode::ALT_SCREEN),
+            g.columns(),
+            scrolled - g.history_size() as i64,
+            scrolled + g.screen_lines() as i64,
+        )
+    };
+    let mut lines = LineWriter::new(format.colors());
+    let mut buf = String::new();
+    while next < end {
+        {
+            let t = terminal.lock();
+            let g = normal_grid(&t);
+            if g.columns() != cols {
+                return Err(ExportError::Resized);
+            }
+            let scrolled = g.scrolled_lines();
+            let (top, bottom) = (-(g.history_size() as i64), g.screen_lines() as i64);
+            let stop = (next + chunk.max(1)).min(end);
+            for stable in next..stop {
+                let line = stable - scrolled;
+                // Rows that left the scrollback meanwhile are gone.
+                if (top..bottom).contains(&line) {
+                    lines.row(&g[Line(line as i32)], cols, &mut buf);
+                }
+            }
+            next = stop;
+        }
+        out.write_all(buf.as_bytes())?;
+        buf.clear();
+        if next < end {
+            between();
+        }
+    }
+    lines.finish(&mut buf);
+    out.write_all(buf.as_bytes())?;
+    Ok(ExportSummary { alt_screen })
+}
+
+/// Export `terminal` to `path` as `format`, gzip-compressed for the `.gz` formats. The file
+/// is written next to `path` under a temporary name and renamed over it at the end, so an
+/// existing file is replaced only by a complete export.
+pub fn write_file(
+    path: &Path,
+    format: ExportFormat,
+    terminal: &SharedTerminal,
+) -> Result<ExportSummary, ExportError> {
+    let dir = path
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map_or_else(|| "export".into(), |n| n.to_string_lossy());
+    let tmp = dir.join(format!(".{name}.{}.part", std::process::id()));
+    let result = (|| {
+        let file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        let summary = if format.gzip() {
+            let mut gz = GzEncoder::new(writer, Compression::default());
+            let summary = export(terminal, format, &mut gz)?;
+            writer = gz.finish()?;
+            summary
+        } else {
+            export(terminal, format, &mut writer)?
+        };
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|e| e.into_error())?
+            .sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(summary)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Turns rows into lines of text: soft-wrapped rows joined, trailing blanks trimmed (with
+/// colors: only blanks that look like nothing), empty lines at the very end left out.
+struct LineWriter {
+    colors: bool,
+    /// The logical line being built.
+    line: String,
+    /// Length of `line` up to its last cell that shows, and whether a style is in force there.
+    keep: usize,
+    keep_styled: bool,
+    /// The SGR style in force in `line`, and the cell style it was made for.
+    style: Option<String>,
+    key: Option<StyleKey>,
+    /// A row has been added to `line` since it was last ended.
+    open: bool,
+    /// Empty lines held back until something follows them.
+    empty: usize,
+}
+
+impl LineWriter {
+    fn new(colors: bool) -> Self {
+        Self {
+            colors,
+            line: String::new(),
+            keep: 0,
+            keep_styled: false,
+            style: None,
+            key: None,
+            open: false,
+            empty: 0,
+        }
+    }
+
+    fn row(&mut self, row: &Row<Cell>, cols: usize, out: &mut String) {
         for c in 0..cols {
-            current.push(&row[Column(c)]);
+            self.cell(&row[Column(c)]);
         }
+        self.open = true;
         let wraps = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
-        if !wraps || l == bottom - 1 {
-            lines.push(std::mem::take(&mut current));
+        if !wraps {
+            self.end_line(out);
         }
     }
-    while lines
-        .last()
-        .is_some_and(|line| line.iter().all(|c| blank(c) && plain_style(c)))
-    {
-        lines.pop();
+
+    fn cell(&mut self, cell: &Cell) {
+        if spacer(cell) {
+            return;
+        }
+        if self.colors {
+            // Formatting a style costs an allocation; most cells share their neighbour's.
+            let key = style_key(cell);
+            if self.key != Some(key) {
+                self.key = Some(key);
+                let next = sgr(cell);
+                if next != self.style {
+                    self.line.push_str(next.as_deref().unwrap_or("\x1b[0m"));
+                    self.style = next;
+                }
+            }
+        }
+        push_cell(&mut self.line, cell);
+        let shows = !blank(cell) || (self.colors && !plain_style(cell));
+        if shows {
+            self.keep = self.line.len();
+            self.keep_styled = self.style.is_some();
+        }
     }
-    lines
+
+    fn end_line(&mut self, out: &mut String) {
+        self.line.truncate(self.keep);
+        if self.keep_styled {
+            self.line.push_str("\x1b[0m");
+        }
+        if self.line.is_empty() {
+            self.empty += 1;
+        } else {
+            for _ in 0..self.empty {
+                out.push('\n');
+            }
+            self.empty = 0;
+            out.push_str(&self.line);
+            out.push('\n');
+        }
+        self.line.clear();
+        self.keep = 0;
+        self.keep_styled = false;
+        self.style = None;
+        self.key = None;
+        self.open = false;
+    }
+
+    /// End the last line if a wrapped row left it open; drop the empty lines held back.
+    fn finish(&mut self, out: &mut String) {
+        if self.open {
+            self.end_line(out);
+        }
+    }
 }
 
 /// A cell that only holds the right half of a wide character, or marks that one did not fit
@@ -204,21 +372,6 @@ fn push_cell(out: &mut String, cell: &Cell) {
     }
 }
 
-/// Plain UTF-8 text, one logical line per line, trailing spaces trimmed.
-pub fn plain(grid: &Grid<Cell>) -> String {
-    let mut out = String::new();
-    for line in logical_lines(grid) {
-        let start = out.len();
-        for cell in line {
-            push_cell(&mut out, cell);
-        }
-        let end = start + out[start..].trim_end_matches(' ').len();
-        out.truncate(end);
-        out.push('\n');
-    }
-    out
-}
-
 /// The SGR parameters for a color, `None` for the default one.
 fn sgr_color(c: Color, fg: bool) -> Option<String> {
     let (base, bright, extended) = if fg { (30, 90, 38) } else { (40, 100, 48) };
@@ -236,6 +389,20 @@ fn sgr_color(c: Color, fg: bool) -> Option<String> {
         Color::Indexed(n) => Some(format!("{extended};5;{n}")),
         Color::Spec(rgb) => Some(format!("{extended};2;{};{};{}", rgb.r, rgb.g, rgb.b)),
     }
+}
+
+/// What [`sgr`] reads from a cell.
+type StyleKey = (Color, Color, Flags);
+
+fn style_key(cell: &Cell) -> StyleKey {
+    let flags = cell.flags
+        & (Flags::BOLD
+            | Flags::DIM
+            | Flags::ITALIC
+            | Flags::INVERSE
+            | Flags::STRIKEOUT
+            | Flags::ALL_UNDERLINES);
+    (cell.fg, cell.bg, flags)
 }
 
 /// The SGR sequence that sets a cell's style from a reset, or `None` for the default style.
@@ -268,39 +435,12 @@ fn sgr(cell: &Cell) -> Option<String> {
     (!params.is_empty()).then(|| format!("\x1b[0;{}m", params.join(";")))
 }
 
-/// Text with colors and attributes as SGR sequences that `less -R` and `cat` replay: a style
-/// change starts from a reset, every line ends in the default style, and trailing blanks
-/// that would look like nothing are trimmed.
-pub fn ansi(grid: &Grid<Cell>) -> String {
-    let mut out = String::new();
-    for line in logical_lines(grid) {
-        let mut cells: Vec<&Cell> = line.into_iter().filter(|c| !spacer(c)).collect();
-        while cells.last().is_some_and(|c| blank(c) && plain_style(c)) {
-            cells.pop();
-        }
-        let mut style: Option<String> = None;
-        for cell in cells {
-            let next = sgr(cell);
-            if next != style {
-                out.push_str(next.as_deref().unwrap_or("\x1b[0m"));
-                style = next;
-            }
-            push_cell(&mut out, cell);
-        }
-        if style.is_some() {
-            out.push_str("\x1b[0m");
-        }
-        out.push('\n');
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::GridSize;
 
-    fn term(cols: u16, rows: u16, bytes: &[u8]) -> Terminal {
+    fn term(cols: u16, rows: u16, bytes: &[u8]) -> SharedTerminal {
         let mut t = Terminal::new(
             GridSize {
                 cols,
@@ -311,7 +451,7 @@ mod tests {
             1000,
         );
         t.feed(bytes);
-        t
+        std::sync::Arc::new(parking_lot::Mutex::new(t))
     }
 
     fn gunzip(bytes: &[u8]) -> io::Result<String> {
@@ -321,8 +461,10 @@ mod tests {
         Ok(s)
     }
 
-    fn text(t: &Terminal, format: ExportFormat) -> String {
-        Snapshot::take(t).render(format)
+    fn text(t: &SharedTerminal, format: ExportFormat) -> String {
+        let mut out = Vec::new();
+        export(t, format, &mut out).unwrap();
+        String::from_utf8(out).unwrap()
     }
 
     #[test]
@@ -398,13 +540,21 @@ mod tests {
     #[test]
     fn the_alt_screen_exports_the_normal_screens_history() {
         let t = term(20, 4, b"normal 1\r\nnormal 2\r\n\x1b[?1049hFULL SCREEN APP");
-        let snap = Snapshot::take(&t);
-        assert!(snap.alt_screen);
-        assert_eq!(snap.render(ExportFormat::Plain), "normal 1\nnormal 2\n");
+        let mut out = Vec::new();
+        assert!(
+            export(&t, ExportFormat::Plain, &mut out)
+                .unwrap()
+                .alt_screen
+        );
+        assert_eq!(out, b"normal 1\nnormal 2\n");
         let t = term(20, 4, b"normal 1\r\n\x1b[?1049hAPP\x1b[?1049l");
-        let snap = Snapshot::take(&t);
-        assert!(!snap.alt_screen);
-        assert_eq!(snap.render(ExportFormat::Plain), "normal 1\n");
+        let mut out = Vec::new();
+        assert!(
+            !export(&t, ExportFormat::Plain, &mut out)
+                .unwrap()
+                .alt_screen
+        );
+        assert_eq!(out, b"normal 1\n");
     }
 
     #[test]
@@ -434,7 +584,7 @@ mod tests {
         for f in ExportFormat::ALL {
             let path = dir.join(format!("out.{}", f.extension()));
             let text = text(&t, f);
-            write_file(&path, f, &text).unwrap();
+            write_file(&path, f, &t).unwrap();
             let bytes = std::fs::read(&path).unwrap();
             let back = if f.gzip() {
                 assert_eq!(&bytes[..2], [0x1f, 0x8b], "gzip magic");
@@ -444,7 +594,75 @@ mod tests {
             };
             assert_eq!(back, text);
         }
+        // Nothing but the four files: no temporary file is left behind.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 4);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_failed_export_leaves_an_existing_file_and_no_temporary_file() {
+        let dir = std::env::temp_dir().join(format!("fbterm-export-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("keep.txt");
+        std::fs::write(&path, "old").unwrap();
+        let t = term(20, 3, b"new");
+        // Resized between chunks: the export fails and the old file stays as it was.
+        let mut grow = || {
+            t.lock().resize(GridSize {
+                cols: 30,
+                rows: 3,
+                cell_width: 8.0,
+                cell_height: 16.0,
+            })
+        };
+        let mut sink = Vec::new();
+        let err = export_chunked(&t, ExportFormat::Plain, &mut sink, 1, &mut grow).unwrap_err();
+        assert!(matches!(err, ExportError::Resized));
+        // An unwritable target: nothing written, the temporary file removed.
+        let missing = dir.join("no such dir").join("x.txt");
+        assert!(matches!(
+            write_file(&missing, ExportFormat::Plain, &t),
+            Err(ExportError::Io(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn output_between_chunks_neither_repeats_nor_skips_lines() {
+        let mut bytes = Vec::new();
+        for i in 0..40 {
+            bytes.extend(format!("old {i}\r\n").bytes());
+        }
+        let t = term(20, 5, &bytes);
+        // Every chunk boundary, new output scrolls the screen by three lines.
+        let mut n = 0;
+        let mut more = || {
+            let mut b = Vec::new();
+            for _ in 0..3 {
+                b.extend(format!("new {n}\r\n").bytes());
+                n += 1;
+            }
+            t.lock().feed(&b);
+        };
+        let mut out = Vec::new();
+        export_chunked(&t, ExportFormat::Plain, &mut out, 7, &mut more).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let old: Vec<&str> = out.lines().filter(|l| l.starts_with("old")).collect();
+        let want: Vec<String> = (0..40).map(|i| format!("old {i}")).collect();
+        assert_eq!(old, want);
+    }
+
+    #[test]
+    fn chunks_join_wrapped_lines_and_keep_styles_across_their_boundaries() {
+        // 5 columns, 1-row chunks: every row is its own chunk.
+        let t = term(5, 6, b"\x1b[31mabcdefghij\x1b[0mxy   \r\nz");
+        let whole = text(&t, ExportFormat::Ansi);
+        let mut out = Vec::new();
+        export_chunked(&t, ExportFormat::Ansi, &mut out, 1, &mut || {}).unwrap();
+        assert_eq!(String::from_utf8(out).unwrap(), whole);
+        assert_eq!(whole, "\x1b[0;31mabcdefghij\x1b[0mxy\nz\n");
     }
 
     #[test]

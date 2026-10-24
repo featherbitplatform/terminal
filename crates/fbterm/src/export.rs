@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use fbterm_term::{ExportFormat, SharedTerminal, Snapshot, TermMode};
+use fbterm_term::{ExportFormat, SharedTerminal, TermMode};
 use iced::widget::{button, container, row, text};
 use iced::{Alignment, Element, Length, Padding, Task, window};
 
@@ -35,14 +35,40 @@ pub struct Exported {
     pub alt_screen: bool,
 }
 
+/// What a notice reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// The file was written (the notice offers to show it).
+    Done,
+    /// Nothing happened, and why.
+    Info,
+    Error,
+}
+
 /// The notice shown in the window an export ran in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportNotice {
     pub window: window::Id,
+    pub kind: NoticeKind,
     pub text: String,
-    /// The written file, for the reveal button (none after a failure).
+    /// The written file, for the reveal button.
     pub path: Option<PathBuf>,
 }
+
+impl ExportNotice {
+    fn info(window: window::Id, text: &str) -> Self {
+        Self {
+            window,
+            kind: NoticeKind::Info,
+            text: text.into(),
+            path: None,
+        }
+    }
+}
+
+/// Most bytes of a tab title kept in a file name (with the date and extension the name stays
+/// well under the usual 255-byte limit).
+const TITLE_BYTES: usize = 200;
 
 /// What the reveal button says on this platform.
 pub const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
@@ -59,7 +85,7 @@ fn forbidden(c: char) -> bool {
 }
 
 /// A tab title made safe as a file name: forbidden characters become spaces, runs of spaces
-/// collapse, leading dots and trailing dots or spaces go, at most 80 characters; "Terminal"
+/// collapse, leading dots and trailing dots or spaces go, at most 200 bytes; "Terminal"
 /// when nothing is left.
 pub fn sanitize(title: &str) -> String {
     let replaced: String = title
@@ -67,11 +93,15 @@ pub fn sanitize(title: &str) -> String {
         .map(|c| if forbidden(c) { ' ' } else { c })
         .collect();
     let collapsed = replaced.split_whitespace().collect::<Vec<_>>().join(" ");
-    let trimmed = collapsed
-        .trim_start_matches('.')
-        .chars()
-        .take(80)
-        .collect::<String>();
+    let trimmed = collapsed.trim_start_matches('.');
+    // At most TITLE_BYTES bytes, cut on a character boundary.
+    let cut = trimmed
+        .char_indices()
+        .map(|(i, c)| i + c.len_utf8())
+        .take_while(|&end| end <= TITLE_BYTES)
+        .last()
+        .unwrap_or(0);
+    let trimmed = &trimmed[..cut];
     let trimmed = trimmed.trim_end_matches(['.', ' ']).trim_start();
     if trimmed.is_empty() {
         "Terminal".into()
@@ -115,10 +145,7 @@ pub fn done_text(e: &Exported) -> String {
 /// Copy, format and write, off the UI thread.
 fn run(terminal: &SharedTerminal, path: PathBuf) -> Result<Exported, String> {
     let format = ExportFormat::from_path(&path);
-    // Only the copy holds the lock; output keeps flowing while the text is built.
-    let snapshot = Snapshot::take(&terminal.lock());
-    let text = snapshot.render(format);
-    fbterm_term::write_file(&path, format, &text).map_err(|e| {
+    let summary = fbterm_term::write_file(&path, format, terminal).map_err(|e| {
         let name = path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into(),
@@ -127,53 +154,64 @@ fn run(terminal: &SharedTerminal, path: PathBuf) -> Result<Exported, String> {
     })?;
     Ok(Exported {
         path,
-        alt_screen: snapshot.alt_screen,
+        alt_screen: summary.alt_screen,
     })
 }
 
-async fn ask_path(title: &'static str, name: String) -> Option<PathBuf> {
-    let mut dialog = rfd::AsyncFileDialog::new()
+/// The one file-type filter the dialog offers. The extension of the name decides the format:
+/// the dialogs cannot report a chosen filter, and some do not rename the file when another is
+/// picked, so a list of formats would promise what it cannot keep.
+pub const FILTER_LABEL: &str = "Text (.txt, .txt.gz, .ansi, .ansi.gz)";
+pub const FILTER_EXTENSIONS: [&str; 3] = ["txt", "gz", "ansi"];
+
+fn dialog(title: &'static str, name: String) -> rfd::AsyncFileDialog {
+    rfd::AsyncFileDialog::new()
         .set_title(title)
-        .set_file_name(name);
-    // The macOS panel shows no type menu (all filters merge into one list of allowed
-    // extensions); the extension typed picks the format there.
-    if cfg!(target_os = "macos") {
-        dialog = dialog.add_filter("Text", &["txt", "gz", "ansi"]);
-    } else {
-        for f in ExportFormat::ALL {
-            dialog = dialog.add_filter(
-                format!("{} (.{})", f.label(), f.extension()),
-                &[f.extension()],
-            );
-        }
-    }
-    dialog.save_file().await.map(|f| f.path().to_path_buf())
+        .set_file_name(name)
+        .add_filter(FILTER_LABEL, &FILTER_EXTENSIONS)
 }
 
 impl App {
     /// Start exporting `wid`'s active tab: open the Save dialog (one at a time).
     pub(crate) fn export_tab(&mut self, wid: Option<window::Id>) -> Task<Message> {
-        if self.exporting {
-            return Task::none();
-        }
         let Some(wid) = wid else {
             return Task::none();
         };
         let Some(tab) = self.windows.get(&wid).and_then(|w| w.active_tab()) else {
             return Task::none();
         };
+        if self.exporting.is_some() {
+            self.export_notice = Some(ExportNotice::info(
+                wid,
+                "An export is already running; try again when it is done.",
+            ));
+            return Task::none();
+        }
         let Some(terminal) = tab.terminal().cloned() else {
+            self.export_notice = Some(ExportNotice::info(
+                wid,
+                "This tab has nothing to export yet.",
+            ));
             return Task::none();
         };
         let alt = terminal.lock().mode().contains(TermMode::ALT_SCREEN);
         let name = default_file_name(&tab.title, chrono::Local::now().naive_local());
-        self.exporting = true;
-        Task::perform(ask_path(dialog_title(alt), name), move |path| {
-            Message::Export(ExportMsg::Chosen {
-                window: wid,
-                terminal: Delivered::new(terminal),
-                path,
-            })
+        self.exporting = Some(wid);
+        let terminal = Delivered::new(terminal);
+        let title = dialog_title(alt);
+        // The dialog belongs to the window (a sheet on macOS).
+        window::run(wid, move |w| dialog(title, name).set_parent(w)).then(move |d| {
+            let terminal = terminal.clone();
+            Task::perform(
+                async move { d.save_file().await.map(|f| f.path().to_path_buf()) },
+                move |path| {
+                    Message::Export(ExportMsg::Chosen {
+                        window: wid,
+                        terminal,
+                        path,
+                    })
+                },
+            )
         })
     }
 
@@ -185,7 +223,7 @@ impl App {
                 path,
             } => {
                 let (Some(path), Some(terminal)) = (path, terminal.take()) else {
-                    self.exporting = false;
+                    self.exporting = None;
                     return Task::none();
                 };
                 Task::perform(
@@ -198,12 +236,13 @@ impl App {
                 )
             }
             ExportMsg::Done(window, result) => {
-                self.exporting = false;
+                self.exporting = None;
                 self.export_notice = Some(match result {
                     Ok(e) => {
                         tracing::info!(path = %e.path.display(), "exported a tab");
                         ExportNotice {
                             window,
+                            kind: NoticeKind::Done,
                             text: done_text(&e),
                             path: Some(e.path),
                         }
@@ -212,6 +251,7 @@ impl App {
                         tracing::warn!(error = %text, "tab export failed");
                         ExportNotice {
                             window,
+                            kind: NoticeKind::Error,
                             text,
                             path: None,
                         }
@@ -239,7 +279,7 @@ pub fn notice_view<'a>(
     base: iced::Color,
     notice: &'a ExportNotice,
 ) -> Element<'a, Message> {
-    let failed = notice.path.is_none();
+    let done = notice.kind == NoticeKind::Done && notice.path.is_some();
     let mut line = row![
         text(notice.text.as_str())
             .font(UI_FONT)
@@ -249,7 +289,7 @@ pub fn notice_view<'a>(
     ]
     .spacing(8)
     .align_y(Alignment::Center);
-    if !failed {
+    if done {
         line = line.push(
             button(text(REVEAL_LABEL).font(UI_FONT).size(12))
                 .on_press(Message::Export(ExportMsg::Reveal))
@@ -263,7 +303,11 @@ pub fn notice_view<'a>(
             .padding(4)
             .style(move |_, status| crate::ui::ghost(t, status)),
     );
-    let tint = if failed { t.danger_soft } else { t.accent_soft };
+    let tint = match notice.kind {
+        NoticeKind::Done => t.accent_soft,
+        NoticeKind::Info => t.hover,
+        NoticeKind::Error => t.danger_soft,
+    };
     let banner = container(line)
         .padding(Padding::from([5.0, 12.0]))
         .width(Length::Fill)
@@ -314,7 +358,36 @@ mod tests {
         assert_eq!(sanitize("///"), "Terminal");
         assert_eq!(sanitize(""), "Terminal");
         assert_eq!(sanitize("日本語 ok"), "日本語 ok");
-        assert_eq!(sanitize(&"x".repeat(200)).chars().count(), 80);
+        assert_eq!(sanitize(&"x".repeat(300)).len(), 200);
+    }
+
+    #[test]
+    fn long_titles_fit_a_file_name_in_bytes_and_are_cut_between_characters() {
+        let now = at(15, 30);
+        // Three bytes each (CJK) and four bytes each (emoji): cut on a character boundary.
+        for title in [
+            "漢".repeat(150),
+            "🦀".repeat(120),
+            format!("a{}", "é".repeat(150)),
+        ] {
+            let cut = sanitize(&title);
+            assert!(cut.len() <= TITLE_BYTES, "{} bytes", cut.len());
+            assert!(cut.len() > TITLE_BYTES - 4);
+            assert!(title.starts_with(&cut));
+            let name = default_file_name(&title, now);
+            assert!(name.len() <= 255, "{} bytes", name.len());
+            assert!(name.ends_with(" 2026-10-24 15.30.txt"));
+        }
+    }
+
+    #[test]
+    fn the_dialog_offers_one_filter_where_the_extension_decides() {
+        assert!(FILTER_LABEL.contains(".txt.gz") && FILTER_LABEL.contains(".ansi.gz"));
+        // Every format's name ends in an extension the filter accepts.
+        for f in ExportFormat::ALL {
+            let last = f.extension().rsplit('.').next().unwrap();
+            assert!(FILTER_EXTENSIONS.contains(&last), "{f:?}");
+        }
     }
 
     #[test]

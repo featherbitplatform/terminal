@@ -25,8 +25,8 @@ pub fn open_settings_file(paths: &Paths) {
     spawn_reaped(opener(&path.to_string_lossy()), "settings.toml");
 }
 
-/// Show the config folder in the file manager (selecting `settings.toml` on macOS when it
-/// exists). The folder is created if missing.
+/// Show the config folder in the file manager (selecting `settings.toml` on macOS and
+/// Windows when it exists). The folder is created if missing.
 pub fn reveal_config_folder(paths: &Paths) {
     if let Err(e) = std::fs::create_dir_all(&paths.config_dir) {
         tracing::warn!(error = %e, "could not create the config folder");
@@ -37,7 +37,7 @@ pub fn reveal_config_folder(paths: &Paths) {
     spawn_reaped(reveal_command(&dir, &file, file.exists()), "config folder");
 }
 
-/// Show `file` in the file manager (selected on macOS; its folder elsewhere).
+/// Show `file` in the file manager (selected on macOS and Windows; its folder on Linux).
 pub fn reveal_file(file: &Path) {
     let file = absolute(file);
     let dir = file
@@ -59,9 +59,15 @@ fn reveal_command(dir: &Path, file: &Path, file_exists: bool) -> Command {
     }
     #[cfg(windows)]
     {
-        let _ = (file, file_exists);
+        use std::os::windows::process::CommandExt;
         let mut cmd = Command::new("explorer");
-        cmd.arg(dir);
+        if file_exists {
+            // One argument, written as Explorer parses it (`/select,"path"`); Windows paths
+            // cannot contain a double quote.
+            cmd.raw_arg(format!("/select,\"{}\"", file.display()));
+        } else {
+            cmd.arg(dir);
+        }
         cmd
     }
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -101,7 +107,10 @@ mod tests {
         #[cfg(windows)]
         {
             assert_eq!(cmd.get_program(), "explorer");
-            assert_eq!(args, [dir.as_os_str()]);
+            assert_eq!(args.len(), 1);
+            let arg = args[0].to_string_lossy();
+            assert!(arg.starts_with("/select,\""), "{arg}");
+            assert!(arg.ends_with("settings.toml\""), "{arg}");
         }
         #[cfg(all(unix, not(target_os = "macos")))]
         {

@@ -163,8 +163,8 @@ A Save dialog opens with a name like `zsh 2026-10-24 15.30.txt` (the tab's title
 | `.ansi` | With colors: colors (including 256-color and true color) and bold, dim, italic, underline, inverse and strikethrough as escape sequences that `less -R` and `cat` show in a terminal. |
 | `.ansi.gz` | With colors, gzip-compressed (`zless -R` reads it). |
 
-Lines the terminal wrapped to fit the window are joined back into one line, and spaces at the end of a line are dropped. On Linux and Windows the dialog also lists the four formats; on macOS type the extension.
+Lines the terminal wrapped to fit the window are joined back into one line, and spaces at the end of a line are dropped. The dialog offers one file type for all four formats: type the extension you want (a name without one is saved as plain text). Saving over an existing file replaces it only once the export is complete.
 
 When the tab is showing a full-screen program (vim, less, top), the file holds the shell's history behind it, not the program's screen; the dialog title and the notice say so. Nothing a program prints can start an export.
 
-When the file is written, a notice under the tab bar names it, with a button that shows it in Finder (Explorer on Windows, your file manager on Linux). An error, such as a folder you cannot write to or a full disk, shows in the same place. The window stays responsive while a long history is written.
+When the file is written, a notice under the tab bar names it, with a button that shows it selected in Finder (in Explorer on Windows; on Linux it opens the folder in your file manager). An error, such as a folder you cannot write to or a full disk, shows in the same place, as does a note when an export is already running or the tab has nothing to export yet. The tab keeps running and the window stays responsive while a long history is written; resizing the window during an export stops it with a message, so try again.
