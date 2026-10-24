@@ -291,9 +291,13 @@ derived from the same table.
 - Builder's notes on the implementation: the search uses the `regex` crate over each logical line
   (rows joined across soft wraps), walking the scrollback newest first in 1000-row chunks with
   the terminal locked one chunk at a time (about 0.5 ms), on tokio's blocking pool, cancellable
-  between chunks. Positions are stable line numbers from a scroll counter added to the vendored
-  grid, so matches stay put while output scrolls; the bar searches again at most every 400 ms
-  while output arrives. Measured (release, Apple Silicon): a full 10,000-line tab 5 ms (plain
+  between chunks; a chunk also gives the lock back after 3 ms at a line boundary. Positions are
+  stable line numbers from a scroll counter added to the vendored grid (kept across output
+  scrolling and row resizes; a column change reflows and starts the search over), so matches
+  stay put while output scrolls; the bar searches again at most every 400 ms while output
+  arrives, keeping its current match and the older matches it already loaded. At most 10,000
+  matches stay loaded per bar. On Windows a Ctrl+Alt press that types a character (AltGr) is
+  never the find-in-all-tabs chord. Measured (release, Apple Silicon): a full 10,000-line tab 5 ms (plain
   text or regex), 20 full tabs in parallel 23 ms; see `crates/fbterm-term/examples/search_bench.rs`.
 
 ## 6. Milestones

@@ -98,10 +98,10 @@ You can also click a row. The palette shows ten rows at a time.
 
 ## Search in detail
 
-**Find in tab** opens a slim bar over the top right of the active tab. Typing searches the tab's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again.
+**Find in tab** opens a slim bar over the top right of the active tab. Typing searches the tab's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again. `Shift+Enter` from the newest match wraps to the oldest match loaded so far: with more than a thousand matches that is not the oldest in the history until you have moved past them with `Enter`. Up to 10,000 matches are kept loaded; past that, `Enter` wraps to the newest.
 
 - **Case:** the search ignores case unless the query has an uppercase letter.
-- **Plain text or regular expression:** plain text by default (every character matches itself). The `.*` button switches to regular expressions; an invalid one shows `Invalid pattern`.
+- **Plain text or regular expression:** plain text by default (every character matches itself). The `.*` button switches to regular expressions; an invalid one shows `Invalid pattern`. Queries longer than 512 characters show `Query too long`.
 - **Wrapped lines** are searched as one line, so a match can continue on the next row. A match never spans a real line break.
 - While the bar is open, keys go to the bar and never to the program in the tab. The tab keeps running; new output is searched too, and the count follows it.
 
