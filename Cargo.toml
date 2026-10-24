@@ -34,12 +34,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 png = "0.17"
 rfd = "0.17.2"
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 
-# alacritty_terminal 0.26.0 with one fix; see vendor/alacritty_terminal/FBTERM_PATCHES.md.
+# alacritty_terminal 0.26.0 with two small patches; see vendor/alacritty_terminal/FBTERM_PATCHES.md.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
