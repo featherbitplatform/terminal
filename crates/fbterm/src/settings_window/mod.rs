@@ -6,6 +6,7 @@
 
 use std::time::Duration;
 
+use fbterm_config::keys::{self as keymap, Action, Bindings, Chord};
 use fbterm_config::settings::{DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE};
 use fbterm_config::{ConfigError, MaxFps, SettingChange, Settings, ThemeMode};
 
@@ -46,6 +47,36 @@ pub enum SettingsMsg {
     ScrollbackSubmit,
     Kitty(bool),
     MaxFps(MaxFps),
+    /// Record a new chord for an action (a click on its chord).
+    Record(Action),
+    /// A key press while recording: its chord, or `None` for a key that cannot be one.
+    Pressed(Option<Chord>),
+    CancelRecording,
+    /// Give the recorded chord to the action being recorded; the action that had it is left
+    /// without one.
+    TakeOver,
+    /// Put an action's default chord back.
+    ResetKey(Action),
+    /// Leave an action without a chord.
+    ClearKey(Action),
+    /// Put every default chord back.
+    ResetKeys,
+}
+
+/// A chord being recorded in the Keyboard section.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Recording {
+    pub action: Action,
+    pub problem: Option<RecordProblem>,
+}
+
+/// Why the last chord pressed while recording was not taken.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecordProblem {
+    /// It cannot be a shortcut; says why.
+    NotAllowed(String),
+    /// Another action has it: take it over or cancel.
+    Taken { chord: Chord, other: Action },
 }
 
 /// Fixed redraw rates offered in the list.
@@ -108,6 +139,8 @@ pub struct SettingsState {
     pub write_error: Option<String>,
     /// The refresh rate `max_fps = "display"` follows, if detected (set by the app).
     pub display_hz: Option<u32>,
+    /// The chord being recorded, if any: the window takes every key press meanwhile.
+    pub recording: Option<Recording>,
     /// Changes applied but not yet written, one per key, oldest first.
     pending: Vec<SettingChange>,
     /// Counts debounced changes, so only the last of a burst writes.
@@ -139,6 +172,7 @@ impl SettingsState {
             read_only,
             write_error: None,
             display_hz: None,
+            recording: None,
             pending: Vec::new(),
             generation: 0,
         };
@@ -238,8 +272,59 @@ impl SettingsState {
         }
     }
 
+    /// The chord of every action as the window shows it.
+    pub fn bindings(&self) -> Bindings {
+        Bindings::current(&self.values.keys.map)
+    }
+
+    /// Stop recording a chord, keeping the one the action had.
+    pub fn cancel_recording(&mut self) {
+        self.recording = None;
+    }
+
+    /// A chord pressed while recording for `action`: taken, or the reason it is not.
+    fn pressed(&mut self, action: Action, chord: Option<Chord>) -> Effect {
+        let bindings = self.bindings();
+        let problem = match chord {
+            None => RecordProblem::NotAllowed("That key cannot be part of a shortcut".into()),
+            Some(chord) => match chord.allowed() {
+                Err(why) => {
+                    RecordProblem::NotAllowed(format!("{}: {why}", chord.label(bindings.mac())))
+                }
+                Ok(()) => match bindings.action(chord) {
+                    Some(other) if other != action => RecordProblem::Taken { chord, other },
+                    Some(_) => {
+                        // Its own chord already: nothing changes.
+                        self.recording = None;
+                        return Effect::NONE;
+                    }
+                    None => {
+                        self.recording = None;
+                        return self.set_keys(&[(action, Some(chord))]);
+                    }
+                },
+            },
+        };
+        self.recording = Some(Recording {
+            action,
+            problem: Some(problem),
+        });
+        Effect::NONE
+    }
+
+    /// Set the chords of `changes` (`None`: unbound) and write the overrides.
+    fn set_keys(&mut self, changes: &[(Action, Option<Chord>)]) -> Effect {
+        let mac = self.bindings().mac();
+        let mut overrides = self.values.keys.map.clone();
+        for (action, chord) in changes {
+            keymap::set_override(mac, &mut overrides, *action, *chord);
+        }
+        self.change(SettingChange::Keys(overrides), false)
+    }
+
     pub fn update(&mut self, msg: SettingsMsg) -> Effect {
         if self.read_only.is_some() {
+            self.recording = None;
             return Effect::NONE;
         }
         match msg {
@@ -268,6 +353,49 @@ impl SettingsState {
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),
+            SettingsMsg::Record(action) => {
+                self.recording = Some(Recording {
+                    action,
+                    problem: None,
+                });
+                Effect::NONE
+            }
+            SettingsMsg::CancelRecording => {
+                self.recording = None;
+                Effect::NONE
+            }
+            SettingsMsg::Pressed(chord) => match &self.recording {
+                Some(r) => self.pressed(r.action, chord),
+                None => Effect::NONE,
+            },
+            SettingsMsg::TakeOver => match self.recording.take() {
+                Some(Recording {
+                    action,
+                    problem: Some(RecordProblem::Taken { chord, other }),
+                }) => self.set_keys(&[(other, None), (action, Some(chord))]),
+                other => {
+                    self.recording = other;
+                    Effect::NONE
+                }
+            },
+            SettingsMsg::ResetKey(action) => {
+                // Like pressing the default chord: another action may have taken it since.
+                match keymap::default_chord(self.bindings().mac(), action) {
+                    Some(chord) => self.pressed(action, Some(chord)),
+                    None => {
+                        self.recording = None;
+                        self.set_keys(&[(action, None)])
+                    }
+                }
+            }
+            SettingsMsg::ClearKey(action) => {
+                self.recording = None;
+                self.set_keys(&[(action, None)])
+            }
+            SettingsMsg::ResetKeys => {
+                self.recording = None;
+                self.change(SettingChange::Keys(Default::default()), false)
+            }
             SettingsMsg::FontSize(v) => {
                 let v = snap(v, 2.0).clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1);
                 self.font_size_text = size_text(v);

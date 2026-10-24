@@ -215,7 +215,7 @@ pub fn view<'a>(
                 ..button::Style::default()
             }
         });
-    let regex = crate::tooltip::tip(t, regex, "Regular expression", None, false);
+    let regex = crate::tooltip::tip(t, regex, "Regular expression", false);
     let top = row![input, container(regex).padding(Padding::from([0.0, 12.0]))]
         .align_y(Alignment::Center);
 

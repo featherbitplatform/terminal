@@ -24,6 +24,9 @@ pub const ICON_DOWN: &str = "\u{e06d}"; // chevron-down
 pub const ICON_COPY: &str = "\u{e09e}";
 pub const ICON_SHIELD_ALERT: &str = "\u{e1fe}";
 pub const ICON_LOCK: &str = "\u{e10b}";
+pub const ICON_SETTINGS: &str = "\u{e154}";
+pub const ICON_RESET: &str = "\u{e148}"; // rotate-ccw
+pub const ICON_WARNING: &str = "\u{e193}"; // triangle-alert
 
 /// An icon `size` pixels square. The font draws each icon on the full em square (the 24-unit
 /// SVG grid scaled to the em, baseline at the bottom), so a one-em line holds it exactly.

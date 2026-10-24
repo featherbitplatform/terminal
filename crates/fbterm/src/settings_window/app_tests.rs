@@ -189,3 +189,81 @@ fn the_redraw_rate_applies_live_and_follows_the_display() {
     let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
     assert_eq!(app.receiver.rate.get(), 90);
 }
+
+#[test]
+fn a_rebound_chord_applies_live_and_is_written_under_the_keys_comment() {
+    use fbterm_config::keys::{Action, Chord};
+    let (mut app, paths) = app();
+    let chord = Chord::parse("ctrl+alt+shift+k").unwrap().unwrap();
+    send(&mut app, SettingsMsg::Record(Action::Palette));
+    send(&mut app, SettingsMsg::Pressed(Some(chord)));
+    assert_eq!(app.bindings.chord(Action::Palette), Some(chord));
+    assert_eq!(app.bindings.action(chord), Some(Action::Palette));
+    assert_eq!(
+        read(&paths).unwrap(),
+        format!("{SETTINGS_TEMPLATE}[keys]\npalette = \"ctrl+alt+shift+k\"\n")
+    );
+    // Restore defaults removes the entry and keeps the template's comments.
+    send(&mut app, SettingsMsg::ResetKeys);
+    assert!(app.bindings.is_default(Action::Palette));
+    assert_eq!(
+        read(&paths).unwrap(),
+        format!("{SETTINGS_TEMPLATE}[keys]\n")
+    );
+}
+
+#[test]
+fn hand_edited_keys_apply_live_and_bad_entries_show_a_notice() {
+    use fbterm_config::keys::{Action, Chord};
+    let (mut app, paths) = app();
+    std::fs::write(
+        paths.settings(),
+        "[keys]\nnew_window = \"ctrl+alt+shift+n\"\nquit = \"x\"\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    let n = Chord::parse("ctrl+alt+shift+n").unwrap().unwrap();
+    assert_eq!(app.bindings.chord(Action::NewWindow), Some(n));
+    assert!(app.bindings.is_default(Action::Quit));
+    let notice = app
+        .settings_notice
+        .clone()
+        .expect("the bad entry is reported");
+    assert!(notice.contains("keys.quit"), "{notice}");
+    assert!(app.notices.contains(&notice));
+    // The window shows the file's chords and stays editable.
+    let (_, state) = app.settings_win.as_ref().unwrap();
+    assert!(state.read_only.is_none());
+    assert_eq!(state.bindings().chord(Action::NewWindow), Some(n));
+    // A change from the window leaves the bad entry for the user to fix.
+    send(&mut app, SettingsMsg::ClearKey(Action::NewWindow));
+    assert_eq!(
+        read(&paths).unwrap(),
+        "[keys]\nnew_window = \"none\"\nquit = \"x\"\n"
+    );
+    send(&mut app, SettingsMsg::ResetKey(Action::NewWindow));
+    assert_eq!(read(&paths).unwrap(), "[keys]\nquit = \"x\"\n");
+    assert!(app.settings_notice.is_some());
+}
+
+#[test]
+fn leaving_the_settings_window_stops_recording() {
+    use fbterm_config::keys::Action;
+    let (mut app, _) = app();
+    send(&mut app, SettingsMsg::Record(Action::NewTab));
+    assert!(app.settings_win.as_ref().unwrap().1.recording.is_some());
+    let id = app.settings_window().unwrap();
+    let _ = app.update(Message::WindowUnfocused(id));
+    assert!(app.settings_win.as_ref().unwrap().1.recording.is_none());
+}
+
+#[test]
+fn the_gear_button_opens_the_settings_window() {
+    let dir = std::env::temp_dir().join(format!("fbterm-settings-test-{}", ProfileId::new()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (mut app, _) = App::build(Paths { config_dir: dir }, true);
+    let w = iced::window::Id::unique();
+    app.windows.insert(w, Default::default());
+    let _ = app.update(Message::TabBar(w, crate::app::TabBarMsg::Settings));
+    assert!(app.settings_window().is_some());
+}

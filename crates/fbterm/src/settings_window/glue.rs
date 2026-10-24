@@ -255,6 +255,9 @@ impl App {
                 );
             }
         }
+        if new.keys.map != self.settings.keys.map {
+            self.bindings = crate::keys::Bindings::current(&new.keys.map);
+        }
         let rate_changed = new.max_fps != self.settings.max_fps;
         self.settings = new;
         if rate_changed {

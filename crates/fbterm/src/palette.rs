@@ -11,7 +11,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::Message;
-use crate::keys::Action;
+use crate::keys::{Action, Bindings};
 use crate::theme::{Tokens, UI_FONT};
 
 /// Rows shown at once.
@@ -109,6 +109,11 @@ fn actions() -> Vec<PaletteItem> {
         label: label.into(),
     })
     .collect()
+}
+
+/// The chord shown next to a palette action: its current one, if it has one.
+pub fn action_hint(action: Action, bindings: &Bindings) -> Option<String> {
+    bindings.label(action)
 }
 
 /// Every profile of the store, then the actions.
@@ -283,6 +288,7 @@ pub fn view<'a>(
     t: &'static Tokens,
     window: iced::window::Id,
     state: &'a PaletteState,
+    bindings: &Bindings,
 ) -> Element<'a, Message> {
     let msg = move |m| Message::Palette(window, m);
     let input = text_input("Search profiles and actions", &state.query)
@@ -315,6 +321,7 @@ pub fn view<'a>(
             pos,
             &state.items[idx],
             pos == state.selected,
+            bindings,
         ));
     }
     let list: Element<'a, Message> = if state.ranked.is_empty() {
@@ -381,6 +388,7 @@ fn item_row<'a>(
     position: usize,
     item: &'a PaletteItem,
     selected: bool,
+    bindings: &Bindings,
 ) -> Element<'a, Message> {
     let mono = iced::Font::with_name("Geist Mono");
     let edge = container(text(""))
@@ -419,11 +427,24 @@ fn item_row<'a>(
             );
         }
         None => {
-            content = content.push(
-                container(text("Action").font(UI_FONT).size(11.5).color(t.text_muted))
-                    .width(Length::Fill)
-                    .align_x(Alignment::End),
-            );
+            // An action shows its current chord, or just that it is an action.
+            let hint = match item {
+                PaletteItem::Action { action, .. } => action_hint(*action, bindings),
+                PaletteItem::Profile { .. } => None,
+            };
+            let hint: Element<'a, Message> = match hint {
+                Some(chord) => text(chord)
+                    .font(mono)
+                    .size(12)
+                    .color(t.text_secondary)
+                    .into(),
+                None => text("Action")
+                    .font(UI_FONT)
+                    .size(11.5)
+                    .color(t.text_muted)
+                    .into(),
+            };
+            content = content.push(container(hint).width(Length::Fill).align_x(Alignment::End));
         }
     }
     let inner = row![edge, container(content).padding(Padding::from([0.0, 14.0]))]
@@ -653,5 +674,24 @@ mod tests {
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
         assert_eq!(list.iter().filter(|i| i.is_action()).count(), 10);
+    }
+
+    #[test]
+    fn actions_show_their_current_chord() {
+        let b = Bindings::defaults(true);
+        assert_eq!(action_hint(Action::NewTab, &b).as_deref(), Some("⌘T"));
+        assert_eq!(action_hint(Action::OpenSettingsFile, &b), None);
+        let mut o = fbterm_config::keys::Overrides::new();
+        o.insert(
+            Action::OpenSettingsFile,
+            fbterm_config::keys::Chord::parse("cmd+alt+o").unwrap(),
+        );
+        o.insert(Action::NewTab, None);
+        let b = Bindings::new(true, &o);
+        assert_eq!(
+            action_hint(Action::OpenSettingsFile, &b).as_deref(),
+            Some("⌥⌘O")
+        );
+        assert_eq!(action_hint(Action::NewTab, &b), None);
     }
 }

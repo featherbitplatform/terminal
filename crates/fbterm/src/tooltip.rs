@@ -12,39 +12,37 @@ use iced::{
 };
 
 use crate::app::Message;
-use crate::keys::{self, Action};
+use crate::keys::{Action, Bindings};
 use crate::theme::{Tokens, UI_FONT};
 
 /// How long the pointer rests on a button before its tooltip shows.
 pub const DELAY: Duration = Duration::from_millis(500);
 
 /// The tooltip text for a button doing `action`: `New tab (⌘T)` on macOS, `New tab
-/// (Ctrl+Shift+T)` elsewhere; just `label` when the action has no chord.
-pub fn tooltip_text(label: &str, action: Action, mac: bool) -> String {
-    match keys::chord_for(mac, action) {
-        Some(c) => format!("{label} ({})", c.label(mac)),
+/// (Ctrl+Shift+T)` elsewhere, with the chord `bindings` give it; just `label` when the action
+/// has no chord.
+pub fn tooltip_text(label: &str, action: Action, bindings: &Bindings) -> String {
+    match bindings.label(action) {
+        Some(chord) => format!("{label} ({chord})"),
         None => label.to_owned(),
     }
 }
 
-/// `content` with a tooltip below it saying `label` and, with an `action`, its shortcut. The
-/// content still receives every press, so the title bar never sees one on a button.
+/// `content` with a tooltip below it saying `label` (see [`tooltip_text`] for one naming a
+/// shortcut). The content still receives every press, so the title bar never sees one on a
+/// button.
 pub fn tip<'a>(
     t: &'static Tokens,
     content: impl Into<Element<'a, Message>>,
-    label: &str,
-    action: Option<Action>,
+    label: impl Into<String>,
     force: bool,
 ) -> Element<'a, Message> {
     let bubble = container(
-        text(match action {
-            Some(a) => tooltip_text(label, a, cfg!(target_os = "macos")),
-            None => label.to_owned(),
-        })
-        .font(UI_FONT)
-        .size(12)
-        .color(t.text)
-        .wrapping(text::Wrapping::None),
+        text(label.into())
+            .font(UI_FONT)
+            .size(12)
+            .color(t.text)
+            .wrapping(text::Wrapping::None),
     )
     .padding(Padding::from([4.0, 8.0]))
     .style(move |_| bubble_style(t));
@@ -205,11 +203,12 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ForceHover<'_> {
     }
 }
 
-/// Which tab-bar button shows its tooltip for `FBTERM_DEMO_TOOLTIP=new|profiles|close`.
+/// Which tab-bar button shows its tooltip for `FBTERM_DEMO_TOOLTIP=new|profiles|settings|close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemoTip {
     New,
     Profiles,
+    Settings,
     /// The first tab's close button.
     Close,
 }
@@ -219,6 +218,7 @@ impl DemoTip {
         match s {
             "new" => Some(Self::New),
             "profiles" => Some(Self::Profiles),
+            "settings" => Some(Self::Settings),
             "close" => Some(Self::Close),
             _ => None,
         }
@@ -232,29 +232,53 @@ mod tests {
     #[test]
     fn tooltips_name_the_platform_chord() {
         assert_eq!(
-            tooltip_text("New tab", Action::NewTab, true),
+            tooltip_text("New tab", Action::NewTab, &Bindings::defaults(true)),
             "New tab (⌘T)"
         );
         assert_eq!(
-            tooltip_text("Edit profiles", Action::EditProfiles, true),
+            tooltip_text(
+                "Edit profiles",
+                Action::EditProfiles,
+                &Bindings::defaults(true)
+            ),
             "Edit profiles (⇧⌘,)"
         );
         assert_eq!(
-            tooltip_text("Close tab", Action::CloseTab, true),
+            tooltip_text("Close tab", Action::CloseTab, &Bindings::defaults(true)),
             "Close tab (⌘W)"
         );
         assert_eq!(
-            tooltip_text("New tab", Action::NewTab, false),
+            tooltip_text("New tab", Action::NewTab, &Bindings::defaults(false)),
             "New tab (Ctrl+Shift+T)"
         );
         assert_eq!(
-            tooltip_text("Close tab", Action::CloseTab, false),
+            tooltip_text("Close tab", Action::CloseTab, &Bindings::defaults(false)),
             "Close tab (Ctrl+Shift+W)"
         );
         assert_eq!(
-            tooltip_text("Reveal", Action::RevealConfigFolder, true),
+            tooltip_text(
+                "Reveal",
+                Action::RevealConfigFolder,
+                &Bindings::defaults(true)
+            ),
             "Reveal"
         );
+    }
+
+    #[test]
+    fn tooltips_follow_rebound_chords() {
+        let mut o = fbterm_config::keys::Overrides::new();
+        o.insert(
+            Action::Settings,
+            fbterm_config::keys::Chord::parse("cmd+shift+s").unwrap(),
+        );
+        o.insert(Action::NewTab, None);
+        let b = Bindings::new(true, &o);
+        assert_eq!(
+            tooltip_text("Settings", Action::Settings, &b),
+            "Settings (⇧⌘S)"
+        );
+        assert_eq!(tooltip_text("New tab", Action::NewTab, &b), "New tab");
     }
 
     #[test]
@@ -262,6 +286,7 @@ mod tests {
         assert_eq!(DemoTip::parse("new"), Some(DemoTip::New));
         assert_eq!(DemoTip::parse("close"), Some(DemoTip::Close));
         assert_eq!(DemoTip::parse("profiles"), Some(DemoTip::Profiles));
+        assert_eq!(DemoTip::parse("settings"), Some(DemoTip::Settings));
         assert_eq!(DemoTip::parse("x"), None);
     }
 }

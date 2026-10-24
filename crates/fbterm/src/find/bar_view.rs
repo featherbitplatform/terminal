@@ -6,9 +6,9 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shado
 
 use super::{FindBar, FindMsg};
 use crate::app::Message;
-use crate::keys::Action;
+use crate::keys::{Action, Bindings};
 use crate::theme::Tokens;
-use crate::tooltip::tip;
+use crate::tooltip::{tip, tooltip_text};
 use crate::ui::{ICON_DOWN, ICON_UP, ICON_X, MONO, icon};
 
 const BAR_WIDTH: f32 = 460.0;
@@ -75,6 +75,7 @@ pub fn view<'a>(
     t: &'static Tokens,
     window: iced::window::Id,
     bar: &'a FindBar,
+    bindings: &Bindings,
 ) -> Element<'a, Message> {
     let msg = move |m| Message::Find(window, m);
     let input = text_input("Find", &bar.query)
@@ -110,13 +111,13 @@ pub fn view<'a>(
         .on_press(msg(FindMsg::ToggleRegex))
         .padding(Padding::from([2.0, 6.0]))
         .style(move |_, status| toggle(t, bar.regex, status));
-    let regex = tip(t, regex, "Regular expression", None, false);
+    let regex = tip(t, regex, "Regular expression", false);
     let nav = |glyph, m, label, action| {
         let b = button(icon(glyph, 14.0, t.text_secondary))
             .on_press(msg(m))
             .padding(4)
             .style(move |_, status| ghost(t, status));
-        tip(t, b, label, Some(action), false)
+        tip(t, b, tooltip_text(label, action, bindings), false)
     };
     let older = nav(ICON_UP, FindMsg::Next, "Older match", Action::FindNext);
     let newer = nav(
@@ -129,7 +130,7 @@ pub fn view<'a>(
         .on_press(msg(FindMsg::Close))
         .padding(4)
         .style(move |_, status| ghost(t, status));
-    let close = tip(t, close, "Close (Esc)", None, false);
+    let close = tip(t, close, "Close (Esc)", false);
     let content = row![input, counter, regex, older, newer, close]
         .spacing(4)
         .align_y(Alignment::Center);

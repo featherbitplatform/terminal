@@ -1,263 +1,153 @@
-//! Application keyboard shortcuts: Cmd on macOS, Ctrl+Shift elsewhere (Settings is Ctrl+,, find
-//! in all tabs Ctrl+Alt+F).
+//! Application keyboard shortcuts: matching key presses against the binding table (the
+//! platform defaults from `fbterm_config::keys` with the user's `[keys]` overrides).
+//! Defaults: Cmd on macOS, Ctrl+Shift elsewhere (Settings is Ctrl+,, find in all tabs
+//! Ctrl+Alt+F).
 
+use iced::keyboard::key::Named;
 use iced::keyboard::{Key, Modifiers};
 
-/// What an application shortcut asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    NewTab,
-    CloseTab,
-    NextTab,
-    PrevTab,
-    /// Select tab `n` (1-based, 1..=9).
-    SelectTab(u8),
-    Palette,
-    NewWindow,
-    /// Save the layout and exit: Cmd+Q on macOS, Ctrl+Shift+Q elsewhere.
-    Quit,
-    /// The profile editor: Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere.
-    EditProfiles,
-    /// The Settings window: Cmd+, on macOS, Ctrl+, elsewhere.
-    Settings,
-    /// Create `settings.toml` if missing and open it with the system's default app (palette only).
-    OpenSettingsFile,
-    /// Show the config folder in the file manager (palette only).
-    RevealConfigFolder,
-    /// The active tab's find bar: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
-    Find,
-    /// The search over every tab: Cmd+Shift+F on macOS, Ctrl+Alt+F elsewhere.
-    FindAll,
-    /// Next match up the scrollback (older), while the find bar is open: Cmd+G on macOS,
-    /// Ctrl+G elsewhere (see [`find_key`]).
-    FindNext,
-    /// Next match down the scrollback (newer), while the find bar is open: Cmd+Shift+G on
-    /// macOS, Ctrl+Shift+G elsewhere.
-    FindPrevious,
-}
+pub use fbterm_config::keys::{Action, Bindings, Chord, ChordKey};
 
-/// The shortcut for `key` (as pressed, without modifiers applied) on this platform. `text` is
-/// what the key press types, if anything.
-pub fn shortcut(key: &Key, mods: Modifiers, text: Option<&str>) -> Option<Action> {
-    shortcut_typed(cfg!(target_os = "macos"), key, mods, text)
-}
-
-/// [`shortcut_for`], except that a Ctrl+Alt press that types a character is that character:
-/// on Windows AltGr is Ctrl+Alt, and AltGr+F types `[` on several European layouts.
-pub fn shortcut_typed(mac: bool, key: &Key, mods: Modifiers, text: Option<&str>) -> Option<Action> {
-    let types = text.is_some_and(|t| t.chars().any(|c| !c.is_control()));
-    if !mac && mods.control() && mods.alt() && types {
-        return None;
-    }
-    shortcut_for(mac, key, mods)
-}
-
-/// The shortcut table, for macOS (`mac`) or the other platforms.
-///
-/// macOS chords use Cmd (with Shift where noted) and never Ctrl or Option. Elsewhere every chord
-/// is Ctrl+Shift, so plain Ctrl keys keep reaching the terminal; the one exception is Ctrl+,
-/// for Settings (the comma has no control code of its own).
-pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
-    let Key::Character(s) = key else {
-        return None;
+/// The chord a key press makes (`key` as pressed, without modifiers applied), or `None` for a
+/// key that cannot be part of a shortcut (a modifier alone, a dead key, media keys ...).
+pub fn press_chord(key: &Key, mods: Modifiers) -> Option<Chord> {
+    let k = match key {
+        Key::Character(s) => {
+            let mut chars = s.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            ChordKey::from_char(c)?
+        }
+        Key::Named(named) => named_key(*named)?,
+        Key::Unidentified => return None,
     };
-    let mut chars = s.chars();
-    let c = chars.next()?.to_ascii_lowercase();
-    if chars.next().is_some() {
-        return None;
-    }
-    let shift = mods.shift();
-    if !mac && c == ',' && mods.control() && !shift && !mods.alt() && !mods.logo() {
-        return Some(Action::Settings);
-    }
-    if !mac && c == 'f' && mods.control() && mods.alt() && !shift && !mods.logo() {
-        return Some(Action::FindAll);
-    }
-    if mac {
-        if !mods.logo() || mods.control() || mods.alt() {
-            return None;
-        }
-    } else if !(mods.control() && shift) || mods.alt() || mods.logo() {
-        return None;
-    }
-    // On macOS Shift is part of the chord only where noted; elsewhere it is always held.
-    let plain = !mac || !shift;
-    let shifted = shift;
-    match c {
-        't' if plain => Some(Action::NewTab),
-        'w' if plain => Some(Action::CloseTab),
-        'n' if plain => Some(Action::NewWindow),
-        'q' if plain => Some(Action::Quit),
-        ',' if mac && !shift => Some(Action::Settings),
-        ',' | '<' if shifted => Some(Action::EditProfiles),
-        'p' if shifted => Some(Action::Palette),
-        'f' if plain => Some(Action::Find),
-        'f' if mac && shifted => Some(Action::FindAll),
-        ']' | '}' if shifted => Some(Action::NextTab),
-        '[' | '{' if shifted => Some(Action::PrevTab),
-        '1'..='9' if plain => Some(Action::SelectTab(c as u8 - b'0')),
-        _ => None,
-    }
+    Some(Chord::pressed(
+        k,
+        mods.control(),
+        mods.alt(),
+        mods.shift(),
+        mods.logo(),
+    ))
 }
 
-/// Find-bar navigation keys (only while the bar is open, so plain Ctrl+G still reaches the
-/// shell otherwise): Cmd+G / Cmd+Shift+G on macOS, Ctrl+G / Ctrl+Shift+G elsewhere.
-pub fn find_key(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
-    let Key::Character(s) = key else {
-        return None;
-    };
-    if !s.eq_ignore_ascii_case("g") || mods.alt() {
-        return None;
-    }
-    let held = if mac {
-        mods.logo() && !mods.control()
-    } else {
-        mods.control() && !mods.logo()
-    };
-    match (held, mods.shift()) {
-        (true, false) => Some(Action::FindNext),
-        (true, true) => Some(Action::FindPrevious),
-        _ => None,
-    }
-}
-
-/// A chord as the user presses it: the key plus its modifiers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Chord {
-    /// The key, lowercase for letters.
-    pub key: char,
-    pub ctrl: bool,
-    /// Option on macOS.
-    pub alt: bool,
-    pub shift: bool,
-    /// Cmd on macOS.
-    pub cmd: bool,
-}
-
-/// The chord that triggers `action` on macOS (`mac`) or the other platforms, if it has one.
-/// Kept in step with [`shortcut_for`] by the tests, so what the app shows is what works.
-pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
-    let (key, mac_shift) = match action {
-        Action::NewTab => ('t', false),
-        Action::CloseTab => ('w', false),
-        Action::NewWindow => ('n', false),
-        Action::Quit => ('q', false),
-        Action::NextTab => (']', true),
-        Action::PrevTab => ('[', true),
-        Action::Palette => ('p', true),
-        Action::SelectTab(n @ 1..=9) => (char::from(b'0' + n), false),
-        Action::EditProfiles => (',', true),
-        Action::Settings if !mac => {
-            return Some(Chord {
-                key: ',',
-                ctrl: true,
-                alt: false,
-                shift: false,
-                cmd: false,
-            });
-        }
-        Action::Settings => (',', false),
-        Action::Find => ('f', false),
-        Action::FindAll if !mac => {
-            return Some(Chord {
-                key: 'f',
-                ctrl: true,
-                alt: true,
-                shift: false,
-                cmd: false,
-            });
-        }
-        Action::FindAll => ('f', true),
-        Action::FindNext | Action::FindPrevious => {
-            let shift = action == Action::FindPrevious;
-            return Some(Chord {
-                key: 'g',
-                ctrl: !mac,
-                alt: false,
-                shift,
-                cmd: mac,
-            });
-        }
-        Action::SelectTab(_) | Action::OpenSettingsFile | Action::RevealConfigFolder => {
-            return None;
-        }
-    };
-    Some(if mac {
-        Chord {
-            key,
-            ctrl: false,
-            alt: false,
-            shift: mac_shift,
-            cmd: true,
-        }
-    } else {
-        Chord {
-            key,
-            ctrl: true,
-            alt: false,
-            shift: true,
-            cmd: false,
-        }
+fn named_key(named: Named) -> Option<ChordKey> {
+    Some(match named {
+        Named::ArrowUp => ChordKey::Up,
+        Named::ArrowDown => ChordKey::Down,
+        Named::ArrowLeft => ChordKey::Left,
+        Named::ArrowRight => ChordKey::Right,
+        Named::PageUp => ChordKey::PageUp,
+        Named::PageDown => ChordKey::PageDown,
+        Named::Home => ChordKey::Home,
+        Named::End => ChordKey::End,
+        Named::Insert => ChordKey::Insert,
+        Named::Delete => ChordKey::Delete,
+        Named::Backspace => ChordKey::Backspace,
+        Named::Space => ChordKey::Space,
+        Named::Tab => ChordKey::Tab,
+        Named::Enter => ChordKey::Enter,
+        Named::Escape => ChordKey::Escape,
+        Named::F1 => ChordKey::F(1),
+        Named::F2 => ChordKey::F(2),
+        Named::F3 => ChordKey::F(3),
+        Named::F4 => ChordKey::F(4),
+        Named::F5 => ChordKey::F(5),
+        Named::F6 => ChordKey::F(6),
+        Named::F7 => ChordKey::F(7),
+        Named::F8 => ChordKey::F(8),
+        Named::F9 => ChordKey::F(9),
+        Named::F10 => ChordKey::F(10),
+        Named::F11 => ChordKey::F(11),
+        Named::F12 => ChordKey::F(12),
+        _ => return None,
     })
 }
 
-impl Chord {
-    /// How the chord is written: `⇧⌘,` on macOS, `Ctrl+Shift+T` elsewhere.
-    pub fn label(self, mac: bool) -> String {
-        let key = self.key.to_ascii_uppercase();
-        if mac {
-            let mut s = String::new();
-            if self.ctrl {
-                s.push('⌃');
-            }
-            if self.alt {
-                s.push('⌥');
-            }
-            if self.shift {
-                s.push('⇧');
-            }
-            if self.cmd {
-                s.push('⌘');
-            }
-            s.push(key);
-            s
-        } else {
-            let mut parts: Vec<String> = Vec::new();
-            if self.ctrl {
-                parts.push("Ctrl".into());
-            }
-            if self.alt {
-                parts.push("Alt".into());
-            }
-            if self.shift {
-                parts.push("Shift".into());
-            }
-            if self.cmd {
-                parts.push("Super".into());
-            }
-            parts.push(key.to_string());
-            parts.join("+")
-        }
-    }
+/// Whether `key` is a modifier on its own (pressed while building a chord).
+pub fn is_modifier(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::Named(
+            Named::Shift
+                | Named::Control
+                | Named::Alt
+                | Named::AltGraph
+                | Named::Super
+                | Named::Meta
+                | Named::Hyper
+                | Named::CapsLock
+                | Named::Fn
+                | Named::FnLock
+                | Named::NumLock
+                | Named::Symbol
+                | Named::SymbolLock
+        )
+    )
+}
 
-    /// The modifiers held for this chord.
-    #[cfg(test)]
-    pub fn modifiers(self) -> Modifiers {
-        let mut m = Modifiers::empty();
-        if self.ctrl {
-            m |= Modifiers::CTRL;
-        }
-        if self.alt {
-            m |= Modifiers::ALT;
-        }
-        if self.shift {
-            m |= Modifiers::SHIFT;
-        }
-        if self.cmd {
-            m |= Modifiers::LOGO;
-        }
-        m
+/// The action a key press triggers under `bindings`, if any. `text` is what the press types,
+/// if anything: off macOS a Ctrl+Alt press that types a character is that character, since
+/// AltGr is Ctrl+Alt on Windows and AltGr+F types `[` on several European layouts.
+///
+/// This includes the find-bar keys ([`Action::is_find_navigation`]); callers act on those only
+/// while the find bar is open.
+pub fn shortcut(
+    bindings: &Bindings,
+    key: &Key,
+    mods: Modifiers,
+    text: Option<&str>,
+) -> Option<Action> {
+    let types = text.is_some_and(|t| t.chars().any(|c| !c.is_control()));
+    if !bindings.mac() && mods.control() && mods.alt() && types {
+        return None;
     }
+    bindings.action(press_chord(key, mods)?)
+}
+
+/// The shortcut for `key` under the default bindings of macOS (`mac`) or the other platforms,
+/// without the find-bar keys (see [`find_key`]).
+#[cfg(test)]
+pub fn shortcut_for(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
+    shortcut(&Bindings::defaults(mac), key, mods, None).filter(|a| !a.is_find_navigation())
+}
+
+/// [`shortcut_for`] with the AltGr rule of [`shortcut`].
+#[cfg(test)]
+pub fn shortcut_typed(mac: bool, key: &Key, mods: Modifiers, text: Option<&str>) -> Option<Action> {
+    shortcut(&Bindings::defaults(mac), key, mods, text).filter(|a| !a.is_find_navigation())
+}
+
+/// The find-bar keys under the default bindings.
+#[cfg(test)]
+pub fn find_key(mac: bool, key: &Key, mods: Modifiers) -> Option<Action> {
+    shortcut(&Bindings::defaults(mac), key, mods, None).filter(|a| a.is_find_navigation())
+}
+
+/// The default chord of `action`.
+#[cfg(test)]
+pub fn chord_for(mac: bool, action: Action) -> Option<Chord> {
+    fbterm_config::keys::default_chord(mac, action)
+}
+
+/// The modifiers held for `chord`.
+#[cfg(test)]
+pub fn modifiers(chord: Chord) -> Modifiers {
+    let mut m = Modifiers::empty();
+    if chord.ctrl {
+        m |= Modifiers::CTRL;
+    }
+    if chord.alt {
+        m |= Modifiers::ALT;
+    }
+    if chord.shift {
+        m |= Modifiers::SHIFT;
+    }
+    if chord.cmd {
+        m |= Modifiers::LOGO;
+    }
+    m
 }
 
 #[cfg(test)]
@@ -298,10 +188,13 @@ mod tests {
                 let Some(c) = chord_for(mac, action) else {
                     continue;
                 };
-                let key = Key::Character(c.key.to_string().into());
+                let ChordKey::Char(ch) = c.key else {
+                    panic!("default chords are character keys");
+                };
+                let key = Key::Character(ch.to_string().into());
                 let found = match action {
-                    Action::FindNext | Action::FindPrevious => find_key(mac, &key, c.modifiers()),
-                    _ => shortcut_for(mac, &key, c.modifiers()),
+                    Action::FindNext | Action::FindPrevious => find_key(mac, &key, modifiers(c)),
+                    _ => shortcut_for(mac, &key, modifiers(c)),
                 };
                 assert_eq!(found, Some(action), "{} (mac: {mac})", c.label(mac));
             }
@@ -481,6 +374,76 @@ mod tests {
         } else {
             ctrl_shift()
         };
-        assert_eq!(shortcut(&k("t"), mods, None), Some(Action::NewTab));
+        let current = Bindings::current(&Default::default());
+        assert_eq!(
+            shortcut(&current, &k("t"), mods, None),
+            Some(Action::NewTab)
+        );
+    }
+
+    fn chord(s: &str) -> Chord {
+        Chord::parse(s).unwrap().unwrap()
+    }
+
+    #[test]
+    fn presses_become_chords() {
+        use iced::keyboard::key::Named;
+        assert_eq!(
+            press_chord(&k("T"), cmd_shift()),
+            Some(chord("cmd+shift+t"))
+        );
+        assert_eq!(
+            press_chord(&k("}"), cmd_shift()),
+            Some(chord("cmd+shift+]"))
+        );
+        assert_eq!(
+            press_chord(&Key::Named(Named::F5), Modifiers::empty()),
+            Some(chord("f5"))
+        );
+        assert_eq!(
+            press_chord(&Key::Named(Named::ArrowLeft), Modifiers::ALT),
+            Some(chord("alt+left"))
+        );
+        assert_eq!(
+            press_chord(&Key::Named(Named::Space), Modifiers::CTRL),
+            Some(chord("ctrl+space"))
+        );
+        assert_eq!(press_chord(&k("ab"), CMD), None);
+        assert_eq!(press_chord(&Key::Named(Named::MediaPlay), CMD), None);
+        assert!(is_modifier(&Key::Named(Named::Shift)));
+        assert!(!is_modifier(&k("a")));
+    }
+
+    #[test]
+    fn overrides_replace_defaults_with_the_same_matching_rules() {
+        let mut o = fbterm_config::keys::Overrides::new();
+        o.insert(Action::NextTab, Some(chord("ctrl+tab")));
+        o.insert(Action::PrevTab, Some(chord("ctrl+shift+tab")));
+        o.insert(Action::FindAll, Some(chord("ctrl+alt+g")));
+        o.insert(Action::NewTab, None);
+        o.insert(Action::OpenSettingsFile, Some(chord("ctrl+shift+.")));
+        let b = Bindings::new(false, &o);
+        let tab = Key::Named(iced::keyboard::key::Named::Tab);
+        assert_eq!(
+            shortcut(&b, &tab, Modifiers::CTRL, None),
+            Some(Action::NextTab)
+        );
+        assert_eq!(
+            shortcut(&b, &tab, ctrl_shift(), None),
+            Some(Action::PrevTab)
+        );
+        // The old chords are free again.
+        assert_eq!(shortcut(&b, &k("]"), ctrl_shift(), None), None);
+        assert_eq!(shortcut(&b, &k("t"), ctrl_shift(), None), None);
+        // A shifted symbol matches whichever way the platform reports it.
+        assert_eq!(
+            shortcut(&b, &k(">"), ctrl_shift(), None),
+            Some(Action::OpenSettingsFile)
+        );
+        // AltGr typing a character is that character, for a rebound chord too.
+        let altgr = Modifiers::CTRL | Modifiers::ALT;
+        assert_eq!(shortcut(&b, &k("g"), altgr, Some("@")), None);
+        assert_eq!(shortcut(&b, &k("g"), altgr, None), Some(Action::FindAll));
+        assert_eq!(shortcut(&b, &k("f"), altgr, None), None);
     }
 }
