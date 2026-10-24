@@ -36,9 +36,20 @@ pub enum Action {
     FindPrevious,
 }
 
-/// The shortcut for `key` (as pressed, without modifiers applied) on this platform.
-pub fn shortcut(key: &Key, mods: Modifiers) -> Option<Action> {
-    shortcut_for(cfg!(target_os = "macos"), key, mods)
+/// The shortcut for `key` (as pressed, without modifiers applied) on this platform. `text` is
+/// what the key press types, if anything.
+pub fn shortcut(key: &Key, mods: Modifiers, text: Option<&str>) -> Option<Action> {
+    shortcut_typed(cfg!(target_os = "macos"), key, mods, text)
+}
+
+/// [`shortcut_for`], except that a Ctrl+Alt press that types a character is that character:
+/// on Windows AltGr is Ctrl+Alt, and AltGr+F types `[` on several European layouts.
+pub fn shortcut_typed(mac: bool, key: &Key, mods: Modifiers, text: Option<&str>) -> Option<Action> {
+    let types = text.is_some_and(|t| t.chars().any(|c| !c.is_control()));
+    if !mac && mods.control() && mods.alt() && types {
+        return None;
+    }
+    shortcut_for(mac, key, mods)
 }
 
 /// The shortcut table, for macOS (`mac`) or the other platforms.
@@ -419,6 +430,21 @@ mod tests {
             Some(Action::FindAll)
         );
         assert_eq!(o("f", ctrl_shift() | Modifiers::ALT), None);
+        // AltGr is Ctrl+Alt on Windows: AltGr+F typing "[" is that character, not the chord.
+        let altgr = Modifiers::CTRL | Modifiers::ALT;
+        assert_eq!(shortcut_typed(false, &k("f"), altgr, Some("[")), None);
+        assert_eq!(
+            shortcut_typed(false, &k("f"), altgr, None),
+            Some(Action::FindAll)
+        );
+        assert_eq!(
+            shortcut_typed(false, &k("f"), altgr, Some("\u{6}")),
+            Some(Action::FindAll)
+        );
+        assert_eq!(
+            shortcut_typed(true, &k("f"), CMD, Some("f")),
+            Some(Action::Find)
+        );
         // Plain Ctrl+F (forward a character) and Ctrl+G stay with the shell.
         assert_eq!(o("f", Modifiers::CTRL), None);
         assert_eq!(o("g", Modifiers::CTRL), None);
@@ -455,6 +481,6 @@ mod tests {
         } else {
             ctrl_shift()
         };
-        assert_eq!(shortcut(&k("t"), mods), Some(Action::NewTab));
+        assert_eq!(shortcut(&k("t"), mods, None), Some(Action::NewTab));
     }
 }

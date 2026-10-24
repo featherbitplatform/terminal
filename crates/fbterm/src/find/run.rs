@@ -52,7 +52,9 @@ fn focus(input: &iced::widget::Id) -> Task<Message> {
 impl App {
     /// The search highlight for a tab's bar: matches tinted violet, the current one in the
     /// accent.
-    pub(crate) fn highlight(&self, bar: &FindBar) -> Option<fbterm_term::Highlight> {
+    /// `alt`: the terminal shows the alternate screen now; the current match is only drawn when
+    /// it was found on the same screen.
+    pub(crate) fn highlight(&self, bar: &FindBar, alt: bool) -> Option<fbterm_term::Highlight> {
         let to_rgb = |c: iced::Color| {
             let [r, g, b, _] = c.into_rgba8();
             fbterm_config::Rgb { r, g, b }
@@ -60,7 +62,7 @@ impl App {
         let accent = to_rgb(self.tokens.accent);
         Some(fbterm_term::Highlight {
             pattern: bar.pattern()?.clone(),
-            current: bar.current_match(),
+            current: bar.current_match().filter(|_| bar.alt_screen == alt),
             match_bg: blend(accent, self.style.scheme.background, 0.38),
             current_bg: accent,
             current_fg: fbterm_config::Rgb {
@@ -178,7 +180,10 @@ impl App {
         }
         let since = bar.last_search.map_or(REFRESH_AFTER, |t| t.elapsed());
         if since >= REFRESH_AFTER {
-            return bar.refresh().map_or(Task::none(), |r| spawn(id, term, r));
+            let view_bottom = term.lock().view_bottom();
+            return bar
+                .refresh(alt, view_bottom)
+                .map_or(Task::none(), |r| spawn(id, term, r));
         }
         // One timer per burst of output, not a loop: it fires once and searches.
         bar.refresh_scheduled = true;
@@ -198,10 +203,19 @@ impl App {
         let Some(bar) = tab.find.as_mut() else {
             return Task::none();
         };
-        bar.refresh().map_or(Task::none(), |r| spawn(id, term, r))
+        let (alt, view_bottom) = {
+            let t = term.lock();
+            (
+                t.mode().contains(fbterm_term::TermMode::ALT_SCREEN),
+                t.view_bottom(),
+            )
+        };
+        bar.refresh(alt, view_bottom)
+            .map_or(Task::none(), |r| spawn(id, term, r))
     }
 
-    /// The active tab of `wid` resized: wrapped lines moved, so its bar searches again.
+    /// The active tab of `wid` resized: its bar searches again, keeping its match when only
+    /// the rows changed (see [`FindBar::resized`]).
     pub(crate) fn find_resized(&mut self, wid: window::Id) -> Task<Message> {
         let Some(tab) = self
             .windows
@@ -216,10 +230,12 @@ impl App {
         let Some(bar) = tab.find.as_mut() else {
             return Task::none();
         };
-        let view_bottom = term.lock().view_bottom();
-        let q = bar.query.clone();
+        let (cols, view_bottom) = {
+            let t = term.lock();
+            (t.size().cols, t.view_bottom())
+        };
         let id = tab.id;
-        bar.set_query(q, view_bottom)
+        bar.resized(cols, view_bottom)
             .map_or(Task::none(), |r| spawn(id, term, r))
     }
 
@@ -357,7 +373,9 @@ impl App {
 /// Scroll the terminal so the bar's current match is in view.
 fn reveal(term: &SharedTerminal, bar: &FindBar) {
     if let Some(m) = bar.current_match() {
-        term.lock().reveal(&m);
+        let mut t = term.lock();
+        let cover = super::bar_view::cover(t.size());
+        t.reveal(&m, Some(cover));
     }
 }
 
@@ -439,7 +457,7 @@ mod tests {
             },
             &std::sync::atomic::AtomicBool::new(false),
         );
-        let seq = bar.seq;
+        let seq = bar.pending.expect("searching").0;
         let _ = app.found(ids[0], seq, outcome);
         let bar = app.windows[&wid].tabs[0].find.as_ref().unwrap();
         // "hello from 0" has two, the prompt line none: newest first.
@@ -476,8 +494,7 @@ mod tests {
         assert!(app.find_box.as_ref().unwrap().searching());
         // Deliver every tab's result as the worker threads would.
         let targets = app.find_targets();
-        // The box's first search.
-        let seq = 1;
+        let seq = app.find_box.as_ref().unwrap().seq();
         for t in targets {
             let req = fbterm_term::SearchRequest {
                 pattern: fbterm_term::SearchPattern::new(&fbterm_term::SearchQuery::new(
