@@ -12,6 +12,7 @@
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
@@ -52,13 +53,32 @@ impl SearchQuery {
     }
 }
 
-/// The query is not a valid regular expression (or is too large to compile).
+/// Longest query compiled, in characters.
+pub const MAX_QUERY_CHARS: usize = 512;
+
+/// Most time one chunk of a search keeps the terminal locked; it then stops at a line
+/// boundary and the next chunk continues there.
+pub const CHUNK_BUDGET: Duration = Duration::from_millis(3);
+
+/// Most time spent finding the matches in view for one frame; past it the frame shows the
+/// matches found so far.
+const VIEW_BUDGET: Duration = Duration::from_millis(4);
+
+/// Why a query cannot be searched for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PatternError;
+pub enum PatternError {
+    /// Not a valid regular expression, or too large to compile.
+    Invalid,
+    /// Longer than [`MAX_QUERY_CHARS`]; not compiled at all.
+    TooLong,
+}
 
 impl std::fmt::Display for PatternError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Invalid pattern")
+        f.write_str(match self {
+            Self::Invalid => "Invalid pattern",
+            Self::TooLong => "Query too long",
+        })
     }
 }
 
@@ -100,6 +120,9 @@ impl SearchPattern {
         if query.text.is_empty() {
             return Ok(None);
         }
+        if query.text.chars().count() > MAX_QUERY_CHARS {
+            return Err(PatternError::TooLong);
+        }
         let source = if query.regex {
             query.text.clone()
         } else {
@@ -110,7 +133,7 @@ impl SearchPattern {
             .size_limit(1 << 20)
             .dfa_size_limit(4 << 20)
             .build()
-            .map_err(|_| PatternError)?;
+            .map_err(|_| PatternError::Invalid)?;
         Ok(Some(Self {
             query: query.clone(),
             re,
@@ -184,6 +207,8 @@ pub struct SearchOutcome {
     pub alt_screen: bool,
     /// The terminal's [`Terminal::generation`] when the search finished.
     pub generation: u64,
+    /// Columns of the terminal searched: positions are only valid at this width.
+    pub cols: u16,
 }
 
 /// One logical line (rows joined across soft wraps) as text, with where each character sits.
@@ -268,13 +293,13 @@ pub fn snippet(text: &str, range: Range<usize>) -> Snippet {
 impl Terminal {
     /// The stable line number of grid line `line` (see [`StablePoint`]).
     pub fn stable_line(&self, line: Line) -> i64 {
-        self.term.grid().scrolled_lines() as i64 + i64::from(line.0)
+        self.term.grid().scrolled_lines() + i64::from(line.0)
     }
 
     /// The grid line showing stable line `stable`, if it is still in the scrollback or on screen.
     pub fn grid_line(&self, stable: i64) -> Option<Line> {
         let grid = self.term.grid();
-        let line = stable - grid.scrolled_lines() as i64;
+        let line = stable - grid.scrolled_lines();
         let line = i32::try_from(line).ok()?;
         (grid.topmost_line().0..=grid.bottommost_line().0)
             .contains(&line)
@@ -366,10 +391,12 @@ impl Terminal {
         below: Option<i64>,
         rows: usize,
         limit: usize,
+        budget: Duration,
     ) -> (Vec<Hit>, Option<i64>) {
+        let started = Instant::now();
         let grid = self.term.grid();
         let top = grid.topmost_line().0;
-        let scrolled = grid.scrolled_lines() as i64;
+        let scrolled = grid.scrolled_lines();
         let last = match below {
             None => grid.bottommost_line().0,
             Some(s) => match i32::try_from(s - scrolled - 1) {
@@ -395,7 +422,7 @@ impl Terminal {
             line.reverse();
             hits.extend(line);
             end = start - 1;
-            if hits.len() >= limit {
+            if hits.len() >= limit || (end >= first && started.elapsed() >= budget) {
                 return (hits, (start > top).then(|| self.stable_line(Line(start))));
             }
         }
@@ -418,9 +445,10 @@ impl Terminal {
         while last < ceiling && self.wraps(last) {
             last += 1;
         }
+        let started = Instant::now();
         let mut out = Vec::new();
         let mut start = first;
-        while start <= last {
+        while start <= last && started.elapsed() < VIEW_BUDGET {
             let mut end = start;
             while end < last && self.wraps(end) {
                 end += 1;
@@ -436,8 +464,10 @@ impl Terminal {
     }
 
     /// Scroll so `m` is in view: nothing when it already is, otherwise its line lands near the
-    /// middle of the view. Returns whether the view moved.
-    pub fn reveal(&mut self, m: &SearchMatch) -> bool {
+    /// middle of the view. `cover` is a part of the view hidden by something drawn over it (the
+    /// find bar): its top `rows` rows from column `from_col` on; a match there counts as out of
+    /// view. Returns whether the view moved.
+    pub fn reveal(&mut self, m: &SearchMatch, cover: Option<Cover>) -> bool {
         let Some(line) = self.grid_line(m.start.line) else {
             return false;
         };
@@ -446,20 +476,45 @@ impl Terminal {
         let rows = grid.screen_lines() as i32;
         let offset = grid.display_offset() as i32;
         let view_top = -offset;
-        if line.0 >= view_top && end.0 < view_top + rows {
+        let covered = cover.is_some_and(|c| {
+            let row = line.0 - view_top;
+            let reaches = m.start.line != m.end.line || usize::from(m.end.col) >= c.from_col;
+            row >= 0 && (row as usize) < c.rows && reaches
+        });
+        if line.0 >= view_top && end.0 < view_top + rows && !covered {
             return false;
         }
         let history = grid.history_size() as i32;
         let target = (rows / 2 - line.0).clamp(0, history);
+        if target == offset {
+            return false;
+        }
         self.term.scroll_display(Scroll::Delta(target - offset));
         self.generation += 1;
         true
     }
 }
 
+/// The part of the view something is drawn over: the top `rows` rows, from column `from_col`
+/// to the right edge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cover {
+    pub rows: usize,
+    pub from_col: usize,
+}
+
 /// Search `term` for `req`, locking it one chunk at a time. Checks `cancel` between chunks.
 /// Meant for a worker thread: a full 10,000-line scrollback takes a few milliseconds.
 pub fn search(term: &SharedTerminal, req: &SearchRequest, cancel: &AtomicBool) -> SearchOutcome {
+    search_with_budget(term, req, cancel, CHUNK_BUDGET)
+}
+
+fn search_with_budget(
+    term: &SharedTerminal,
+    req: &SearchRequest,
+    cancel: &AtomicBool,
+    budget: Duration,
+) -> SearchOutcome {
     let mut out = SearchOutcome::default();
     let mut below = req.below;
     loop {
@@ -469,8 +524,9 @@ pub fn search(term: &SharedTerminal, req: &SearchRequest, cancel: &AtomicBool) -
         }
         let t = term.lock();
         let left = req.limit.saturating_sub(out.hits.len()).max(1);
-        let (hits, next) = t.search_chunk(req, below, CHUNK_ROWS, left);
+        let (hits, next) = t.search_chunk(req, below, CHUNK_ROWS, left, budget);
         out.alt_screen = t.mode().contains(crate::TermMode::ALT_SCREEN);
+        out.cols = t.size().cols;
         out.generation = t.generation();
         drop(t);
         out.hits.extend(hits);
@@ -560,6 +616,10 @@ mod tests {
     fn invalid_regex_is_an_error_not_a_panic() {
         let e = SearchPattern::new(&SearchQuery::new("(unclosed", true)).unwrap_err();
         assert_eq!(e.to_string(), "Invalid pattern");
+        let long = "a".repeat(MAX_QUERY_CHARS + 1);
+        let e = SearchPattern::new(&SearchQuery::new(long, false)).unwrap_err();
+        assert_eq!(e, PatternError::TooLong);
+        assert_eq!(e.to_string(), "Query too long");
         assert!(SearchPattern::new(&SearchQuery::new("(unclosed", false)).is_ok());
         assert!(
             SearchPattern::new(&SearchQuery::new("", true))
@@ -638,6 +698,93 @@ mod tests {
         );
     }
 
+    /// The text at stable line `stable`, trimmed.
+    fn text_at(t: &Terminal, stable: i64) -> Option<String> {
+        let line = t.grid_line(stable)?;
+        let row = &t.term().grid()[line];
+        let s: String = (0..t.term().grid().columns())
+            .map(|c| row[Column(c)].c)
+            .collect();
+        Some(s.trim_end().to_owned())
+    }
+
+    fn resize_rows(t: &mut Terminal, rows: u16) {
+        let size = t.size();
+        t.resize(GridSize { rows, ..size });
+    }
+
+    #[test]
+    fn stable_lines_survive_row_resizes() {
+        // With history: lines come back from it when the screen grows.
+        let mut t = term(20, 10, 1000);
+        for i in 0..50 {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let old = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>();
+        let find = |t: &Terminal, s: &str| {
+            let g = t.term().grid();
+            (g.topmost_line().0..=g.bottommost_line().0)
+                .map(|l| t.stable_line(Line(l)))
+                .find(|&st| text_at(t, st).as_deref() == Some(s))
+                .unwrap()
+        };
+        let in_history = find(&t, &old[10]);
+        let on_screen = find(&t, &old[48]);
+        for rows in [20, 5, 30, 10, 40] {
+            resize_rows(&mut t, rows);
+            assert_eq!(
+                text_at(&t, in_history).as_deref(),
+                Some("line 10"),
+                "rows {rows}"
+            );
+            assert_eq!(
+                text_at(&t, on_screen).as_deref(),
+                Some("line 48"),
+                "rows {rows}"
+            );
+        }
+
+        // No history yet: growing adds blank rows below; shrinking then growing again.
+        let mut t = term(20, 10, 1000);
+        t.feed(b"needle\r\nsecond");
+        let needle = t.stable_line(Line(0));
+        for rows in [20, 2, 20, 1, 15] {
+            resize_rows(&mut t, rows);
+            assert_eq!(
+                text_at(&t, needle).as_deref(),
+                Some("needle"),
+                "rows {rows}"
+            );
+        }
+
+        // Only part of the growth can come from history.
+        let mut t = term(20, 10, 1000);
+        for i in 0..13 {
+            t.feed(format!("row {i}\r\n").as_bytes());
+        }
+        assert!(t.term().grid().history_size() < 10);
+        let first = find(&t, "row 0");
+        let last = find(&t, "row 12");
+        for rows in [20, 4, 25] {
+            resize_rows(&mut t, rows);
+            assert_eq!(text_at(&t, first).as_deref(), Some("row 0"), "rows {rows}");
+            assert_eq!(text_at(&t, last).as_deref(), Some("row 12"), "rows {rows}");
+        }
+
+        // No scrollback at all.
+        let mut t = term(20, 10, 0);
+        t.feed(b"needle\r\nsecond");
+        let second = t.stable_line(Line(1));
+        for rows in [20, 3, 12] {
+            resize_rows(&mut t, rows);
+            assert_eq!(
+                text_at(&t, second).as_deref(),
+                Some("second"),
+                "rows {rows}"
+            );
+        }
+    }
+
     #[test]
     fn matches_span_soft_wraps_but_not_line_breaks() {
         let mut t = term(10, 5, 100);
@@ -703,6 +850,24 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_out_of_time_stops_at_a_line_and_the_next_continues() {
+        let mut t = term(10, 5, 5000);
+        for i in 0..2000 {
+            // Some lines wrap, so chunk edges must respect logical lines.
+            let pad = if i % 3 == 0 { "-----------" } else { "" };
+            t.feed(format!("hit{pad} {i}\r\n").as_bytes());
+        }
+        let shared: SharedTerminal = Arc::new(Mutex::new(t));
+        let r = req("hit", false);
+        let normal = search(&shared, &r, &AtomicBool::new(false));
+        // No time at all: every chunk does one line, the result is the same.
+        let sliced = search_with_budget(&shared, &r, &AtomicBool::new(false), Duration::ZERO);
+        assert_eq!(normal.hits, sliced.hits);
+        assert_eq!(normal.resume, sliced.resume);
+        assert_eq!(normal.cols, 10);
+    }
+
+    #[test]
     fn a_cancelled_search_stops() {
         let mut t = term(20, 5, 100);
         t.feed(b"hit");
@@ -718,6 +883,9 @@ mod tests {
     #[test]
     fn visible_matches_and_reveal() {
         let mut t = term(20, 5, 1000);
+        for i in 0..10 {
+            t.feed(format!("before {i}\r\n").as_bytes());
+        }
         t.feed(b"target\r\n");
         for i in 0..100 {
             t.feed(format!("filler {i}\r\n").as_bytes());
@@ -727,10 +895,29 @@ mod tests {
         let shared: SharedTerminal = Arc::new(Mutex::new(t));
         let out = search(&shared, &req("target", false), &AtomicBool::new(false));
         let mut t = shared.lock();
-        assert!(t.reveal(&out.hits[0].range));
+        assert!(t.reveal(&out.hits[0].range, None));
         assert_eq!(t.visible_matches(&p), vec![out.hits[0].range]);
-        assert!(!t.reveal(&out.hits[0].range), "already in view");
+        assert!(!t.reveal(&out.hits[0].range, None), "already in view");
         assert!(t.view_bottom() > out.hits[0].range.start.line);
+        // At the top row, under something covering the top right: scrolled to the middle.
+        let m = out.hits[0].range;
+        let row = |t: &Terminal| {
+            t.grid_line(m.start.line).unwrap().0 + t.term().grid().display_offset() as i32
+        };
+        let up = row(&t);
+        t.scroll(-up);
+        assert_eq!(row(&t), 0);
+        let away = Cover {
+            rows: 1,
+            from_col: 10,
+        };
+        assert!(!t.reveal(&m, Some(away)), "the cover is right of the match");
+        let over = Cover {
+            rows: 1,
+            from_col: 3,
+        };
+        assert!(t.reveal(&m, Some(over)));
+        assert_eq!(row(&t), 2);
     }
 
     #[test]

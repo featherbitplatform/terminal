@@ -14,8 +14,9 @@ pub use input::{
 };
 pub use palette::{ColorScheme, blend, contrast_ratio};
 pub use search::{
-    CHUNK_ROWS, Hit, MATCH_CAP, PatternError, SearchMatch, SearchOutcome, SearchPattern,
-    SearchQuery, SearchRequest, Snippet, StablePoint, is_case_sensitive, search, snippet,
+    CHUNK_BUDGET, CHUNK_ROWS, Cover, Hit, MATCH_CAP, MAX_QUERY_CHARS, PatternError, SearchMatch,
+    SearchOutcome, SearchPattern, SearchQuery, SearchRequest, Snippet, StablePoint,
+    is_case_sensitive, search, snippet,
 };
 pub use selection::Selection;
 pub use terminal::{EventProxy, GridSize, SharedTerminal, TermEvent, TermMode, Terminal};

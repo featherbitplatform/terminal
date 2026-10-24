@@ -17,7 +17,7 @@ With an empty title stack the original line panics (`Vec::remove(0)` on an empty
 
 ## 2. Scroll counter on the grid (scrollback search)
 
-`src/grid/mod.rs`: `Grid` gains a `scrolled_lines: u64` field (skipped by serde), incremented by `positions` where `Grid::scroll_up` rotates the whole buffer into history, and a getter `Grid::scrolled_lines()`. `scrolled_lines() as i64 + line` is a line number that stays the same while output scrolls the line upward, which the find bar uses to keep its matches and current match in place as new output arrives. Nothing upstream reads the field.
+`src/grid/mod.rs`: `Grid` gains a `scrolled_lines: i64` field (skipped by serde), incremented by `positions` where `Grid::scroll_up` rotates the whole buffer into history, and a getter `Grid::scrolled_lines()`. `src/grid/resize.rs`: `grow_lines` subtracts the lines it adds (lines pulled back from history move down the screen, and the rotation its `scroll_up` counts only undoes the growth), so the counter can go below zero (wrapping arithmetic). `scrolled_lines() + line` is a line number that stays the same while output scrolls the line upward and while the screen grows or shrinks, which the find bar uses to keep its matches and current match in place as new output arrives. Nothing upstream reads the field.
 
 ## Packaging
 

@@ -139,7 +139,7 @@ pub struct Grid<T> {
     /// Lines rotated into history since the grid was created (fbterm patch: lets a host keep
     /// positions stable while output scrolls).
     #[cfg_attr(feature = "serde", serde(skip))]
-    scrolled_lines: u64,
+    scrolled_lines: i64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -157,8 +157,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     }
 
     /// Lines rotated into history since the grid was created (fbterm patch). A line at
-    /// `Line(l)` keeps the same `scrolled_lines() as i64 + l` while output scrolls it upward.
-    pub fn scrolled_lines(&self) -> u64 {
+    /// `Line(l)` keeps the same `scrolled_lines() + l` while output scrolls it upward and while
+    /// the screen grows or shrinks. Can be negative (a grow pulled lines back from history).
+    pub fn scrolled_lines(&self) -> i64 {
         self.scrolled_lines
     }
 
@@ -299,7 +300,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
             // Rotate the entire line buffer upward.
             self.raw.rotate(-(positions as isize));
-            self.scrolled_lines += positions as u64;
+            self.scrolled_lines = self.scrolled_lines.wrapping_add(positions as i64);
 
             // Swap the fixed lines at the bottom back into position.
             let screen_lines = self.screen_lines() as i32;
