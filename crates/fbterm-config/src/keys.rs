@@ -34,6 +34,8 @@ pub enum Action {
     OpenSettingsFile,
     /// Show the config folder in the file manager (no chord by default).
     RevealConfigFolder,
+    /// Save the active tab's text to a file (no chord by default).
+    ExportTab,
     /// The active tab's find bar: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
     Find,
     /// The search over every tab: Cmd+Shift+F on macOS, Ctrl+Alt+F elsewhere.
@@ -70,7 +72,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 24] = [
+    pub const ALL: [Action; 25] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -84,6 +86,7 @@ impl Action {
         Action::SelectTab(7),
         Action::SelectTab(8),
         Action::SelectTab(9),
+        Action::ExportTab,
         Action::NewWindow,
         Action::EditProfiles,
         Action::Settings,
@@ -120,6 +123,7 @@ impl Action {
             Self::Settings => "settings",
             Self::OpenSettingsFile => "open_settings_file",
             Self::RevealConfigFolder => "reveal_config_folder",
+            Self::ExportTab => "export_tab",
             Self::Find => "find",
             Self::FindAll => "find_all",
             Self::FindNext => "find_next",
@@ -147,6 +151,7 @@ impl Action {
             Self::Settings => "Settings".into(),
             Self::OpenSettingsFile => "Open settings file".into(),
             Self::RevealConfigFolder => "Reveal config folder".into(),
+            Self::ExportTab => "Export tab to file".into(),
             Self::Find => "Find in tab".into(),
             Self::FindAll => "Find in all tabs".into(),
             Self::FindNext => "Older match".into(),
@@ -156,9 +161,12 @@ impl Action {
 
     pub fn group(self) -> ActionGroup {
         match self {
-            Self::NewTab | Self::CloseTab | Self::NextTab | Self::PrevTab | Self::SelectTab(_) => {
-                ActionGroup::Tabs
-            }
+            Self::NewTab
+            | Self::CloseTab
+            | Self::NextTab
+            | Self::PrevTab
+            | Self::SelectTab(_)
+            | Self::ExportTab => ActionGroup::Tabs,
             Self::NewWindow | Self::EditProfiles | Self::Settings => ActionGroup::Windows,
             Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious => ActionGroup::Search,
             Self::Palette | Self::OpenSettingsFile | Self::RevealConfigFolder | Self::Quit => {
@@ -564,7 +572,10 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
                 ctrl_chord('g', shift, false)
             });
         }
-        Action::SelectTab(_) | Action::OpenSettingsFile | Action::RevealConfigFolder => {
+        Action::SelectTab(_)
+        | Action::OpenSettingsFile
+        | Action::RevealConfigFolder
+        | Action::ExportTab => {
             return None;
         }
     };

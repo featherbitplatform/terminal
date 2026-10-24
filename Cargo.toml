@@ -34,6 +34,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
 png = "0.17"
 rfd = "0.17.2"
+# Tab export: gzip output, and the local time in the default file name.
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 

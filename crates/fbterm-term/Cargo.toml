@@ -12,6 +12,7 @@ iced = { workspace = true, features = ["advanced"] }
 alacritty_terminal = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
+flate2 = { workspace = true }
 fbterm-config = { path = "../fbterm-config" }
 
 [dev-dependencies]

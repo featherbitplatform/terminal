@@ -52,6 +52,7 @@ impl App {
                 crate::config_files::reveal_config_folder(&self.paths);
                 Task::none()
             }
+            Action::ExportTab => self.export_tab(wid),
             Action::Quit => self.quit(),
             Action::Find => match wid {
                 Some(wid) => self.find(wid, crate::find::FindMsg::Open),

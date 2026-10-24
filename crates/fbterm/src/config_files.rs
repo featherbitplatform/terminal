@@ -37,6 +37,15 @@ pub fn reveal_config_folder(paths: &Paths) {
     spawn_reaped(reveal_command(&dir, &file, file.exists()), "config folder");
 }
 
+/// Show `file` in the file manager (selected on macOS; its folder elsewhere).
+pub fn reveal_file(file: &Path) {
+    let file = absolute(file);
+    let dir = file
+        .parent()
+        .map_or_else(|| file.clone(), Path::to_path_buf);
+    spawn_reaped(reveal_command(&dir, &file, file.exists()), "exported file");
+}
+
 fn reveal_command(dir: &Path, file: &Path, file_exists: bool) -> Command {
     #[cfg(target_os = "macos")]
     {

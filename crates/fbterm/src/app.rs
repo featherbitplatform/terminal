@@ -139,6 +139,8 @@ pub enum Message {
     },
     Editor(EditorMsg),
     Settings(SettingsMsg),
+    /// Exporting a tab to a file.
+    Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
     Shoot,
     Shot(Screenshot),
@@ -245,6 +247,10 @@ pub struct App {
     /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
     /// shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
+    /// A tab export is under way (its Save dialog open or its file being written).
+    pub(crate) exporting: bool,
+    /// The last export's outcome, shown in the window it ran in until dismissed.
+    pub(crate) export_notice: Option<crate::export::ExportNotice>,
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -441,6 +447,8 @@ impl App {
             shooting: false,
             demo_tip: debug_env("FBTERM_DEMO_TOOLTIP")
                 .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
+            exporting: false,
+            export_notice: None,
         };
         app.update_output_rate();
         let mut task = match crate::perf::opts() {
@@ -689,6 +697,9 @@ impl App {
                 }
                 self.prompts.remove_window(id);
                 self.grids.remove(&id);
+                if self.export_notice.as_ref().is_some_and(|n| n.window == id) {
+                    self.export_notice = None;
+                }
                 if self.focused == Some(id) {
                     self.focused = self.windows.keys().next().copied();
                 }
@@ -718,6 +729,7 @@ impl App {
             }
             Message::DebugFind { all, query } => self.debug_find(all, query),
             Message::Editor(msg) => self.editor_msg(msg),
+            Message::Export(msg) => self.export_msg(msg),
             Message::Settings(msg) => self.settings_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::WindowResized(id, size) => {

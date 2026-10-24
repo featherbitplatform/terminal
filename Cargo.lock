@@ -1271,6 +1271,7 @@ dependencies = [
  "alacritty_terminal",
  "async-trait",
  "block2 0.6.2",
+ "chrono",
  "directories",
  "fbterm-config",
  "fbterm-secrets",
@@ -1346,6 +1347,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "fbterm-config",
+ "flate2",
  "iced",
  "parking_lot",
  "png",
