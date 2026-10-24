@@ -570,3 +570,33 @@ fn color_as_is_saved_with_the_profile_and_kept_untouched() {
     let (ed, _) = editor(&store);
     assert_eq!(ed.draft(shell.id).unwrap().accent_style, AccentStyle::Tab);
 }
+
+#[test]
+fn clearing_the_accent_resets_color_as_to_the_stripe() {
+    let shell = local("zsh");
+    let mut store = ProfileStore {
+        profiles: vec![shell.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(shell.id));
+    ed.update(EditorMsg::Accent(Some(Rgb {
+        r: 0x2b,
+        g: 0xbb,
+        b: 0x71,
+    })));
+    ed.update(EditorMsg::AccentStyle(AccentStyle::Tab));
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(store.get(shell.id).unwrap().accent_style, AccentStyle::Tab);
+    ed.update(EditorMsg::Accent(None));
+    let path = file();
+    ed.save(&mut store, &path).unwrap();
+    assert_eq!(
+        store.get(shell.id).unwrap().accent_style,
+        AccentStyle::Stripe
+    );
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("accent_style")
+    );
+}
