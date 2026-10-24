@@ -28,6 +28,7 @@ png = { workspace = true }
 [dev-dependencies]
 alacritty_terminal = { workspace = true }
 toml = { workspace = true }
+read-fonts = "=0.41.0"
 
 # Window occlusion (see `visibility.rs`): the same versions iced's windowing already uses.
 [target.'cfg(target_os = "macos")'.dependencies]
