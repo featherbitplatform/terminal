@@ -41,6 +41,8 @@ pub struct Tab {
     pub placeholder: Option<SharedTerminal>,
     /// Aborts the in-flight connect when dropped (closing a connecting tab abandons the dial).
     pub connecting: Option<iced::task::Handle>,
+    /// The find bar, while open.
+    pub find: Option<crate::find::FindBar>,
 }
 
 impl Tab {
@@ -56,6 +58,7 @@ impl Tab {
             session: None,
             placeholder: None,
             connecting: None,
+            find: None,
         }
     }
 

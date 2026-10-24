@@ -8,6 +8,8 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector, keyboard, mouse, win
 
 use crate::app::Message;
 use crate::editor::EditorMsg;
+use crate::find::FindMsg;
+use crate::find::all::FindAllMsg;
 use crate::keys::{self, Action};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
@@ -19,11 +21,18 @@ pub(crate) enum Mode {
     /// Application shortcuts act; other keys pass on.
     Normal,
     /// Beneath an overlay: every key is dropped, so nothing reaches the terminal and no
-    /// shortcut acts behind the overlay, except the palette toggle when `palette_toggle`.
-    Blocked { palette_toggle: bool },
+    /// shortcut acts behind the overlay, except the palette and find-in-all-tabs toggles when
+    /// `toggles`.
+    Blocked { toggles: bool },
     /// The palette's own: Up/Down, Ctrl+P/N, Enter and Escape drive it; the rest goes on to the
     /// search box.
     Palette,
+    /// The find-in-all-tabs box: like the palette.
+    FindAll,
+    /// A window whose active tab has its find bar open: Enter / Shift+Enter and the find keys
+    /// move between matches, Escape closes the bar, application shortcuts act, and typing goes
+    /// to the bar's field, never to the terminal (the terminal is drawn unfocused).
+    Find,
     /// A connection dialog: Escape cancels, Enter submits; other keys go to its field.
     Prompt,
     /// The profile editor window: Cmd+W closes it, Cmd+S saves, Settings and Quit work; other
@@ -53,6 +62,32 @@ fn palette_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<Palette
     }
 }
 
+/// The find-in-all-tabs message a key means while the box is up.
+fn find_all_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<FindAllMsg> {
+    palette_key(key, mods).map(|m| match m {
+        PaletteMsg::Up => FindAllMsg::Up,
+        PaletteMsg::Down => FindAllMsg::Down,
+        PaletteMsg::Submit => FindAllMsg::Submit,
+        _ => FindAllMsg::Close,
+    })
+}
+
+/// The find-bar message a key means while the bar is open.
+fn find_bar_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<FindMsg> {
+    use keyboard::key::Named;
+    match keys::find_key(cfg!(target_os = "macos"), key, mods) {
+        Some(Action::FindNext) => return Some(FindMsg::Next),
+        Some(Action::FindPrevious) => return Some(FindMsg::Previous),
+        _ => {}
+    }
+    match key {
+        keyboard::Key::Named(Named::Escape) => Some(FindMsg::Close),
+        keyboard::Key::Named(Named::Enter) if mods.shift() => Some(FindMsg::Previous),
+        keyboard::Key::Named(Named::Enter) => Some(FindMsg::Next),
+        _ => None,
+    }
+}
+
 /// Wraps a window's content and turns application shortcuts into messages before the terminal
 /// sees the key, so Ctrl+Shift chords never reach the shell.
 pub(crate) struct Shortcuts<'a> {
@@ -78,12 +113,17 @@ fn key_message(
             (!repeat || matches!(action, Action::NextTab | Action::PrevTab))
                 .then_some(Message::Shortcut(w, action))
         }),
-        Mode::Blocked { palette_toggle } => shortcut.map(|action| {
-            (palette_toggle && action == Action::Palette && !repeat)
+        Mode::Blocked { toggles } => shortcut.map(|action| {
+            (toggles && matches!(action, Action::Palette | Action::FindAll) && !repeat)
                 .then_some(Message::Shortcut(w, action))
         }),
         // Other shortcuts fall through to the layer beneath, which handles them.
         Mode::Palette => palette_key(key, mods).map(|m| Some(Message::Palette(w, m))),
+        Mode::FindAll => find_all_key(key, mods).map(|m| Some(Message::FindAll(w, m))),
+        Mode::Find => match find_bar_key(key, mods) {
+            Some(m) => Some(Some(Message::Find(w, m))),
+            None => key_message(Mode::Normal, w, key, mods, repeat),
+        },
         Mode::Prompt => match key {
             keyboard::Key::Named(Named::Escape) => {
                 Some(Some(Message::Prompt(PromptMsg::Cancel(w))))
@@ -107,6 +147,26 @@ fn key_message(
             _ => None,
         }),
     }
+}
+
+/// Printable text a key press types (no Cmd, Ctrl or Alt held).
+fn typed_text(event: &Event) -> Option<String> {
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        text: Some(text),
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if modifiers.command() || modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return None;
+    }
+    let text = text.to_string();
+    text.chars()
+        .all(|c| !c.is_control())
+        .then_some(text)
+        .filter(|t| !t.is_empty())
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
@@ -184,6 +244,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
             shell,
             viewport,
         );
+        // Typing the bar's field did not take (it lost focus to a click): the bar takes it.
+        if self.mode == Mode::Find
+            && !shell.is_event_captured()
+            && let Some(text) = typed_text(event)
+        {
+            shell.publish(Message::Find(self.window, FindMsg::Type(text)));
+            shell.capture_event();
+        }
     }
 
     fn mouse_interaction(
@@ -265,9 +333,7 @@ mod tests {
 
     #[test]
     fn under_the_palette_only_the_toggle_acts() {
-        let blocked = Mode::Blocked {
-            palette_toggle: true,
-        };
+        let blocked = Mode::Blocked { toggles: true };
         for c in ["w", "n", "t", "1", "9"] {
             assert!(
                 matches!(press(blocked, c, false), Some(None)),
@@ -286,9 +352,7 @@ mod tests {
 
     #[test]
     fn under_a_dialog_nothing_acts() {
-        let blocked = Mode::Blocked {
-            palette_toggle: false,
-        };
+        let blocked = Mode::Blocked { toggles: false };
         assert!(matches!(press(blocked, "p", true), Some(None)));
         assert!(matches!(press(Mode::Prompt, "w", false), Some(None)));
         let esc = keyboard::Key::Named(keyboard::key::Named::Escape);
@@ -314,6 +378,128 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    fn key(
+        named: keyboard::key::Named,
+        mods: keyboard::Modifiers,
+        mode: Mode,
+    ) -> Option<Option<Message>> {
+        key_message(
+            mode,
+            window::Id::unique(),
+            &keyboard::Key::Named(named),
+            mods,
+            false,
+        )
+    }
+
+    #[test]
+    fn the_find_bar_takes_enter_escape_and_the_find_keys() {
+        use keyboard::key::Named;
+        let none = keyboard::Modifiers::empty();
+        assert!(matches!(
+            key(Named::Enter, none, Mode::Find),
+            Some(Some(Message::Find(_, FindMsg::Next)))
+        ));
+        assert!(matches!(
+            key(Named::Enter, keyboard::Modifiers::SHIFT, Mode::Find),
+            Some(Some(Message::Find(_, FindMsg::Previous)))
+        ));
+        assert!(matches!(
+            key(Named::Escape, none, Mode::Find),
+            Some(Some(Message::Find(_, FindMsg::Close)))
+        ));
+        let (g, mods) = if cfg!(target_os = "macos") {
+            ("g", keyboard::Modifiers::LOGO)
+        } else {
+            ("g", keyboard::Modifiers::CTRL)
+        };
+        let g = keyboard::Key::Character(g.into());
+        assert!(matches!(
+            key_message(Mode::Find, window::Id::unique(), &g, mods, true),
+            Some(Some(Message::Find(_, FindMsg::Next)))
+        ));
+        assert!(matches!(
+            key_message(
+                Mode::Find,
+                window::Id::unique(),
+                &g,
+                mods | keyboard::Modifiers::SHIFT,
+                false
+            ),
+            Some(Some(Message::Find(_, FindMsg::Previous)))
+        ));
+        // Outside the bar, Ctrl+G is the shell's.
+        if !cfg!(target_os = "macos") {
+            assert!(key_message(Mode::Normal, window::Id::unique(), &g, mods, false).is_none());
+        }
+        // Application shortcuts still act; plain typing goes on to the bar's field.
+        assert!(matches!(
+            press(Mode::Find, "t", false),
+            Some(Some(Message::Shortcut(_, Action::NewTab)))
+        ));
+        let a = keyboard::Key::Character("a".into());
+        assert!(key_message(Mode::Find, window::Id::unique(), &a, none, false).is_none());
+        // Typed text is recognised for the bar; chords are not.
+        let typed = |text: &str, modifiers| {
+            typed_text(&Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character(text.into()),
+                modified_key: keyboard::Key::Character(text.into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+                location: keyboard::Location::Standard,
+                modifiers,
+                text: Some(text.into()),
+                repeat: false,
+            }))
+        };
+        assert_eq!(typed("a", none).as_deref(), Some("a"));
+        assert_eq!(typed("a", keyboard::Modifiers::CTRL), None);
+        assert_eq!(typed("\u{8}", none), None);
+    }
+
+    #[test]
+    fn the_find_all_box_is_driven_like_the_palette_and_toggles_from_beneath() {
+        use keyboard::key::Named;
+        let none = keyboard::Modifiers::empty();
+        assert!(matches!(
+            key(Named::ArrowDown, none, Mode::FindAll),
+            Some(Some(Message::FindAll(_, FindAllMsg::Down)))
+        ));
+        assert!(matches!(
+            key(Named::Enter, none, Mode::FindAll),
+            Some(Some(Message::FindAll(_, FindAllMsg::Submit)))
+        ));
+        assert!(matches!(
+            key(Named::Escape, none, Mode::FindAll),
+            Some(Some(Message::FindAll(_, FindAllMsg::Close)))
+        ));
+        let (f, mods) = if cfg!(target_os = "macos") {
+            ("f", keyboard::Modifiers::LOGO | keyboard::Modifiers::SHIFT)
+        } else {
+            ("f", keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT)
+        };
+        let f = keyboard::Key::Character(f.into());
+        assert!(matches!(
+            key_message(
+                Mode::Blocked { toggles: true },
+                window::Id::unique(),
+                &f,
+                mods,
+                false
+            ),
+            Some(Some(Message::Shortcut(_, Action::FindAll)))
+        ));
+        assert!(matches!(
+            key_message(
+                Mode::Blocked { toggles: false },
+                window::Id::unique(),
+                &f,
+                mods,
+                false
+            ),
+            Some(None)
+        ));
     }
 
     #[test]

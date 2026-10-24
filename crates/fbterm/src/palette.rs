@@ -95,6 +95,8 @@ fn actions() -> Vec<PaletteItem> {
         (Action::NewTab, "New tab"),
         (Action::NewWindow, "New window"),
         (Action::CloseTab, "Close tab"),
+        (Action::Find, "Find in tab"),
+        (Action::FindAll, "Find in all tabs"),
         (Action::EditProfiles, "Edit profiles"),
         (Action::Settings, "Settings"),
         (Action::OpenSettingsFile, "Open settings file"),
@@ -499,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn actions_list_settings_and_the_settings_file_actions_after_edit_profiles() {
+    fn actions_list_find_settings_and_the_settings_file_actions() {
         let labels: Vec<String> = actions().iter().map(|a| a.label().to_string()).collect();
         assert_eq!(
             labels,
@@ -507,6 +509,8 @@ mod tests {
                 "New tab",
                 "New window",
                 "Close tab",
+                "Find in tab",
+                "Find in all tabs",
                 "Edit profiles",
                 "Settings",
                 "Open settings file",
@@ -648,6 +652,6 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 8);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 10);
     }
 }

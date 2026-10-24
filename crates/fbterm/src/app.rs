@@ -11,7 +11,7 @@ use fbterm_config::{
 use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
-use fbterm_term::{GridSize, TerminalOutput, TerminalStyle};
+use fbterm_term::{GridSize, SearchOutcome, TerminalOutput, TerminalStyle};
 use iced::window::{self, Screenshot};
 use iced::{Event, Subscription, Task, Theme};
 use parking_lot::Mutex;
@@ -20,6 +20,8 @@ use tokio::sync::mpsc::unbounded_channel;
 use crate::chrome::{self, BarAction};
 use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
+use crate::find::FindMsg;
+use crate::find::all::{FindAll, FindAllMsg};
 use crate::keys::Action;
 use crate::palette::{PaletteMsg, Palettes, Recency};
 use crate::prompts::{
@@ -111,6 +113,29 @@ pub enum Message {
     DismissNotices,
     /// Palette input for one window.
     Palette(window::Id, PaletteMsg),
+    /// The find bar of a window's active tab.
+    Find(window::Id, FindMsg),
+    /// A tab's find-bar search finished.
+    Found {
+        tab: TabId,
+        seq: u64,
+        outcome: SearchOutcome,
+    },
+    /// Search a tab's find bar again for the output that arrived (one timer per burst).
+    FindRefresh(TabId),
+    /// The find-in-all-tabs box, open in a window.
+    FindAll(window::Id, FindAllMsg),
+    /// One tab's part of a find-in-all-tabs search finished.
+    FoundAll {
+        seq: u64,
+        tab: TabId,
+        outcome: SearchOutcome,
+    },
+    /// Debug aid: open the find bar or the box with a query once output has arrived.
+    DebugFind {
+        all: bool,
+        query: String,
+    },
     Editor(EditorMsg),
     Settings(SettingsMsg),
     Prompt(PromptMsg),
@@ -171,6 +196,8 @@ pub struct App {
     pub focused: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
+    /// The find-in-all-tabs box, when open (in one window at a time).
+    pub find_box: Option<FindAll>,
     /// The profile editor window, when open.
     pub editor: Option<(window::Id, EditorState)>,
     /// The Settings window, when open.
@@ -377,6 +404,7 @@ impl App {
             grids: HashMap::new(),
             focused: None,
             palettes: Palettes::new(),
+            find_box: None,
             editor: None,
             settings_win: None,
             prompts: PromptQueues::default(),
@@ -420,6 +448,7 @@ impl App {
         task = task.chain(app.open_debug_editor());
         task = task.chain(app.open_debug_settings());
         task = task.chain(app.open_debug_prompt());
+        task = task.chain(app.open_debug_find());
         (app, task)
     }
 
@@ -642,6 +671,9 @@ impl App {
                 self.sizes.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
+                if self.find_box.as_ref().is_some_and(|f| f.window == id) {
+                    self.close_find_all();
+                }
                 self.prompts.remove_window(id);
                 self.grids.remove(&id);
                 if self.focused == Some(id) {
@@ -663,6 +695,15 @@ impl App {
                 Task::none()
             }
             Message::Palette(wid, msg) => self.palette(wid, msg),
+            Message::Find(wid, msg) => self.find(wid, msg),
+            Message::Found { tab, seq, outcome } => self.found(tab, seq, outcome),
+            Message::FindRefresh(tab) => self.find_refresh(tab),
+            Message::FindAll(wid, msg) => self.find_all(wid, msg),
+            Message::FoundAll { seq, tab, outcome } => {
+                self.found_all(seq, tab, outcome);
+                Task::none()
+            }
+            Message::DebugFind { all, query } => self.debug_find(all, query),
             Message::Editor(msg) => self.editor_msg(msg),
             Message::Settings(msg) => self.settings_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),

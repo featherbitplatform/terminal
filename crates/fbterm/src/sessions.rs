@@ -279,8 +279,9 @@ impl App {
             // the terminal. A hidden tab, or any tab of a window that cannot be seen (see
             // `crate::visibility`), leaves the flag pending, so its session raises no further
             // Dirty until it is shown (see `App::shown`).
-            if !self.occluded.contains(&wid) {
-                tabs::on_dirty(window, index);
+            if !self.occluded.contains(&wid) && tabs::on_dirty(window, index) {
+                // A find bar on the shown tab follows its output.
+                return self.find_output(wid, index);
             }
             return Task::none();
         }
@@ -335,7 +336,7 @@ impl App {
                 {
                     s.resize(grid);
                 }
-                Task::none()
+                self.find_resized(wid)
             }
             // The widget already put the text on the clipboard.
             TerminalOutput::Copy(_) => Task::none(),
