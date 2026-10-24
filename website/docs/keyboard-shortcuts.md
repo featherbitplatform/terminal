@@ -105,8 +105,10 @@ Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear butt
 - **Change one:** click its shortcut, then press the new one. While you record, keys go to the recorder only: they never reach a terminal and never run a shortcut. `Escape` cancels and keeps the old shortcut.
 - **Already in use:** if another action has that shortcut, the row names it and offers **Take over** (the other action is then left without a shortcut) or **Cancel**. Two actions never share a shortcut.
 - **Not allowed:** a shortcut needs `Cmd`, `Ctrl` or `Alt` (`Option`), except `F1` to `F12`, which work alone. Plain letters, `Enter`, `Tab` and `Escape` cannot be shortcuts on their own, and `Escape` never can.
+- **Reserved:** keys that already do something outside this list cannot be taken: copy and paste in the terminal (`Cmd+C` and `Cmd+V` on macOS, `Ctrl+Shift+C` and `Ctrl+Shift+V` elsewhere), the scrollback keys (`Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, `Shift+End`, and `Cmd+Home`, `Cmd+End` on macOS), Save in the profile editor (`Cmd+S`, `Ctrl+S` elsewhere) and, on macOS, the app menu's `Cmd+Q` (Quit), `Cmd+H` (Hide) and `Cmd+Option+H` (Hide Others). The row says what uses the key.
+- **Quit on macOS** is always `Cmd+Q`: the app menu handles it before any window sees the key, so its row is fixed.
 - **Taken from programs:** a shortcut that programs in the terminal would normally receive works, but its row shows a warning saying what is lost when that is known (for example ``Ctrl+R is reverse search in bash and zsh``). On macOS that is any shortcut without `Cmd`. On Linux and Windows it is `Ctrl` with a letter (without `Shift`), `Ctrl` with a few symbols, arrows and editing keys, any `Alt` shortcut (Meta in bash, zsh and emacs) and `F` keys on their own.
-- **Remove one:** the `x` next to a shortcut leaves the action without one (it stays in the palette).
+- **Remove one:** the `x` that appears when you point at a row leaves the action without a shortcut (it stays in the palette).
 - **Go back:** a changed row has a reset button that restores its default, and **Restore defaults** restores them all.
 
 Changes apply at once in every window, the palette and the tooltips, and are saved to `settings.toml`. The keys inside the palette, the find bar and the find-in-all-tabs box (`Enter`, `Shift+Enter`, `Escape`, `Up`, `Down`, `Ctrl+P`, `Ctrl+N`) stay as they are; the find bar's next and previous match shortcuts (`Cmd+G`, `Cmd+Shift+G`) can be changed like the others and still act only while the bar is open. `Cmd+S` in the profile editor and copy and paste are not in the list.
@@ -123,7 +125,7 @@ next_tab = "ctrl+tab"
 open_settings_file = "cmd+shift+o"
 ```
 
-A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt` (also `option`), `shift` and `cmd` (written `super` on Linux and Windows, where it is the Windows or Super key); the app writes them in that order, but any order and case are read. The key is a character (`t`, `1`, `,`, `]`), `f1` to `f12`, `up`, `down`, `left`, `right`, `pageup`, `pagedown`, `home`, `end`, `insert`, `delete`, `backspace`, `space`, `tab`, `enter` or `plus` for the `+` key. `"none"` leaves the action without a shortcut. With `shift`, a symbol is the key it is typed on (`shift+]` is the same as `shift+}`).
+A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt` (also `option`), `shift` and `cmd` (written `super` on Linux and Windows, where it is the Windows or Super key); the app writes them in that order, but any order and case are read. The key is a character (`t`, `1`, `,`, `]`), `f1` to `f12`, `up`, `down`, `left`, `right`, `pageup`, `pagedown`, `home`, `end`, `insert`, `delete`, `backspace`, `space`, `tab`, `enter` or `plus` for the `+` key. `"none"` leaves the action without a shortcut. `shift+}`, `shift+{` and `shift+<` are the same as `shift+]`, `shift+[` and `shift+,`; any other symbol is its own key, as your keyboard layout types it without `Shift` (on AZERTY, `ctrl+shift+&` is the `1` key). `f13` to `f24` work too, with a modifier.
 
 | Name | Action |
 | --- | --- |
@@ -133,7 +135,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `find`, `find_all`, `find_next`, `find_previous` | Find in tab, find in all tabs, older and newer match in the find bar |
 | `palette`, `open_settings_file`, `reveal_config_folder`, `quit` | The palette, the palette actions of the same names, quit |
 
-Edits to the table apply while the app runs, like every setting. An entry that names no action, a shortcut that cannot be read or is not allowed, and a shortcut another action already has are reported like other problems in `settings.toml`, with the file and line, and that action keeps its default; the rest of the file still applies. The Settings window writes only the lines of the actions you change there, so your comments and any entry it could not use stay as you wrote them.
+Edits to the table apply while the app runs, like every setting. An entry that names no action, a shortcut that cannot be read, is not allowed or is reserved, a shortcut another action already has, and `quit` on macOS are reported like other problems in `settings.toml`, with the file and line, and that action keeps its default; the rest of the file still applies. The Settings window writes only the lines of the actions you change there, keeping your comments (a comment above a removed line moves to the next one). An entry it could not read stays as you wrote it; an entry it could read but did not use (for example one that took another action's shortcut) is replaced when you change shortcuts there, so what runs is always what the file says.
 
 ## Search in detail
 

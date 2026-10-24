@@ -301,10 +301,17 @@ derived from the same table.
   and editing keys, and F keys alone; Ctrl+Alt chords are not (AltGr typing is let through on
   Windows), nor chords with Super. The find-bar keys never show a warning, since they act only
   while the bar has the keys. Escape is never bindable, even with modifiers (it cancels
-  recording). With Shift, a shifted symbol is stored as its key (`shift+}` is `shift+]`).
-  Entries that conflict fall back to their default one by one until no chord is shared; the
-  Settings window writes only the actions it changes, so a bad entry stays until the user fixes
-  or rebinds it. Recording also stops when the Settings window loses focus.
+  recording). iced reports a press as the layout's unshifted key, so only `}`, `{` and `<`
+  with Shift fold to `]`, `[` and `,` (as before rebinding); other symbols are keys of their own
+  (AZERTY `&` is never `7`). Reserved, refused when recording and on load: terminal copy/paste,
+  the scrollback keys, the editor's Save and, on macOS, the app menu's Cmd+Q / Cmd+H /
+  Cmd+Option+H; Quit on macOS is fixed at Cmd+Q. Entries that conflict fall back to their
+  default one by one until no chord is shared. The Settings window writes only the actions it
+  changes, diffed against the entries as written (so one load dropped never comes back), and
+  keeps the comments of removed lines; an unreadable entry stays until the user fixes it.
+  Recording stops when the Settings window loses focus or the chords change on disk, and Take
+  over checks again that the other action still has the chord. The clear button shows on
+  hover.
 
 ### 5.12 Search *(owner's decisions, 2026-10-24; done)*
 
