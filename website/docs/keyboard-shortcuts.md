@@ -6,7 +6,9 @@ sidebar_label: Keyboard shortcuts
 
 Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it. The exceptions are `Ctrl+,` for Settings and `Ctrl+Alt+F` for find in all tabs.
 
-Hover over a button in the tab bar to see what it does and its shortcut.
+These are the defaults. Every application shortcut can be changed or removed in the **Keyboard** section of the Settings window (see [Changing shortcuts](#changing-shortcuts)); the tables below list the defaults, and the Settings window, the palette and the tab-bar tooltips always show the shortcuts in force.
+
+Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings.
 
 On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled by the terminal view and are not in this table. Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
 
@@ -64,11 +66,11 @@ While the find bar is open:
 | Open Settings | `Cmd+,` | `Ctrl+,` |
 | Open the profile editor | `Cmd+Shift+,` | `Ctrl+Shift+,` |
 
-The profiles button after the new-tab button in the tab bar opens the profile editor too. The Settings window has a control for every option in [`settings.toml`](files#settingstoml); changes apply at once and are saved to the file. In the profile editor and Settings windows, `Cmd+W` (`Ctrl+Shift+W`) closes the window, and each window's shortcut opens the other.
+The profiles button after the new-tab button in the tab bar opens the profile editor too, and the gear button after it opens Settings. The Settings window has a control for every option in [`settings.toml`](files#settingstoml); changes apply at once and are saved to the file. In the profile editor and Settings windows, `Cmd+W` (`Ctrl+Shift+W`) closes the window, and each window's shortcut opens the other.
 
 ## Palette actions
 
-These actions are listed after your profiles. Type part of a name to find one.
+These actions are listed after your profiles, each with its shortcut when it has one. Type part of a name to find one.
 
 | Action | Does |
 | --- | --- |
@@ -95,6 +97,43 @@ The palette searches profiles and actions as you type. These keys work while it 
 | `Escape` | Close the palette |
 
 You can also click a row. The palette shows ten rows at a time.
+
+## Changing shortcuts
+
+Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear button in the tab bar) and scroll to **Keyboard**. It lists every action with its shortcut, grouped into Tabs, Windows, Search and App.
+
+- **Change one:** click its shortcut, then press the new one. While you record, keys go to the recorder only: they never reach a terminal and never run a shortcut. `Escape` cancels and keeps the old shortcut.
+- **Already in use:** if another action has that shortcut, the row names it and offers **Take over** (the other action is then left without a shortcut) or **Cancel**. Two actions never share a shortcut.
+- **Not allowed:** a shortcut needs `Cmd`, `Ctrl` or `Alt` (`Option`), except `F1` to `F12`, which work alone. Plain letters, `Enter`, `Tab` and `Escape` cannot be shortcuts on their own, and `Escape` never can.
+- **Taken from programs:** a shortcut that programs in the terminal would normally receive works, but its row shows a warning saying what is lost when that is known (for example ``Ctrl+R is reverse search in bash and zsh``). On macOS that is any shortcut without `Cmd`. On Linux and Windows it is `Ctrl` with a letter (without `Shift`), `Ctrl` with a few symbols, arrows and editing keys, any `Alt` shortcut (Meta in bash, zsh and emacs) and `F` keys on their own.
+- **Remove one:** the `x` next to a shortcut leaves the action without one (it stays in the palette).
+- **Go back:** a changed row has a reset button that restores its default, and **Restore defaults** restores them all.
+
+Changes apply at once in every window, the palette and the tooltips, and are saved to `settings.toml`. The keys inside the palette, the find bar and the find-in-all-tabs box (`Enter`, `Shift+Enter`, `Escape`, `Up`, `Down`, `Ctrl+P`, `Ctrl+N`) stay as they are; the find bar's next and previous match shortcuts (`Cmd+G`, `Cmd+Shift+G`) can be changed like the others and still act only while the bar is open. `Cmd+S` in the profile editor and copy and paste are not in the list.
+
+### The `[keys]` table
+
+Only the shortcuts you change are saved, in a `[keys]` table in [`settings.toml`](files#settingstoml), one line per action:
+
+```toml
+[keys]
+new_tab = "ctrl+shift+y"
+close_tab = "none"
+next_tab = "ctrl+tab"
+open_settings_file = "cmd+shift+o"
+```
+
+A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt` (also `option`), `shift` and `cmd` (written `super` on Linux and Windows, where it is the Windows or Super key); the app writes them in that order, but any order and case are read. The key is a character (`t`, `1`, `,`, `]`), `f1` to `f12`, `up`, `down`, `left`, `right`, `pageup`, `pagedown`, `home`, `end`, `insert`, `delete`, `backspace`, `space`, `tab`, `enter` or `plus` for the `+` key. `"none"` leaves the action without a shortcut. With `shift`, a symbol is the key it is typed on (`shift+]` is the same as `shift+}`).
+
+| Name | Action |
+| --- | --- |
+| `new_tab`, `close_tab`, `next_tab`, `previous_tab` | Tabs |
+| `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
+| `new_window`, `edit_profiles`, `settings` | New window, the profile editor, Settings |
+| `find`, `find_all`, `find_next`, `find_previous` | Find in tab, find in all tabs, older and newer match in the find bar |
+| `palette`, `open_settings_file`, `reveal_config_folder`, `quit` | The palette, the palette actions of the same names, quit |
+
+Edits to the table apply while the app runs, like every setting. An entry that names no action, a shortcut that cannot be read or is not allowed, and a shortcut another action already has are reported like other problems in `settings.toml`, with the file and line, and that action keeps its default; the rest of the file still applies. The Settings window writes only the lines of the actions you change there, so your comments and any entry it could not use stay as you wrote them.
 
 ## Search in detail
 
