@@ -1034,7 +1034,7 @@ mod tests {
         assert!(text.contains("\x1b[2mThe server refused the shell.\x1b[0m"));
         assert!(text.starts_with("\r\n"));
         // The notice lands on the line after the existing output.
-        use alacritty_terminal::index::{Column, Line};
+        use feathercritty::index::{Column, Line};
         let grid = term.term().grid();
         let line: String = (0..60).map(|c| grid[Line(1)][Column(c)].c).collect();
         assert_eq!(line.trim_end(), "The server refused the shell.");

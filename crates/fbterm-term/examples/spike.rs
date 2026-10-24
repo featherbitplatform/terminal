@@ -1,7 +1,7 @@
 //! Rendering spike (Task 2): can iced draw a busy 200x60 terminal grid at display refresh rate?
 //!
 //! Throwaway code. Approach A ("native"): a custom `iced::advanced::Widget` that draws the
-//! `alacritty_terminal` grid with iced's own primitives: one `fill_quad` per background run and
+//! `feathercritty` grid with iced's own primitives: one `fill_quad` per background run and
 //! one `fill_text` per foreground run (consecutive cells sharing color and style).
 //!
 //! `--mode widget` renders through the production `fbterm_term::terminal_view` widget instead,
@@ -27,13 +27,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use alacritty_terminal::event::VoidListener;
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::sync::FairMutex;
-use alacritty_terminal::term::cell::Flags;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, Rgb};
+use feathercritty::event::VoidListener;
+use feathercritty::index::{Column, Line};
+use feathercritty::sync::FairMutex;
+use feathercritty::term::cell::Flags;
+use feathercritty::term::test::TermSize;
+use feathercritty::term::{Config, Term};
+use feathercritty::vte::ansi::{Color as AnsiColor, NamedColor, Processor, Rgb};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad, Renderer as _};
 use iced::advanced::text::{self, Paragraph as _, Renderer as _};
@@ -315,7 +315,7 @@ fn palette(idx: usize) -> [u8; 3] {
     }
 }
 
-fn resolve(c: AnsiColor, colors: &alacritty_terminal::term::color::Colors, fg: bool) -> [u8; 3] {
+fn resolve(c: AnsiColor, colors: &feathercritty::term::color::Colors, fg: bool) -> [u8; 3] {
     let from_rgb = |r: Rgb| [r.r, r.g, r.b];
     match c {
         AnsiColor::Spec(rgb) => from_rgb(rgb),

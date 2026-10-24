@@ -552,11 +552,11 @@ async fn agent_auth() {
 mod pool {
     use super::*;
 
-    use alacritty_terminal::index::{Column, Line};
     use fbterm_config::ProfileStore;
     use fbterm_session::ssh::SshPool;
     use fbterm_session::{AuthWarning, EventSink, SessionEvent, SessionHandle, SessionId};
     use fbterm_term::GridSize;
+    use feathercritty::index::{Column, Line};
     use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
     type Events = UnboundedReceiver<(SessionId, SessionEvent)>;

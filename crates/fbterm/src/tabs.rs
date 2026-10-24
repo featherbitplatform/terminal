@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn restart_reset_keeps_old_content_and_continues_below() {
-        use alacritty_terminal::index::{Column, Line};
+        use feathercritty::index::{Column, Line};
         let size = fbterm_term::GridSize {
             cols: 20,
             rows: 6,

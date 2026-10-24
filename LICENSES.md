@@ -8,7 +8,7 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 | License | Where it appears |
 | --- | --- |
-| Apache-2.0 | Most of the dependency tree, including `russh`, `alacritty_terminal`, `iced` support crates and `wgpu`. |
+| Apache-2.0 | Most of the dependency tree, including `russh`, `feathercritty`, `iced` support crates and `wgpu`. |
 | MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also the Lucide icons derived from Feather (see below). |
 | BSD-2-Clause | `arrayref`, `serial2`, `zerocopy`. |
 | BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `subtle`, `tiny-skia`, `num_enum`. |
@@ -25,9 +25,9 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 - BSL-1.0 is used only by Windows builds, through `clipboard-win` and `error-code`, which `iced_winit` pulls in for Windows clipboard support (`iced_winit` > `window_clipboard` > `clipboard-win` > `error-code`).
 - CC0-1.0 comes from `hexf-parse`, used by the `naga` shader compiler that `wgpu` depends on, and from `notify`, the file-watching crate fbterm uses directly.
 
-## Vendored code
+## feathercritty
 
-`vendor/alacritty_terminal/` is a copy of `alacritty_terminal` 0.26.0 (Apache-2.0, license in `vendor/alacritty_terminal/LICENSE-APACHE`) with small patches (a bug fix, a scroll counter and a read-only getter), described in `vendor/alacritty_terminal/FBTERM_PATCHES.md`.
+The terminal emulation library, [feathercritty](https://github.com/featherbitplatform/feathercritty), is our fork of [`alacritty_terminal`](https://github.com/alacritty/alacritty/tree/master/alacritty_terminal) 0.26.0 by the Alacritty authors (Apache-2.0, license in the fork's `LICENSE-APACHE`; attribution required). It is used as a git dependency pinned by commit. The fork's changes (a bug fix, a scroll counter, a read-only getter and the rename) are listed in its README, and the files it modifies say so in their first line.
 
 ## Bundled fonts
 

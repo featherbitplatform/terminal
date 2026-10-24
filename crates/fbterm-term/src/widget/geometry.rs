@@ -1,6 +1,6 @@
 //! Pixel <-> grid conversions.
 
-use alacritty_terminal::index::{Column, Line, Point};
+use feathercritty::index::{Column, Line, Point};
 use iced::Size;
 
 use crate::GridSize;

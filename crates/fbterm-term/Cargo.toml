@@ -9,7 +9,7 @@ workspace = true
 
 [dependencies]
 iced = { workspace = true, features = ["advanced"] }
-alacritty_terminal = { workspace = true }
+feathercritty = { workspace = true }
 parking_lot = { workspace = true }
 regex = { workspace = true }
 flate2 = { workspace = true }

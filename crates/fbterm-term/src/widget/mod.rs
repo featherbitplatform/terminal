@@ -11,8 +11,8 @@ mod input;
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use alacritty_terminal::term::cell::Hyperlink;
 use fbterm_config::Rgb;
+use feathercritty::term::cell::Hyperlink;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text::{self, Paragraph as _};
 use iced::advanced::widget::{self, Widget};

@@ -5,11 +5,11 @@
 //! primitive per run of equal foreground and font style. Wide characters and cells carrying
 //! combining characters are drawn on their own so a fallback font cannot shift the rest of the row.
 
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
-use alacritty_terminal::term::cell::{Flags, Hyperlink};
-use alacritty_terminal::vte::ansi::CursorShape;
 use fbterm_config::Rgb;
+use feathercritty::grid::Dimensions;
+use feathercritty::index::{Column, Line, Point};
+use feathercritty::term::cell::{Flags, Hyperlink};
+use feathercritty::vte::ansi::CursorShape;
 use iced::advanced::renderer::{Quad, Renderer as _};
 use iced::advanced::text::{self, Renderer as _};
 use iced::{Border, Font, Pixels, Rectangle, Size};

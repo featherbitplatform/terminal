@@ -1,8 +1,8 @@
 //! Text selection over the emulator grid.
 
-use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Point};
-use alacritty_terminal::term::cell::Flags;
+use feathercritty::grid::Dimensions;
+use feathercritty::index::{Column, Point};
+use feathercritty::term::cell::Flags;
 
 use crate::Terminal;
 
@@ -97,7 +97,7 @@ impl Selection {
 mod tests {
     use super::*;
     use crate::{GridSize, Terminal};
-    use alacritty_terminal::index::{Column, Line, Point};
+    use feathercritty::index::{Column, Line, Point};
 
     fn p(l: i32, c: usize) -> Point {
         Point::new(Line(l), Column(c))

@@ -27,4 +27,4 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
-alacritty_terminal = { workspace = true }
+feathercritty = { workspace = true }

@@ -13,12 +13,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alacritty_terminal::index::{Column, Line, Point};
 use fbterm_config::Rgb;
 use fbterm_term::{
     ColorScheme, GridSize, Selection, SharedTerminal, Terminal, TerminalOutput, TerminalStyle,
     terminal_view,
 };
+use feathercritty::index::{Column, Line, Point};
 use iced::widget::{column, container, row, text};
 use iced::window::Screenshot;
 use iced::{Element, Font, Length, Size, Subscription, Task};
