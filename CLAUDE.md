@@ -63,7 +63,7 @@ cd website && npm start                  # docs dev server; `npm run build` buil
 ### Debug aids (environment variables)
 
 - Always available: `FBTERM_CONFIG_DIR=<dir>` (use this directory instead of the real config), `FBTERM_SECRETS=memory` (never touch the OS keychain), and the release-build measurement flags `--perf-tabs <N> --perf-cmd <cmd> [--perf-exit-after <secs>]`.
-- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor|settings`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_OPEN_SETTINGS=1`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`, `FBTERM_DEMO_TOOLTIP=new|profiles|close` (keep that tab-bar tooltip showing). Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
+- Debug builds only (ignored in release): `FBTERM_OPEN_TABS=<profile>,<profile>`, `FBTERM_PALETTE_QUERY=<text>`, `FBTERM_SCREENSHOT=<path.png>` (capture the first window and exit), `FBTERM_SCREENSHOT_WINDOW=editor|settings`, `FBTERM_OPEN_EDITOR=<profile>`, `FBTERM_OPEN_SETTINGS=1`, `FBTERM_DEMO_PROMPT=hostkey|password|changed`, `FBTERM_DEMO_TOOLTIP=new|profiles|close` (keep that tab-bar tooltip showing), `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (open the active tab's find bar or the find-in-all-tabs box with that query, about a second after startup). Runs with `FBTERM_OPEN_TABS` or `FBTERM_SCREENSHOT` never write `state.toml`.
 - Rule for agents: look at the app only through its own-window screenshots (`FBTERM_SCREENSHOT`), never full-screen capture. Combine with `FBTERM_CONFIG_DIR` and `FBTERM_SECRETS=memory` so a run cannot touch real profiles or secrets.
 
 ## Gotchas learned
@@ -72,6 +72,7 @@ cd website && npm start                  # docs dev server; `npm run build` buil
 - `hdiutil create` fails locally on macOS 27 ("Resource busy"); `dev/package-macos.sh` falls back to `diskutil image create` locally, CI uses `hdiutil` only.
 - Redraw contract: call `take_dirty` before locking the terminal to draw; hidden tabs, and every tab of a window that cannot be seen (`visibility.rs`), leave `Dirty` pending until they are shown. Every message redraws every window, so output `Dirty` is paced before it reaches the update loop (`pacing.rs`, at most `max_fps` per second: the setting, default `OUTPUT_FPS` = 60, or the fastest display with `"display"` via `display_rate.rs`; read live from the shared `OutputRate`); never add a periodic subscription or redraw loop that keeps running without new output or input (debug aids aside).
 - `alacritty_terminal` is vendored and patched (`vendor/alacritty_terminal`, changes listed in its `FBTERM_PATCHES.md`) and wired in through `[patch.crates-io]` in the root `Cargo.toml`; bumping the crate means re-applying the patches or dropping the vendored copy.
+- Search positions are `StablePoint`s (`fbterm-term/src/search.rs`): stable line = the vendored grid's `scrolled_lines()` + grid line, unchanged while output scrolls; a resize (reflow) or a screen switch invalidates them, so the find bar searches again then.
 - A session can continue into an existing `SharedTerminal` (`spawn_local_into`, `open_shell_into`), which is how reconnect keeps scrollback.
 
 ## Status

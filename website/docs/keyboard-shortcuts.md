@@ -4,7 +4,7 @@ title: Keyboard shortcuts
 sidebar_label: Keyboard shortcuts
 ---
 
-Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it. The one exception is `Ctrl+,` for Settings.
+Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it. The exceptions are `Ctrl+,` for Settings and `Ctrl+Alt+F` for find in all tabs.
 
 Hover over a button in the tab bar to see what it does and its shortcut.
 
@@ -39,6 +39,23 @@ On Linux and Windows the window keeps the system title bar for now.
 
 A page is the height of the terminal less one line, so the last line of the previous page stays in view. Typing anything returns to the bottom. While a full-screen program (an editor, a pager, a system monitor) uses the alternate screen there is no scrollback, so these keys go to the program instead.
 
+## Search
+
+| Action | macOS | Linux and Windows |
+| --- | --- | --- |
+| Find in tab | `Cmd+F` | `Ctrl+Shift+F` |
+| Find in all tabs | `Cmd+Shift+F` | `Ctrl+Alt+F` |
+
+While the find bar is open:
+
+| Key | Does |
+| --- | --- |
+| `Enter`, `Cmd+G` (`Ctrl+G`) | Next match up the scrollback (older) |
+| `Shift+Enter`, `Cmd+Shift+G` (`Ctrl+Shift+G`) | Next match down the scrollback (newer) |
+| `Escape` | Close the bar and return to the bottom |
+
+`Ctrl+G` and `Ctrl+Shift+G` only move between matches while the bar is open; otherwise they reach the shell as usual. In the find-in-all-tabs box, `Up` and `Down` (or `Ctrl+P` and `Ctrl+N`) move the selection, `Enter` jumps to the selected match and `Escape` closes the box. See [Search](#search-in-detail) below.
+
 ## Palette and settings
 
 | Action | macOS | Linux and Windows |
@@ -58,6 +75,8 @@ These actions are listed after your profiles. Type part of a name to find one.
 | New tab | Choose a profile to open in a new tab. |
 | New window | Open a new window. |
 | Close tab | Close the active tab. |
+| Find in tab | Open the active tab's find bar. |
+| Find in all tabs | Open the search over every tab. |
 | Edit profiles | Open the profile editor. |
 | Settings | Open the Settings window. |
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
@@ -76,3 +95,14 @@ The palette searches profiles and actions as you type. These keys work while it 
 | `Escape` | Close the palette |
 
 You can also click a row. The palette shows ten rows at a time.
+
+## Search in detail
+
+**Find in tab** opens a slim bar over the top right of the active tab. Typing searches the tab's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again.
+
+- **Case:** the search ignores case unless the query has an uppercase letter.
+- **Plain text or regular expression:** plain text by default (every character matches itself). The `.*` button switches to regular expressions; an invalid one shows `Invalid pattern`.
+- **Wrapped lines** are searched as one line, so a match can continue on the next row. A match never spans a real line break.
+- While the bar is open, keys go to the bar and never to the program in the tab. The tab keeps running; new output is searched too, and the count follows it.
+
+**Find in all tabs** opens a box in the middle of the window, like the palette. It searches every tab of every window, including tabs that are not shown and tabs that are disconnected (they keep their history). Results appear tab by tab as each tab's search finishes, grouped under the tab's name and accent (and its window, when several are open), one row per match with the line around it. Each tab lists up to 50 matches and the box up to 500 in all, with a note when there are more. `Enter` (or a click) on a match brings its window forward, selects the tab, closes the box and opens that tab's find bar on the same query with that match current.

@@ -269,6 +269,33 @@ on macOS and Ctrl+, elsewhere (the one Ctrl chord without Shift); the profile ed
 Cmd+Shift+, (Ctrl+Shift+, elsewhere). Tab-bar buttons show their action and chord in a tooltip,
 derived from the same table.
 
+### 5.12 Search *(owner's decisions, 2026-10-24; done)*
+
+- **Find in tab:** Cmd+F (Ctrl+Shift+F elsewhere) opens a slim bar at the top of the active tab's
+  terminal (floating at the top right, so the grid and the pty keep their size). Incremental
+  search over the whole scrollback and screen; all matches in view tinted violet, the current
+  one in the accent; Enter / Shift+Enter and Cmd+G / Cmd+Shift+G (Ctrl+G / Ctrl+Shift+G
+  elsewhere, only while the bar is open) move with wrap-around and scroll it into view; counter
+  "3 of 41", "No matches", "Invalid pattern". Smart case; plain text by default, a ".*" toggle
+  for regular expressions. Escape closes, clears and returns to the bottom. While the bar is open
+  keys go to the bar, never to the program. Builder's notes: Enter moves up the history (older)
+  and matches are numbered from the newest; counting stops at 1000 ("1000+") and moving past the
+  thousandth loads the next thousand.
+- **Find in all tabs (cross-tab search):** Cmd+Shift+F (Ctrl+Alt+F elsewhere) opens a centered,
+  modal box like the palette: same query rules, results grouped by tab (name, accent stripe,
+  window when there are several), one row per match with the line trimmed around it, 50 per tab
+  and 500 overall with "more matches" notes, streaming in tab by tab. Enter focuses the window,
+  selects the tab, closes the box and opens that tab's find bar on the same query with the chosen
+  match current. Every tab of every window, hidden and disconnected ones included.
+- Both are palette actions ("Find in tab", "Find in all tabs").
+- Builder's notes on the implementation: the search uses the `regex` crate over each logical line
+  (rows joined across soft wraps), walking the scrollback newest first in 1000-row chunks with
+  the terminal locked one chunk at a time (about 0.5 ms), on tokio's blocking pool, cancellable
+  between chunks. Positions are stable line numbers from a scroll counter added to the vendored
+  grid, so matches stay put while output scrolls; the bar searches again at most every 400 ms
+  while output arrives. Measured (release, Apple Silicon): a full 10,000-line tab 5 ms (plain
+  text or regex), 20 full tabs in parallel 23 ms; see `crates/fbterm-term/examples/search_bench.rs`.
+
 ## 6. Milestones
 
 Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
@@ -277,7 +304,8 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    keychain password), jump hosts, host-key checks, profile editor, quick-launch palette, settings
    file, Graphite theme, CI (macOS + Linux + Windows build/test), unsigned macOS `.dmg` (Apple
    Silicon and Intel) on GitHub releases, docs site skeleton on GitHub Pages.
-2. Tiling, per-profile accent, color schemes, find in scrollback.
+2. Tiling, per-profile accent, color schemes, find in scrollback (find in scrollback done
+   2026-10-24, with a search over all tabs; see 5.12).
 3. Tunnels.
 4. File panel.
 5. Export/import, optional main-password vault.
