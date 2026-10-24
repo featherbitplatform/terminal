@@ -150,6 +150,9 @@ mod mac {
 
     pub(super) fn unwatch(id: window::Id) {
         if let Some(observer) = OBSERVERS.with(|o| o.borrow_mut().remove(&id)) {
+            debug_assert!(MainThreadMarker::new().is_some());
+            // Safe after the NSWindow is gone: the center neither retains nor dereferences the
+            // `object:` filter, only the observer token is used.
             // SAFETY: `observer` was returned by addObserverForName on the default center.
             unsafe { NSNotificationCenter::defaultCenter().removeObserver(any(&observer)) };
         }

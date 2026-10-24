@@ -289,8 +289,8 @@ Performance follow-up (measured 2026-10-24, `dev/perf/README.md`):
   visible 100-lines/s stream went from 84 to 54 frames per second and from 14.1% to 10.2% of a
   core; the same stream on a locked screen from 74-77 frames per second, 11% CPU and 390 MB
   footprint to no frames, 0.1% CPU and 88 MB. This also bounds the runaway seen with the display
-  asleep (about 3,000 frames per second and 2-3 GB footprint). The tab-bar and dialog icons are
-  glyphs of a bundled Lucide icon font instead of SVGs, so the 2048x2048 image atlas (16 MB of
+  asleep (about 3,000 frames per second and 2-3 GB footprint) by construction (not re-measured). The tab-bar and
+  dialog icons are glyphs of a bundled Lucide icon font instead of SVGs, so the 2048x2048 image atlas (16 MB of
   GPU memory per window) is never created: idle footprint with one tab went from about 76 MB to
   60 MB.
 - Measured facts: Activity Monitor's "Memory" is the phys_footprint (`footprint <pid>`), not

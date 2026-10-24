@@ -238,3 +238,31 @@ pub fn window_header<'a>(t: &'static Tokens, window: window::Id) -> Element<'a, 
         Message::TitleBar(window, a)
     })
 }
+
+#[cfg(test)]
+mod icon_font_tests {
+    #[test]
+    fn bundled_icon_font_has_every_icon_codepoint() {
+        use read_fonts::{FontRef, TableProvider};
+        let font = FontRef::new(include_bytes!("../assets/fonts/lucide-icons.ttf"))
+            .expect("icon font parses");
+        let cmap = font.cmap().expect("icon font has a cmap");
+        let src = include_str!("ui.rs");
+        let mut seen = 0;
+        for line in src.lines() {
+            let Some(rest) = line.strip_prefix("pub const ICON_") else {
+                continue;
+            };
+            let Some(hex) = rest.split("\\u{").nth(1).and_then(|r| r.split('}').next()) else {
+                continue;
+            };
+            let ch = char::from_u32(u32::from_str_radix(hex, 16).unwrap()).unwrap();
+            assert!(
+                cmap.map_codepoint(ch).is_some(),
+                "missing U+{hex} in {rest}"
+            );
+            seen += 1;
+        }
+        assert!(seen >= 8, "found only {seen} ICON_ constants");
+    }
+}

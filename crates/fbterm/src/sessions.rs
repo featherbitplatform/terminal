@@ -3,7 +3,6 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use fbterm_config::{Profile, ProfileKind};
@@ -27,21 +26,21 @@ type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
 #[derive(Clone)]
 pub(crate) struct EventReceiver {
     pub(crate) rx: Arc<Mutex<Option<Events>>>,
-    /// Set when the user types into a terminal: the next output (the echo) skips pacing.
-    typed: Arc<AtomicBool>,
+    /// The session the user last typed into: its next output (the echo) skips pacing.
+    typed: Arc<Mutex<Option<SessionId>>>,
 }
 
 impl EventReceiver {
     pub(crate) fn new(rx: Events) -> Self {
         Self {
             rx: Arc::new(Mutex::new(Some(rx))),
-            typed: Arc::new(AtomicBool::new(false)),
+            typed: Arc::new(Mutex::new(None)),
         }
     }
 
     /// The user sent input to a session; its echo should show on the next frame.
-    pub(crate) fn typed(&self) {
-        self.typed.store(true, Ordering::Relaxed);
+    pub(crate) fn typed(&self, id: SessionId) {
+        *self.typed.lock() = Some(id);
     }
 }
 
@@ -51,9 +50,20 @@ impl Hash for EventReceiver {
     }
 }
 
+/// Whether a `Dirty` from `id` is the echo of the user's input; only that session consumes it.
+fn take_typed(slot: &Mutex<Option<SessionId>>, id: SessionId) -> bool {
+    let mut slot = slot.lock();
+    if *slot == Some(id) {
+        *slot = None;
+        true
+    } else {
+        false
+    }
+}
+
 struct Paced {
     rx: Events,
-    typed: Arc<AtomicBool>,
+    typed: Arc<Mutex<Option<SessionId>>>,
     pacer: Pacer<SessionId>,
     ready: VecDeque<(SessionId, SessionEvent)>,
 }
@@ -88,7 +98,7 @@ pub(crate) fn session_stream(
             };
             let (id, event) = received?;
             if event == SessionEvent::Dirty {
-                let typed = s.typed.swap(false, Ordering::Relaxed);
+                let typed = take_typed(&s.typed, id);
                 let ids = s.pacer.dirty(id, Instant::now(), typed);
                 s.ready
                     .extend(ids.into_iter().map(|id| (id, SessionEvent::Dirty)));
@@ -296,7 +306,7 @@ impl App {
                 match tabs::route_input(&tab.state, &bytes) {
                     InputRoute::Send => {
                         if let Some(s) = &tab.session {
-                            self.receiver.typed();
+                            self.receiver.typed(s.id);
                             s.send(bytes);
                         }
                         Task::none()
@@ -457,7 +467,17 @@ pub(crate) fn spawn_reaped(mut cmd: std::process::Command, what: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LinkAction, link_action};
+    use super::{LinkAction, link_action, take_typed};
+    use fbterm_session::SessionId;
+    use parking_lot::Mutex;
+
+    #[test]
+    fn typing_echo_is_consumed_only_by_its_own_session() {
+        let slot = Mutex::new(Some(SessionId(1)));
+        assert!(!take_typed(&slot, SessionId(2)), "other session's output");
+        assert!(take_typed(&slot, SessionId(1)), "the typed-into session");
+        assert!(!take_typed(&slot, SessionId(1)), "consumed once");
+    }
 
     #[test]
     fn web_and_mail_links_open() {

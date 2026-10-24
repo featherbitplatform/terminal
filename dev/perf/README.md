@@ -144,7 +144,7 @@ The same stream with the screen locked (display awake, window on screen behind t
 
 A minimized window behaves the same: 0 frames while minimized, back to 54 frames per second on
 restore. The runaway seen earlier with the display asleep (about 3,000 frames per second, 2-3 GB
-footprint) is bounded by the same two rules.
+footprint) is bounded by construction (not re-measured) by the same two rules.
 
 ### Icons from a font
 
