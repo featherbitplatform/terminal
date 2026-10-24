@@ -267,3 +267,26 @@ fn the_gear_button_opens_the_settings_window() {
     let _ = app.update(Message::TabBar(w, crate::app::TabBarMsg::Settings));
     assert!(app.settings_window().is_some());
 }
+
+#[test]
+fn clearing_a_chord_does_not_bring_back_an_entry_load_dropped() {
+    use fbterm_config::keys::{Action, Bindings};
+    let (mut app, paths) = app();
+    let mac = app.bindings.mac();
+    let close = app.bindings.chord(Action::CloseTab).unwrap();
+    std::fs::write(
+        paths.settings(),
+        format!("[keys]\nnew_tab = \"{}\"\n", close.to_config(mac)),
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(SETTINGS_CHANGED));
+    assert!(app.settings_notice.is_some(), "the conflict is reported");
+    assert!(app.bindings.is_default(Action::NewTab));
+    send(&mut app, SettingsMsg::ClearKey(Action::CloseTab));
+    // What runs now is what the file gives on the next launch.
+    let reloaded = Settings::load_checked(&paths.settings()).unwrap();
+    assert!(reloaded.1.is_none(), "{:?}", read(&paths));
+    assert_eq!(Bindings::current(&reloaded.0.keys.map), app.bindings);
+    assert_eq!(app.bindings.action(close), None);
+    assert!(app.settings_notice.is_none());
+}

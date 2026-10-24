@@ -61,6 +61,18 @@ fn named_key(named: Named) -> Option<ChordKey> {
         Named::F10 => ChordKey::F(10),
         Named::F11 => ChordKey::F(11),
         Named::F12 => ChordKey::F(12),
+        Named::F13 => ChordKey::F(13),
+        Named::F14 => ChordKey::F(14),
+        Named::F15 => ChordKey::F(15),
+        Named::F16 => ChordKey::F(16),
+        Named::F17 => ChordKey::F(17),
+        Named::F18 => ChordKey::F(18),
+        Named::F19 => ChordKey::F(19),
+        Named::F20 => ChordKey::F(20),
+        Named::F21 => ChordKey::F(21),
+        Named::F22 => ChordKey::F(22),
+        Named::F23 => ChordKey::F(23),
+        Named::F24 => ChordKey::F(24),
         _ => return None,
     })
 }
@@ -421,7 +433,7 @@ mod tests {
         o.insert(Action::PrevTab, Some(chord("ctrl+shift+tab")));
         o.insert(Action::FindAll, Some(chord("ctrl+alt+g")));
         o.insert(Action::NewTab, None);
-        o.insert(Action::OpenSettingsFile, Some(chord("ctrl+shift+.")));
+        o.insert(Action::OpenSettingsFile, Some(chord("ctrl+alt+shift+]")));
         let b = Bindings::new(false, &o);
         let tab = Key::Named(iced::keyboard::key::Named::Tab);
         assert_eq!(
@@ -435,9 +447,9 @@ mod tests {
         // The old chords are free again.
         assert_eq!(shortcut(&b, &k("]"), ctrl_shift(), None), None);
         assert_eq!(shortcut(&b, &k("t"), ctrl_shift(), None), None);
-        // A shifted symbol matches whichever way the platform reports it.
+        // `}` with Shift is `]`, whichever the platform reports.
         assert_eq!(
-            shortcut(&b, &k(">"), ctrl_shift(), None),
+            shortcut(&b, &k("}"), ctrl_shift() | Modifiers::ALT, None),
             Some(Action::OpenSettingsFile)
         );
         // AltGr typing a character is that character, for a rebound chord too.
@@ -445,5 +457,18 @@ mod tests {
         assert_eq!(shortcut(&b, &k("g"), altgr, Some("@")), None);
         assert_eq!(shortcut(&b, &k("g"), altgr, None), Some(Action::FindAll));
         assert_eq!(shortcut(&b, &k("f"), altgr, None), None);
+    }
+
+    #[test]
+    fn layout_symbols_are_their_own_keys() {
+        // On AZERTY the digit row types & é " ' ( - è _ ç à unshifted: Ctrl+Shift+& is not
+        // tab 7 or tab 1, as before; and `!`, `$`, `*` (and German `#`) are not digits.
+        for sym in ["&", "(", "*", "!", "$", "#", "_", "+"] {
+            assert_eq!(shortcut_for(false, &k(sym), ctrl_shift()), None, "{sym}");
+            assert_eq!(shortcut_for(true, &k(sym), CMD), None, "{sym}");
+        }
+        // The F keys past 12 are keys too (with a modifier).
+        let f13 = Key::Named(iced::keyboard::key::Named::F13);
+        assert_eq!(press_chord(&f13, Modifiers::CTRL), Some(chord("ctrl+f13")));
     }
 }

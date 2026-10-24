@@ -297,7 +297,7 @@ fn a_recorded_free_chord_is_applied_and_written_at_once() {
 #[test]
 fn a_chord_that_cannot_be_bound_keeps_recording_and_says_why() {
     let mut s = state();
-    s.update(SettingsMsg::Record(Action::Quit));
+    s.update(SettingsMsg::Record(Action::NewWindow));
     for pressed in [
         Some(chord("q")),
         Some(chord("shift+q")),
@@ -314,7 +314,7 @@ fn a_chord_that_cannot_be_bound_keeps_recording_and_says_why() {
     // F keys work alone.
     s.update(SettingsMsg::Pressed(Some(chord("f9"))));
     assert!(s.recording.is_none());
-    assert_eq!(s.bindings().chord(Action::Quit), Some(chord("f9")));
+    assert_eq!(s.bindings().chord(Action::NewWindow), Some(chord("f9")));
 }
 
 #[test]
@@ -363,12 +363,12 @@ fn rows_reset_and_clear_and_restore_defaults_resets_all() {
     s.update(SettingsMsg::ResetKey(Action::OpenSettingsFile));
     assert!(s.values.keys.map.is_empty());
     // Resetting a row whose default another action took asks first.
-    let quit = defaults.chord(Action::Quit).unwrap();
+    let palette = defaults.chord(Action::Palette).unwrap();
     s.update(SettingsMsg::Record(Action::NewWindow));
-    s.update(SettingsMsg::Pressed(Some(quit)));
+    s.update(SettingsMsg::Pressed(Some(palette)));
     s.update(SettingsMsg::TakeOver);
-    assert_eq!(s.bindings().chord(Action::Quit), None);
-    s.update(SettingsMsg::ResetKey(Action::Quit));
+    assert_eq!(s.bindings().chord(Action::Palette), None);
+    s.update(SettingsMsg::ResetKey(Action::Palette));
     assert!(matches!(
         s.recording.as_ref().unwrap().problem,
         Some(RecordProblem::Taken {
@@ -394,4 +394,64 @@ fn a_read_only_window_records_nothing() {
     s.update(SettingsMsg::Record(Action::NewTab));
     assert!(s.recording.is_none());
     assert_eq!(s.update(SettingsMsg::ResetKeys), Effect::NONE);
+}
+
+#[test]
+fn chords_the_terminal_or_the_system_owns_are_refused() {
+    let mut s = state();
+    let mac = s.bindings().mac();
+    let copy = if mac { "cmd+c" } else { "ctrl+shift+c" };
+    s.update(SettingsMsg::Record(Action::NewTab));
+    s.update(SettingsMsg::Pressed(Some(chord(copy))));
+    let Some(RecordProblem::NotAllowed(why)) = &s.recording.as_ref().unwrap().problem else {
+        panic!("{:?}", s.recording);
+    };
+    assert!(why.ends_with("is used by Copy"), "{why}");
+    assert!(s.values.keys.map.is_empty());
+    if mac {
+        // Cmd+Q belongs to the app menu even for another action, and Quit itself is fixed.
+        s.update(SettingsMsg::Pressed(Some(chord("cmd+q"))));
+        assert!(matches!(
+            s.recording.as_ref().unwrap().problem,
+            Some(RecordProblem::NotAllowed(_))
+        ));
+        s.update(SettingsMsg::CancelRecording);
+        s.update(SettingsMsg::Record(Action::Quit));
+        assert!(s.recording.is_none());
+        assert_eq!(s.update(SettingsMsg::ClearKey(Action::Quit)), Effect::NONE);
+    }
+}
+
+#[test]
+fn an_edit_on_disk_ends_a_stale_take_over_question() {
+    let mut s = state();
+    let close = s.bindings().chord(Action::CloseTab).unwrap();
+    s.update(SettingsMsg::Record(Action::NewTab));
+    s.update(SettingsMsg::Pressed(Some(close)));
+    assert!(s.recording.is_some());
+    // The file changes the chords meanwhile: the question goes away.
+    let mut disk = Settings::default();
+    disk.keys.map.insert(Action::CloseTab, None);
+    s.sync(&disk);
+    assert!(s.recording.is_none());
+    assert_eq!(s.update(SettingsMsg::TakeOver), Effect::NONE);
+    // A sync that leaves the chords alone keeps recording.
+    s.update(SettingsMsg::Record(Action::NewTab));
+    s.sync(&disk);
+    assert!(s.recording.is_some());
+}
+
+#[test]
+fn take_over_checks_the_chord_is_still_taken() {
+    let mut s = state();
+    let close = s.bindings().chord(Action::CloseTab).unwrap();
+    s.update(SettingsMsg::Record(Action::NewTab));
+    s.update(SettingsMsg::Pressed(Some(close)));
+    // The question stands, but Close tab let go of the chord in between.
+    s.values.keys.map.insert(Action::CloseTab, None);
+    let e = s.update(SettingsMsg::TakeOver);
+    assert!(e.apply.is_some());
+    let b = s.bindings();
+    assert_eq!(b.chord(Action::NewTab), Some(close));
+    assert_eq!(b.chord(Action::CloseTab), None);
 }
