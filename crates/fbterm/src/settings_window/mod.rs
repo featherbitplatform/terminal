@@ -183,6 +183,10 @@ impl SettingsState {
     /// Show `values` (the file changed on disk): every control and typed number follows, and
     /// unwritten changes are dropped (the file wins).
     pub fn sync(&mut self, values: &Settings) {
+        // A recording (and any question it asks) was about the old chords.
+        if values.keys.map != self.values.keys.map {
+            self.recording = None;
+        }
         self.values = values.clone();
         self.font_size_text = size_text(values.font_size);
         self.opacity_text = percent_text(values.background_opacity);
@@ -287,6 +291,13 @@ impl SettingsState {
         let bindings = self.bindings();
         let problem = match chord {
             None => RecordProblem::NotAllowed("That key cannot be part of a shortcut".into()),
+            Some(chord) if keymap::reserved(bindings.mac(), chord).is_some() => {
+                let what = keymap::reserved(bindings.mac(), chord).unwrap_or_default();
+                RecordProblem::NotAllowed(format!(
+                    "{} is used by {what}",
+                    chord.label(bindings.mac())
+                ))
+            }
             Some(chord) => match chord.allowed() {
                 Err(why) => {
                     RecordProblem::NotAllowed(format!("{}: {why}", chord.label(bindings.mac())))
@@ -353,6 +364,13 @@ impl SettingsState {
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),
+            SettingsMsg::Record(action)
+            | SettingsMsg::ResetKey(action)
+            | SettingsMsg::ClearKey(action)
+                if action.is_fixed(self.bindings().mac()) =>
+            {
+                Effect::NONE
+            }
             SettingsMsg::Record(action) => {
                 self.recording = Some(Recording {
                     action,
@@ -372,7 +390,15 @@ impl SettingsState {
                 Some(Recording {
                     action,
                     problem: Some(RecordProblem::Taken { chord, other }),
-                }) => self.set_keys(&[(other, None), (action, Some(chord))]),
+                }) => {
+                    // The bindings may have changed since the question (an edit on disk):
+                    // take over only if `other` still has the chord, else ask again.
+                    if self.bindings().action(chord) == Some(other) {
+                        self.set_keys(&[(other, None), (action, Some(chord))])
+                    } else {
+                        self.pressed(action, Some(chord))
+                    }
+                }
                 other => {
                     self.recording = other;
                     Effect::NONE

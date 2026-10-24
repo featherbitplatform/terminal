@@ -399,6 +399,11 @@ fn keyboard<'a>(
     column![header, list].spacing(8).into()
 }
 
+/// Width of a chord in the Keyboard section.
+const PILL_WIDTH: f32 = 150.0;
+/// Size of the small icon buttons of a row (a 13 px icon with 5 px padding).
+const CLEAR_SIZE: f32 = 23.0;
+
 /// One action: its name, then reset and clear buttons and its chord; below, what recording
 /// says or a warning when the chord takes a key from programs in the terminal.
 fn key_row<'a>(
@@ -417,15 +422,16 @@ fn key_row<'a>(
             .style(move |_, status| ui::ghost(t, status));
         crate::tooltip::tip(t, b, tip_text, false)
     };
-    let mut line = row![
+    let fixed = action.is_fixed(mac);
+    let editable = editable && !fixed;
+    let title = || {
         text(action.title())
             .font(UI_FONT)
             .size(13)
             .color(t.text)
             .width(Length::Fill)
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
+    };
+    let mut line = row![title()].spacing(4).align_y(Alignment::Center);
     if !bindings.is_default(action) {
         line = line.push(small(
             ui::ICON_RESET,
@@ -433,13 +439,9 @@ fn key_row<'a>(
             SettingsMsg::ResetKey(action),
         ));
     }
-    if chord.is_some() {
-        line = line.push(small(
-            ui::ICON_X,
-            "Remove shortcut",
-            SettingsMsg::ClearKey(action),
-        ));
-    }
+    // The clear button shows only while the pointer is on the row (see `hover` below); this
+    // keeps its place.
+    line = line.push(Space::new().width(CLEAR_SIZE).height(CLEAR_SIZE));
     let (caption, color) = match (recording, chord) {
         (Some(_), _) => ("Press a shortcut".to_owned(), t.accent),
         (None, Some(c)) => (c.label(mac), t.text),
@@ -455,7 +457,7 @@ fn key_row<'a>(
                     SettingsMsg::Record(action)
                 })
             }))
-            .width(150)
+            .width(PILL_WIDTH)
             .padding(Padding::from([4.0, 10.0]))
             .style(move |_, status| {
                 let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
@@ -471,6 +473,19 @@ fn key_row<'a>(
                 }
             });
     let line = line.push(Space::new().width(4)).push(pill);
+    let line: Element<'a, Message> = if chord.is_some() && editable && recording.is_none() {
+        let clear = row![
+            Space::new().width(Length::Fill),
+            small(ui::ICON_X, "Remove shortcut", SettingsMsg::ClearKey(action)),
+            Space::new().width(4),
+            Space::new().width(PILL_WIDTH),
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+        iced::widget::hover(line, clear)
+    } else {
+        line.into()
+    };
     let note: Option<Element<'a, Message>> = match recording {
         Some(Recording { problem: None, .. }) => Some(
             text("Press the new shortcut. Esc cancels.")
@@ -515,6 +530,13 @@ fn key_row<'a>(
             .spacing(8)
             .align_y(Alignment::Center)
             .into(),
+        ),
+        None if fixed => Some(
+            text("Fixed on macOS: the app menu owns it.")
+                .font(UI_FONT)
+                .size(12)
+                .color(t.text_muted)
+                .into(),
         ),
         None => chord
             .filter(|_| !action.is_find_navigation())
