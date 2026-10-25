@@ -14,7 +14,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use feathercritty::grid::{Dimensions, Grid, Row};
+use feathercritty::grid::{Dimensions, Grid, Row, RowReader};
 use feathercritty::index::{Column, Line};
 use feathercritty::term::cell::{Cell, Flags};
 use feathercritty::vte::ansi::{Color, NamedColor};
@@ -160,6 +160,7 @@ fn export_chunked(
         )
     };
     let mut lines = LineWriter::new(format.colors());
+    let mut reader = RowReader::new();
     let mut buf = String::new();
     while next < end {
         {
@@ -175,7 +176,8 @@ fn export_chunked(
                 let line = stable - scrolled;
                 // Rows that left the scrollback meanwhile are gone.
                 if (top..bottom).contains(&line) {
-                    lines.row(&g[Line(line as i32)], cols, &mut buf);
+                    let line = Line(line as i32);
+                    lines.row(reader.row(g, line), g.wraps(line), cols, &mut buf);
                 }
             }
             next = stop;
@@ -264,12 +266,12 @@ impl LineWriter {
         }
     }
 
-    fn row(&mut self, row: &Row<Cell>, cols: usize, out: &mut String) {
+    /// Add a row; `wraps` says it continues on the next row (a soft wrap).
+    fn row(&mut self, row: &Row<Cell>, wraps: bool, cols: usize, out: &mut String) {
         for c in 0..cols {
             self.cell(&row[Column(c)]);
         }
         self.open = true;
-        let wraps = cols > 0 && row[Column(cols - 1)].flags.contains(Flags::WRAPLINE);
         if !wraps {
             self.end_line(out);
         }
@@ -652,6 +654,46 @@ mod tests {
         let old: Vec<&str> = out.lines().filter(|l| l.starts_with("old")).collect();
         let want: Vec<String> = (0..40).map(|i| format!("old {i}")).collect();
         assert_eq!(old, want);
+    }
+
+    #[test]
+    fn export_survives_history_clear_midway() {
+        let mut t = Terminal::new(
+            GridSize {
+                cols: 20,
+                rows: 5,
+                cell_width: 8.0,
+                cell_height: 16.0,
+            },
+            10_000,
+        );
+        let mut bytes = Vec::new();
+        for i in 0..5000 {
+            bytes.extend(format!("line {i}\r\n").bytes());
+        }
+        t.feed(&bytes);
+        let t = std::sync::Arc::new(parking_lot::Mutex::new(t));
+        // After the first 1000-row chunk, the history is erased (CSI 3 J).
+        let mut calls = 0;
+        let mut clear = || {
+            calls += 1;
+            if calls == 1 {
+                t.lock().feed(b"\x1b[3J");
+            }
+        };
+        let mut out = Vec::new();
+        export_chunked(&t, ExportFormat::Plain, &mut out, 1000, &mut clear).unwrap();
+        assert!(calls >= 1, "the export ran in more than one chunk");
+        let out = String::from_utf8(out).unwrap();
+        let numbers: Vec<usize> = out
+            .lines()
+            .map(|l| l.strip_prefix("line ").unwrap().parse().unwrap())
+            .collect();
+        // The rows read before the clear are all there, then only what survived it (the
+        // screen), never a row twice or out of order.
+        assert_eq!(numbers[..1000], (0..1000).collect::<Vec<_>>()[..]);
+        assert!(numbers.windows(2).all(|w| w[0] < w[1]), "{numbers:?}");
+        assert_eq!(numbers.last(), Some(&4999));
     }
 
     #[test]

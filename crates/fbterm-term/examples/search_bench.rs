@@ -11,6 +11,7 @@ use fbterm_term::{
     ColorScheme, ExportFormat, GridSize, MATCH_CAP, SearchPattern, SearchQuery, SearchRequest,
     SharedTerminal, Terminal, build_draw_list, export, search,
 };
+use feathercritty::grid::RowReader;
 use parking_lot::Mutex;
 
 const LINES: usize = 10_000;
@@ -202,8 +203,10 @@ fn main() {
             } else {
                 t.scroll(offset);
             }
+            // One reader across frames, as the widget keeps it.
+            let mut reader = RowReader::new();
             best_of(200, || {
-                let list = build_draw_list(&t, &scheme, true, None, None);
+                let list = build_draw_list(&mut reader, &t, &scheme, true, None, None);
                 list.quads.len() + list.texts.len()
             })
         };

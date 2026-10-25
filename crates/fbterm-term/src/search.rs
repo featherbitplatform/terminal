@@ -14,9 +14,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use feathercritty::grid::{Dimensions, Scroll};
+use feathercritty::grid::{Dimensions, RowReader, Scroll};
 use feathercritty::index::{Column, Line};
-use feathercritty::term::cell::Flags;
+use feathercritty::term::cell::{Cell, Flags};
 use regex::{Regex, RegexBuilder};
 
 use crate::{SharedTerminal, Terminal};
@@ -315,20 +315,18 @@ impl Terminal {
 
     /// Whether row `line` continues on the next row (soft wrap).
     fn wraps(&self, line: i32) -> bool {
-        let grid = self.term.grid();
-        let last = grid.columns() - 1;
-        grid[Line(line)][Column(last)]
-            .flags
-            .contains(Flags::WRAPLINE)
+        self.term.grid().wraps(Line(line))
     }
 
-    fn line_text(&self, first: i32, last: i32) -> LineText {
+    /// The logical line of rows `first..=last`, read through `reader` (one per chunk, so a
+    /// history row is decoded into its scratch row instead of being copied per line).
+    fn line_text(&self, reader: &mut RowReader<Cell>, first: i32, last: i32) -> LineText {
         let grid = self.term.grid();
         let cols = grid.columns();
         let mut text = String::new();
         let mut cells = Vec::new();
         for (k, line) in (first..=last).enumerate() {
-            let row = &grid[Line(line)];
+            let row = reader.row(grid, Line(line));
             for c in 0..cols {
                 let cell = &row[Column(c)];
                 if cell
@@ -366,12 +364,13 @@ impl Terminal {
     /// Matches on the logical line of rows `first..=last`, left to right.
     fn line_hits(
         &self,
+        reader: &mut RowReader<Cell>,
         pattern: &SearchPattern,
         first: i32,
         last: i32,
         snippets: bool,
     ) -> Vec<Hit> {
-        let line = self.line_text(first, last);
+        let line = self.line_text(reader, first, last);
         pattern
             .find_iter(&line.text)
             .filter_map(|bytes| {
@@ -411,6 +410,7 @@ impl Terminal {
         while first > top && self.wraps(first - 1) {
             first -= 1;
         }
+        let mut reader = RowReader::new();
         let mut hits = Vec::new();
         let mut end = last;
         while end >= first {
@@ -418,7 +418,7 @@ impl Terminal {
             while start > first && self.wraps(start - 1) {
                 start -= 1;
             }
-            let mut line = self.line_hits(&req.pattern, start, end, req.snippets);
+            let mut line = self.line_hits(&mut reader, &req.pattern, start, end, req.snippets);
             line.reverse();
             hits.extend(line);
             end = start - 1;
@@ -446,6 +446,7 @@ impl Terminal {
             last += 1;
         }
         let started = Instant::now();
+        let mut reader = RowReader::new();
         let mut out = Vec::new();
         let mut start = first;
         while start <= last && started.elapsed() < VIEW_BUDGET {
@@ -454,7 +455,7 @@ impl Terminal {
                 end += 1;
             }
             out.extend(
-                self.line_hits(pattern, start, end, false)
+                self.line_hits(&mut reader, pattern, start, end, false)
                     .into_iter()
                     .map(|h| h.range),
             );
@@ -550,6 +551,7 @@ mod tests {
 
     use super::*;
     use crate::GridSize;
+    use feathercritty::index::Point;
 
     fn term(cols: u16, rows: u16, history: usize) -> Terminal {
         Terminal::new(
@@ -670,7 +672,7 @@ mod tests {
         assert_eq!(before.hits[0].range, after.hits[0].range);
         let t = shared.lock();
         let line = t.grid_line(after.hits[0].range.start.line).unwrap();
-        assert_eq!(t.term().grid()[line][Column(0)].c, 'n');
+        assert_eq!(t.term().grid().cell(Point::new(line, Column(0))).c, 'n');
     }
 
     #[test]
@@ -701,7 +703,8 @@ mod tests {
     /// The text at stable line `stable`, trimmed.
     fn text_at(t: &Terminal, stable: i64) -> Option<String> {
         let line = t.grid_line(stable)?;
-        let row = &t.term().grid()[line];
+        let mut reader = RowReader::new();
+        let row = reader.row(t.term().grid(), line);
         let s: String = (0..t.term().grid().columns())
             .map(|c| row[Column(c)].c)
             .collect();

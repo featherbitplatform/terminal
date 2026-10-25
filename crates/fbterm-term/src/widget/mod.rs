@@ -12,7 +12,8 @@ use std::cell::RefCell;
 use std::sync::Arc;
 
 use fbterm_config::Rgb;
-use feathercritty::term::cell::Hyperlink;
+use feathercritty::grid::RowReader;
+use feathercritty::term::cell::{Cell, Hyperlink};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::text::{self, Paragraph as _};
 use iced::advanced::widget::{self, Widget};
@@ -120,6 +121,9 @@ struct Measured {
 struct State {
     measured: Option<Measured>,
     cache: RefCell<Option<(CacheKey, draw::DrawList)>>,
+    /// Reads the rows in view while building the draw list; kept across frames so a view
+    /// scrolled into the history reuses its scratch row.
+    reader: RefCell<RowReader<Cell>>,
     /// Terminal and grid size last synced to the terminal, to avoid locking on every event.
     synced: Option<(usize, GridSize)>,
     input: input::InputState,
@@ -292,6 +296,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
             };
             if cache.as_ref().is_none_or(|(k, _)| *k != key) {
                 let list = draw::build(
+                    &mut state.reader.borrow_mut(),
                     &term,
                     &self.style.scheme,
                     key.focused,

@@ -333,15 +333,15 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"hi");
         let g = t.term().grid();
-        assert_eq!(g[Line(0)][Column(0)].c, 'h');
-        assert_eq!(g[Line(0)][Column(1)].c, 'i');
+        assert_eq!(g.screen()[Line(0)][Column(0)].c, 'h');
+        assert_eq!(g.screen()[Line(0)][Column(1)].c, 'i');
     }
 
     #[test]
     fn sgr_truecolor_sets_cell_fg() {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b[38;2;10;20;30mX");
-        let c = &t.term().grid()[Line(0)][Column(0)];
+        let c = &t.term().grid().screen()[Line(0)][Column(0)];
         assert_eq!(
             c.fg,
             Color::Spec(Rgb {
@@ -357,9 +357,13 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed("界".as_bytes());
         let g = t.term().grid();
-        assert!(g[Line(0)][Column(0)].flags.contains(Flags::WIDE_CHAR));
         assert!(
-            g[Line(0)][Column(1)]
+            g.screen()[Line(0)][Column(0)]
+                .flags
+                .contains(Flags::WIDE_CHAR)
+        );
+        assert!(
+            g.screen()[Line(0)][Column(1)]
                 .flags
                 .contains(Flags::WIDE_CHAR_SPACER)
         );

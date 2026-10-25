@@ -345,7 +345,7 @@ fn selections() -> Vec<(&'static str, Point, Point)> {
 }
 
 /// Runs of cells carrying an OSC 8 link, read as the app reads them for link clicks
-/// (`grid()[point].hyperlink()`), over the whole history and screen: "line:first-last id uri".
+/// (`grid().cell(point).hyperlink()`), over the whole history and screen: "line:first-last id uri".
 /// A link without an explicit id gets a generated "<counter>_<library name>" id; record only
 /// the counter, so the golden does not carry the generator's suffix.
 fn link_id(id: &str) -> String {
@@ -368,7 +368,8 @@ fn links_json(shared: &SharedTerminal) -> Value {
             }
         };
         for c in 0..grid.columns() {
-            let desc = grid[Line(l)][Column(c)]
+            let desc = grid
+                .cell(Point::new(Line(l), Column(c)))
                 .hyperlink()
                 .map(|h| format!("id={} uri={}", link_id(h.id()), h.uri()));
             match (&mut run, desc) {

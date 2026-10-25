@@ -381,7 +381,7 @@ mod tests {
         term.feed(b"ccc");
         let row = |r: i32| -> String {
             (0..3)
-                .map(|c| term.term().grid()[Line(r)][Column(c)].c)
+                .map(|c| term.term().grid().screen()[Line(r)][Column(c)].c)
                 .collect()
         };
         assert_eq!([row(0), row(1), row(2)], ["aaa", "bbb", "ccc"]);

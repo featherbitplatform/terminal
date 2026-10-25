@@ -280,6 +280,26 @@ how many color runs a row has (about 8 ms with 5 runs of 40 cells, about 15 ms w
 10 cells); the 6.5 ms in the spec was measured with different content, so the gate compares
 this harness before and after.
 
+### After the screen and history split (feathercritty `0.26.0+fbterm.4`, 2026-10-25)
+
+History is read through feathercritty's read API (`RowReader`, `Grid::wraps`, `Grid::cell`);
+rows are still stored dense. Same harness, release builds of `9747adb` (before) and the
+migration commit (after), run alternately 5 times each on the same machine; load average
+3.5-4.6 during the runs, so absolute numbers are higher than in the table above. Median
+[range] of the per-run best:
+
+| Read | Before | After | After / before |
+|---|---|---|---|
+| search, one tab: literal, no match | 6.45 [5.29 - 6.85] ms | 5.69 [5.51 - 6.49] ms | 0.88 |
+| search, one tab: literal, 1 in 4 lines | 2.35 [2.29 - 2.72] ms | 2.47 [2.43 - 2.74] ms | 1.05 |
+| search, one tab: regex, rare / 1 in 4 lines | 5.68 / 5.73 ms | 5.98 / 6.03 ms | 1.05 / 1.05 |
+| search, 20 tabs, rare literal: sequential / one thread per tab | 109.7 / 21.5 ms | 116.5 / 21.4 ms | 1.06 / 1.00 |
+| export, plain / with colors | 2.81 / 7.99 ms | 2.55 / 7.21 ms | 0.91 / 0.90 |
+| draw-list build: bottom / middle / top | 0.058 / 0.058 / 0.058 ms | 0.056 / 0.057 / 0.056 ms | 0.97 / 0.98 / 0.97 |
+
+Search is about 5% slower (the literal no-match row is noisy in both builds), export about 10%
+faster, the draw-list build unchanged. The per-chunk lock time stays about 0.5 ms.
+
 ## Re-running
 
 ```
