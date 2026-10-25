@@ -80,6 +80,8 @@ pub enum Message {
     /// Tab-bar and shortcut actions act on the focused window.
     NewTab,
     CloseTab(usize),
+    /// `--perf-close-after`: close every tab of the window but the active one.
+    PerfCloseOthers(window::Id),
     SelectTab(usize),
     NextTab,
     PrevTab,
@@ -589,6 +591,7 @@ impl App {
                 Some(wid) => self.close_tab(wid, i),
                 None => Task::none(),
             },
+            Message::PerfCloseOthers(wid) => self.perf_close_others(wid),
             Message::SelectTab(i) => self.with_focused(|w| w.select(i)),
             Message::NextTab => self.with_focused(WindowState::next),
             Message::PrevTab => self.with_focused(WindowState::prev),

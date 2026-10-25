@@ -7,6 +7,8 @@
 //! - Without `FBTERM_CONFIG_DIR` a fresh temporary config dir is used, so perf profiles can never
 //!   reach the real `profiles.toml`.
 //! - `--perf-exit-after <secs>`: quit cleanly after that long.
+//! - `--perf-close-after <secs>`: after that long, close every tab but the active (last) one,
+//!   as a user closing them would (dev/perf scenario G).
 //!
 //! There is no `--help`; this comment is the documentation.
 
@@ -23,6 +25,7 @@ pub(crate) struct PerfOpts {
     pub tabs: usize,
     pub cmd: String,
     pub exit_after: Option<u64>,
+    pub close_after: Option<u64>,
 }
 
 static PERF: OnceLock<PerfOpts> = OnceLock::new();
@@ -36,7 +39,7 @@ pub(crate) fn opts() -> Option<&'static PerfOpts> {
 /// ignored; `Ok(None)` when no perf flag is present.
 pub(crate) fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Option<PerfOpts>, String> {
     let mut args = args.into_iter();
-    let (mut tabs, mut cmd, mut exit_after) = (None, None, None);
+    let (mut tabs, mut cmd, mut exit_after, mut close_after) = (None, None, None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--perf-tabs" => {
@@ -55,6 +58,13 @@ pub(crate) fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Option<Pe
                         .map_err(|_| format!("bad --perf-exit-after: {v}"))?,
                 );
             }
+            "--perf-close-after" => {
+                let v = args.next().ok_or("--perf-close-after needs seconds")?;
+                close_after = Some(
+                    v.parse()
+                        .map_err(|_| format!("bad --perf-close-after: {v}"))?,
+                );
+            }
             _ => {}
         }
     }
@@ -64,6 +74,7 @@ pub(crate) fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Option<Pe
             tabs,
             cmd: cmd.unwrap_or_else(|| "sleep 100000".into()),
             exit_after,
+            close_after,
         })),
         (None, Some(_)) => Err("--perf-cmd needs --perf-tabs".into()),
     }
@@ -123,6 +134,25 @@ impl App {
                 Task::future(tokio::time::sleep(Duration::from_secs(secs))).then(|()| iced::exit()),
             );
         }
+        if let Some(secs) = o.close_after {
+            tasks.push(
+                Task::future(tokio::time::sleep(Duration::from_secs(secs)))
+                    .map(move |()| Message::PerfCloseOthers(wid)),
+            );
+        }
+        Task::batch(tasks)
+    }
+
+    /// Close every tab of `wid` but the active one, one `close_tab` at a time.
+    pub(crate) fn perf_close_others(&mut self, wid: iced::window::Id) -> Task<Message> {
+        let mut tasks = Vec::new();
+        while let Some(w) = self.windows.get(&wid) {
+            if w.tabs.len() <= 1 {
+                break;
+            }
+            let victim = if w.active == 0 { 1 } else { 0 };
+            tasks.push(self.close_tab(wid, victim));
+        }
         Task::batch(tasks)
     }
 }
@@ -158,9 +188,19 @@ mod tests {
             PerfOpts {
                 tabs: 20,
                 cmd: "yes".into(),
-                exit_after: Some(60)
+                exit_after: Some(60),
+                close_after: None
             }
         );
+    }
+
+    #[test]
+    fn close_after() {
+        let o = p(&["--perf-tabs", "3", "--perf-close-after", "5"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(o.close_after, Some(5));
+        assert!(p(&["--perf-tabs", "3", "--perf-close-after", "x"]).is_err());
     }
 
     #[test]

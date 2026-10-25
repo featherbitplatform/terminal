@@ -23,6 +23,7 @@ use crate::palette::ColorScheme;
 use crate::{GridSize, SearchMatch, SearchPattern, SharedTerminal};
 
 pub use colors::cell_colors;
+pub use draw::{DrawList, build as build_draw_list};
 pub use geometry::{grid_size_from_bounds, pixel_to_cell, pixel_to_point};
 
 /// How a terminal is drawn.
