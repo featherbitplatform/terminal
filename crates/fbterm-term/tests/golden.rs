@@ -344,6 +344,47 @@ fn selections() -> Vec<(&'static str, Point, Point)> {
     ]
 }
 
+/// Runs of cells carrying an OSC 8 link, read as the app reads them for link clicks
+/// (`grid()[point].hyperlink()`), over the whole history and screen: "line:first-last id uri".
+/// A link without an explicit id gets a generated "<counter>_<library name>" id; record only
+/// the counter, so the golden does not carry the generator's suffix.
+fn link_id(id: &str) -> String {
+    match id.split_once('_') {
+        Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => format!("auto:{n}"),
+        _ => format!("{id:?}"),
+    }
+}
+
+fn links_json(shared: &SharedTerminal) -> Value {
+    use feathercritty::grid::Dimensions;
+    let t = shared.lock();
+    let grid = t.term().grid();
+    let mut out = Vec::new();
+    for l in grid.topmost_line().0..=grid.bottommost_line().0 {
+        let mut run: Option<(usize, usize, String)> = None;
+        let flush = |run: &mut Option<(usize, usize, String)>, out: &mut Vec<Value>| {
+            if let Some((a, b, d)) = run.take() {
+                out.push(Value::String(format!("{l}:{a}-{b} {d}")));
+            }
+        };
+        for c in 0..grid.columns() {
+            let desc = grid[Line(l)][Column(c)]
+                .hyperlink()
+                .map(|h| format!("id={} uri={}", link_id(h.id()), h.uri()));
+            match (&mut run, desc) {
+                (Some((_, b, d)), Some(n)) if *d == n => *b = c,
+                (_, Some(n)) => {
+                    flush(&mut run, &mut out);
+                    run = Some((c, c, n));
+                }
+                (_, None) => flush(&mut run, &mut out),
+            }
+        }
+        flush(&mut run, &mut out);
+    }
+    Value::Array(out)
+}
+
 fn selection_json(shared: &SharedTerminal) -> Value {
     let t = shared.lock();
     let mut map = serde_json::Map::new();
@@ -402,10 +443,11 @@ fn search_and_selection_match_the_golden_files() {
                     ))).collect::<Vec<_>>(),
                 }));
             }
-            states.insert(
-                state.into(),
-                json!({ "find_bar": bar, "selections": selection_json(shared) }),
-            );
+            let mut entry = json!({ "find_bar": bar, "selections": selection_json(shared) });
+            if *name == "hyperlinks" {
+                entry["links"] = links_json(shared);
+            }
+            states.insert(state.into(), entry);
         });
         check(
             &format!("{name}.json"),
