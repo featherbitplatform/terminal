@@ -1,0 +1,187 @@
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub2
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs3x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub3
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+bash: foo3: command not found, error code 127
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs4x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub4
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs5x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub5
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40085
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs6x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub6
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs7x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub7
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs8x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub8
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs9x
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub9
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs10
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub10
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+bash: foo10: command not found, error code 127
+col1	   col2	   col3	   id=40170
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs11
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub11
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs12
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub12
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs13
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub13
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs14
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub14
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs15
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub15
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40255
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs16
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub16
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs17
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub17
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+bash: foo17: command not found, error code 127
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs18
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub18
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs19
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub19
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs20
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub20
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40340
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs21
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub21
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs22
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub22
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs23
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub23
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs24
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub24
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+bash: foo24: command not found, error code 127
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs25
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub25
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40425
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs26
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub26
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs27
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub27
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs28
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub28
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs29
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub29
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs30
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub30
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40510
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs31
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub31
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+bash: foo31: command not found, error code 127
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs32
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub32
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs33
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub33
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs34
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs35
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40595
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs36
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub36
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs37
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs38
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub38
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+bash: foo38: command not found, error code 127
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs39
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub39
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs40
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub40
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+col1	   col2	   col3	   id=40680
+[0;1;32muser@host[0m:[0;1;34m~/proj1[0m$ ls -la rs41
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub41
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj2[0m$ ls -la rs42
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub42
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj3[0m$ ls -la rs43
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub43
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+[0;1;32muser@host[0m:[0;1;34m~/proj0[0m$ ls -la rs44
+total 8
+drwxr-xr-x  3 user user 4096 Oct 25 12:00 sub44
+-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt
+overwritten line, error gone
+[0;1;32muser@host[0m:[0;1;34m~[0m$

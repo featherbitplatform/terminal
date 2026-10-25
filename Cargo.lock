@@ -1330,6 +1330,7 @@ dependencies = [
  "png",
  "portable-pty",
  "regex",
+ "serde_json",
 ]
 
 [[package]]
