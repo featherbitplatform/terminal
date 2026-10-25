@@ -34,6 +34,17 @@ task implements the section it cites; read that section before starting the task
 - feathercritty stays Apache-2.0 only. Every file it changes or adds starts with
   `// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.`
   (`#` in TOML).
+- **Merge-ready documentation in feathercritty (owner, 2026-10-25).** Every piece of code added
+  or changed in feathercritty carries enough comments for someone merging a new upstream release
+  to resolve conflicts without this plan: module docs for new files (what the module owns, its
+  invariants, how it relates to the upstream code it replaced); at each changed upstream
+  function or hunk, a short `// feathercritty:` comment saying what upstream did there, what we
+  do instead and why, and what to re-check if upstream changes that code (for example "upstream
+  indexed `self.raw[line]`; history rows are now read through `RowReader`; if upstream adds a
+  read here, classify it as screen or history"). In `resize.rs`, mark each container call that
+  differs from upstream so the algorithm text can be diffed against upstream. The README change
+  entry lists every changed upstream file with a one-line note on what to watch when merging.
+  Reviewers treat missing merge context on a changed upstream hunk as an Important finding.
 - No new `unsafe` in feathercritty. The only new `unsafe` in the whole change is the
   `malloc_zone_pressure_relief` call in fbterm, with a `SAFETY` comment.
 - feathercritty must not call into the allocator to release memory; a remote program (`CSI 3 J`,
