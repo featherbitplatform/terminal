@@ -1544,6 +1544,22 @@ mod access {
             .err()
             .unwrap();
         assert!(matches!(err, SshError::NeedsInput), "{err:?}");
-        assert!(pool.connected_profiles() == vec![key_id]);
+
+        // So does a saved password the server rejects (asking for another is a question), and
+        // the saved one is left alone.
+        fx.store.set(&pw_id, SecretKind::Password, "wrong").unwrap();
+        let err = acquire(&pool, &store, pw_id, none.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SshError::NeedsInput), "{err:?}");
+        assert_eq!(
+            fx.store
+                .get(&pw_id, SecretKind::Password)
+                .unwrap()
+                .as_deref(),
+            Some("wrong")
+        );
+        assert_eq!(pool.connected_profiles(), vec![key_id]);
     }
 }

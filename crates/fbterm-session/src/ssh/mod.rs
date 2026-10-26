@@ -102,7 +102,8 @@ pub trait Prompter: Send + Sync {
 
 /// The prompter of automatic reconnects: never asks anyone. Unknown host keys are not
 /// trusted and no secret is given, so a connect that needs the user fails at once (as
-/// [`SshError::NeedsInput`] from [`SshPool::acquire`]) instead of opening a prompt.
+/// [`SshError::NeedsInput`] from [`SshPool::acquire`]) instead of opening a prompt. That
+/// includes a saved secret the server rejects: asking again for a better one is a question.
 pub struct NoPrompt;
 
 #[async_trait]
@@ -261,9 +262,10 @@ pub struct ClientHandler {
     forwards: Option<Forwards>,
 }
 
-/// Refuse a channel the server wanted to open.
+/// Refuse a channel the server wanted to open. Logged at debug level only: a server can open
+/// channels as fast as it likes, and must not be able to flood the log.
 async fn refuse(kind: &str, reply: client::ChannelOpenHandle) {
-    tracing::warn!(kind, "refused a channel opened by the server");
+    tracing::debug!(kind, "refused a channel opened by the server");
     reply
         .reject(ChannelOpenFailure::AdministrativelyProhibited)
         .await;
@@ -414,9 +416,11 @@ impl client::Handler for ClientHandler {
                 let _ = tx.send(channel);
             }
             None => {
-                tracing::warn!(
+                // Debug level (a server must not flood the log) and Debug-formatted (the
+                // address is server-supplied text).
+                tracing::debug!(
                     host = %self.host,
-                    address = connected_address,
+                    address = ?connected_address,
                     port = connected_port,
                     "refused a forwarded connection nobody asked for"
                 );

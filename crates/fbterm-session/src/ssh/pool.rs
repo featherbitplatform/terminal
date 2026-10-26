@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -84,7 +84,8 @@ impl SshPool {
     /// Like [`SshPool::open_shell_into`], with the questions of this call's connect (host key,
     /// secrets, for every hop) going to `prompter` instead of the pool's own. When the call
     /// joins a connect already in flight for the profile, that connect keeps asking whoever
-    /// started it.
+    /// started it; a connect that cannot ask anyone (an automatic reconnect with
+    /// [`super::NoPrompt`]) is never joined by a prompter that can: this call dials its own.
     pub async fn open_shell_prompting(
         &self,
         store: &ProfileStore,
@@ -93,10 +94,12 @@ impl SshPool {
         events: EventSink,
         prompter: Arc<dyn Prompter>,
     ) -> Result<SessionHandle, SshError> {
+        let can_ask = prompter.can_ask();
         let dialer = self.dialer(store, profile, prompter)?;
         self.slots
             .open_with(
                 *profile,
+                can_ask,
                 Connection::is_alive,
                 Connection::mark_dead,
                 dialer,
@@ -112,8 +115,11 @@ impl SshPool {
     /// The connection stays open while the returned reference (or any shell) is held.
     ///
     /// With a prompter that cannot ask ([`super::NoPrompt`], automatic reconnects), a connect
-    /// that needed the user fails with [`SshError::NeedsInput`]. Joining a connect already in
-    /// flight waits for it, prompts included, like a shell does.
+    /// that needed the user fails with [`SshError::NeedsInput`]; such a call never opens a
+    /// prompt of its own, but when it joins a connect already in flight that another caller
+    /// started with a prompter that can ask, it waits for that connect, including a prompt
+    /// that caller opened. A call whose prompter can ask never joins a connect that cannot
+    /// ask: it dials its own, as [`SshPool::open_shell_prompting`] does.
     pub async fn acquire(
         &self,
         store: &ProfileStore,
@@ -125,6 +131,7 @@ impl SshPool {
         self.slots
             .open_with(
                 *profile,
+                can_ask,
                 Connection::is_alive,
                 Connection::mark_dead,
                 dialer,
@@ -623,9 +630,19 @@ enum Slot<C> {
     Dialing {
         token: u64,
         future: Dial<C>,
-        waiters: usize,
-        task: tokio::task::AbortHandle,
+        /// Whether the dial's prompter can ask the user. A caller that can ask never joins a
+        /// dial that cannot (it would fail for want of an answer nobody was asked for).
+        can_ask: bool,
+        share: Arc<DialShare>,
     },
+}
+
+/// The callers of one dial, kept beside the slot so a dial replaced in the map (by an
+/// interactive caller) is still aborted when its own callers give up.
+struct DialShare {
+    /// Changed only under the slots' map lock.
+    waiters: AtomicUsize,
+    task: tokio::task::AbortHandle,
 }
 
 /// Per-profile bookkeeping of the pool, generic so it can be tested without a server.
@@ -649,22 +666,18 @@ struct Waiter<'a, C> {
     slots: &'a Slots<C>,
     id: ProfileId,
     token: u64,
+    share: Arc<DialShare>,
 }
 
 impl<C> Drop for Waiter<'_, C> {
     fn drop(&mut self) {
         let mut map = self.slots.map.lock();
-        if let Some(Slot::Dialing {
-            token,
-            waiters,
-            task,
-            ..
-        }) = map.get_mut(&self.id)
-            && *token == self.token
-        {
-            *waiters -= 1;
-            if *waiters == 0 {
-                task.abort();
+        if self.share.waiters.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Harmless when the dial already finished.
+            self.share.task.abort();
+            if let Some(Slot::Dialing { token, .. }) = map.get(&self.id)
+                && *token == self.token
+            {
                 map.remove(&self.id);
             }
         }
@@ -673,10 +686,14 @@ impl<C> Drop for Waiter<'_, C> {
 
 impl<C: Send + Sync + 'static> Slots<C> {
     /// The profile's live connection (`true`: reused), or the result of the connect in
-    /// flight for it, or of a new connect made with `dial` (`false`).
+    /// flight for it, or of a new connect made with `dial` (`false`). `can_ask` says whether
+    /// `dial`'s prompter can ask the user: such a caller does not join a dial in flight that
+    /// cannot, but replaces it with its own (whose callers then get its own result); a caller
+    /// that cannot ask joins any dial in flight.
     async fn get_or_dial<F>(
         &self,
         id: ProfileId,
+        can_ask: bool,
         alive: fn(&C) -> bool,
         dial: F,
     ) -> Result<(Arc<C>, bool), SshError>
@@ -690,7 +707,13 @@ impl<C: Send + Sync + 'static> Slots<C> {
             {
                 return Ok((c, true));
             }
-            if !matches!(map.get(&id), Some(Slot::Dialing { .. })) {
+            let joinable = match map.get(&id) {
+                Some(Slot::Dialing {
+                    can_ask: dial_asks, ..
+                }) => *dial_asks || !can_ask,
+                _ => false,
+            };
+            if !joinable {
                 let task = tokio::spawn(dial());
                 let abort = task.abort_handle();
                 let future: Dial<C> = async move {
@@ -709,25 +732,29 @@ impl<C: Send + Sync + 'static> Slots<C> {
                     Slot::Dialing {
                         token,
                         future,
-                        waiters: 0,
-                        task: abort,
+                        can_ask,
+                        share: Arc::new(DialShare {
+                            waiters: AtomicUsize::new(0),
+                            task: abort,
+                        }),
                     },
                 );
             }
             let Some(Slot::Dialing {
                 token,
                 future,
-                waiters,
+                share,
                 ..
-            }) = map.get_mut(&id)
+            }) = map.get(&id)
             else {
                 unreachable!("a dial slot was just ensured");
             };
-            *waiters += 1;
+            share.waiters.fetch_add(1, Ordering::AcqRel);
             let waiter = Waiter {
                 slots: self,
                 id,
                 token: *token,
+                share: share.clone(),
             };
             (future.clone(), waiter)
         };
@@ -760,6 +787,7 @@ impl<C: Send + Sync + 'static> Slots<C> {
     async fn open_with<T, D, O>(
         &self,
         id: ProfileId,
+        can_ask: bool,
         alive: fn(&C) -> bool,
         kill: fn(&C),
         dial: D,
@@ -769,13 +797,13 @@ impl<C: Send + Sync + 'static> Slots<C> {
         D: Fn() -> BoxFuture<'static, Result<C, SshError>>,
         O: Fn(Arc<C>) -> BoxFuture<'static, Result<T, SshError>>,
     {
-        let (c, reused) = self.get_or_dial(id, alive, &dial).await?;
+        let (c, reused) = self.get_or_dial(id, can_ask, alive, &dial).await?;
         match open(c.clone()).await {
             Err(e) if reused => {
                 tracing::info!(error = %e, "reused connection failed; reconnecting");
                 kill(&c);
                 drop(c);
-                let (c, _) = self.get_or_dial(id, alive, &dial).await?;
+                let (c, _) = self.get_or_dial(id, can_ask, alive, &dial).await?;
                 open(c).await
             }
             other => other,
@@ -804,7 +832,6 @@ impl<C: Send + Sync + 'static> Slots<C> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
 
     /// A stand-in connection whose liveness the test controls.
     struct Fake {
@@ -872,6 +899,109 @@ mod tests {
     }
 
     const QUICK: Duration = Duration::from_millis(50);
+    /// Whether the caller's prompter can ask the user (`NoPrompt` cannot).
+    const ASK: bool = true;
+    const NO_ASK: bool = false;
+
+    #[tokio::test]
+    async fn interactive_caller_does_not_inherit_no_prompt_dial() {
+        let slots = Slots::<Fake>::default();
+        let id = ProfileId::new();
+        let dials = Dials::default();
+        let slow = Duration::from_millis(200);
+        // An automatic reconnect (no prompts) is dialling and will fail for want of an answer;
+        // meanwhile the user opens a tab, whose prompter can ask.
+        let (automatic, by_hand) = tokio::join!(
+            slots.get_or_dial(id, NO_ASK, fake_alive, dials.dialer(slow, true)),
+            async {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                slots
+                    .get_or_dial(id, ASK, fake_alive, dials.dialer(slow, false))
+                    .await
+            },
+        );
+        // The tab dialled on its own (with its own prompter) and got through ...
+        assert_eq!(dials.started(), 2);
+        let (c, reused) = by_hand.expect("the interactive caller must not inherit the failure");
+        assert_eq!((c.serial, reused), (2, false));
+        // ... the reconnect got its own result ...
+        assert!(automatic.is_err());
+        // ... and the tab's connection is the one the pool keeps.
+        assert_eq!(slots.live(fake_alive), vec![id]);
+        let (again, reused) = slots
+            .get_or_dial(id, NO_ASK, fake_alive, dials.dialer(QUICK, true))
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&c, &again) && reused);
+    }
+
+    #[tokio::test]
+    async fn replaced_no_prompt_dial_is_still_aborted_when_abandoned() {
+        let slots = Slots::<Fake>::default();
+        let id = ProfileId::new();
+        let dials = Dials::default();
+        // The no-prompt caller gives up while the interactive dial that replaced its slot
+        // goes on: its own dial is aborted, the interactive one is not.
+        let (gave_up, by_hand) = tokio::join!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                slots.get_or_dial(
+                    id,
+                    NO_ASK,
+                    fake_alive,
+                    dials.dialer(Duration::from_secs(30), false)
+                ),
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                slots
+                    .get_or_dial(
+                        id,
+                        ASK,
+                        fake_alive,
+                        dials.dialer(Duration::from_millis(150), false),
+                    )
+                    .await
+            },
+        );
+        assert!(gave_up.is_err());
+        let (c, _) = by_hand.unwrap();
+        assert_eq!(c.serial, 2);
+        eventually("the abandoned no-prompt dial to be dropped", || {
+            dials.dropped_unfinished.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(slots.live(fake_alive), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn no_prompt_caller_may_join_interactive_dial() {
+        let slots = Slots::<Fake>::default();
+        let id = ProfileId::new();
+        let dials = Dials::default();
+        // The user's dial is in flight (possibly showing a prompt); an automatic caller joins it
+        // instead of dialling a second connection.
+        let (by_hand, automatic) = tokio::join!(
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false)),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                slots
+                    .get_or_dial(id, NO_ASK, fake_alive, dials.dialer(QUICK, false))
+                    .await
+            },
+        );
+        let ((a, _), (b, _)) = (by_hand.unwrap(), automatic.unwrap());
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(dials.started(), 1);
+        // Likewise two interactive callers, or two automatic ones, share one dial.
+        let other = ProfileId::new();
+        let (x, y) = tokio::join!(
+            slots.get_or_dial(other, NO_ASK, fake_alive, dials.dialer(QUICK, false)),
+            slots.get_or_dial(other, NO_ASK, fake_alive, dials.dialer(QUICK, false)),
+        );
+        assert!(Arc::ptr_eq(&x.unwrap().0, &y.unwrap().0));
+        assert_eq!(dials.started(), 2);
+    }
 
     #[tokio::test]
     async fn concurrent_callers_share_one_dial() {
@@ -879,9 +1009,9 @@ mod tests {
         let id = ProfileId::new();
         let dials = Dials::default();
         let (a, b, c) = tokio::join!(
-            slots.get_or_dial(id, fake_alive, dials.dialer(QUICK, false)),
-            slots.get_or_dial(id, fake_alive, dials.dialer(QUICK, false)),
-            slots.get_or_dial(id, fake_alive, dials.dialer(QUICK, false)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false)),
         );
         let ((a, ra), (b, rb), (c, rc)) = (a.unwrap(), b.unwrap(), c.unwrap());
         assert_eq!(dials.started(), 1);
@@ -890,7 +1020,7 @@ mod tests {
         assert_eq!(slots.live(fake_alive), vec![id]);
         // Later callers reuse it without dialling.
         let (d, reused) = slots
-            .get_or_dial(id, fake_alive, dials.dialer(QUICK, false))
+            .get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false))
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&a, &d) && reused);
@@ -903,8 +1033,8 @@ mod tests {
         let id = ProfileId::new();
         let dials = Dials::default();
         let (a, b) = tokio::join!(
-            slots.get_or_dial(id, fake_alive, dials.dialer(QUICK, true)),
-            slots.get_or_dial(id, fake_alive, dials.dialer(QUICK, true)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, true)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, true)),
         );
         for e in [a.err().unwrap(), b.err().unwrap()] {
             match e {
@@ -918,7 +1048,7 @@ mod tests {
         assert!(slots.live(fake_alive).is_empty());
         // The next call retries.
         let (c, _) = slots
-            .get_or_dial(id, fake_alive, dials.dialer(QUICK, false))
+            .get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false))
             .await
             .unwrap();
         assert_eq!(c.serial, 2);
@@ -930,14 +1060,14 @@ mod tests {
         let id = ProfileId::new();
         let dials = Dials::default();
         let (first, _) = slots
-            .get_or_dial(id, fake_alive, dials.dialer(QUICK, false))
+            .get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false))
             .await
             .unwrap();
         fake_kill(&first);
         // Still referenced (a tab shows its disconnected notice), but not listed or reused.
         assert!(slots.live(fake_alive).is_empty());
         let (second, reused) = slots
-            .get_or_dial(id, fake_alive, dials.dialer(QUICK, false))
+            .get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false))
             .await
             .unwrap();
         assert_eq!((first.serial, second.serial, reused), (1, 2, false));
@@ -950,11 +1080,11 @@ mod tests {
         let (x, y) = (ProfileId::new(), ProfileId::new());
         let dials = Dials::default();
         let (cx, _) = slots
-            .get_or_dial(x, fake_alive, dials.dialer(QUICK, false))
+            .get_or_dial(x, ASK, fake_alive, dials.dialer(QUICK, false))
             .await
             .unwrap();
         let (cy, _) = slots
-            .get_or_dial(y, fake_alive, dials.dialer(QUICK, false))
+            .get_or_dial(y, ASK, fake_alive, dials.dialer(QUICK, false))
             .await
             .unwrap();
         let mut both = vec![x, y];
@@ -986,7 +1116,12 @@ mod tests {
         // The only caller gives up (its tab was closed while connecting) on a slow dial.
         let gave_up = tokio::time::timeout(
             Duration::from_millis(20),
-            slots.get_or_dial(id, fake_alive, dials.dialer(Duration::from_secs(30), false)),
+            slots.get_or_dial(
+                id,
+                ASK,
+                fake_alive,
+                dials.dialer(Duration::from_secs(30), false),
+            ),
         )
         .await;
         assert!(gave_up.is_err());
@@ -1000,7 +1135,7 @@ mod tests {
         // The next caller dials afresh and gets its connection promptly.
         let (c, reused) = tokio::time::timeout(
             Duration::from_secs(2),
-            slots.get_or_dial(id, fake_alive, dials.dialer(QUICK, false)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(QUICK, false)),
         )
         .await
         .expect("a fresh dial must not time out")
@@ -1017,9 +1152,9 @@ mod tests {
         let (gave_up, stayed) = tokio::join!(
             tokio::time::timeout(
                 Duration::from_millis(20),
-                slots.get_or_dial(id, fake_alive, dials.dialer(slow, false)),
+                slots.get_or_dial(id, ASK, fake_alive, dials.dialer(slow, false)),
             ),
-            slots.get_or_dial(id, fake_alive, dials.dialer(slow, false)),
+            slots.get_or_dial(id, ASK, fake_alive, dials.dialer(slow, false)),
         );
         assert!(gave_up.is_err());
         let (c, _) = stayed.unwrap();
@@ -1051,13 +1186,13 @@ mod tests {
         let dials = Dials::default();
         let dial = dials.dialer(QUICK, false);
         let first = slots
-            .open_with(id, fake_alive, fake_kill, &dial, opener(&[]))
+            .open_with(id, ASK, fake_alive, fake_kill, &dial, opener(&[]))
             .await
             .unwrap();
         assert_eq!(first.serial, 1);
         // Connection 1 silently died: opening on it fails, so it is killed and replaced.
         let second = slots
-            .open_with(id, fake_alive, fake_kill, &dial, opener(&[1]))
+            .open_with(id, ASK, fake_alive, fake_kill, &dial, opener(&[1]))
             .await
             .unwrap();
         assert_eq!((second.serial, dials.started()), (2, 2));
@@ -1065,7 +1200,7 @@ mod tests {
         assert_eq!(slots.live(fake_alive), vec![id]);
         // Only once: if the fresh connection fails too, the error is returned.
         let err = slots
-            .open_with(id, fake_alive, fake_kill, &dial, opener(&[2, 3]))
+            .open_with(id, ASK, fake_alive, fake_kill, &dial, opener(&[2, 3]))
             .await
             .err()
             .unwrap();
@@ -1081,6 +1216,7 @@ mod tests {
         let err = slots
             .open_with(
                 id,
+                ASK,
                 fake_alive,
                 fake_kill,
                 dials.dialer(QUICK, false),
