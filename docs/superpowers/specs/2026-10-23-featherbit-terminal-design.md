@@ -459,7 +459,7 @@ Performance follow-up (measured 2026-10-24, `dev/perf/README.md`):
   rendered, the Metal driver holds about 300 MB more (a minimal iced app shows the same); it is
   released 10-20 s after rendering stops. So a visible stream shows about 390-430 MB in
   Activity Monitor while RSS is about 120 MB.
-- Compact scrollback: done on branch `feature/compact-history` (2026-10-26; design in
+- Compact scrollback: done (2026-10-26, merged to `develop`; design in
   `2026-10-24-compact-history-design.md`, numbers in `dev/perf/README.md`): history is stored as
   text plus attribute runs in feathercritty, `scrollback_lines` applies live to open tabs, and
   freed memory goes back to the OS. The paragraph below is the original plan.
