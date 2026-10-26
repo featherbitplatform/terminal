@@ -10,8 +10,12 @@
 //! - A connection whose transport has ended (server drop, keepalive timeout) is never reused.
 //!   Each of its shells reports [`SessionEvent::Disconnected`] once and keeps its terminal
 //!   content; a shell that ends normally reports [`SessionEvent::Exited`].
+//! - [`SshPool::acquire`] hands out the connection itself (shared with the shells, dialled the
+//!   same way) for tunnels: holding it keeps the connection open without any shell, and
+//!   [`Connection::closed`] says when it ended.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -20,12 +24,12 @@ use fbterm_config::{Profile, ProfileId, ProfileStore, ValidationError};
 use fbterm_term::{GridSize, SharedTerminal, Terminal};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use parking_lot::Mutex;
-use russh::ChannelMsg;
 use russh::client::{Handle, Msg};
+use russh::{Channel, ChannelMsg};
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    ClientHandler, HOP_TIMEOUT, Hop, Prompter, SshContext, SshError, connect_hop, in_hop,
+    ClientHandler, Forwards, HOP_TIMEOUT, Hop, Prompter, SshContext, SshError, connect_hop, in_hop,
     ssh_profile, tcp_connect, timed_out,
 };
 use crate::{AuthWarning, Command, EventSink, Feeder, SessionEvent, SessionHandle, SessionId};
@@ -89,6 +93,55 @@ impl SshPool {
         events: EventSink,
         prompter: Arc<dyn Prompter>,
     ) -> Result<SessionHandle, SshError> {
+        let dialer = self.dialer(store, profile, prompter)?;
+        self.slots
+            .open_with(
+                *profile,
+                Connection::is_alive,
+                Connection::mark_dead,
+                dialer,
+                move |connection| {
+                    open_shell_channel(connection, terminal.clone(), events.clone()).boxed()
+                },
+            )
+            .await
+    }
+
+    /// The profile's connection itself, for tunnels: its live one (shared with its shells),
+    /// or the connect in flight for it, or a new connect, exactly as a shell would get it.
+    /// The connection stays open while the returned reference (or any shell) is held.
+    ///
+    /// With a prompter that cannot ask ([`super::NoPrompt`], automatic reconnects), a connect
+    /// that needed the user fails with [`SshError::NeedsInput`]. Joining a connect already in
+    /// flight waits for it, prompts included, like a shell does.
+    pub async fn acquire(
+        &self,
+        store: &ProfileStore,
+        profile: &ProfileId,
+        prompter: Arc<dyn Prompter>,
+    ) -> Result<Arc<Connection>, SshError> {
+        let can_ask = prompter.can_ask();
+        let dialer = self.dialer(store, profile, prompter)?;
+        self.slots
+            .open_with(
+                *profile,
+                Connection::is_alive,
+                Connection::mark_dead,
+                dialer,
+                |connection| async move { Ok(connection) }.boxed(),
+            )
+            .await
+            .map_err(|e| e.without_prompts(can_ask))
+    }
+
+    /// The dial step for `profile` (its jump chain, then the profile), asking `prompter`.
+    fn dialer(
+        &self,
+        store: &ProfileStore,
+        profile: &ProfileId,
+        prompter: Arc<dyn Prompter>,
+    ) -> Result<impl Fn() -> BoxFuture<'static, Result<Connection, SshError>> + use<>, SshError>
+    {
         let target = store
             .get(*profile)
             .ok_or_else(|| {
@@ -109,17 +162,7 @@ impl SshPool {
             prompter,
             ..self.ctx.clone()
         };
-        self.slots
-            .open_with(
-                *profile,
-                Connection::is_alive,
-                Connection::mark_dead,
-                move || dial(chain.clone(), target.clone(), ctx.clone()).boxed(),
-                move |connection| {
-                    open_shell_channel(connection, terminal.clone(), events.clone()).boxed()
-                },
-            )
-            .await
+        Ok(move || dial(chain.clone(), target.clone(), ctx.clone()).boxed())
     }
 
     /// Profiles with a live connection (one that is still in use and has not ended).
@@ -128,14 +171,19 @@ impl SshPool {
     }
 }
 
-/// One profile's connection: the target plus every hop in front of it.
-pub(crate) struct Connection {
+/// One profile's SSH connection: the target plus every hop in front of it, shared by the
+/// profile's shells and tunnels and closed (hops included) when the last of them lets go.
+/// Get one from [`SshPool::acquire`].
+pub struct Connection {
     /// `None` only while being dropped.
     chain: Option<Chain>,
     /// Set when using the connection failed although its transport looked alive.
     dead: AtomicBool,
     /// What authenticating any hop of the chain turned up; every shell reports it once.
     warnings: Vec<AuthWarning>,
+    /// The remote forwards requested on the target; its handler routes forwarded channels
+    /// only to these.
+    forwards: Forwards,
     runtime: tokio::runtime::Handle,
 }
 
@@ -146,8 +194,9 @@ struct Chain {
 }
 
 impl Connection {
-    /// Whether every SSH session of the chain is still running.
-    fn is_alive(&self) -> bool {
+    /// Whether every SSH session of the chain is still running (and the pool would still hand
+    /// this connection out).
+    pub fn is_alive(&self) -> bool {
         !self.dead.load(Ordering::Acquire)
             && self.chain.as_ref().is_some_and(|c| {
                 !c.target.handle.is_closed() && c.hops.iter().all(|h| !h.handle.is_closed())
@@ -159,7 +208,7 @@ impl Connection {
         self.dead.store(true, Ordering::Release);
     }
 
-    fn target(&self) -> &Handle<ClientHandler> {
+    pub(crate) fn target(&self) -> &Handle<ClientHandler> {
         &self
             .chain
             .as_ref()
@@ -168,15 +217,84 @@ impl Connection {
             .handle
     }
 
-    /// Why the connection ended: the hop nearest to us that knows, since a hop going away
-    /// takes everything behind it along.
-    fn lost_reason(&self) -> String {
+    /// Every hop of the chain in connection order, the target last.
+    fn hops(&self) -> impl Iterator<Item = &Hop> {
         self.chain
             .iter()
             .flat_map(|c| c.hops.iter().chain(std::iter::once(&c.target)))
-            .find_map(|h| h.lost.lock().clone())
-            .unwrap_or_else(|| "connection lost".to_owned())
     }
+
+    /// Why the connection ended: the hop nearest to us that knows, since a hop going away
+    /// takes everything behind it along.
+    fn lost_reason(&self) -> String {
+        lost_reason_of(self.hops().map(|h| &h.lost))
+    }
+
+    /// Resolves, with the reason, once the target or any hop of the chain has disconnected;
+    /// at once if that already happened. Holds no reference to the connection, so waiting on
+    /// it does not keep the connection open.
+    pub fn closed(&self) -> impl Future<Output = String> + Send + 'static {
+        let ended: Vec<watch::Receiver<bool>> = self.hops().map(|h| h.ended.clone()).collect();
+        let lost: Vec<Arc<Mutex<Option<String>>>> = self.hops().map(|h| h.lost.clone()).collect();
+        async move {
+            first_ended(ended).await;
+            lost_reason_of(lost.iter())
+        }
+    }
+
+    /// Ask the server to listen on `address:port` (port 0: a port of its choosing) and send
+    /// its connections back as `forwarded-tcpip` channels. Returns the port it listens on.
+    /// Those channels are refused until [`Connection::register_forward`] claims the port.
+    pub async fn request_remote_forward(&self, address: &str, port: u32) -> Result<u32, SshError> {
+        let bound = self.target().tcpip_forward(address, port).await?;
+        Ok(if port == 0 { bound } else { port })
+    }
+
+    /// Ask the server to stop listening on `address:port` (a forward requested earlier).
+    pub async fn cancel_remote_forward(&self, address: &str, port: u32) -> Result<(), SshError> {
+        Ok(self.target().cancel_tcpip_forward(address, port).await?)
+    }
+
+    /// Claim the forwarded channels for `address:port` (the address as requested, the port
+    /// the server listens on): from now on they are accepted and arrive on the returned
+    /// receiver. Replaces an earlier claim on the same forward. Dropping the receiver refuses
+    /// them again, as does [`Connection::unregister_forward`].
+    pub fn register_forward(
+        &self,
+        address: &str,
+        port: u32,
+    ) -> mpsc::UnboundedReceiver<Channel<Msg>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.forwards.lock().insert((address.to_owned(), port), tx);
+        rx
+    }
+
+    /// Stop accepting forwarded channels for `address:port`.
+    pub fn unregister_forward(&self, address: &str, port: u32) {
+        self.forwards.lock().remove(&(address.to_owned(), port));
+    }
+}
+
+/// The first reason recorded among `lost`, in hop order.
+fn lost_reason_of<'a>(lost: impl Iterator<Item = &'a Arc<Mutex<Option<String>>>>) -> String {
+    lost.into_iter()
+        .find_map(|l| l.lock().clone())
+        .unwrap_or_else(|| "connection lost".to_owned())
+}
+
+/// Resolves once any of `ended` turns `true` or loses its sender (the hop's session task is
+/// gone); never for an empty list.
+async fn first_ended(ended: Vec<watch::Receiver<bool>>) {
+    if ended.is_empty() {
+        return std::future::pending().await;
+    }
+    futures_util::future::select_all(ended.into_iter().map(|mut rx| {
+        async move {
+            let _ = rx.wait_for(|e| *e).await;
+        }
+        .boxed()
+    }))
+    .await;
 }
 
 impl Drop for Connection {
@@ -211,17 +329,22 @@ async fn dial(
     target: Profile,
     ctx: SshContext,
 ) -> Result<Connection, SshError> {
+    let forwards = Forwards::default();
+    // Only the target gets the registry: a jump hop refuses every forwarded channel.
+    let registry = |is_target: bool| is_target.then(|| forwards.clone());
+    let hops_before_target = chain.len();
     let mut route = chain.iter().chain(std::iter::once(&target));
     let first = route.next().expect("the route always contains the target");
     let stream = tcp_connect(ssh_profile(first)?)
         .await
         .map_err(|e| in_hop(first, e))?;
-    let mut current = connect_hop(stream, first, &ctx)
+    let mut current = connect_hop(stream, first, &ctx, registry(hops_before_target == 0))
         .await
         .map_err(|e| in_hop(first, e))?;
     let mut via = first;
     let mut hops = Vec::new();
-    for next in route {
+    for (index, next) in route.enumerate() {
+        let is_target = index + 1 == hops_before_target;
         let ssh = ssh_profile(next)?;
         let channel = tokio::time::timeout(
             HOP_TIMEOUT,
@@ -251,7 +374,7 @@ async fn dial(
                 ))),
             )
         })?;
-        let hop = connect_hop(channel.into_stream(), next, &ctx)
+        let hop = connect_hop(channel.into_stream(), next, &ctx, registry(is_target))
             .await
             .map_err(|e| in_hop(next, e))?;
         hops.push(std::mem::replace(&mut current, hop));
@@ -270,6 +393,7 @@ async fn dial(
         }),
         dead: AtomicBool::new(false),
         warnings,
+        forwards,
         runtime: tokio::runtime::Handle::current(),
     })
 }
@@ -967,6 +1091,45 @@ mod tests {
             .unwrap();
         assert!(matches!(err, SshError::Connect(_)), "{err:?}");
         assert_eq!(dials.started(), 1);
+    }
+
+    #[tokio::test]
+    async fn first_ended_waits_for_any_hop() {
+        let (hop_tx, hop_rx) = watch::channel(false);
+        let (target_tx, target_rx) = watch::channel(false);
+        let waiting = tokio::spawn(first_ended(vec![hop_rx, target_rx]));
+        tokio::time::sleep(QUICK).await;
+        assert!(!waiting.is_finished());
+        // A hop (not the target) ending is enough.
+        hop_tx.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
+            .expect("a hop ending must resolve it")
+            .unwrap();
+        // Already ended: at once.
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            first_ended(vec![hop_tx.subscribe(), target_tx.subscribe()]),
+        )
+        .await
+        .expect("an ended hop resolves at once");
+        // A session task that went away without a word counts as ended too.
+        let (gone_tx, gone_rx) = watch::channel(false);
+        drop(gone_tx);
+        tokio::time::timeout(Duration::from_secs(1), first_ended(vec![gone_rx]))
+            .await
+            .expect("a dropped sender resolves it");
+        drop(target_tx);
+    }
+
+    #[test]
+    fn lost_reason_prefers_the_nearest_hop() {
+        let hop = Arc::new(Mutex::new(None));
+        let target = Arc::new(Mutex::new(Some("target gone".to_owned())));
+        assert_eq!(lost_reason_of([&hop, &target].into_iter()), "target gone");
+        *hop.lock() = Some("hop gone".into());
+        assert_eq!(lost_reason_of([&hop, &target].into_iter()), "hop gone");
+        assert_eq!(lost_reason_of(std::iter::empty()), "connection lost");
     }
 
     #[test]
