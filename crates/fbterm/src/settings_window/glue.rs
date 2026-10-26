@@ -10,7 +10,7 @@ use iced::{Font, Task, window};
 use parking_lot::Mutex;
 
 use super::{SettingsMsg, SettingsState, WRITE_DEBOUNCE, Write, fonts};
-use crate::app::{App, Message};
+use crate::app::{App, Message, SettingsSource};
 use crate::chrome::Chrome;
 use crate::theme;
 
@@ -72,7 +72,7 @@ impl App {
                 if let Some(change) = effect.apply {
                     let mut next = self.settings.clone();
                     change.apply(&mut next);
-                    self.apply_settings(next);
+                    self.apply_settings(next, SettingsSource::Window);
                 }
                 match effect.write {
                     Write::Not => Task::none(),
@@ -187,7 +187,7 @@ impl App {
                     tracing::warn!(warning = %w, "settings.toml values clamped");
                     self.show_settings_notice(w.to_string());
                 }
-                self.apply_settings(new);
+                self.apply_settings(new, SettingsSource::File);
                 tracing::info!("settings.toml reloaded");
                 if let Some((_, state)) = &mut self.settings_win {
                     state.read_only = None;
@@ -212,13 +212,17 @@ impl App {
     }
 
     /// Font, size and theme take effect in every open terminal and window at once (they are
-    /// read each frame). The scrollback length applies to terminals opened from now on.
+    /// read each frame). The scrollback length applies to every open terminal's normal screen
+    /// and to new ones: raising it keeps everything, lowering it drops the oldest lines at once
+    /// and then releases the freed memory (a lowered value read from `settings.toml` also sets
+    /// the settings notice; one the Settings window applied after the user confirmed does not,
+    /// see [`SettingsSource`]).
     /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
     /// protocol flags programs have set, turning it on affects their requests from then on.
     /// `background_opacity` is read each frame too; a window can only show through if it was
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
-    pub(crate) fn apply_settings(&mut self, new: Settings) {
+    pub(crate) fn apply_settings(&mut self, new: Settings, source: SettingsSource) {
         if new == self.settings {
             return;
         }
@@ -240,6 +244,9 @@ impl App {
                     term.lock().set_kitty_keyboard(new.kitty_keyboard);
                 }
             }
+        }
+        if new.scrollback_lines != self.settings.scrollback_lines {
+            self.apply_scrollback(new.scrollback_lines, source);
         }
         let backdrop =
             |s: &Settings| Chrome::current().backdrop(s.background_opacity, s.background_blur);
@@ -265,6 +272,40 @@ impl App {
         }
     }
 
+    /// Set every open terminal's scrollback limit. If any lost lines, release the freed memory
+    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines.
+    fn apply_scrollback(&mut self, lines: usize, source: SettingsSource) {
+        let mut trimmed = 0;
+        for tab in self.windows.values().flat_map(|w| w.tabs.iter()) {
+            if let Some(term) = tab.terminal()
+                && term.lock().set_scrollback(lines) > 0
+            {
+                trimmed += 1;
+            }
+        }
+        if trimmed == 0 {
+            return;
+        }
+        crate::memory::release_freed();
+        if source == SettingsSource::File {
+            let tabs = if trimmed == 1 {
+                "1 open tab lost its oldest lines".to_owned()
+            } else {
+                format!("{trimmed} open tabs lost their oldest lines")
+            };
+            let line = format!("Scrollback lowered to {} lines: {tabs}.", thousands(lines));
+            // A clamp warning from the same reload stays; the two share the banner.
+            let line = match self.settings_notice.take() {
+                Some(old) => {
+                    self.notices.retain(|n| *n != old);
+                    format!("{old} {line}")
+                }
+                None => line,
+            };
+            self.show_settings_notice(line);
+        }
+    }
+
     /// The refresh rate `max_fps = "display"` follows: the fastest display a terminal window is
     /// on, if any is known.
     pub(crate) fn display_hz(&self) -> Option<u32> {
@@ -284,6 +325,19 @@ impl App {
             state.display_hz = hz;
         }
     }
+}
+
+/// `n` with a comma between thousands (`2,000`).
+fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// The keys of `changes`, for a message.

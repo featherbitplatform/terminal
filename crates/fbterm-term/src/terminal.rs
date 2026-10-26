@@ -215,19 +215,46 @@ impl Terminal {
             return;
         }
         self.config.kitty_keyboard = enabled;
-        let before = self.shared.lock().events.len();
+        let seen = self.shared.lock().events.len();
         self.term.set_options(self.config.clone());
-        // Setting options re-announces the current title; nothing changed, so drop that one
-        // event and keep any title a program set before.
-        {
-            let mut sh = self.shared.lock();
-            if let Some(i) =
-                (before..sh.events.len()).find(|&i| matches!(sh.events[i], TermEvent::Title(_)))
-            {
-                sh.events.remove(i);
-            }
-        }
+        self.drop_reannounced_title(seen);
         self.generation += 1;
+    }
+
+    /// Set the scrollback limit of the normal screen (the alternate screen keeps none). Raising
+    /// it keeps everything; lowering it drops the oldest lines at once, and a view scrolled
+    /// further back is pulled down to the new oldest line. Returns how many history lines were
+    /// dropped. Like [`Terminal::set_kitty_keyboard`], the title the emulator re-announces is
+    /// discarded.
+    pub fn set_scrollback(&mut self, lines: usize) -> usize {
+        let before = self.history_len();
+        self.config.scrolling_history = lines;
+        let seen = self.shared.lock().events.len();
+        self.term.set_options(self.config.clone());
+        self.drop_reannounced_title(seen);
+        self.generation += 1;
+        before.saturating_sub(self.history_len())
+    }
+
+    /// Lines of scrollback the normal screen holds (while the alternate screen is up, the
+    /// normal screen's, which is kept aside).
+    pub fn history_len(&self) -> usize {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.term.inactive_grid().history_size()
+        } else {
+            self.term.grid().history_size()
+        }
+    }
+
+    /// Setting options re-announces the current title; nothing changed, so remove that one event
+    /// (raised after `seen` events were pending) and keep any title a program set before.
+    fn drop_reannounced_title(&self, seen: usize) {
+        let mut sh = self.shared.lock();
+        if let Some(i) =
+            (seen..sh.events.len()).find(|&i| matches!(sh.events[i], TermEvent::Title(_)))
+        {
+            sh.events.remove(i);
+        }
     }
 
     pub fn kitty_keyboard(&self) -> bool {
@@ -388,6 +415,91 @@ mod tests {
         }
         assert!(t.term().grid().history_size() <= 100);
         assert!(t.term().grid().history_size() > 0);
+    }
+
+    fn fill(t: &mut Terminal, n: usize) {
+        for i in 0..n {
+            t.feed(format!("line {i}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn set_scrollback_raises_and_lowers_limit() {
+        let mut t = Terminal::new(size(20, 5), 100);
+        fill(&mut t, 500);
+        assert_eq!(t.history_len(), 100);
+        assert_eq!(t.set_scrollback(300), 0, "raising drops nothing");
+        fill(&mut t, 500);
+        assert_eq!(t.history_len(), 300);
+        t.set_scrollback(50);
+        assert_eq!(t.history_len(), 50);
+        fill(&mut t, 500);
+        assert_eq!(t.history_len(), 50, "the new limit holds as output arrives");
+    }
+
+    #[test]
+    fn set_scrollback_keeps_alt_screen_at_zero() {
+        let mut t = Terminal::new(size(20, 5), 100);
+        fill(&mut t, 50);
+        let held = t.history_len();
+        t.feed(b"\x1b[?1049h");
+        assert_eq!(t.term().grid().history_size(), 0);
+        let dropped = t.set_scrollback(20);
+        assert_eq!(
+            dropped,
+            held - 20,
+            "the kept-aside normal screen is trimmed"
+        );
+        fill(&mut t, 100);
+        assert_eq!(
+            t.term().grid().history_size(),
+            0,
+            "alt screen has no history"
+        );
+        t.feed(b"\x1b[?1049l");
+        assert_eq!(t.history_len(), 20);
+    }
+
+    #[test]
+    fn set_scrollback_keeps_title() {
+        let mut t = Terminal::new(size(20, 5), 100);
+        t.feed(b"\x1b]2;my title\x07");
+        assert_eq!(t.take_events(), vec![TermEvent::Title("my title".into())]);
+        t.set_scrollback(10);
+        assert!(t.take_events().is_empty(), "no title re-announced");
+        t.feed(b"\x1b]2;next\x07");
+        t.set_scrollback(20);
+        assert_eq!(t.take_events(), vec![TermEvent::Title("next".into())]);
+    }
+
+    #[test]
+    fn set_scrollback_reports_dropped_lines() {
+        let mut t = Terminal::new(size(20, 5), 1000);
+        fill(&mut t, 200);
+        let held = t.history_len();
+        assert!(held > 100);
+        assert_eq!(t.set_scrollback(40), held - 40);
+        assert_eq!(t.set_scrollback(40), 0);
+        assert_eq!(t.set_scrollback(0), 40);
+        assert_eq!(t.history_len(), 0);
+    }
+
+    #[test]
+    fn lowering_scrollback_clamps_scrolled_view() {
+        let mut t = Terminal::new(size(20, 5), 5000);
+        fill(&mut t, 5100);
+        assert_eq!(t.history_len(), 5000);
+        t.scroll_to_top();
+        assert_eq!(t.term().grid().display_offset(), 5000);
+        let old_top = t.stable_line(feathercritty::index::Line(-5000));
+        let old_kept = t.stable_line(feathercritty::index::Line(-1000));
+        assert!(t.grid_line(old_top).is_some());
+        assert_eq!(t.set_scrollback(1000), 4000);
+        assert!(t.term().grid().display_offset() <= 1000);
+        assert_eq!(t.grid_line(old_top), None, "dropped lines resolve to None");
+        assert!(t.grid_line(old_kept).is_some());
+        t.scroll(5);
+        t.scroll_to_bottom();
     }
 
     #[test]

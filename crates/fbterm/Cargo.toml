@@ -37,3 +37,7 @@ objc2 = "0.6"
 block2 = "0.6"
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
+
+# `malloc_trim` for `memory::release_freed` (glibc only; macOS declares its own call, other targets do nothing).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"

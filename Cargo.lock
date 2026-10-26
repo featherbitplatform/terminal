@@ -1255,6 +1255,7 @@ dependencies = [
  "fbterm-term",
  "feathercritty",
  "iced",
+ "libc",
  "notify",
  "nucleo-matcher",
  "objc2 0.6.5",

@@ -481,3 +481,167 @@ fn closing_last_tab_of_last_window_restores_default() {
     let (relaunched, _) = App::build(paths, true);
     assert_eq!(relaunched.windows.len(), 1, "the default window");
 }
+
+fn first_terminal(app: &App) -> fbterm_term::SharedTerminal {
+    app.windows.values().next().unwrap().tabs[0]
+        .terminal()
+        .cloned()
+        .expect("started tab has a terminal")
+}
+
+fn fill_history(term: &fbterm_term::SharedTerminal, lines: usize) {
+    let mut t = term.lock();
+    for i in 0..lines {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+}
+
+#[test]
+fn toml_lowering_trims_and_sets_notice() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let term = first_terminal(&app);
+    fill_history(&term, 5_000);
+    let changed = Changed {
+        profiles: false,
+        settings: true,
+    };
+
+    // Raising applies at once and says nothing.
+    std::fs::write(paths.settings(), "scrollback_lines = 20000\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert!(app.settings_notice.is_none());
+    let before = crate::memory::requests();
+
+    // Lowering below what the tab holds trims it, says so, and releases memory.
+    std::fs::write(paths.settings(), "scrollback_lines = 2000\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(term.lock().history_len(), 2_000);
+    assert_eq!(
+        app.settings_notice.as_deref(),
+        Some("Scrollback lowered to 2,000 lines: 1 open tab lost its oldest lines.")
+    );
+    assert_eq!(app.notices.len(), 1);
+    assert_eq!(crate::memory::requests(), before + 1);
+
+    // Lowering below nothing the tab holds changes nothing visible.
+    std::fs::write(paths.settings(), "scrollback_lines = 1500\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(term.lock().history_len(), 1_500);
+    std::fs::write(paths.settings(), "scrollback_lines = 1400\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(term.lock().history_len(), 1_400);
+
+    // New terminals use the new limit.
+    let grid = term.lock().size();
+    fill_history(&app.new_terminal(grid), 3_000);
+}
+
+#[test]
+fn confirmed_lowering_from_the_settings_window_sets_no_notice() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let term = first_terminal(&app);
+    fill_history(&term, 500);
+    let new = fbterm_config::Settings {
+        scrollback_lines: 100,
+        ..app.settings.clone()
+    };
+    let before = crate::memory::requests();
+    app.apply_settings(new, crate::app::SettingsSource::Window);
+    assert_eq!(term.lock().history_len(), 100);
+    assert!(app.settings_notice.is_none());
+    assert_eq!(crate::memory::requests(), before + 1);
+}
+
+#[test]
+fn closing_tab_requests_release_after_last_reference() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    SavedState {
+        windows: vec![saved(&[&a, &b], 1)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let wid = *app.windows.keys().next().unwrap();
+    let held = app.windows[&wid].tabs[1].terminal().cloned().unwrap();
+    let before = crate::memory::requests();
+    let _ = app.close_tab(wid, 1);
+    assert_eq!(
+        crate::memory::requests(),
+        before,
+        "something still holds the terminal"
+    );
+    let weak = std::sync::Arc::downgrade(&held);
+    let _ = app.update(Message::ReleaseWhenFree(vec![weak.clone()], 0));
+    assert_eq!(
+        crate::memory::requests(),
+        before,
+        "still held: keeps waiting"
+    );
+    drop(held);
+    let _ = app.update(Message::ReleaseWhenFree(vec![weak], 1));
+    assert_eq!(crate::memory::requests(), before + 1);
+
+    // With nothing else holding it, closing requests the release at once.
+    let (c, d) = (profile("c"), profile("d"));
+    let paths = paths_with(&[c.clone(), d.clone()]);
+    SavedState {
+        windows: vec![saved(&[&c, &d], 1)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let wid = *app.windows.keys().next().unwrap();
+    let before = crate::memory::requests();
+    let _ = app.close_tab(wid, 1);
+    assert_eq!(crate::memory::requests(), before + 1);
+}
+
+#[test]
+fn remote_history_clear_never_requests_release() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let term = first_terminal(&app);
+    let before = crate::memory::requests();
+    fill_history(&term, 500);
+    assert!(term.lock().history_len() > 0);
+    term.lock().feed(b"\x1b[3J");
+    assert_eq!(term.lock().history_len(), 0, "the program cleared it");
+    fill_history(&term, 500);
+    term.lock().feed(b"\x1bc");
+    assert_eq!(term.lock().history_len(), 0);
+    let _ = app.update(Message::Session(
+        fbterm_session::SessionId::next(),
+        fbterm_session::SessionEvent::Dirty,
+    ));
+    assert_eq!(
+        crate::memory::requests(),
+        before,
+        "no release was requested"
+    );
+}

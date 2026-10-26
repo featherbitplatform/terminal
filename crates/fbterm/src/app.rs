@@ -158,6 +158,20 @@ pub enum Message {
     SaveState(u64),
     /// `profiles.toml` and/or `settings.toml` changed on disk.
     ConfigChanged(Changed),
+    /// After a tab or window closed: request the memory release once nothing holds the closed
+    /// tabs' terminals any more (the session task may outlive the tab briefly); the count is
+    /// how many times this has waited.
+    ReleaseWhenFree(Vec<crate::memory::WeakTerminal>, u32),
+}
+
+/// Where a settings change came from. The scrollback notice is for edits made in
+/// `settings.toml` only; a change confirmed in the Settings window already told the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsSource {
+    /// `settings.toml` was edited on disk and reloaded.
+    File,
+    /// The Settings window applied it (for a lowered scrollback: after the user confirmed).
+    Window,
 }
 
 /// Size used for sessions started before their window has laid out.
@@ -700,6 +714,11 @@ impl App {
                 }
                 // Dropping the window's tabs closes their sessions and abandons their dials;
                 // its dialogs answer "no".
+                let freed = self
+                    .windows
+                    .get(&id)
+                    .map(|w| crate::memory::weak_terminals(w.tabs.iter()))
+                    .unwrap_or_default();
                 let was_terminal = self.windows.remove(&id).is_some();
                 visibility::unwatch(id);
                 display_rate::unwatch(id);
@@ -733,8 +752,10 @@ impl App {
                 }
                 if self.windows.is_empty() && self.editor.is_none() && self.settings_win.is_none() {
                     iced::exit()
-                } else {
+                } else if self.quitting {
                     Task::none()
+                } else {
+                    self.release_when_free(freed, 0)
                 }
             }
             Message::Shortcut(wid, action) => self.action(Some(wid), action),
@@ -789,6 +810,9 @@ impl App {
                 Task::none()
             }
             Message::CloseRequested(id) => self.close_requested(id),
+            Message::ReleaseWhenFree(terminals, waited) => {
+                self.release_when_free(terminals, waited)
+            }
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
                 if let Some(path) = &self.screenshot {

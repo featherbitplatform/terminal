@@ -90,13 +90,42 @@ impl App {
         let Some(closed) = window.close(index) else {
             return Task::none();
         };
+        let freed = crate::memory::weak_terminals(std::iter::once(&closed.tab));
         drop(closed.tab);
         self.save_state();
+        let release = self.release_when_free(freed, 0);
         if closed.window_empty {
-            self.close_window(wid)
+            Task::batch([self.close_window(wid), release])
         } else {
-            self.shown(wid)
+            Task::batch([self.shown(wid), release])
         }
+    }
+
+    /// Ask for the memory release once none of `terminals` is held any more: the closed tab's
+    /// session task may still hold its terminal for a moment, so wait (polling, up to a minute)
+    /// until the last reference is gone. Only user actions come here (closing a tab or window),
+    /// never output from a program.
+    pub(crate) fn release_when_free(
+        &mut self,
+        terminals: Vec<crate::memory::WeakTerminal>,
+        waited: u32,
+    ) -> Task<Message> {
+        /// Poll interval and the longest wait (a session that has not let go by then is left).
+        const POLL: Duration = Duration::from_millis(100);
+        const GIVE_UP: u32 = 600;
+        if terminals.is_empty() {
+            return Task::none();
+        }
+        if terminals.iter().all(|t| t.strong_count() == 0) {
+            crate::memory::release_freed();
+            return Task::none();
+        }
+        if waited >= GIVE_UP {
+            return Task::none();
+        }
+        Task::perform(async { tokio::time::sleep(POLL).await }, move |()| {
+            Message::ReleaseWhenFree(terminals.clone(), waited + 1)
+        })
     }
 
     /// The active tab of `wid` was just shown (selected, created, or its window focused): take
