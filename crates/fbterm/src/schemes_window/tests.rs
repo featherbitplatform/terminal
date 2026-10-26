@@ -817,6 +817,28 @@ fn import_same_id_replace_updates_and_reapplies() {
 }
 
 #[test]
+fn replace_import_over_dirty_draft_shows_imported() {
+    let mine = user_scheme("Mine", 0x101010);
+    let (mut app, _, _, _) = app_with(
+        &[fbterm_config_profile("a")],
+        "",
+        std::slice::from_ref(&mine),
+    );
+    open(&mut app, &mine.id);
+    send(&mut app, SchemesMsg::Color(Entry::Cursor, rgb(0x00ff00)));
+    assert!(win(&app).is_dirty(&mine.id));
+    let mut incoming = mine.clone();
+    incoming.name = "Mine v2".into();
+    incoming.colors.background = rgb(0x505050);
+    let src = scratch(&app).join("same.toml");
+    fbterm_config::schemes::write_file(&src, &incoming).unwrap();
+    import_file(&mut app, src);
+    send(&mut app, SchemesMsg::ImportChoice(ImportChoice::Replace));
+    assert_eq!(win(&app).draft(&mine.id), Some(&incoming));
+    assert!(!win(&app).is_dirty(&mine.id));
+}
+
+#[test]
 fn import_oversized_file_is_refused() {
     let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
     open(&mut app, "graphite");

@@ -418,6 +418,9 @@ impl App {
         }
         tracing::info!(id = %scheme.id, "scheme imported");
         state.notice = Some(format!("Imported \"{}\"", scheme.name.trim()));
+        // The file is the truth now: an open draft of the same id (with unsaved edits)
+        // takes the imported version instead of keeping the stale edits.
+        state.mark_saved(&scheme);
         let task = self.reload_schemes();
         if let Some((_, state)) = &mut self.schemes_win
             && state.draft(&scheme.id).is_some()
