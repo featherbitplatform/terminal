@@ -79,6 +79,15 @@ fn header<'a>(t: &'static Tokens, group: &'a Group) -> Element<'a, Message> {
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    if let Some(p) = &group.pane_label {
+        line = line.push(
+            text(p.as_str())
+                .font(UI_FONT)
+                .size(11.5)
+                .color(t.text_muted)
+                .wrapping(text::Wrapping::None),
+        );
+    }
     if let Some(w) = &group.window_label {
         line = line.push(
             text(w.as_str())

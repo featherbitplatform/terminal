@@ -12,7 +12,12 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 
 use crate::app::Message;
 use crate::keys::{Action, Bindings};
+use crate::layout::{Drop, PaneId, Side};
+use crate::tabs::{Tab, TabId, WindowState};
 use crate::theme::{Tokens, UI_FONT};
+
+/// The footer line: what Shift+Enter does.
+pub const SPLIT_HINT: &str = "Shift+Enter opens in a split";
 
 /// Rows shown at once.
 const VISIBLE_ROWS: usize = 10;
@@ -26,7 +31,10 @@ pub enum PaletteMsg {
     Query(String),
     Up,
     Down,
-    Submit,
+    /// Enter; with `split` (Shift+Enter) a profile opens in a split instead of a new tab.
+    Submit {
+        split: bool,
+    },
     Pick(usize),
     Close,
 }
@@ -43,19 +51,111 @@ pub enum PaletteItem {
         action: Action,
         label: String,
     },
+    /// A step of rearranging: a tab to merge into, or where a tab or tile lands.
+    Choice {
+        pick: Pick,
+        label: String,
+    },
+}
+
+/// What a rearranging choice picks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pick {
+    Tab(TabId),
+    Drop(Drop),
+}
+
+/// What is being placed by the palette's second stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placing {
+    /// A whole tab, merged into another.
+    Tab(TabId),
+    /// A tile, moved within its tab.
+    Tile(PaneId),
+}
+
+/// What the palette lists: profiles and actions, or the steps of a rearrangement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Launch,
+    /// "Merge tab into…": which tab `source` goes into.
+    MergeInto {
+        source: TabId,
+    },
+    /// Where `what` lands in tab `into`.
+    Place {
+        what: Placing,
+        into: TabId,
+    },
 }
 
 impl PaletteItem {
     fn label(&self) -> &str {
         match self {
             Self::Profile { name, .. } => name,
-            Self::Action { label, .. } => label,
+            Self::Action { label, .. } | Self::Choice { label, .. } => label,
         }
     }
 
+    /// Listed in a fixed order after the profiles (actions and choices).
     fn is_action(&self) -> bool {
-        matches!(self, Self::Action { .. })
+        !matches!(self, Self::Profile { .. })
     }
+}
+
+/// "Merge tab into…", first step: the window's other tabs, by title.
+pub fn tab_choices(window: &WindowState, source: TabId) -> Vec<PaletteItem> {
+    window
+        .tabs
+        .iter()
+        .filter(|t| t.id != source)
+        .map(|t| PaletteItem::Choice {
+            pick: Pick::Tab(t.id),
+            label: t.title().to_owned(),
+        })
+        .collect()
+}
+
+/// Where something can land in `tab`: beside each pane, then a whole row or column along an
+/// outer edge. `moving`: the tile being moved within `tab`; it is never its own target, and
+/// choices that would leave the arrangement as it is are left out.
+pub fn drop_choices(tab: &Tab, moving: Option<PaneId>) -> Vec<PaletteItem> {
+    let sides = [
+        (Side::Left, "left"),
+        (Side::Right, "right"),
+        (Side::Top, "above"),
+        (Side::Bottom, "below"),
+    ];
+    let mut out = Vec::new();
+    for id in tab.layout.panes() {
+        if Some(id) == moving {
+            continue;
+        }
+        let title = tab.pane(id).map_or("", |p| p.title.as_str());
+        for (side, word) in sides {
+            out.push((Drop::Tile(id, side), format!("Next to {title}: {word}")));
+        }
+    }
+    for (side, label) in [
+        (Side::Left, "Whole column on the left"),
+        (Side::Right, "Whole column on the right"),
+        (Side::Top, "Whole row on top"),
+        (Side::Bottom, "Whole row on bottom"),
+    ] {
+        out.push((Drop::Edge(side), label.to_owned()));
+    }
+    out.into_iter()
+        .filter(|(at, _)| {
+            moving.is_none_or(|pane| {
+                let mut moved = tab.layout.clone();
+                moved.move_pane(pane, *at) && moved != tab.layout
+            })
+        })
+        .map(|(at, label)| PaletteItem::Choice {
+            pick: Pick::Drop(at),
+            label,
+        })
+        .collect()
 }
 
 /// When each profile was last opened (unix seconds). Persisted by the state file.
@@ -94,8 +194,15 @@ fn actions() -> Vec<PaletteItem> {
     [
         (Action::NewTab, "New tab"),
         (Action::NewWindow, "New window"),
-        (Action::CloseTab, "Close tab"),
-        (Action::Find, "Find in tab"),
+        (Action::CloseTab, "Close pane"),
+        (Action::SplitRight, "Split right"),
+        (Action::SplitDown, "Split down"),
+        (Action::MaximizePane, "Maximize pane"),
+        (Action::MergeTab, "Merge tab into\u{2026}"),
+        (Action::MoveTile, "Move tile\u{2026}"),
+        (Action::TileToTab, "Move tile to new tab"),
+        (Action::Find, "Find in pane"),
+        (Action::FindInTab, "Find in this tab"),
         (Action::FindAll, "Find in all tabs"),
         (Action::ExportTab, "Export tab to file…"),
         (Action::EditProfiles, "Edit profiles"),
@@ -154,7 +261,7 @@ pub fn items(store: &ProfileStore) -> Vec<PaletteItem> {
 pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize> {
     let recent = |item: &PaletteItem| match item {
         PaletteItem::Profile { id, .. } => recency.get(*id),
-        PaletteItem::Action { .. } => None,
+        PaletteItem::Action { .. } | PaletteItem::Choice { .. } => None,
     };
     let name_key = |i: usize| items[i].label().to_lowercase();
 
@@ -194,7 +301,9 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
         .filter_map(|(i, item)| {
             let best = match item {
                 PaletteItem::Profile { name, detail, .. } => score(&format!("{name} {detail}")),
-                PaletteItem::Action { label, .. } => score(label),
+                PaletteItem::Action { label, .. } | PaletteItem::Choice { label, .. } => {
+                    score(label)
+                }
             };
             best.map(|s| (i, s))
         })
@@ -214,6 +323,8 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
 /// One window's open palette.
 #[derive(Debug)]
 pub struct PaletteState {
+    /// What is listed: the launcher, or a step of a rearrangement.
+    pub stage: Stage,
     pub query: String,
     items: Vec<PaletteItem>,
     ranked: Vec<usize>,
@@ -225,6 +336,7 @@ impl PaletteState {
     pub fn new(items: Vec<PaletteItem>, query: String, recency: &Recency) -> Self {
         let ranked = rank(&query, &items, recency);
         Self {
+            stage: Stage::Launch,
             query,
             items,
             ranked,
@@ -233,8 +345,20 @@ impl PaletteState {
         }
     }
 
-    /// Replace the listed items (the profiles changed), keeping the query and the input.
+    /// A rearranging step listing `items`, with an empty query.
+    pub fn staged(stage: Stage, items: Vec<PaletteItem>) -> Self {
+        Self {
+            stage,
+            ..Self::new(items, String::new(), &Recency::new())
+        }
+    }
+
+    /// Replace the listed items (the profiles changed), keeping the query and the input. A
+    /// rearranging step keeps its own list.
     pub fn set_items(&mut self, items: Vec<PaletteItem>, recency: &Recency) {
+        if self.stage != Stage::Launch {
+            return;
+        }
         self.items = items;
         self.ranked = rank(&self.query, &self.items, recency);
         self.selected = self.selected.min(self.ranked.len().saturating_sub(1));
@@ -292,7 +416,12 @@ pub fn view<'a>(
     bindings: &Bindings,
 ) -> Element<'a, Message> {
     let msg = move |m| Message::Palette(window, m);
-    let input = text_input("Search profiles and actions", &state.query)
+    let placeholder = match state.stage {
+        Stage::Launch => "Search profiles and actions",
+        Stage::MergeInto { .. } => "Merge into which tab?",
+        Stage::Place { .. } => "Where should it go?",
+    };
+    let input = text_input(placeholder, &state.query)
         .id(state.input.clone())
         .on_input(move |q| msg(PaletteMsg::Query(q)))
         .font(UI_FONT)
@@ -350,9 +479,24 @@ pub fn view<'a>(
             background: Some(t.border.into()),
             ..container::Style::default()
         });
-    let card = container(column![input, divider, list])
+    let mut body = column![input, divider, list];
+    // The launcher's footer; a rearranging step has no Shift+Enter.
+    if state.stage == Stage::Launch {
+        body = body.push(
+            container(
+                text(SPLIT_HINT)
+                    .font(UI_FONT)
+                    .size(11.5)
+                    .color(t.text_muted),
+            )
+            .width(Length::Fill)
+            .padding(Padding::from([6.0, 14.0]))
+            .align_x(Alignment::End),
+        );
+    }
+    let card = container(body)
         .width(CARD_WIDTH)
-        .max_height(ROW_HEIGHT * VISIBLE_ROWS as f32 + 60.0)
+        .max_height(ROW_HEIGHT * VISIBLE_ROWS as f32 + 90.0)
         .clip(true)
         .style(move |_| container::Style {
             background: Some(t.raised.into()),
@@ -401,7 +545,9 @@ fn item_row<'a>(
         });
     let (label, detail) = match item {
         PaletteItem::Profile { name, detail, .. } => (name.as_str(), Some(detail.as_str())),
-        PaletteItem::Action { label, .. } => (label.as_str(), None),
+        PaletteItem::Action { label, .. } | PaletteItem::Choice { label, .. } => {
+            (label.as_str(), None)
+        }
     };
     let mut content = row![
         text(label)
@@ -431,7 +577,7 @@ fn item_row<'a>(
             // An action shows its current chord, or just that it is an action.
             let hint = match item {
                 PaletteItem::Action { action, .. } => action_hint(*action, bindings),
-                PaletteItem::Profile { .. } => None,
+                PaletteItem::Profile { .. } | PaletteItem::Choice { .. } => None,
             };
             let hint: Element<'a, Message> = match hint {
                 Some(chord) => text(chord)
@@ -439,6 +585,7 @@ fn item_row<'a>(
                     .size(12)
                     .color(t.text_secondary)
                     .into(),
+                None if matches!(item, PaletteItem::Choice { .. }) => text("").into(),
                 None => text("Action")
                     .font(UI_FONT)
                     .size(11.5)
@@ -494,7 +641,7 @@ mod tests {
     fn id(item: &PaletteItem) -> ProfileId {
         match item {
             PaletteItem::Profile { id, .. } => *id,
-            PaletteItem::Action { .. } => panic!("not a profile"),
+            PaletteItem::Action { .. } | PaletteItem::Choice { .. } => panic!("not a profile"),
         }
     }
 
@@ -530,8 +677,15 @@ mod tests {
             [
                 "New tab",
                 "New window",
-                "Close tab",
-                "Find in tab",
+                "Close pane",
+                "Split right",
+                "Split down",
+                "Maximize pane",
+                "Merge tab into\u{2026}",
+                "Move tile\u{2026}",
+                "Move tile to new tab",
+                "Find in pane",
+                "Find in this tab",
                 "Find in all tabs",
                 "Export tab to file\u{2026}",
                 "Edit profiles",
@@ -541,6 +695,11 @@ mod tests {
                 "Quit"
             ]
         );
+    }
+
+    #[test]
+    fn the_footer_names_shift_enter() {
+        assert_eq!(SPLIT_HINT, "Shift+Enter opens in a split");
     }
 
     #[test]
@@ -676,7 +835,7 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 11);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 18);
     }
 
     #[test]

@@ -23,6 +23,7 @@ use crate::editor::{EditorMsg, EditorState};
 use crate::find::FindMsg;
 use crate::find::all::{FindAll, FindAllMsg};
 use crate::keys::{Action, Bindings};
+use crate::layout::PaneId;
 use crate::palette::{PaletteMsg, Palettes, Recency};
 use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
@@ -30,7 +31,7 @@ use crate::prompts::{
 use crate::restore;
 use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::settings_window::{SettingsMsg, SettingsState};
-use crate::tabs::{Tab, TabId, TabState, WindowState};
+use crate::tabs::{Pane, TabState, WindowState};
 use crate::theme;
 use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
@@ -76,7 +77,13 @@ impl<T> std::fmt::Debug for Delivered<T> {
 #[derive(Debug, Clone)]
 pub enum Message {
     Session(SessionId, SessionEvent),
-    Terminal(window::Id, TerminalOutput),
+    Terminal(window::Id, PaneId, TerminalOutput),
+    /// Focus, divider drags and the area of a window's panes.
+    Tiles(window::Id, crate::tiles::TilesMsg),
+    /// A tab or tile carried between the tab bar and the panes.
+    Drag(window::Id, crate::windows::DragMsg),
+    /// A pane's resize quiet period passed; applies if no newer resize came (its generation).
+    ResizeSettled(PaneId, u64),
     /// Tab-bar and shortcut actions act on the focused window.
     NewTab,
     CloseTab(usize),
@@ -90,11 +97,11 @@ pub enum Message {
         window: window::Id,
     },
     /// A dial finished; carries the pty size it was opened with.
-    Connected(TabId, Delivered<SessionHandle>, GridSize),
-    ConnectFailed(TabId, String),
-    /// A dial was refused because the host key changed: fail the tab and explain.
+    Connected(PaneId, Delivered<SessionHandle>, GridSize),
+    ConnectFailed(PaneId, String),
+    /// A dial was refused because the host key changed: fail the pane and explain.
     HostKeyChanged {
-        tab: TabId,
+        pane: PaneId,
         host: String,
         port: u16,
         reason: String,
@@ -118,20 +125,20 @@ pub enum Message {
     Palette(window::Id, PaletteMsg),
     /// The find bar of a window's active tab.
     Find(window::Id, FindMsg),
-    /// A tab's find-bar search finished.
+    /// A pane's find-bar search finished.
     Found {
-        tab: TabId,
+        pane: PaneId,
         seq: u64,
         outcome: SearchOutcome,
     },
-    /// Search a tab's find bar again for the output that arrived (one timer per burst).
-    FindRefresh(TabId),
+    /// Search a pane's find bar again for the output that arrived (one timer per burst).
+    FindRefresh(PaneId),
     /// The find-in-all-tabs box, open in a window.
     FindAll(window::Id, FindAllMsg),
-    /// One tab's part of a find-in-all-tabs search finished.
+    /// One pane's part of a find-in-all-tabs search finished.
     FoundAll {
         seq: u64,
-        tab: TabId,
+        pane: PaneId,
         outcome: SearchOutcome,
     },
     /// Debug aid: open the find bar or the box with a query once output has arrived.
@@ -210,11 +217,24 @@ pub struct App {
     /// The refresh rate of the display each terminal window is on, where known.
     pub(crate) display_rates: HashMap<window::Id, Option<u32>>,
     pub windows: BTreeMap<window::Id, WindowState>,
-    pub(crate) grids: HashMap<window::Id, GridSize>,
+    /// Each pane's grid as its view last laid it out.
+    pub(crate) grids: HashMap<PaneId, GridSize>,
+    /// The area each terminal window lays its panes out in, as last drawn.
+    pub(crate) areas: HashMap<window::Id, iced::Size>,
+    /// Session resizes waiting for their quiet period: generation and grid, by pane.
+    pub(crate) pending_resizes: HashMap<PaneId, (u64, GridSize)>,
+    /// Counts pane resizes, so only the last of a burst reaches the session.
+    pub(crate) resize_generation: u64,
     /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
+    /// The tab or tile being dragged, and in which window.
+    pub(crate) carry: Option<(window::Id, crate::windows::Carry)>,
+    /// The tab button a carried tab hovers: window, index and the hover's generation.
+    pub(crate) hover: Option<(window::Id, usize, u64)>,
+    /// Counts hovers, so only the latest one's timer switches tabs.
+    pub(crate) hover_generation: u64,
     /// The find-in-all-tabs box, when open (in one window at a time).
     pub find_box: Option<FindAll>,
     /// The profile editor window, when open.
@@ -254,7 +274,6 @@ pub struct App {
     /// Whether one of our windows has focus at all (the app is in front).
     pub app_active: bool,
     pub style: TerminalStyle,
-    pub style_unfocused: TerminalStyle,
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
@@ -435,8 +454,14 @@ impl App {
             display_rates: HashMap::new(),
             windows: BTreeMap::new(),
             grids: HashMap::new(),
+            areas: HashMap::new(),
+            pending_resizes: HashMap::new(),
+            resize_generation: 0,
             focused: None,
             palettes: Palettes::new(),
+            carry: None,
+            hover: None,
+            hover_generation: 0,
             find_box: None,
             editor: None,
             settings_win: None,
@@ -445,6 +470,7 @@ impl App {
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
             recency: Recency::from(saved.recency),
             state_saving_enabled: debug_env("FBTERM_OPEN_TABS").is_none()
+                && debug_env("FBTERM_SPLITS").is_none()
                 && debug_env("FBTERM_SCREENSHOT").is_none()
                 && crate::perf::opts().is_none(),
             quitting: false,
@@ -457,10 +483,6 @@ impl App {
             settings_notice,
             pending_release: Vec::new(),
             app_active: true,
-            style_unfocused: TerminalStyle {
-                focused: false,
-                ..style.clone()
-            },
             style,
             screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
             screenshot_window: match debug_env("FBTERM_SCREENSHOT_WINDOW") {
@@ -485,6 +507,7 @@ impl App {
             None => app.restore_windows(&plan),
         };
         task = task.chain(app.open_debug_tabs());
+        task = task.chain(app.open_debug_splits());
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
         task = task.chain(app.open_debug_settings());
@@ -531,7 +554,7 @@ impl App {
             return "Settings · fbterm".into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
-            Some(tab) => format!("{} · fbterm", tab.title),
+            Some(tab) => format!("{} · fbterm", tab.title()),
             None => "fbterm".into(),
         }
     }
@@ -593,16 +616,22 @@ impl App {
             .values()
             .next()
             .and_then(WindowState::active_tab)
-            .is_some_and(|t| t.state != TabState::NotConnected)
+            .is_some_and(|t| t.state() != &TabState::NotConnected)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Session(id, event) => self.session_event(id, event),
-            Message::Terminal(wid, output) => self.terminal_output(wid, output),
+            Message::Terminal(wid, pane, output) => self.terminal_output(wid, pane, output),
+            Message::Tiles(wid, msg) => self.tiles_msg(wid, msg),
+            Message::Drag(wid, msg) => self.drag_msg(wid, msg),
+            Message::ResizeSettled(pane, generation) => {
+                self.resize_settled(pane, generation);
+                Task::none()
+            }
             Message::NewTab => self.action(None, Action::NewTab),
             Message::CloseTab(i) => match self.focused_window() {
-                Some(wid) => self.close_tab(wid, i),
+                Some(wid) => self.close_tab_asking(wid, i),
                 None => Task::none(),
             },
             Message::PerfCloseOthers(wid) => self.perf_close_others(wid),
@@ -610,24 +639,24 @@ impl App {
             Message::NextTab => self.with_focused(WindowState::next),
             Message::PrevTab => self.with_focused(WindowState::prev),
             Message::OpenProfile { profile, window } => self.open_tab(window, profile),
-            Message::Connected(tab, delivered, requested) => {
+            Message::Connected(pane, delivered, requested) => {
                 if let Some(handle) = delivered.take() {
-                    self.connected(tab, handle, requested);
+                    self.connected(pane, handle, requested);
                 }
                 Task::none()
             }
-            Message::ConnectFailed(tab, reason) => {
-                self.connect_failed(tab, reason);
+            Message::ConnectFailed(pane, reason) => {
+                self.connect_failed(pane, reason);
                 Task::none()
             }
             Message::HostKeyChanged {
-                tab,
+                pane,
                 host,
                 port,
                 reason,
             } => {
-                let task = self.host_key_changed(tab, host, port);
-                self.connect_failed(tab, reason);
+                let task = self.host_key_changed(pane, host, port);
+                self.connect_failed(pane, reason);
                 task
             }
             Message::NewWindow => self.action(None, Action::NewWindow),
@@ -690,7 +719,7 @@ impl App {
                 self.focused = Some(wid);
                 match msg {
                     TabBarMsg::Select(i) => self.with_window(wid, |w| w.select(i)),
-                    TabBarMsg::Close(i) => self.close_tab(wid, i),
+                    TabBarMsg::Close(i) => self.close_tab_asking(wid, i),
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
@@ -717,8 +746,14 @@ impl App {
                 let freed = self
                     .windows
                     .get(&id)
-                    .map(|w| crate::memory::weak_terminals(w.tabs.iter()))
+                    .map(|w| crate::memory::weak_terminals(w.tabs.iter().flat_map(|t| &t.panes)))
                     .unwrap_or_default();
+                let gone: Vec<PaneId> = self
+                    .windows
+                    .get(&id)
+                    .map(|w| w.tabs.iter().flat_map(|t| &t.panes).map(|p| p.id).collect())
+                    .unwrap_or_default();
+                self.forget_panes(&gone);
                 let was_terminal = self.windows.remove(&id).is_some();
                 visibility::unwatch(id);
                 display_rate::unwatch(id);
@@ -730,11 +765,15 @@ impl App {
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
+                if self.carry.is_some_and(|(w, _)| w == id) {
+                    self.carry = None;
+                    self.hover = None;
+                }
                 if self.find_box.as_ref().is_some_and(|f| f.window == id) {
                     self.close_find_all();
                 }
                 self.prompts.remove_window(id);
-                self.grids.remove(&id);
+                self.areas.remove(&id);
                 if self.export_notice.as_ref().is_some_and(|n| n.window == id) {
                     self.export_notice = None;
                 }
@@ -766,11 +805,11 @@ impl App {
             }
             Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::Find(wid, msg) => self.find(wid, msg),
-            Message::Found { tab, seq, outcome } => self.found(tab, seq, outcome),
-            Message::FindRefresh(tab) => self.find_refresh(tab),
+            Message::Found { pane, seq, outcome } => self.found(pane, seq, outcome),
+            Message::FindRefresh(pane) => self.find_refresh(pane),
             Message::FindAll(wid, msg) => self.find_all(wid, msg),
-            Message::FoundAll { seq, tab, outcome } => {
-                self.found_all(seq, tab, outcome);
+            Message::FoundAll { seq, pane, outcome } => {
+                self.found_all(seq, pane, outcome);
                 Task::none()
             }
             Message::DebugFind { all, query } => self.debug_find(all, query),
@@ -824,8 +863,8 @@ impl App {
         }
     }
 
-    fn connect_failed(&mut self, tab: TabId, reason: String) {
-        if let Some(t) = self.tab_mut(tab) {
+    fn connect_failed(&mut self, pane: PaneId, reason: String) {
+        if let Some((_, t)) = self.pane_mut(pane) {
             t.connecting = None;
             let text = if reason.starts_with("could not connect") {
                 format!("{reason}, press Enter to retry")
@@ -873,10 +912,12 @@ impl App {
         }
     }
 
-    pub(crate) fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
-        self.windows
-            .values_mut()
-            .find_map(|w| w.find(id).map(|i| &mut w.tabs[i]))
+    /// The pane `id`, wherever it is, with its window.
+    pub(crate) fn pane_mut(&mut self, id: PaneId) -> Option<(window::Id, &mut Pane)> {
+        self.windows.iter_mut().find_map(|(wid, w)| {
+            let (t, p) = w.locate(id)?;
+            Some((*wid, &mut w.tabs[t].panes[p]))
+        })
     }
 
     fn shoot(&mut self) -> Task<Message> {

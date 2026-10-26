@@ -6,7 +6,44 @@ use iced::Task;
 
 use crate::app::{App, Message, debug_env};
 use crate::editor::EditorMsg;
+use crate::layout::{Axis, Layout};
 use crate::prompts::{Ask, Dialog};
+use crate::tabs::Pane;
+
+/// Each join: the axis and the index of the name joined to everything before it.
+type Joins = Vec<(Axis, usize)>;
+
+/// Parses an `FBTERM_SPLITS` layout: profile names joined by `|` (side by side) and `/`
+/// (stacked), binding left to right with equal halves: `A|B/C` is `A` beside `B`, both above
+/// `C`. Returns the names in reading order and a tree over their indices.
+fn parse_splits(spec: &str) -> Option<(Vec<String>, Joins)> {
+    let mut names = Vec::new();
+    let mut joins = Vec::new();
+    let mut axis = None;
+    let mut name = String::new();
+    for c in spec.chars().chain(std::iter::once('\0')) {
+        let next = match c {
+            '|' => Some(Axis::Row),
+            '/' => Some(Axis::Column),
+            '\0' => None,
+            _ => {
+                name.push(c);
+                continue;
+            }
+        };
+        let n = name.trim().to_string();
+        if n.is_empty() {
+            return None;
+        }
+        names.push(n);
+        name.clear();
+        if let Some(a) = axis {
+            joins.push((a, names.len() - 1));
+        }
+        axis = next;
+    }
+    Some((names, joins))
+}
 
 impl App {
     /// `FBTERM_OPEN_TABS=name,name` (debug aid): extra tabs opened in the first window at
@@ -29,6 +66,50 @@ impl App {
         if let Some(w) = self.windows.get_mut(&wid) {
             w.active = 0;
         }
+        Task::batch(tasks)
+    }
+
+    /// `FBTERM_SPLITS=<layout>` (debug aid): the first tab of the first window replaced by
+    /// panes of these profiles (by name) in this layout (see `parse_splits`), for screenshots.
+    pub(crate) fn open_debug_splits(&mut self) -> Task<Message> {
+        let Some(spec) = debug_env("FBTERM_SPLITS") else {
+            return Task::none();
+        };
+        let Some((names, joins)) = parse_splits(&spec.to_string_lossy()) else {
+            tracing::warn!("FBTERM_SPLITS: not a layout");
+            return Task::none();
+        };
+        let Some(panes) = names
+            .iter()
+            .map(|n| self.profiles.profiles.iter().find(|p| p.name == *n))
+            .map(|p| p.map(Pane::for_profile))
+            .collect::<Option<Vec<Pane>>>()
+        else {
+            tracing::warn!("FBTERM_SPLITS: unknown profile name");
+            return Task::none();
+        };
+        let Some(&wid) = self.windows.keys().next() else {
+            return Task::none();
+        };
+        let ids: Vec<_> = panes.iter().map(|p| p.id).collect();
+        let mut layout = Layout::Pane(ids[0]);
+        for (axis, i) in joins {
+            layout = Layout::Split {
+                axis,
+                ratio: 0.5,
+                first: Box::new(layout),
+                second: Box::new(Layout::Pane(ids[i])),
+            };
+        }
+        let Some(tab) = self.windows.get_mut(&wid).and_then(|w| w.tabs.first_mut()) else {
+            return Task::none();
+        };
+        tab.layout = layout;
+        tab.panes = panes;
+        tab.focused = ids[0];
+        tab.maximized = None;
+        tab.recent = vec![ids[0]];
+        let tasks: Vec<_> = ids.into_iter().map(|id| self.start(wid, id)).collect();
         Task::batch(tasks)
     }
 
@@ -100,7 +181,7 @@ impl App {
             .windows
             .get(&wid)
             .and_then(|w| w.active_tab())
-            .and_then(|t| t.find.as_ref())
+            .and_then(|t| t.focused_pane().find.as_ref())
             .map(|bar| bar.input.clone());
         let focus = input.map_or(Task::none(), |id| {
             iced::widget::operation::focus(id.clone())
@@ -149,5 +230,21 @@ impl App {
         };
         self.prompts.ask(w, u64::MAX, dialog);
         self.focus_prompt(w)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_splits;
+    use crate::layout::Axis;
+
+    #[test]
+    fn splits_bind_left_to_right() {
+        let (names, joins) = parse_splits("A|B / C").unwrap();
+        assert_eq!(names, ["A", "B", "C"]);
+        assert_eq!(joins, [(Axis::Row, 1), (Axis::Column, 2)]);
+        assert_eq!(parse_splits("solo").unwrap().1, []);
+        assert!(parse_splits("A||B").is_none());
+        assert!(parse_splits("A|").is_none());
     }
 }

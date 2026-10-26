@@ -26,6 +26,8 @@ pub struct Tokens {
     pub warning: Color,
     pub danger: Color,
     pub danger_soft: Color,
+    /// The terminal's default background (the Graphite color scheme's, in both modes).
+    pub terminal: Color,
 }
 
 pub const DARK: Tokens = Tokens {
@@ -44,6 +46,7 @@ pub const DARK: Tokens = Tokens {
     warning: color!(0xf2a635),
     danger: color!(0xed4a49),
     danger_soft: Color::from_rgba(237.0 / 255.0, 74.0 / 255.0, 73.0 / 255.0, 0.14),
+    terminal: color!(0x0b0b0e),
 };
 
 pub const LIGHT: Tokens = Tokens {
@@ -62,6 +65,7 @@ pub const LIGHT: Tokens = Tokens {
     warning: color!(0xbe7100),
     danger: color!(0xc52b30),
     danger_soft: Color::from_rgba(197.0 / 255.0, 43.0 / 255.0, 48.0 / 255.0, 0.08),
+    terminal: color!(0x0b0b0e),
 };
 
 pub fn tokens(mode: ThemeMode) -> &'static Tokens {
@@ -108,6 +112,14 @@ mod tests {
         assert_eq!(p.primary, color!(0x7c49e3));
         assert_eq!(p.success, color!(0x2bbb71));
         assert_eq!(p.danger, color!(0xed4a49));
+    }
+
+    #[test]
+    fn terminal_token_is_the_terminal_background() {
+        let bg = fbterm_term::ColorScheme::graphite().background;
+        for t in [&DARK, &LIGHT] {
+            assert_eq!(t.terminal, Color::from_rgb8(bg.r, bg.g, bg.b));
+        }
     }
 
     #[test]

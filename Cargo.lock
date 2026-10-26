@@ -1255,6 +1255,7 @@ dependencies = [
  "fbterm-term",
  "feathercritty",
  "iced",
+ "iced_tiny_skia",
  "libc",
  "notify",
  "nucleo-matcher",

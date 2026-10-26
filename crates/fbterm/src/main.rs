@@ -5,12 +5,15 @@
 //!   in `<dir>` instead of the platform config directory.
 //! - `FBTERM_SECRETS=memory`: keep secrets in memory only; the OS keychain is never touched.
 //!
-//! Measurement mode (works in release builds, see `perf.rs`): `--perf-tabs <N> --perf-cmd <cmd>
-//! [--perf-exit-after <secs>] [--perf-close-after <secs>]`.
+//! Measurement mode (works in release builds, see `perf.rs`): `--perf-tabs <N> | --perf-panes <N>
+//! --perf-cmd <cmd> [--perf-exit-after <secs>] [--perf-close-after <secs>]`.
 //!
 //! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
-//!   Runs with this set (or `FBTERM_SCREENSHOT`) never write `state.toml`.
+//!   Runs with this set (or `FBTERM_SPLITS`, `FBTERM_SCREENSHOT`) never write `state.toml`.
+//! - `FBTERM_SPLITS=<layout>`: replace the first window's first tab with split panes of these
+//!   profiles (by name): `|` side by side, `/` stacked, binding left to right with equal
+//!   halves, e.g. `A|B/C` (`A` beside `B`, both above `C`).
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
@@ -39,9 +42,11 @@ mod editor;
 mod export;
 mod find;
 mod keys;
+mod layout;
 mod memory;
 mod pacing;
 mod palette;
+mod pane_actions;
 mod perf;
 mod prompt_view;
 mod prompts;
@@ -55,6 +60,7 @@ mod shortcuts;
 mod tab_look;
 mod tabs;
 mod theme;
+mod tiles;
 mod tooltip;
 mod ui;
 mod visibility;

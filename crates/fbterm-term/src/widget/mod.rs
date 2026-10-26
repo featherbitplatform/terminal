@@ -8,6 +8,7 @@ mod draw;
 mod geometry;
 mod input;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::sync::Arc;
 
@@ -43,6 +44,18 @@ pub struct TerminalStyle {
     pub background_opacity: f32,
 }
 
+impl<'a> From<&'a TerminalStyle> for Cow<'a, TerminalStyle> {
+    fn from(style: &'a TerminalStyle) -> Self {
+        Cow::Borrowed(style)
+    }
+}
+
+impl From<TerminalStyle> for Cow<'_, TerminalStyle> {
+    fn from(style: TerminalStyle) -> Self {
+        Cow::Owned(style)
+    }
+}
+
 /// Search matches to show: every match of `pattern` in view tinted with `match_bg`, the
 /// `current` one drawn in `current_fg` on `current_bg`.
 #[derive(Debug, Clone, PartialEq)]
@@ -76,16 +89,17 @@ pub fn terminal_view<'a, Message: 'a>(
     highlighted_terminal_view(term, style, None, on_event)
 }
 
-/// A terminal view showing search matches (see [`Highlight`]).
+/// A terminal view showing search matches (see [`Highlight`]). `style` is borrowed
+/// or owned (e.g. a per-pane style built for this view).
 pub fn highlighted_terminal_view<'a, Message: 'a>(
     term: &'a SharedTerminal,
-    style: &'a TerminalStyle,
+    style: impl Into<Cow<'a, TerminalStyle>>,
     highlight: Option<Highlight>,
     on_event: impl Fn(TerminalOutput) -> Message + 'a,
 ) -> Element<'a, Message> {
     Element::new(TerminalView {
         term,
-        style,
+        style: style.into(),
         highlight,
         on_event: Box::new(on_event),
     })
@@ -93,7 +107,7 @@ pub fn highlighted_terminal_view<'a, Message: 'a>(
 
 struct TerminalView<'a, Message> {
     term: &'a SharedTerminal,
-    style: &'a TerminalStyle,
+    style: Cow<'a, TerminalStyle>,
     highlight: Option<Highlight>,
     on_event: Box<dyn Fn(TerminalOutput) -> Message + 'a>,
 }

@@ -46,23 +46,58 @@ pub enum Action {
     /// Next match down the scrollback (newer), only while the find bar is open: Cmd+Shift+G on
     /// macOS, Ctrl+Shift+G elsewhere.
     FindPrevious,
+    /// Split the focused pane, the new pane to its right: Cmd+D on macOS, Ctrl+Shift+D elsewhere.
+    SplitRight,
+    /// Split the focused pane, the new pane below it: Cmd+Shift+D on macOS, Ctrl+Shift+Alt+D
+    /// elsewhere.
+    SplitDown,
+    /// Move focus to the neighbouring pane: Cmd+Option+arrow on macOS, Ctrl+Alt+arrow elsewhere.
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    /// Bigger text in the focused pane only: Cmd+= on macOS, Ctrl+Shift+= elsewhere.
+    ZoomIn,
+    /// Smaller text in the focused pane only: Cmd+- on macOS, Ctrl+Shift+- elsewhere.
+    ZoomOut,
+    /// The focused pane's text back to the Settings size: Cmd+0 on macOS, Ctrl+Shift+0 elsewhere.
+    ZoomReset,
+    /// Let the focused pane fill the tab, or give the tab back to all panes: Cmd+Shift+Enter on
+    /// macOS, Ctrl+Shift+Enter elsewhere.
+    MaximizePane,
+    /// Search the panes of the active tab (no chord by default).
+    FindInTab,
+    /// Move this tab's panes into another tab (no chord by default).
+    MergeTab,
+    /// Move the focused pane elsewhere (no chord by default).
+    MoveTile,
+    /// Move the focused pane into a tab of its own (no chord by default).
+    TileToTab,
 }
 
 /// The groups the Settings window lists actions in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActionGroup {
     Tabs,
+    Panes,
     Windows,
     Search,
     App,
 }
 
 impl ActionGroup {
-    pub const ALL: [ActionGroup; 4] = [Self::Tabs, Self::Windows, Self::Search, Self::App];
+    pub const ALL: [ActionGroup; 5] = [
+        Self::Tabs,
+        Self::Panes,
+        Self::Windows,
+        Self::Search,
+        Self::App,
+    ];
 
     pub fn title(self) -> &'static str {
         match self {
             Self::Tabs => "Tabs",
+            Self::Panes => "Panes",
             Self::Windows => "Windows",
             Self::Search => "Search",
             Self::App => "App",
@@ -72,7 +107,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 25] = [
+    pub const ALL: [Action; 39] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -87,6 +122,19 @@ impl Action {
         Action::SelectTab(8),
         Action::SelectTab(9),
         Action::ExportTab,
+        Action::MergeTab,
+        Action::SplitRight,
+        Action::SplitDown,
+        Action::FocusLeft,
+        Action::FocusRight,
+        Action::FocusUp,
+        Action::FocusDown,
+        Action::ZoomIn,
+        Action::ZoomOut,
+        Action::ZoomReset,
+        Action::MaximizePane,
+        Action::MoveTile,
+        Action::TileToTab,
         Action::NewWindow,
         Action::EditProfiles,
         Action::Settings,
@@ -94,6 +142,7 @@ impl Action {
         Action::FindAll,
         Action::FindNext,
         Action::FindPrevious,
+        Action::FindInTab,
         Action::Palette,
         Action::OpenSettingsFile,
         Action::RevealConfigFolder,
@@ -128,6 +177,20 @@ impl Action {
             Self::FindAll => "find_all",
             Self::FindNext => "find_next",
             Self::FindPrevious => "find_previous",
+            Self::SplitRight => "split_right",
+            Self::SplitDown => "split_down",
+            Self::FocusLeft => "focus_left",
+            Self::FocusRight => "focus_right",
+            Self::FocusUp => "focus_up",
+            Self::FocusDown => "focus_down",
+            Self::ZoomIn => "zoom_in",
+            Self::ZoomOut => "zoom_out",
+            Self::ZoomReset => "zoom_reset",
+            Self::MaximizePane => "maximize_pane",
+            Self::FindInTab => "find_in_tab",
+            Self::MergeTab => "merge_tab",
+            Self::MoveTile => "move_tile",
+            Self::TileToTab => "tile_to_tab",
         }
     }
 
@@ -140,7 +203,7 @@ impl Action {
     pub fn title(self) -> String {
         match self {
             Self::NewTab => "New tab".into(),
-            Self::CloseTab => "Close tab".into(),
+            Self::CloseTab => "Close pane".into(),
             Self::NextTab => "Next tab".into(),
             Self::PrevTab => "Previous tab".into(),
             Self::SelectTab(n) => format!("Tab {n}"),
@@ -152,10 +215,24 @@ impl Action {
             Self::OpenSettingsFile => "Open settings file".into(),
             Self::RevealConfigFolder => "Reveal config folder".into(),
             Self::ExportTab => "Export tab to file".into(),
-            Self::Find => "Find in tab".into(),
+            Self::Find => "Find in pane".into(),
             Self::FindAll => "Find in all tabs".into(),
             Self::FindNext => "Older match".into(),
             Self::FindPrevious => "Newer match".into(),
+            Self::SplitRight => "Split right".into(),
+            Self::SplitDown => "Split down".into(),
+            Self::FocusLeft => "Focus left".into(),
+            Self::FocusRight => "Focus right".into(),
+            Self::FocusUp => "Focus up".into(),
+            Self::FocusDown => "Focus down".into(),
+            Self::ZoomIn => "Zoom in".into(),
+            Self::ZoomOut => "Zoom out".into(),
+            Self::ZoomReset => "Reset zoom".into(),
+            Self::MaximizePane => "Maximize pane".into(),
+            Self::FindInTab => "Find in this tab".into(),
+            Self::MergeTab => "Merge tab into\u{2026}".into(),
+            Self::MoveTile => "Move tile\u{2026}".into(),
+            Self::TileToTab => "Move tile to new tab".into(),
         }
     }
 
@@ -166,9 +243,24 @@ impl Action {
             | Self::NextTab
             | Self::PrevTab
             | Self::SelectTab(_)
-            | Self::ExportTab => ActionGroup::Tabs,
+            | Self::ExportTab
+            | Self::MergeTab => ActionGroup::Tabs,
+            Self::SplitRight
+            | Self::SplitDown
+            | Self::FocusLeft
+            | Self::FocusRight
+            | Self::FocusUp
+            | Self::FocusDown
+            | Self::ZoomIn
+            | Self::ZoomOut
+            | Self::ZoomReset
+            | Self::MaximizePane
+            | Self::MoveTile
+            | Self::TileToTab => ActionGroup::Panes,
             Self::NewWindow | Self::EditProfiles | Self::Settings => ActionGroup::Windows,
-            Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious => ActionGroup::Search,
+            Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious | Self::FindInTab => {
+                ActionGroup::Search
+            }
             Self::Palette | Self::OpenSettingsFile | Self::RevealConfigFolder | Self::Quit => {
                 ActionGroup::App
             }
@@ -233,7 +325,8 @@ const NAMED: [(ChordKey, &str); 15] = [
 /// The symbols a press with Shift held may report instead of their key on some platforms:
 /// `}` for `]`, `{` for `[` and `<` for `,`. Only these fold, as they always have: the key a
 /// press reports is the layout's own unshifted key, so folding other symbols would make, for
-/// example, `&` (the 1 key on AZERTY) count as `7`.
+/// example, `&` (the 1 key on AZERTY) count as `7`. (`+` and `=` are one key for shortcuts, see
+/// [`Chord::same_plus_key`].)
 const SHIFTED: [(char, char); 3] = [('{', '['), ('}', ']'), ('<', ',')];
 
 impl ChordKey {
@@ -351,6 +444,19 @@ impl Chord {
             shift,
             cmd,
         }
+    }
+
+    /// Whether `self` and `other` are the plus key, however it is typed: `=` with Shift (US
+    /// layouts), `=` alone, or a layout's own `+` key, with the same Ctrl and Alt. With Cmd the
+    /// Shift state does not matter (Cmd+= and Cmd+plus both zoom in); without it a `+` or a
+    /// Shift+`=` stand together and a bare `=` is only itself, so Ctrl+= keeps reaching programs.
+    pub fn same_plus_key(self, other: Chord) -> bool {
+        let plus = |c: Chord| matches!(c.key, ChordKey::Char('+' | '='));
+        let shifted = |c: Chord| c.shift || c.key == ChordKey::Char('+');
+        plus(self)
+            && plus(other)
+            && (self.ctrl, self.alt, self.cmd) == (other.ctrl, other.alt, other.cmd)
+            && (self.cmd || shifted(self) == shifted(other))
     }
 
     /// Read a chord as written in `settings.toml`: `Ok(None)` for `"none"` (unbound).
@@ -488,6 +594,17 @@ fn ctrl_chord(key: char, shift: bool, alt: bool) -> Chord {
     }
 }
 
+/// Directional pane focus: Cmd+Option+arrow on macOS, Ctrl+Alt+arrow elsewhere.
+fn arrow_chord(mac: bool, key: ChordKey) -> Chord {
+    Chord {
+        key,
+        ctrl: !mac,
+        alt: true,
+        shift: false,
+        cmd: mac,
+    }
+}
+
 /// What already owns `chord` outside the binding table, so it cannot be bound: the terminal's
 /// copy, paste and scroll keys, Save in the profile editor, and on macOS the app menu's Quit,
 /// Hide and Hide Others (which act before any window sees the key).
@@ -544,10 +661,12 @@ pub fn reserved(mac: bool, chord: Chord) -> Option<&'static str> {
 
 /// The built-in chord for `action` on macOS (`mac`) or the other platforms, if it has one.
 ///
-/// macOS chords use Cmd (with Shift where noted) and never Ctrl or Option. Elsewhere chords
+/// macOS chords use Cmd (with Shift where noted) and never Ctrl; Option only with the arrows
+/// that move pane focus. Elsewhere chords
 /// are Ctrl+Shift, so plain Ctrl keys keep reaching the terminal; the exceptions are Ctrl+,
 /// for Settings (the comma has no control code of its own), Ctrl+Alt+F for find in all tabs,
-/// and Ctrl+G / Ctrl+Shift+G, which only act while the find bar is open.
+/// Ctrl+Shift+Alt+D for split down, Ctrl+Alt+arrow for pane focus, and Ctrl+G / Ctrl+Shift+G,
+/// which only act while the find bar is open.
 pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
     let (key, mac_shift) = match action {
         Action::NewTab => ('t', false),
@@ -572,10 +691,33 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
                 ctrl_chord('g', shift, false)
             });
         }
+        Action::SplitRight => ('d', false),
+        Action::SplitDown if !mac => return Some(ctrl_chord('d', true, true)),
+        Action::SplitDown => ('d', true),
+        Action::FocusLeft => return Some(arrow_chord(mac, ChordKey::Left)),
+        Action::FocusRight => return Some(arrow_chord(mac, ChordKey::Right)),
+        Action::FocusUp => return Some(arrow_chord(mac, ChordKey::Up)),
+        Action::FocusDown => return Some(arrow_chord(mac, ChordKey::Down)),
+        Action::ZoomIn => ('=', false),
+        Action::ZoomOut => ('-', false),
+        Action::ZoomReset => ('0', false),
+        Action::MaximizePane => {
+            return Some(Chord {
+                key: ChordKey::Enter,
+                ctrl: !mac,
+                alt: false,
+                shift: true,
+                cmd: mac,
+            });
+        }
         Action::SelectTab(_)
         | Action::OpenSettingsFile
         | Action::RevealConfigFolder
-        | Action::ExportTab => {
+        | Action::ExportTab
+        | Action::FindInTab
+        | Action::MergeTab
+        | Action::MoveTile
+        | Action::TileToTab => {
             return None;
         }
     };
@@ -749,10 +891,18 @@ impl Bindings {
     }
 
     /// The action `chord` triggers, if any.
+    ///
+    /// The plus key matches however it is typed (see [`Chord::same_plus_key`]), for whichever
+    /// action has a plus chord, so a rebound zoom keeps that.
     pub fn action(&self, chord: Chord) -> Option<Action> {
-        Action::ALL
+        let exact = Action::ALL
             .into_iter()
-            .find(|a| self.chord(*a) == Some(chord))
+            .find(|a| self.chord(*a) == Some(chord));
+        exact.or_else(|| {
+            Action::ALL
+                .into_iter()
+                .find(|a| self.chord(*a).is_some_and(|c| c.same_plus_key(chord)))
+        })
     }
 
     /// Whether `action` has its default chord.
@@ -1191,5 +1341,79 @@ mod tests {
         let mut k = KeyOverrides::default();
         k.map.insert(Action::Quit, None);
         assert!(k.drop_reserved(false).is_empty());
+    }
+
+    #[test]
+    fn pane_actions_have_names_and_titles() {
+        let expected = [
+            (Action::SplitRight, "split_right", "Split right"),
+            (Action::SplitDown, "split_down", "Split down"),
+            (Action::FocusLeft, "focus_left", "Focus left"),
+            (Action::FocusRight, "focus_right", "Focus right"),
+            (Action::FocusUp, "focus_up", "Focus up"),
+            (Action::FocusDown, "focus_down", "Focus down"),
+            (Action::ZoomIn, "zoom_in", "Zoom in"),
+            (Action::ZoomOut, "zoom_out", "Zoom out"),
+            (Action::ZoomReset, "zoom_reset", "Reset zoom"),
+            (Action::MaximizePane, "maximize_pane", "Maximize pane"),
+            (Action::FindInTab, "find_in_tab", "Find in this tab"),
+            (Action::MergeTab, "merge_tab", "Merge tab into\u{2026}"),
+            (Action::MoveTile, "move_tile", "Move tile\u{2026}"),
+            (Action::TileToTab, "tile_to_tab", "Move tile to new tab"),
+        ];
+        for (action, name, title) in expected {
+            assert!(Action::ALL.contains(&action), "{name} is listed");
+            assert_eq!(action.name(), name);
+            assert_eq!(Action::from_name(name), Some(action));
+            assert_eq!(action.title(), title);
+        }
+        assert_eq!(Action::CloseTab.name(), "close_tab");
+        assert_eq!(Action::CloseTab.title(), "Close pane");
+        assert_eq!(Action::SplitRight.group(), ActionGroup::Panes);
+        assert_eq!(Action::MaximizePane.group(), ActionGroup::Panes);
+        assert_eq!(ActionGroup::ALL[1], ActionGroup::Panes, "after Tabs");
+        assert_eq!(ActionGroup::Panes.title(), "Panes");
+    }
+
+    #[test]
+    fn pane_action_default_chords() {
+        let d = |mac, a| default_chord(mac, a).map(|c| c.to_config(mac));
+        for (a, mac, other) in [
+            (Action::SplitRight, "cmd+d", "ctrl+shift+d"),
+            (Action::SplitDown, "shift+cmd+d", "ctrl+alt+shift+d"),
+            (Action::FocusLeft, "alt+cmd+left", "ctrl+alt+left"),
+            (Action::FocusRight, "alt+cmd+right", "ctrl+alt+right"),
+            (Action::FocusUp, "alt+cmd+up", "ctrl+alt+up"),
+            (Action::FocusDown, "alt+cmd+down", "ctrl+alt+down"),
+            (Action::ZoomIn, "cmd+=", "ctrl+shift+="),
+            (Action::ZoomOut, "cmd+-", "ctrl+shift+-"),
+            (Action::ZoomReset, "cmd+0", "ctrl+shift+0"),
+            (Action::MaximizePane, "shift+cmd+enter", "ctrl+shift+enter"),
+        ] {
+            assert_eq!(d(true, a).as_deref(), Some(mac), "{}", a.name());
+            assert_eq!(d(false, a).as_deref(), Some(other), "{}", a.name());
+        }
+        for a in [
+            Action::FindInTab,
+            Action::MergeTab,
+            Action::MoveTile,
+            Action::TileToTab,
+        ] {
+            assert_eq!(default_chord(true, a), None);
+            assert_eq!(default_chord(false, a), None);
+        }
+        // The plus key zooms in however it is typed: `plus` and `=` are one chord, with or
+        // without Shift, except that a bare `Ctrl+=` is not one (it stays with programs).
+        let plus = |a: &str, b: &str| c(a).same_plus_key(c(b));
+        assert!(plus("ctrl+shift+plus", "ctrl+shift+="));
+        assert!(plus("ctrl+plus", "ctrl+shift+="));
+        assert!(
+            !plus("ctrl+=", "ctrl+shift+="),
+            "bare Ctrl+= stays with programs"
+        );
+        assert!(plus("cmd+=", "cmd+shift+="));
+        assert!(plus("cmd+plus", "cmd+="));
+        assert!(!plus("cmd+=", "alt+cmd+="));
+        assert!(!plus("cmd+-", "cmd+="));
     }
 }

@@ -16,21 +16,22 @@ use std::time::{Duration, Instant};
 use fbterm_term::Terminal;
 use parking_lot::Mutex;
 
-use crate::tabs::Tab;
+use crate::tabs::Pane;
 
-/// A closed tab's terminal, watched until its last holder lets go.
+/// A closed pane's terminal, watched until its last holder lets go.
 pub(crate) type WeakTerminal = std::sync::Weak<Mutex<Terminal>>;
 
-/// The terminals (session and placeholder) of `tabs`, to watch while they close.
-pub(crate) fn weak_terminals<'a>(tabs: impl Iterator<Item = &'a Tab>) -> Vec<WeakTerminal> {
-    tabs.flat_map(|t| {
-        t.session
-            .iter()
-            .map(|s| &s.terminal)
-            .chain(t.placeholder.iter())
-    })
-    .map(Arc::downgrade)
-    .collect()
+/// The terminals (session and placeholder) of `panes`, to watch while they close.
+pub(crate) fn weak_terminals<'a>(panes: impl Iterator<Item = &'a Pane>) -> Vec<WeakTerminal> {
+    panes
+        .flat_map(|p| {
+            p.session
+                .iter()
+                .map(|s| &s.terminal)
+                .chain(p.placeholder.iter())
+        })
+        .map(Arc::downgrade)
+        .collect()
 }
 
 /// Minimum time between two releases.

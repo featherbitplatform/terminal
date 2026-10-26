@@ -1,16 +1,17 @@
 //! One window's view: tab bar, notices and the active tab's terminal.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use fbterm_term::highlighted_terminal_view;
 use iced::advanced::layout::{self, Layout};
-use iced::advanced::widget::{Operation, Tree, Widget};
+use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::widget::{button, column, container, row, scrollable, stack, text};
 use iced::window::{self, Screenshot};
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Padding, Rectangle, Size, Vector,
-    mouse,
+    Alignment, Background, Border, Color, Element, Event, Length, Padding, Pixels, Point,
+    Rectangle, Size, Vector, mouse,
 };
 
 use crate::app::{App, Message, TabBarMsg};
@@ -19,13 +20,16 @@ use crate::keys::{Action, Bindings};
 use crate::palette;
 use crate::shortcuts::{Mode, Shortcuts};
 use crate::tab_look::{Surroundings, look};
-use crate::tabs::{Tab, TabState};
+use crate::tabs::{Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
 use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_USERS, ICON_X, icon};
+use crate::windows::{Carry, DragMsg};
 
 /// Gap between the top of the tab bar and the top of a tab.
 const TAB_TOP_GAP: f32 = 4.0;
+/// How far a pressed tab must travel before it is carried (less is a click).
+const TAB_DRAG_THRESHOLD: f32 = 6.0;
 
 pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let t = app.tokens;
@@ -68,13 +72,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };
-    // With the find bar open, keys go to the bar: the terminal is drawn (and acts) unfocused.
-    let find = win.active_tab().and_then(|t| t.find.as_ref());
-    let style = if app.app_active && app.focused == Some(id) && find.is_none() {
-        &app.style
-    } else {
-        &app.style_unfocused
-    };
+    // With the focused pane's find bar open, keys go to the bar (see `App::pane_style`).
+    let find = win
+        .active_tab()
+        .and_then(|t| t.focused_pane().find.as_ref());
+    let style = &app.style;
     // The default background and the chrome around it take the background opacity; text,
     // cursor, selection and cells with their own background stay opaque (the terminal widget
     // draws those and leaves its default background to the container below).
@@ -85,6 +87,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let find_box = app.find_box.as_ref().filter(|f| f.window == id);
     let dialog = app.prompts.front(id);
     let modal = palette.is_some() || find_box.is_some() || dialog.is_some();
+    let carry = app.carry_in(id);
     let bar = TabBar {
         window: id,
         bar_bg,
@@ -98,6 +101,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         modal,
         demo_tip: app.demo_tip,
         bindings: &app.bindings,
+        carry,
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -107,25 +111,38 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     if let Some(n) = app.export_notice.as_ref().filter(|n| n.window == id) {
         body = body.push(crate::export::notice_view(t, bar_bg, n));
     }
-    // Only the active tab builds a terminal view; background tabs render nothing.
-    let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
-        Some(term) => {
-            let highlight = find.and_then(|bar| {
-                let alt = term
-                    .lock()
-                    .mode()
-                    .contains(fbterm_term::TermMode::ALT_SCREEN);
-                app.highlight(bar, alt)
-            });
-            let view = highlighted_terminal_view(term, style, highlight, move |o| {
-                Message::Terminal(id, o)
-            });
-            match find {
-                Some(bar) => {
-                    stack![view, crate::find::bar_view::view(t, id, bar, &app.bindings)].into()
+    // Only the active tab builds terminal views (one per pane on screen); background tabs
+    // render nothing.
+    let content: Element<'_, Message> = match win.active_tab() {
+        Some(tab) => {
+            // In the tab's own pane order, not the layout's: moving a tile then keeps each
+            // pane's widget state (find field, selection drag) with its pane.
+            let shown = tab.visible_panes();
+            let panes = tab
+                .panes
+                .iter()
+                .filter(|pane| shown.contains(&pane.id))
+                .map(|pane| (pane.id, pane_view(app, id, tab, pane)))
+                .collect();
+            let incoming = match carry {
+                Some(Carry::Tab(source)) => {
+                    win.tabs
+                        .iter()
+                        .find(|t| t.id == source)
+                        .map(|from| crate::tiles::Incoming {
+                            tab: source,
+                            mergeable: source != tab.id,
+                            layout: from.layout.clone(),
+                        })
                 }
-                None => view,
-            }
+                _ => None,
+            };
+            // The minimum pane size is measured in the focused pane's cells, as for splits.
+            let cell = app
+                .grids
+                .get(&tab.focused)
+                .map(|g| Size::new(g.cell_width, g.cell_height));
+            crate::tiles::tiles(t, id, tab, panes, !modal, incoming, cell)
         }
         None if win.tabs.is_empty() => container(
             text("No shells found. Add a profile in profiles.toml.")
@@ -152,8 +169,22 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let covered = Mode::Blocked {
         toggles: dialog.is_none(),
     };
-    let base = Element::new(Shortcuts {
+    // A carried tab follows the pointer over the whole window.
+    let ghost = match carry {
+        Some(Carry::Tab(source)) => win
+            .tabs
+            .iter()
+            .find(|tab| tab.id == source)
+            .map(|tab| tab.title().to_owned()),
+        _ => None,
+    };
+    let body = Element::new(Carried {
         content: body.into(),
+        ghost,
+        tokens: t,
+    });
+    let base = Element::new(Shortcuts {
+        content: body,
         window: id,
         mode: if modal {
             covered
@@ -198,6 +229,41 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         }));
     }
     layers.into()
+}
+
+/// One pane's terminal, with its find bar over its top right while open.
+fn pane_view<'a>(
+    app: &'a App,
+    id: window::Id,
+    tab: &'a Tab,
+    pane: &'a Pane,
+) -> Element<'a, Message> {
+    let Some(term) = pane.terminal() else {
+        return text("").into();
+    };
+    let find = pane.find.as_ref();
+    let highlight = find.and_then(|bar| {
+        let alt = term
+            .lock()
+            .mode()
+            .contains(fbterm_term::TermMode::ALT_SCREEN);
+        app.highlight(bar, alt)
+    });
+    let pid = pane.id;
+    let view = highlighted_terminal_view(
+        term,
+        Cow::Owned(app.pane_style(id, tab, pane)),
+        highlight,
+        move |o| Message::Terminal(id, pid, o),
+    );
+    match find {
+        Some(bar) => stack![
+            view,
+            crate::find::bar_view::view(app.tokens, id, bar, &app.bindings)
+        ]
+        .into(),
+        None => view,
+    }
 }
 
 fn to_color(c: fbterm_config::Rgb) -> Color {
@@ -245,6 +311,8 @@ struct TabBar<'b> {
     demo_tip: Option<DemoTip>,
     /// The chords tooltips name.
     bindings: &'b Bindings,
+    /// A tab or tile being dragged in this window.
+    carry: Option<Carry>,
 }
 
 fn tab_bar<'a>(
@@ -325,12 +393,19 @@ fn tab_bar<'a>(
         .height(height)
         .align_y(Alignment::End);
     let bar = Element::new(BarBackground {
+        window,
+        ids: tabs.iter().map(|t| t.id).collect(),
+        carry: tabs_bar.carry,
+        modal,
         content: bar.into(),
         color: bar_bg,
         hole: (active < tabs.len()).then_some(active),
         tokens: t,
         around: tabs_bar.around,
-        tabs: tabs.iter().map(|t| (t.accent, t.accent_style)).collect(),
+        tabs: tabs
+            .iter()
+            .map(|t| (t.accent(), t.accent_style()))
+            .collect(),
         scale: tabs_bar.scale,
     });
     chrome::title_bar(bar, modal, move |a| Message::TitleBar(window, a))
@@ -507,7 +582,17 @@ fn corners(hole: Rectangle, radius: f32) -> [Corner; 2] {
 /// Paints the tab bar's background everywhere except under the active tab (child `hole` of
 /// the bar's row), which draws its own, and its flares; and the inactive tabs' backgrounds
 /// (hover, tint), kept off the flares.
+///
+/// It also turns a press on a tab that travels `TAB_DRAG_THRESHOLD` into a tab drag (a shorter
+/// one stays a click), reports the tab a carried tab hovers, and takes a tile dropped on the
+/// bar as a new tab at the gap nearest the pointer.
 struct BarBackground<'a> {
+    window: window::Id,
+    /// Each tab's id, in row order.
+    ids: Vec<TabId>,
+    carry: Option<Carry>,
+    /// The palette or a dialog covers the window: no tab drags.
+    modal: bool,
     content: Element<'a, Message>,
     color: Color,
     hole: Option<usize>,
@@ -519,7 +604,158 @@ struct BarBackground<'a> {
     scale: f32,
 }
 
+/// A press on a tab button, until its release.
+struct TabPress {
+    index: usize,
+    origin: Point,
+    /// Travelled past the threshold: the tab is carried, the release is no click.
+    dragging: bool,
+}
+
+#[derive(Default)]
+struct BarState {
+    press: Option<TabPress>,
+    /// The tab button a carried tab hovers, as last reported.
+    over: Option<usize>,
+    /// Where a carried tile would become a tab, as last drawn.
+    gap: Option<usize>,
+}
+
+/// The tab buttons' bounds: the first `n` children of the bar's row (container -> row).
+fn tab_rects(layout: Layout<'_>, n: usize) -> Vec<Rectangle> {
+    layout
+        .children()
+        .next()
+        .map(|row| row.children().take(n).map(|tab| tab.bounds()).collect())
+        .unwrap_or_default()
+}
+
+/// Where a tile dropped at `p` becomes a tab: before the tab whose left half is under `p`,
+/// after the one whose right half is, else at the nearest gap. Over its own tab (`own`):
+/// nowhere.
+fn tab_gap(buttons: &[Rectangle], own: Option<usize>, p: Point) -> Option<usize> {
+    if let Some(i) = buttons.iter().position(|r| r.contains(p)) {
+        if Some(i) == own {
+            return None;
+        }
+        return Some(if p.x < buttons[i].center_x() {
+            i
+        } else {
+            i + 1
+        });
+    }
+    Some(
+        buttons
+            .iter()
+            .position(|r| p.x < r.center_x())
+            .unwrap_or(buttons.len()),
+    )
+}
+
+impl BarBackground<'_> {
+    fn publish(&self, shell: &mut Shell<'_, Message>, msg: DragMsg) {
+        shell.publish(Message::Drag(self.window, msg));
+    }
+
+    /// The tab-drag side of `event`. Returns `true` when the content must not see where the
+    /// pointer is (the release that ends a tab drag is no click on a button).
+    fn drag_event(
+        &self,
+        state: &mut BarState,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        let bounds = layout.bounds();
+        let buttons = tab_rects(layout, self.ids.len());
+        let under = |p: Point| buttons.iter().position(|r| r.contains(p));
+        let tile = matches!(self.carry, Some(Carry::Tile(_)));
+        // A tile drag that ended elsewhere (Escape) leaves no gap behind.
+        if !tile && state.gap.take().is_some() {
+            shell.request_redraw();
+        }
+        let gap = |p: Option<Point>| {
+            p.filter(|_| tile)
+                .and_then(|p| tab_gap(&buttons, self.hole, p))
+        };
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                state.press = cursor
+                    .position_over(bounds)
+                    .filter(|_| !self.modal)
+                    .and_then(|p| {
+                        under(p).map(|index| TabPress {
+                            index,
+                            origin: p,
+                            dragging: false,
+                        })
+                    });
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if let (Some(press), Some(p)) = (&mut state.press, cursor.position()) {
+                    if !press.dragging && p.distance(press.origin) >= TAB_DRAG_THRESHOLD {
+                        press.dragging = true;
+                        if let Some(id) = self.ids.get(press.index) {
+                            shell.publish(Message::Drag(self.window, DragMsg::StartTab(*id)));
+                        }
+                    }
+                    if press.dragging && matches!(self.carry, Some(Carry::Tab(_))) {
+                        let over = cursor
+                            .position_over(bounds)
+                            .and_then(under)
+                            .filter(|i| *i != press.index);
+                        if over != state.over {
+                            state.over = over;
+                            self.publish(shell, DragMsg::OverTab(over));
+                        }
+                    }
+                }
+                let at = gap(cursor.position_over(bounds));
+                if at != state.gap {
+                    state.gap = at;
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.gap.take().is_some() {
+                    shell.request_redraw();
+                }
+                if let Some(TabPress { dragging: true, .. }) = state.press.take() {
+                    state.over = None;
+                    self.publish(shell, DragMsg::End);
+                    return true;
+                }
+                if let (Some(Carry::Tile(pane)), Some(index)) =
+                    (self.carry, gap(cursor.position_over(bounds)))
+                {
+                    self.publish(shell, DragMsg::TileToTab { pane, index });
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused) => {
+                if let Some(TabPress { dragging: true, .. }) = state.press.take() {
+                    self.publish(shell, DragMsg::End);
+                }
+                state.over = None;
+                if state.gap.take().is_some() {
+                    shell.request_redraw();
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+}
+
 impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<BarState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(BarState::default())
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -566,6 +802,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        let state = tree.state.downcast_mut::<BarState>();
+        // The button pressed at the start of a drag is let go without a click: it sees the
+        // release with no pointer over it.
+        let cursor = if self.drag_event(state, event, layout, cursor, shell) {
+            mouse::Cursor::Unavailable
+        } else {
+            cursor
+        };
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -607,17 +851,11 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
     ) {
         use iced::advanced::Renderer as _;
         let bounds = layout.bounds();
-        // container -> row -> tabs
-        let tab_bounds: Vec<Rectangle> = layout
-            .children()
-            .next()
-            .map(|row| {
-                row.children()
-                    .take(self.tabs.len())
-                    .map(|tab| snap_rect(tab.bounds(), self.scale))
-                    .collect()
-            })
-            .unwrap_or_default();
+        let buttons = tab_rects(layout, self.tabs.len());
+        let tab_bounds: Vec<Rectangle> = buttons
+            .iter()
+            .map(|tab| snap_rect(*tab, self.scale))
+            .collect();
         let hole = self
             .hole
             .and_then(|i| tab_bounds.get(i).copied())
@@ -731,6 +969,205 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
             cursor,
             viewport,
         );
+        // A carried tile: a violet bar in the gap where it would become a tab.
+        let state = tree.state.downcast_ref::<BarState>();
+        if let (Some(Carry::Tile(_)), Some(gap)) = (self.carry, state.gap) {
+            let x = match buttons.get(gap) {
+                Some(next) => next.x - 2.0,
+                None => buttons.last().map_or(bounds.x, |r| r.x + r.width),
+            };
+            let height = buttons.first().map_or(bounds.height, |r| r.height);
+            let marker = snap_rect(
+                Rectangle {
+                    x,
+                    y: bounds.y + bounds.height - height,
+                    width: 2.0,
+                    height,
+                },
+                self.scale,
+            );
+            renderer.with_layer(bounds, |renderer| {
+                renderer.fill_quad(quad(marker, Border::default()), self.tokens.accent);
+            });
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+/// The window's content; while a tab is carried, its title follows the pointer.
+struct Carried<'a> {
+    content: Element<'a, Message>,
+    /// The carried tab's title.
+    ghost: Option<String>,
+    tokens: &'static Tokens,
+}
+
+/// The carried tab's size, and where it hangs from the pointer.
+const GHOST_SIZE: Size = Size::new(180.0, 28.0);
+const GHOST_GRIP: Vector = Vector::new(-24.0, -14.0);
+
+impl Widget<Message, iced::Theme, iced::Renderer> for Carried<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        // The ghost follows the pointer: a move redraws while a tab is carried.
+        if self.ghost.is_some() && matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. })) {
+            shell.request_redraw();
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        if self.ghost.is_some() {
+            return mouse::Interaction::Grabbing;
+        }
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        use iced::advanced::Renderer as _;
+        use iced::advanced::text::{self, Renderer as _};
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+        let (Some(title), Some(p)) = (&self.ghost, cursor.position()) else {
+            return;
+        };
+        let t = self.tokens;
+        let bounds = layout.bounds();
+        let r = Rectangle::new(p + GHOST_GRIP, GHOST_SIZE);
+        renderer.with_layer(bounds, |renderer| {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: r,
+                    border: Border {
+                        color: t.accent,
+                        width: 1.0,
+                        radius: TAB_RADIUS.into(),
+                    },
+                    snap: true,
+                    ..renderer::Quad::default()
+                },
+                t.raised,
+            );
+            let inner = Rectangle {
+                x: r.x + 12.0,
+                width: r.width - 24.0,
+                ..r
+            };
+            renderer.fill_text(
+                text::Text {
+                    content: title.clone(),
+                    bounds: inner.size(),
+                    size: Pixels(12.5),
+                    line_height: text::LineHeight::default(),
+                    font: UI_FONT,
+                    align_x: text::Alignment::Left,
+                    align_y: iced::alignment::Vertical::Center,
+                    shaping: text::Shaping::Advanced,
+                    wrapping: text::Wrapping::None,
+                },
+                Point::new(inner.x, inner.center_y()),
+                t.text,
+                inner,
+            );
+        });
     }
 
     fn overlay<'b>(
@@ -776,7 +1213,7 @@ fn tab_button<'a>(
 ) -> Element<'a, Message> {
     let window = bar.window;
     let demo_tip = index == 0 && bar.demo_tip == Some(DemoTip::Close);
-    let (accent, accent_style, around) = (tab.accent, tab.accent_style, bar.around);
+    let (accent, accent_style, around) = (tab.accent(), tab.accent_style(), bar.around);
     let radius = tab_radius(bar.scale);
     let idle = look(t, accent, accent_style, active, false, around);
     let stripe = container(text(""))
@@ -790,7 +1227,7 @@ fn tab_button<'a>(
             },
             ..container::Style::default()
         });
-    let label = text(tab.title.as_str())
+    let label = text(tab.title())
         .font(UI_FONT)
         .size(12.5)
         .wrapping(text::Wrapping::None)
@@ -799,26 +1236,29 @@ fn tab_button<'a>(
         .on_press(Message::TabBar(window, TabBarMsg::Close(index)))
         .padding(3)
         .style(move |_, status| ghost(t, status));
-    // The shortcut closes the active tab only, so only its button names it.
+    // The shortcut closes the active tab only, so only its button names it, and only while the
+    // tab is one pane: in a split tab the chord closes the focused pane, the button the tab.
     let close = tip(
         t,
         close,
-        if active {
+        if active && tab.panes.len() == 1 {
             tooltip_text("Close tab", Action::CloseTab, bar.bindings)
         } else {
             "Close tab".to_owned()
         },
         demo_tip,
     );
-    let inner = row![
-        stripe,
-        dot(state_color(t, &tab.state)),
-        container(label).width(Length::Fill).clip(true),
-        close
-    ]
-    .spacing(8)
-    .height(Length::Fill)
-    .align_y(Alignment::Center);
+    let mut inner = row![stripe, dot(state_color(t, tab.state()))];
+    // A background pane that lost its session: a second dot, the theme's warning color.
+    if tab.trouble() {
+        inner = inner.push(dot(t.warning));
+    }
+    let inner = inner
+        .push(container(label).width(Length::Fill).clip(true))
+        .push(close)
+        .spacing(8)
+        .height(Length::Fill)
+        .align_y(Alignment::Center);
     button(inner)
         .on_press(Message::TabBar(window, TabBarMsg::Select(index)))
         .width(Length::Fixed(196.0))
@@ -1039,6 +1479,215 @@ mod tests {
                 }
                 assert!((f.square.y + f.square.height - (tab.y + tab.height)).abs() < 1e-3);
             }
+        }
+    }
+
+    mod press_path {
+        use iced::advanced::clipboard;
+        use iced::advanced::widget::Tree;
+        use iced::{Pixels, Point};
+
+        use super::*;
+        use crate::layout::PaneId;
+        use crate::windows::{Carry, DragMsg};
+
+        const SIZE: Size = Size::new(1000.0, 40.0);
+
+        fn press() -> Event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        }
+
+        fn release() -> Event {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        }
+
+        fn moved(p: Point) -> Event {
+            Event::Mouse(mouse::Event::CursorMoved { position: p })
+        }
+
+        fn tabs() -> Vec<Tab> {
+            ["one", "two", "three"]
+                .iter()
+                .map(|n| Tab::single(Pane::new(fbterm_config::ProfileId::new(), *n, None)))
+                .collect()
+        }
+
+        /// Runs `steps` (an event and the pointer position) through a tab bar of `tabs` (the
+        /// first active) while `carry` is under way; `steps` gets each tab button's bounds.
+        /// Returns the messages published.
+        fn drive(
+            tabs: &[Tab],
+            carry: Option<Carry>,
+            steps: impl FnOnce(&[Rectangle]) -> Vec<(Event, Point)>,
+        ) -> Vec<Message> {
+            let bindings = Bindings::defaults(cfg!(target_os = "macos"));
+            let t = &crate::theme::DARK;
+            let bar = TabBar {
+                window: window::Id::unique(),
+                bar_bg: t.surface,
+                around: Surroundings {
+                    terminal: Color::BLACK,
+                    bar: t.surface,
+                    opacity: 1.0,
+                },
+                scale: 1.0,
+                fullscreen: false,
+                modal: false,
+                demo_tip: None,
+                bindings: &bindings,
+                carry,
+            };
+            let mut element = tab_bar(t, bar, tabs, 0);
+            let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+                iced::Font::DEFAULT,
+                Pixels(16.0),
+            ));
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, SIZE),
+            );
+            // title bar -> background -> container -> row -> tabs
+            let buttons: Vec<Rectangle> = Layout::new(&node)
+                .children()
+                .next()
+                .expect("the row")
+                .children()
+                .take(tabs.len())
+                .map(|l| l.bounds())
+                .collect();
+            let viewport = Rectangle::with_size(SIZE);
+            let mut messages = Vec::new();
+            for (event, at) in steps(&buttons) {
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Available(at),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+            }
+            messages
+        }
+
+        fn selects(messages: &[Message]) -> Vec<usize> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::TabBar(_, TabBarMsg::Select(i)) => Some(*i),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn drags(messages: &[Message]) -> Vec<DragMsg> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::Drag(_, d) => Some(d.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn tab_click_still_selects() {
+            let tabs = tabs();
+            let messages = drive(&tabs, None, |b| {
+                let at = b[1].center();
+                // A hair of travel is still a click.
+                let near = Point::new(at.x + 3.0, at.y + 2.0);
+                vec![
+                    (moved(at), at),
+                    (press(), at),
+                    (moved(near), near),
+                    (release(), near),
+                ]
+            });
+            assert_eq!(selects(&messages), [1]);
+            assert!(drags(&messages).is_empty(), "{messages:?}");
+            assert!(
+                !messages.iter().any(|m| matches!(m, Message::TitleBar(..))),
+                "a press on a tab never drags the window"
+            );
+        }
+
+        #[test]
+        fn tab_drag_starts_after_six_pixels() {
+            let tabs = tabs();
+            let id = tabs[1].id;
+            let messages = drive(&tabs, None, |b| {
+                let at = b[1].center();
+                let near = Point::new(at.x, at.y + 5.9);
+                let far = Point::new(at.x, at.y + 6.0);
+                vec![
+                    (press(), at),
+                    (moved(near), near),
+                    (moved(far), far),
+                    (release(), at),
+                ]
+            });
+            // Exactly 6 px starts it (5.9 did not: it is the first drag message).
+            assert_eq!(drags(&messages)[0], DragMsg::StartTab(id));
+            assert_eq!(drags(&messages).len(), 2, "start and end only");
+            assert!(selects(&messages).is_empty(), "a drag is not a click");
+
+            // While carried, the tab under the pointer is reported (not the carried one).
+            let messages = drive(&tabs, Some(Carry::Tab(id)), |b| {
+                let at = b[1].center();
+                let over = b[2].center();
+                vec![
+                    (press(), at),
+                    (
+                        moved(Point::new(at.x + 10.0, at.y)),
+                        Point::new(at.x + 10.0, at.y),
+                    ),
+                    (moved(over), over),
+                    (release(), over),
+                ]
+            });
+            let drags = drags(&messages);
+            assert!(drags.contains(&DragMsg::OverTab(Some(2))), "{drags:?}");
+            assert!(!drags.contains(&DragMsg::OverTab(Some(1))), "{drags:?}");
+            assert_eq!(drags.last(), Some(&DragMsg::End));
+            assert!(
+                selects(&messages).is_empty(),
+                "dropping on a tab is not a click"
+            );
+        }
+
+        #[test]
+        fn a_tile_dropped_on_the_bar_becomes_a_tab_there() {
+            let tabs = tabs();
+            let pane = PaneId(77);
+            let dropped = |x: fn(&[Rectangle]) -> Point| {
+                drags(&drive(&tabs, Some(Carry::Tile(pane)), |b| {
+                    let p = x(b);
+                    vec![(moved(p), p), (release(), p)]
+                }))
+            };
+            // The right half of tab 1: after it.
+            assert_eq!(
+                dropped(|b| Point::new(b[1].x + b[1].width * 0.75, b[1].center_y())),
+                [DragMsg::TileToTab { pane, index: 2 }]
+            );
+            // The left half of tab 2: before it.
+            assert_eq!(
+                dropped(|b| Point::new(b[2].x + 5.0, b[2].center_y())),
+                [DragMsg::TileToTab { pane, index: 2 }]
+            );
+            // Past the last tab: at the end.
+            assert_eq!(
+                dropped(|b| Point::new(b[2].x + b[2].width + 200.0, b[2].center_y())),
+                [DragMsg::TileToTab { pane, index: 3 }]
+            );
+            // Its own tab (the active one): nothing.
+            assert_eq!(dropped(|b| b[0].center()), []);
         }
     }
 

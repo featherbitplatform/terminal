@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 
 use crate::app::Delivered;
 use crate::redact::Redacted;
+use crate::tabs::TabId;
 
 /// Identifies one question for the lifetime of the process.
 pub type PromptId = u64;
@@ -163,6 +164,8 @@ pub enum PromptMsg {
     /// Enter: submit a secret (ignored by the other dialogs).
     Submit(window::Id),
     Copy(String),
+    /// Close the tab the shown close confirmation names.
+    CloseTab(window::Id),
 }
 
 /// A dialog waiting in a window's queue.
@@ -175,6 +178,8 @@ pub enum Dialog {
     },
     /// A refused, changed host key: explained, never accepted.
     Changed { host: String, port: u16 },
+    /// Closing a whole tab that has `panes` panes, more than one of them live: asked first.
+    CloseTab { tab: TabId, panes: usize },
     Secret {
         profile: String,
         kind: SecretKind,
@@ -243,7 +248,7 @@ impl Dialog {
                     let _ = r.send(None);
                 }
             }
-            Self::Changed { .. } => {}
+            Self::Changed { .. } | Self::CloseTab { .. } => {}
         }
     }
 }
@@ -340,6 +345,25 @@ impl PromptQueues {
         {
             let _ = r.send(Some(SecretAnswer { value, remember }));
         }
+    }
+
+    /// Take the shown close confirmation off the queue: the tab to close. Other dialogs are
+    /// left alone.
+    pub fn confirm_close(&mut self, window: window::Id) -> Option<TabId> {
+        let Some(Dialog::CloseTab { tab, .. }) = self.front(window) else {
+            return None;
+        };
+        let tab = *tab;
+        self.pop(window);
+        Some(tab)
+    }
+
+    /// Whether `window` already asks about closing `tab`.
+    pub fn has_close(&self, window: window::Id, tab: TabId) -> bool {
+        self.0.get(&window).is_some_and(|q| {
+            q.iter()
+                .any(|p| matches!(&p.dialog, Dialog::CloseTab { tab: t, .. } if *t == tab))
+        })
     }
 
     /// Whether `window` already has a changed-key dialog for this host.
