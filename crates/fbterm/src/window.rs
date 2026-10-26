@@ -76,12 +76,16 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let find = win
         .active_tab()
         .and_then(|t| t.focused_pane().find.as_ref());
-    let style = &app.style;
     // The default background and the chrome around it take the background opacity; text,
     // cursor, selection and cells with their own background stay opaque (the terminal widget
-    // draws those and leaves its default background to the container below).
+    // draws those and leaves its default background to the container below, and the tiles
+    // to each pane's scheme where it differs). The container and the active tab's fade into
+    // it take the focused pane's scheme.
     let opacity = app.settings.background_opacity;
-    let term_bg = to_color(style.scheme.background).scale_alpha(opacity);
+    let focused_bg = win.active_tab().map_or(app.style.scheme.background, |tab| {
+        app.pane_background(tab.focused_pane())
+    });
+    let term_bg = to_color(focused_bg).scale_alpha(opacity);
     let bar_bg = t.surface.scale_alpha(opacity);
     let palette = app.palettes.get(&id);
     let find_box = app.find_box.as_ref().filter(|f| f.window == id);
@@ -92,7 +96,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         window: id,
         bar_bg,
         around: Surroundings {
-            terminal: to_color(style.scheme.background),
+            terminal: to_color(focused_bg),
             bar: t.surface,
             opacity,
         },
@@ -122,7 +126,10 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 .panes
                 .iter()
                 .filter(|pane| shown.contains(&pane.id))
-                .map(|pane| (pane.id, pane_view(app, id, tab, pane)))
+                .map(|pane| {
+                    let bg = to_color(app.pane_background(pane));
+                    (pane.id, pane_view(app, id, tab, pane), bg)
+                })
                 .collect();
             let incoming = match carry {
                 Some(Carry::Tab(source)) => {
@@ -142,7 +149,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 .grids
                 .get(&tab.focused)
                 .map(|g| Size::new(g.cell_width, g.cell_height));
-            crate::tiles::tiles(t, id, tab, panes, !modal, incoming, cell)
+            let ground = crate::tiles::Ground {
+                under: to_color(focused_bg),
+                opacity,
+            };
+            crate::tiles::tiles(t, id, tab, panes, ground, !modal, incoming, cell)
         }
         None if win.tabs.is_empty() => container(
             text("No shells found. Add a profile in profiles.toml.")
@@ -247,7 +258,7 @@ fn pane_view<'a>(
             .lock()
             .mode()
             .contains(fbterm_term::TermMode::ALT_SCREEN);
-        app.highlight(bar, alt)
+        app.highlight(bar, alt, app.pane_background(pane))
     });
     let pid = pane.id;
     let view = highlighted_terminal_view(

@@ -217,6 +217,7 @@ fn a_hand_edit_of_profiles_replaces_them_and_keeps_open_tabs() {
     let _ = app.update(Message::ConfigChanged(Changed {
         profiles: true,
         settings: false,
+        schemes: false,
     }));
     assert!(app.profiles.get(b.id).is_some());
     assert!(app.profiles_error.is_none());
@@ -232,6 +233,7 @@ fn a_broken_edit_keeps_the_previous_profiles_and_goes_read_only_until_fixed() {
     let changed = Changed {
         profiles: true,
         settings: false,
+        schemes: false,
     };
 
     let broken = "[[profiles]\nname = 1\n";
@@ -279,6 +281,7 @@ fn a_change_event_for_text_we_already_have_is_ignored() {
     let _ = app.update(Message::ConfigChanged(Changed {
         profiles: true,
         settings: false,
+        schemes: false,
     }));
     assert_eq!(
         app.profiles.profiles.len(),
@@ -294,6 +297,7 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
     std::fs::write(
         paths.settings(),
@@ -343,6 +347,7 @@ fn kitty_keyboard_setting_reaches_open_and_new_terminals() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
     std::fs::write(paths.settings(), "kitty_keyboard = true\n").unwrap();
     let _ = app.update(Message::ConfigChanged(changed));
@@ -377,6 +382,7 @@ fn out_of_range_settings_apply_clamped_and_say_so() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
     std::fs::write(
         paths.settings(),
@@ -516,6 +522,7 @@ fn toml_lowering_trims_and_sets_notice() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
 
     // Raising applies at once and says nothing.
@@ -581,6 +588,7 @@ fn lowering_in_two_tabs_says_plural_with_separators() {
     let _ = app.update(Message::ConfigChanged(Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     }));
     assert_eq!(
         app.settings_notice.as_deref(),

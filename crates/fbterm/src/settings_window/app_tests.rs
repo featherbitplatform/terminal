@@ -10,6 +10,7 @@ use crate::watch::Changed;
 const SETTINGS_CHANGED: Changed = Changed {
     profiles: false,
     settings: true,
+    schemes: false,
 };
 
 fn app() -> (App, Paths) {

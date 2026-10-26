@@ -163,7 +163,7 @@ pub enum Message {
     WindowMode(window::Id, window::Mode),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
     SaveState(u64),
-    /// `profiles.toml` and/or `settings.toml` changed on disk.
+    /// `profiles.toml`, `settings.toml` and/or a file in `schemes/` changed on disk.
     ConfigChanged(Changed),
 }
 
@@ -268,6 +268,12 @@ pub struct App {
     pub(crate) settings_seen: Option<String>,
     /// The banner line for a `settings.toml` that failed to load.
     pub(crate) settings_notice: Option<String>,
+    /// Every color scheme: the built-ins and the files in `schemes/`.
+    pub schemes: fbterm_config::schemes::SchemeSet,
+    /// The scheme files that did not load, as banner lines.
+    pub(crate) scheme_errors: Vec<String>,
+    /// The banner lines about schemes now in `notices` (see `App::refresh_scheme_notices`).
+    pub(crate) scheme_notices: Vec<String>,
     /// Terminals of tabs the user closed that a session task still holds; the release is
     /// requested when `SessionEvent::Released` shows the last holder let go (`windows.rs`).
     pub(crate) pending_release: Vec<Vec<crate::memory::WeakTerminal>>,
@@ -411,6 +417,7 @@ impl App {
         } else {
             restore::plan(&saved, &profiles)
         };
+        let (schemes, scheme_errors) = crate::schemes::load(&paths.schemes());
         let profiles_seen = std::fs::read_to_string(paths.profiles()).ok();
         let settings_seen = std::fs::read_to_string(paths.settings()).ok();
 
@@ -481,6 +488,9 @@ impl App {
             profiles_seen,
             settings_seen,
             settings_notice,
+            schemes,
+            scheme_errors,
+            scheme_notices: Vec::new(),
             pending_release: Vec::new(),
             app_active: true,
             style,
@@ -502,6 +512,7 @@ impl App {
             os_scales: HashMap::new(),
         };
         app.update_output_rate();
+        app.refresh_scheme_notices();
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -841,13 +852,17 @@ impl App {
                 Task::none()
             }
             Message::ConfigChanged(changed) => {
+                let mut tasks = Vec::new();
+                if changed.schemes {
+                    tasks.push(self.reload_schemes());
+                }
                 if changed.profiles {
                     self.profiles_file_changed();
                 }
                 if changed.settings {
-                    return self.settings_file_changed();
+                    tasks.push(self.settings_file_changed());
                 }
-                Task::none()
+                Task::batch(tasks)
             }
             Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),

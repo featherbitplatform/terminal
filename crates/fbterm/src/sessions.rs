@@ -119,6 +119,8 @@ pub(crate) fn session_stream(
 }
 
 impl App {
+    /// A terminal with the settings applied, in Graphite's colors; [`App::start`] gives it its
+    /// pane's scheme.
     pub(crate) fn new_terminal(&self, grid: GridSize) -> SharedTerminal {
         let mut term = Terminal::new(grid, self.settings.scrollback_lines);
         term.set_kitty_keyboard(self.settings.kitty_keyboard);
@@ -137,7 +139,14 @@ impl App {
             .get(&wid)
             .and_then(|w| w.locate(id).map(|(t, p)| w.tabs[t].panes[p].profile))
             .and_then(|p| self.profiles.get(p).cloned());
-        let scheme = self.style.scheme;
+        let Some(scheme) = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.locate(id).map(|(t, p)| &w.tabs[t].panes[p]))
+            .map(|pane| self.scheme_colors(pane))
+        else {
+            return Task::none();
+        };
         let Some(pane) = self.windows.get_mut(&wid).and_then(|w| {
             let (t, p) = w.locate(id)?;
             w.tabs[t].panes.get_mut(p)
@@ -160,6 +169,8 @@ impl App {
             }
             None => (fresh_terminal, true),
         };
+        // New or continued, local or remote: the pane's scheme as it is now.
+        scheme.apply_to(&mut terminal.lock());
         pane.title = pane.name.clone();
         pane.placeholder = Some(terminal.clone());
         let Some(profile) = profile else {
@@ -171,9 +182,6 @@ impl App {
             ProfileKind::Local(local) => {
                 match spawn_local_into(local, terminal, events) {
                     Ok(handle) => {
-                        if fresh {
-                            scheme.apply_to(&mut handle.terminal.lock());
-                        }
                         pane.session = Some(handle);
                         pane.placeholder = None;
                         pane.state = TabState::Connected;
@@ -741,7 +749,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod pane_tests {
+pub(crate) mod pane_tests {
     use fbterm_term::GridSize;
     use iced::{Size, window};
 
@@ -831,7 +839,7 @@ mod pane_tests {
     }
 
     #[cfg(unix)]
-    mod unix {
+    pub(crate) mod unix {
         use std::time::{Duration, Instant};
 
         use fbterm_config::{LocalProfile, Paths, ProfileId};
@@ -847,12 +855,12 @@ mod pane_tests {
         use crate::tabs::{self, Pane, Tab, TabState, WindowState};
         use crate::tiles::TilesMsg;
 
-        type Sink = tokio::sync::mpsc::UnboundedSender<(
+        pub(crate) type Sink = tokio::sync::mpsc::UnboundedSender<(
             fbterm_session::SessionId,
             fbterm_session::SessionEvent,
         )>;
 
-        fn shell(script: &str, tx: Sink) -> SessionHandle {
+        pub(crate) fn shell(script: &str, tx: Sink) -> SessionHandle {
             let local = LocalProfile {
                 program: "/bin/sh".into(),
                 args: vec!["-c".into(), script.into()],
@@ -862,14 +870,14 @@ mod pane_tests {
             fbterm_session::spawn_local(&local, crate::app::DEFAULT_GRID, 100, tx).expect("spawn")
         }
 
-        fn connected(name: &str, session: SessionHandle) -> Pane {
+        pub(crate) fn connected(name: &str, session: SessionHandle) -> Pane {
             let mut pane = Pane::new(ProfileId::new(), name, None);
             pane.session = Some(session);
             pane.state = TabState::Connected;
             pane
         }
 
-        fn screen(term: &SharedTerminal) -> String {
+        pub(crate) fn screen(term: &SharedTerminal) -> String {
             let t = term.lock();
             let size = t.size();
             let grid = t.term().grid();
@@ -941,7 +949,7 @@ mod pane_tests {
             }
         }
 
-        fn wait_for(term: &SharedTerminal, text: &str) {
+        pub(crate) fn wait_for(term: &SharedTerminal, text: &str) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while !screen(term).contains(text) {
                 assert!(

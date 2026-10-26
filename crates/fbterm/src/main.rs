@@ -54,6 +54,9 @@ mod redact;
 mod restore;
 #[cfg(test)]
 mod restore_tests;
+mod schemes;
+#[cfg(test)]
+mod schemes_tests;
 mod sessions;
 mod settings_window;
 mod shortcuts;

@@ -51,11 +51,16 @@ fn focus(input: &iced::widget::Id) -> Task<Message> {
 }
 
 impl App {
-    /// The search highlight for a pane's bar: matches tinted violet, the current one in the
-    /// accent.
+    /// The search highlight for a pane's bar: matches tinted violet over the pane's
+    /// `background`, the current one in the accent.
     /// `alt`: the terminal shows the alternate screen now; the current match is only drawn when
     /// it was found on the same screen.
-    pub(crate) fn highlight(&self, bar: &FindBar, alt: bool) -> Option<fbterm_term::Highlight> {
+    pub(crate) fn highlight(
+        &self,
+        bar: &FindBar,
+        alt: bool,
+        background: fbterm_config::Rgb,
+    ) -> Option<fbterm_term::Highlight> {
         let to_rgb = |c: iced::Color| {
             let [r, g, b, _] = c.into_rgba8();
             fbterm_config::Rgb { r, g, b }
@@ -64,7 +69,7 @@ impl App {
         Some(fbterm_term::Highlight {
             pattern: bar.pattern()?.clone(),
             current: bar.current_match().filter(|_| bar.alt_screen == alt),
-            match_bg: blend(accent, self.style.scheme.background, 0.38),
+            match_bg: blend(accent, background, 0.38),
             current_bg: accent,
             current_fg: fbterm_config::Rgb {
                 r: 255,

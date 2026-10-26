@@ -30,7 +30,7 @@ use crate::windows::DragMsg;
 const SLOP: f32 = 2.0;
 /// Two presses on a divider within this time equalize its split.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// Alpha of the terminal background laid over the panes that do not have focus.
+/// Alpha of a pane's own background laid over it when it does not have focus.
 const DIM: f32 = 0.35;
 /// Depth of the band along the content's outer edge that drops a tile as a whole row or column.
 const EDGE_BAND: f32 = 24.0;
@@ -272,21 +272,46 @@ pub struct Incoming {
     pub layout: Layout,
 }
 
-/// Lays `panes` (the views of `tab.visible_panes()`, in any order) out at their rectangles
-/// of the tab's layout. `focused_outline`: nothing modal covers the tiles, so (when the tab
-/// shows more than one pane) the focus outline is drawn and tiles can be picked up.
-/// `incoming`: a tab carried over the window, which may be dropped on these tiles.
+/// What the panes are painted on: the window paints `under` (the focused pane's scheme
+/// background) behind the tiles at `opacity`; a pane whose scheme has another background gets
+/// its own, at the same opacity. Below full opacity that pane lies over the window's
+/// background too, so it shows through a little less.
+#[derive(Debug, Clone, Copy)]
+pub struct Ground {
+    pub under: Color,
+    pub opacity: f32,
+}
+
+/// Lays `panes` (the views of `tab.visible_panes()`, in any order, each with its scheme's
+/// background) out at their rectangles of the tab's layout. `focused_outline`: nothing modal
+/// covers the tiles, so (when the tab shows more than one pane) the focus outline is drawn and
+/// tiles can be picked up. `incoming`: a tab carried over the window, which may be dropped on
+/// these tiles.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site, each argument distinct"
+)]
 pub fn tiles<'a>(
     t: &'static Tokens,
     window: window::Id,
     tab: &'a Tab,
-    panes: Vec<(PaneId, Element<'a, Message>)>,
+    panes: Vec<(PaneId, Element<'a, Message>, Color)>,
+    ground: Ground,
     focused_outline: bool,
     incoming: Option<Incoming>,
     cell: Option<Size>,
 ) -> Element<'a, Message> {
-    let (ids, children) = panes.into_iter().unzip();
+    let mut ids = Vec::with_capacity(panes.len());
+    let mut children = Vec::with_capacity(panes.len());
+    let mut backgrounds = Vec::with_capacity(panes.len());
+    for (id, child, bg) in panes {
+        ids.push(id);
+        children.push(child);
+        backgrounds.push(bg);
+    }
     Element::new(Tiles {
+        backgrounds,
+        ground: Some(ground),
         t,
         window,
         layout: tab.shown_layout(),
@@ -311,6 +336,10 @@ struct Tiles<'a> {
     focused: PaneId,
     ids: Vec<PaneId>,
     children: Vec<Element<'a, Message>>,
+    /// Each pane's scheme background (opaque), in `ids` order.
+    backgrounds: Vec<Color>,
+    /// What the window paints behind the tiles; none paints no pane backgrounds.
+    ground: Option<Ground>,
     outline: bool,
     incoming: Option<Incoming>,
     /// The cell size the minimum pane size is measured in (the focused pane's).
@@ -1002,21 +1031,6 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
         viewport: &Rectangle,
     ) {
         use iced::advanced::Renderer as _;
-        for ((child, state), layout) in self
-            .children
-            .iter()
-            .zip(&tree.children)
-            .zip(layout.children())
-        {
-            child
-                .as_widget()
-                .draw(state, renderer, theme, style, layout, cursor, viewport);
-        }
-        let bounds = layout.bounds();
-        if !self.several() {
-            self.draw_incoming(tree, renderer, bounds);
-            return;
-        }
         let fill = |renderer: &mut iced::Renderer, bounds: Rectangle, color: Color| {
             renderer.fill_quad(
                 renderer::Quad {
@@ -1027,15 +1041,40 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                 color,
             );
         };
+        for (i, ((child, state), layout)) in self
+            .children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .enumerate()
+        {
+            // A pane whose scheme differs from what the window paints behind the tiles gets
+            // its own background (the terminal draws none of its own).
+            if let Some(ground) = self.ground
+                && let Some(&bg) = self.backgrounds.get(i)
+                && bg != ground.under
+            {
+                fill(renderer, layout.bounds(), bg.scale_alpha(ground.opacity));
+            }
+            child
+                .as_widget()
+                .draw(state, renderer, theme, style, layout, cursor, viewport);
+        }
+        let bounds = layout.bounds();
+        if !self.several() {
+            self.draw_incoming(tree, renderer, bounds);
+            return;
+        }
         // Over the panes' text, so in a layer of its own; one pixel wider for the outline.
         renderer.with_layer(bounds.expand(1.0), |renderer| {
-            let dim = self.t.terminal.scale_alpha(DIM);
             let mut focused = None;
-            for (id, placed) in self.ids.iter().zip(layout.children()) {
+            for (i, (id, placed)) in self.ids.iter().zip(layout.children()).enumerate() {
                 if *id == self.focused {
                     focused = Some(placed.bounds());
                 } else {
-                    fill(renderer, placed.bounds(), dim);
+                    // Each pane dims towards its own background.
+                    let bg = self.backgrounds.get(i).copied().unwrap_or(self.t.terminal);
+                    fill(renderer, placed.bounds(), bg.scale_alpha(DIM));
                 }
             }
             for d in self.layout.dividers(bounds) {
@@ -1481,6 +1520,8 @@ mod tests {
                 focused: PaneId(1),
                 ids,
                 children,
+                backgrounds: Vec::new(),
+                ground: None,
                 outline: true,
                 incoming,
                 cell: None,
@@ -1581,6 +1622,8 @@ mod tests {
                     focused: PaneId(1),
                     ids,
                     children,
+                    backgrounds: Vec::new(),
+                    ground: None,
                     outline: true,
                     incoming: None,
                     cell: None,

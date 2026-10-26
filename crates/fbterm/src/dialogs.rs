@@ -168,13 +168,15 @@ impl App {
         }
     }
 
-    /// The profile store changed: open palettes list the new names, panes take new names and
-    /// accents (they keep their sessions; they refer to profiles by id).
+    /// The profile store changed: open palettes list the new names, panes take new names,
+    /// accents and color schemes (they keep their sessions; they refer to profiles by id), and
+    /// the panes whose scheme changed are recolored.
     fn profiles_changed(&mut self) {
         let items = palette::items(&self.profiles);
         for state in self.palettes.values_mut() {
             state.set_items(items.clone(), &self.recency);
         }
+        let before = self.pane_colors();
         for w in self.windows.values_mut() {
             for pane in w.tabs.iter_mut().flat_map(|t| &mut t.panes) {
                 if let Some(p) = self.profiles.get(pane.profile) {
@@ -184,9 +186,11 @@ impl App {
                     pane.name = p.name.clone();
                     pane.accent = p.accent;
                     pane.accent_style = p.accent_style;
+                    pane.scheme.clone_from(&p.color_scheme);
                 }
             }
         }
+        self.schemes_moved(&before);
     }
 
     pub(crate) fn prompt_msg(&mut self, msg: PromptMsg) -> Task<Message> {

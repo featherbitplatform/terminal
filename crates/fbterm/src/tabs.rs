@@ -50,6 +50,8 @@ pub struct Pane {
     pub find: Option<crate::find::FindBar>,
     /// Font size steps away from the setting (0: the setting).
     pub zoom: i8,
+    /// The profile's color scheme id; none follows the global scheme (see `App::scheme_for`).
+    pub scheme: Option<String>,
 }
 
 impl Pane {
@@ -68,13 +70,15 @@ impl Pane {
             connecting: None,
             find: None,
             zoom: 0,
+            scheme: None,
         }
     }
 
-    /// A pane for a saved profile: its name, accent and accent style.
+    /// A pane for a saved profile: its name, accent, accent style and color scheme.
     pub fn for_profile(p: &Profile) -> Self {
         Self {
             accent_style: p.accent_style,
+            scheme: p.color_scheme.clone(),
             ..Self::new(p.id, p.name.clone(), p.accent)
         }
     }
