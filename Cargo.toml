@@ -1,0 +1,44 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[workspace.dependencies]
+iced = "0.14.0"
+# Terminal emulation (our fork, see LICENSES.md). Change it in the feathercritty repo, then bump the rev.
+feathercritty = { git = "https://github.com/featherbitplatform/feathercritty", rev = "bc59f0620d23f7bd95c533c6d9d588f734f96e48" }
+russh = { version = "0.64.1", default-features = false, features = ["flate2", "ring", "rsa"] }
+portable-pty = "0.9.0"
+keyring = "4.2.0"
+nucleo-matcher = "0.3.1"
+directories = "6.0.0"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+# Same major as the one `toml` uses; edits settings.toml in place.
+toml_edit = "0.22"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+serde_json = "1"
+parking_lot = "0.12"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std"] }
+png = "0.17"
+rfd = "0.17.2"
+# Tab export: gzip output, and the local time in the default file name.
+flate2 = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
