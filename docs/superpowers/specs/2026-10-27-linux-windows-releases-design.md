@@ -1,6 +1,6 @@
 # Linux and Windows releases: design
 
-Status: draft for the owner's review, 2026-10-27. First part of milestone 6 of
+Status: approved by the owner, 2026-10-27. First part of milestone 6 of
 `2026-10-23-featherbit-terminal-design.md` (sections 6 and 8), which this document refines.
 
 ## 1. Intent
