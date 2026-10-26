@@ -70,6 +70,8 @@ pub enum EditorMsg {
     Group(String),
     Accent(Option<Rgb>),
     AccentStyle(AccentStyle),
+    /// The profile's own scheme id, or `None` to follow the global one.
+    ColorScheme(Option<String>),
     Host(String),
     Port(String),
     User(String),
@@ -713,6 +715,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::Group(v), _) => d.group = v,
         (EditorMsg::Accent(v), _) => d.accent = v,
         (EditorMsg::AccentStyle(v), _) => d.accent_style = v,
+        (EditorMsg::ColorScheme(v), _) => d.color_scheme = v,
         (EditorMsg::Host(v), DraftKind::Ssh(s)) => s.host = v,
         (EditorMsg::Port(v), DraftKind::Ssh(s)) => {
             // Digits only, a valid port or empty while typing.

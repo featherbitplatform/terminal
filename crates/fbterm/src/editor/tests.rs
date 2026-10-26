@@ -602,3 +602,48 @@ fn clearing_the_accent_resets_color_as_to_the_stripe() {
             .contains("accent_style")
     );
 }
+
+#[test]
+fn editor_scheme_choice_saves_with_profile() {
+    let shell = local("zsh");
+    let mut store = ProfileStore {
+        profiles: vec![shell.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(shell.id));
+    ed.update(EditorMsg::ColorScheme(Some("ember".into())));
+    let path = file();
+    ed.save(&mut store, &path).unwrap();
+    assert_eq!(
+        store.get(shell.id).unwrap().color_scheme.as_deref(),
+        Some("ember")
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("color_scheme = \"ember\"")
+    );
+}
+
+#[test]
+fn editor_use_global_clears_override() {
+    let mut shell = local("zsh");
+    shell.color_scheme = Some("harbor".into());
+    let mut store = ProfileStore {
+        profiles: vec![shell.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(shell.id));
+    ed.update(EditorMsg::ColorScheme(None));
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(store.get(shell.id).unwrap().color_scheme, None);
+}
+
+#[test]
+fn draft_keeps_color_scheme() {
+    let mut p = ssh("web", "example.test", vec![]);
+    p.color_scheme = Some("user-1234".into());
+    let d = Draft::from_profile(&p);
+    assert_eq!(d.color_scheme.as_deref(), Some("user-1234"));
+    assert_eq!(d.to_profile().color_scheme.as_deref(), Some("user-1234"));
+}

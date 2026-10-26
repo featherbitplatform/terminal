@@ -478,3 +478,50 @@ fn lowering_scrollback_refreshes_an_open_find_bar() {
     let after = matches_in(&app, wid);
     assert!(after < before && after <= 100 + 24, "{before} -> {after}");
 }
+
+#[test]
+fn settings_scheme_choice_writes_and_applies() {
+    let (mut app, paths) = app();
+    send(&mut app, SettingsMsg::ColorScheme("ember".into()));
+    assert_eq!(app.settings.color_scheme, "ember");
+    assert_eq!(
+        Settings::load(&paths.settings()).unwrap().color_scheme,
+        "ember"
+    );
+    let (_, state) = app.settings_win.as_ref().unwrap();
+    assert_eq!(state.values.color_scheme, "ember");
+}
+
+#[test]
+fn settings_lists_builtins_first() {
+    let (app, _) = app();
+    let ids: Vec<_> = app
+        .scheme_choices(false)
+        .into_iter()
+        .map(|c| c.id.unwrap())
+        .collect();
+    assert_eq!(ids[..4], ["graphite", "graphite-light", "harbor", "ember"]);
+}
+
+#[test]
+fn lists_refresh_after_scheme_set_changes() {
+    let (mut app, paths) = app();
+    assert_eq!(app.scheme_choices(false).len(), 4);
+    let mut mine = fbterm_config::schemes::builtins().remove(0);
+    mine.id = fbterm_config::schemes::new_user_id();
+    mine.name = "Mine".into();
+    mine.builtin = false;
+    fbterm_config::schemes::save_user(&paths.schemes(), &mine).unwrap();
+    let _ = app.update(Message::ConfigChanged(Changed {
+        profiles: false,
+        settings: false,
+        schemes: true,
+    }));
+    let own = app.scheme_choices(false);
+    assert_eq!(own.len(), 5);
+    assert_eq!(own[4].name, "Mine");
+    let with_global = app.scheme_choices(true);
+    assert_eq!(with_global.len(), 6);
+    assert_eq!(with_global[0].id, None);
+    assert_eq!(with_global[0].to_string(), "Use global scheme");
+}

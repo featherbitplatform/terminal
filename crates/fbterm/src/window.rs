@@ -37,11 +37,12 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         && *eid == id
     {
         let degraded = app.fallback.as_ref().is_some_and(|f| f.degraded());
+        let schemes = app.scheme_choices(true);
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id));
         }
-        let content = content.push(crate::editor::view::view(t, state, degraded));
+        let content = content.push(crate::editor::view::view(t, state, schemes, degraded));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -57,7 +58,10 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             content = content.push(crate::ui::window_header(t, id));
         }
         let notice = app.settings_notice.as_deref();
-        let content = content.push(crate::settings_window::view::view(t, state, notice));
+        let schemes = app.scheme_choices(false);
+        let content = content.push(crate::settings_window::view::view(
+            t, state, schemes, notice,
+        ));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,

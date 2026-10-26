@@ -1,12 +1,16 @@
 //! The profile editor window: profiles by group on the left, the selected one's form on the right.
 
 use fbterm_config::{AccentStyle, Rgb};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::ssh_view::{auth, jumps};
 use super::{ACCENTS, Draft, DraftKind, EditorMsg, EditorState};
 use crate::app::Message;
+use crate::schemes::SchemeChoice;
+use crate::settings_window::view::{menu_style, pick_style};
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -20,6 +24,7 @@ pub(super) fn msg(m: EditorMsg) -> Message {
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a EditorState,
+    schemes: Vec<SchemeChoice>,
     degraded: bool,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
@@ -29,7 +34,7 @@ pub fn view<'a>(
     }
     let form: Element<'a, Message> = match state.selected_draft() {
         Some(d) => scrollable(
-            container(form(t, state, d, editable, degraded))
+            container(form(t, state, d, schemes, editable, degraded))
                 .padding(Padding::from([20.0, 28.0]))
                 .max_width(FORM_WIDTH + 56.0),
         )
@@ -251,6 +256,26 @@ fn field<'a>(
     .into()
 }
 
+/// The profile's scheme list: `Use global scheme` or one scheme.
+fn scheme_pick<'a>(
+    t: &'static Tokens,
+    d: &'a Draft,
+    schemes: Vec<SchemeChoice>,
+) -> Element<'a, Message> {
+    let selected = schemes.iter().find(|c| c.id == d.color_scheme).cloned();
+    pick_list(schemes, selected, |c: SchemeChoice| {
+        msg(EditorMsg::ColorScheme(c.id))
+    })
+    .placeholder("Scheme not found")
+    .font(UI_FONT)
+    .text_size(13)
+    .padding(Padding::from([7.0, 10.0]))
+    .width(240)
+    .style(move |_, status| pick_style(t, status))
+    .menu_style(move |_| menu_style(t))
+    .into()
+}
+
 pub(super) fn input<'a>(
     t: &'static Tokens,
     placeholder: &'a str,
@@ -279,6 +304,7 @@ fn form<'a>(
     t: &'static Tokens,
     state: &'a EditorState,
     d: &'a Draft,
+    schemes: Vec<SchemeChoice>,
     editable: bool,
     degraded: bool,
 ) -> Element<'a, Message> {
@@ -315,6 +341,7 @@ fn form<'a>(
             .spacing(6),
         ]
         .spacing(24),
+        column![ui::label(t, "Color scheme"), scheme_pick(t, d, schemes)].spacing(6),
     ]
     .spacing(14)
     .width(Length::Fill);

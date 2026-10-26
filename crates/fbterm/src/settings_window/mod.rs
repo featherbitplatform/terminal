@@ -36,6 +36,8 @@ pub enum SettingsMsg {
     Release,
     Theme(ThemeMode),
     Font(FontChoice),
+    /// The id of the chosen global color scheme.
+    ColorScheme(String),
     FontSize(f32),
     FontSizeText(String),
     FontSizeSubmit,
@@ -411,6 +413,7 @@ impl SettingsState {
             },
             SettingsMsg::Theme(v) => self.change(SettingChange::Theme(v), false),
             SettingsMsg::Font(f) => self.change(SettingChange::FontFamily(f.family), false),
+            SettingsMsg::ColorScheme(id) => self.change(SettingChange::ColorScheme(id), false),
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),

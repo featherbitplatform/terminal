@@ -38,7 +38,40 @@ pub(crate) fn load(dir: &std::path::Path) -> (SchemeSet, Vec<String>) {
     (set, errors.iter().map(ToString::to_string).collect())
 }
 
+/// The first entry of the profile editor's scheme list: no override.
+pub(crate) const USE_GLOBAL: &str = "Use global scheme";
+
+/// One entry of a scheme list: a scheme (`id`), or "use the global scheme" (`None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemeChoice {
+    pub id: Option<String>,
+    pub name: String,
+}
+
+impl std::fmt::Display for SchemeChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
 impl App {
+    /// The entries of a scheme list, built-ins first (the set's order), read from the current
+    /// set each time a view is drawn so a changed `schemes/` shows at once. `with_global`
+    /// puts `Use global scheme` first (the profile editor).
+    pub(crate) fn scheme_choices(&self, with_global: bool) -> Vec<SchemeChoice> {
+        let global = with_global.then(|| SchemeChoice {
+            id: None,
+            name: USE_GLOBAL.into(),
+        });
+        global
+            .into_iter()
+            .chain(self.schemes.all().iter().map(|s| SchemeChoice {
+                id: Some(s.id.clone()),
+                name: s.name.clone(),
+            }))
+            .collect()
+    }
+
     /// The scheme `pane` uses: its own if known, else the global one if known, else Graphite.
     pub(crate) fn scheme_for(&self, pane: &Pane) -> &Scheme {
         pane.scheme

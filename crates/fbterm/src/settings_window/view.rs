@@ -11,6 +11,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
+use crate::schemes::SchemeChoice;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -24,6 +25,7 @@ fn msg(m: SettingsMsg) -> Message {
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
+    schemes: Vec<SchemeChoice>,
     notice: Option<&'a str>,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
@@ -43,7 +45,11 @@ pub fn view<'a>(
         body = body.push(read_only_banner(t, err));
     }
     body = body
-        .push(section(t, "Appearance", appearance(t, state, editable)))
+        .push(section(
+            t,
+            "Appearance",
+            appearance(t, state, schemes, editable),
+        ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
         .push(keyboard(t, state, editable));
     let page = scrollable(
@@ -185,6 +191,7 @@ fn setting<'a>(
 fn appearance<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
+    schemes: Vec<SchemeChoice>,
     editable: bool,
 ) -> Vec<Element<'a, Message>> {
     let v = &state.values;
@@ -210,6 +217,20 @@ fn appearance<'a>(
         msg(SettingsMsg::Font(f))
     })
     .font(MONO)
+    .text_size(12.5)
+    .padding(Padding::from([6.0, 10.0]))
+    .width(240)
+    .style(move |_, status| pick_style(t, status))
+    .menu_style(move |_| menu_style(t));
+    let selected = schemes
+        .iter()
+        .find(|c| c.id.as_deref() == Some(v.color_scheme.as_str()))
+        .cloned();
+    let scheme = pick_list(schemes, selected, |c: SchemeChoice| {
+        msg(SettingsMsg::ColorScheme(c.id.unwrap_or_default()))
+    })
+    .placeholder("Scheme not found")
+    .font(UI_FONT)
     .text_size(12.5)
     .padding(Padding::from([6.0, 10.0]))
     .width(240)
@@ -259,6 +280,7 @@ fn appearance<'a>(
     vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
+        setting(t, "Color scheme", None, false, scheme),
         setting(t, "Font size", None, false, size),
         setting(
             t,
@@ -873,7 +895,7 @@ fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::S
     }
 }
 
-fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
+pub(crate) fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
     let border = match status {
         pick_list::Status::Opened { .. } => t.accent_edge,
         pick_list::Status::Hovered => t.text_muted,
@@ -892,7 +914,7 @@ fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
     }
 }
 
-fn menu_style(t: &Tokens) -> iced::overlay::menu::Style {
+pub(crate) fn menu_style(t: &Tokens) -> iced::overlay::menu::Style {
     iced::overlay::menu::Style {
         background: Background::Color(t.raised),
         border: Border {
