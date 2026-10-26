@@ -240,8 +240,10 @@ Jump-chain references are exported together with the profiles they point to.
 - Terminal color scheme: built-in schemes (including a default derived from the Graphite palette)
   plus user-imported schemes *(builder's call: accept a simple TOML scheme format; supporting popular
   third-party formats is a nice-to-have)*.
-- Per-profile accent: shown on tab and pane border; a scheme override per profile is a
-  nice-to-have.
+- Per-profile accent: shown on tab and pane border (pane border in split tabs only). A scheme
+  override per profile is built too. *(Done 2026-10-27, milestone 2: built-in schemes Graphite,
+  Graphite Light, Harbor and Ember, user schemes as TOML files, the Color schemes window, global
+  and per-profile choice; see `2026-10-27-color-schemes-design.md`.)*
 - *(Owner's decision, 2026-10-23)* **Unified title bar on macOS.** The tab bar is the title bar:
   the OS title strip is transparent and hidden, the content runs under it, the native window
   buttons stay and sit vertically centered on the bar (32 px high, tabs start 78 px in, at the
@@ -447,7 +449,7 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    keychain password), jump hosts, host-key checks, profile editor, quick-launch palette, settings
    file, Graphite theme, CI (macOS + Linux + Windows build/test), unsigned macOS `.dmg` (Apple
    Silicon and Intel) on GitHub releases, docs site skeleton on GitHub Pages.
-2. Tiling, per-profile accent, color schemes, find in scrollback (find in scrollback done
+2. Tiling, per-profile accent, color schemes, find in scrollback (milestone 2 done 2026-10-27; color schemes and pane accent borders: see 5.10 and `2026-10-27-color-schemes-design.md`; find in scrollback done
    2026-10-24, with a search over all tabs; see 5.12; tiling done 2026-10-26, see 5.6 and
    `2026-10-26-tiling-design.md`; measurements in `dev/perf/README.md`, scenario H).
 3. Tunnels.
