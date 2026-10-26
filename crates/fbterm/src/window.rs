@@ -153,7 +153,12 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 .filter(|pane| shown.contains(&pane.id))
                 .map(|pane| {
                     let bg = to_color(app.pane_background(pane));
-                    (pane.id, pane_view(app, id, tab, pane), bg)
+                    (
+                        pane.id,
+                        pane_view(app, id, tab, pane),
+                        bg,
+                        pane.accent.map(to_color),
+                    )
                 })
                 .collect();
             let incoming = match carry {
