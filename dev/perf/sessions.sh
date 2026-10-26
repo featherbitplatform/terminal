@@ -14,6 +14,9 @@
 #   F  as E with short lines (16 characters)
 #   G  as E, then at SOAK_E s the app closes 19 of the 20 tabs (--perf-close-after) and RSS is
 #      read 10 s later
+#   H  one tab with 4 panes, every pane streaming the system log (--perf-panes 4); H-tabs is
+#      the comparison: 4 tabs, every tab streaming, the last one visible. No gate: it shows
+#      what splitting costs against the same streams in background tabs
 # Every run records RSS and, on macOS, footprint (`footprint <pid>`, phys_footprint: includes
 # GPU memory that RSS misses); footprint is `na` where the tool is missing.
 # The window must stay visible and unoccluded during runs (a hidden window may not render).
@@ -28,7 +31,8 @@ TABS=${TABS:-20}
 WARMUP=${WARMUP:-30}
 SAMPLE=${SAMPLE:-10}
 RUNS=${RUNS:-3}
-SCENARIOS=${SCENARIOS:-A B C D E F G}
+SCENARIOS=${SCENARIOS:-A B C D E F G H Ht}
+PANES=${PANES:-4}
 SOAK_E=${SOAK_E:-120}
 BIN=target/release/fbterm
 
@@ -93,8 +97,9 @@ run_one() {
   local closeflag=(); [ -n "$closeafter" ] && closeflag=(--perf-close-after "$closeafter")
   CFG=$(mktemp -d)
   local load; load=$(uptime | sed 's/.*load averages*: //')
+  local unit=--perf-tabs; [ -n "${PERF_PANES_MODE:-}" ] && unit=--perf-panes
   local cmd="if [ \"\$FBTERM_PERF_TAB\" -lt \"\$FBTERM_PERF_TABS\" ]; then $idle; else $vis; fi"
-  FBTERM_CONFIG_DIR="$CFG" "$BIN" --perf-tabs "$tabs" --perf-cmd "$cmd" \
+  FBTERM_CONFIG_DIR="$CFG" "$BIN" "$unit" "$tabs" --perf-cmd "$cmd" \
     --perf-exit-after $((warm + SAMPLE + 60)) "${closeflag[@]+"${closeflag[@]}"}" 2>"$CFG/stderr" &
   PID=$!
   sleep "$warm"
@@ -132,6 +137,8 @@ for s in $SCENARIOS; do
       E) run_one E all-full-scrollback "$TABS" "$FILL" "$FILL" "$SOAK_E" ;;
       F) run_one F all-full-short-lines "$TABS" "$FILL_SHORT" "$FILL_SHORT" "$SOAK_E" ;;
       G) run_one G full-then-19-closed "$TABS" "$FILL" "$FILL" $((SOAK_E + 10)) "$SOAK_E" ;;
+      H) PERF_PANES_MODE=1 run_one H one-tab-streaming-panes "$PANES" "$STREAM" "$STREAM" "$WARMUP" ;;
+      Ht) run_one Ht streaming-tabs "$PANES" "$STREAM" "$STREAM" "$WARMUP" ;;
     esac
   done
 done

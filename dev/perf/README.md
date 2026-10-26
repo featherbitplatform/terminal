@@ -11,7 +11,8 @@ idle CPU near zero. The numbers may be retuned after measuring.
   one window, each running the command through the user's shell (`$SHELL -c`), the last tab
   active (each shell gets `FBTERM_PERF_TAB` and `FBTERM_PERF_TABS`). The flag implies no session restore, no state saving and in-memory secrets (no
   keychain). It works in release builds. `--perf-exit-after` quits the app cleanly; `--perf-close-after <secs>` closes every tab but the
-  active one after that long (scenario G).
+  active one after that long (scenario G). `--perf-panes <N>` (instead of `--perf-tabs`) opens
+  one tab with N panes in two columns, each running the command (scenario H).
 - The script uses a temporary `FBTERM_CONFIG_DIR` (and `--perf-tabs` alone defaults to a fresh temp dir), so nothing touches a real config. No screen
   capture is involved.
 - Per run: wait 30 s (warm-up), read RSS of the fbterm process (`ps -o rss=`), then mean CPU
@@ -457,9 +458,38 @@ Paired pre-change build (`f5582a5`, no footprint column in that script), RSS MB 
 11.8, 141.0 / 11.8, 140.4 / 11.8 (load_start 8.0, 5.2, 3.9); B 103.2, 104.2, 104.5 (0.00%); D
 99.5, 101.2, 99.8 (0.00%).
 
+## Split panes (2026-10-26)
+
+Scenario H measures what splitting costs. `fbterm --perf-panes 4 --perf-cmd "<cmd>"` opens one
+tab with four panes in two columns (a 2x2 grid), each running the command; `Ht` is the same
+four streams as four tabs with only the last visible. The stream is the one of scenario A
+(`/usr/bin/log stream --style compact`, roughly 100 lines per second per stream). All
+other settings are the defaults (10,000 lines of scrollback, 60 redraws per second). 4 streams
+are 4 `log stream` processes in both cases. There is no gate for H. Release build, macOS, 30 s
+warm-up and 10 s CPU sample, 3 runs each; load averages (1 minute) at the start of the runs were
+2.9 to 3.8, as the machine was otherwise busy with background work at about 3 (`uptime`).
+
+| Scenario | fbterm RSS (MB) | footprint (MB) | fbterm CPU (%) | child shells |
+|---|---|---|---|---|
+| H, 1 tab with 4 panes, all visible | 106.3, 106.7, 107.0 | 381.4, 384.2, 373.1 | 13.3, 13.0, 13.3 | 4 (24.5 MB RSS) |
+| Ht, 4 tabs, one visible | 107.6, 107.7, 110.5 | 374.0, 374.1, 386.3 | 13.0, 12.9, 14.9 | 4 (24.4 MB RSS) |
+
+What it shows: the two layouts are within run-to-run noise of each other in CPU (about 13%) and
+in memory (about 107 MB RSS), although in H all four streams are drawn and in Ht three of the
+four are only parsed. A pane costs about what a background tab costs: its terminal and its
+scrollback. Redraws stay paced per session, so showing four streaming panes at once does not
+multiply the cost by four. For scale, scenario A (one stream, 19 idle tabs) measured 11.7% CPU
+(median) in the run above; the 4 streams here cost about 13%, but the log rate differs between
+runs, so the comparison between H and Ht is the meaningful one.
+
+```
+H  one-tab-streaming-panes  106.3 / 106.7 / 107.0 MB RSS, 13.30 / 13.00 / 13.30 % CPU
+Ht streaming-tabs           107.6 / 107.7 / 110.5 MB RSS, 13.00 / 12.90 / 14.90 % CPU
+```
+
 ## Re-running
 
 ```
-bash dev/perf/sessions.sh                      # everything, 3 runs each (about 35 minutes)
+bash dev/perf/sessions.sh                      # everything, 3 runs each (about 45 minutes)
 SCENARIOS=A RUNS=1 WARMUP=10 bash dev/perf/sessions.sh   # quick check
 ```

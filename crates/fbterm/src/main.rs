@@ -5,8 +5,8 @@
 //!   in `<dir>` instead of the platform config directory.
 //! - `FBTERM_SECRETS=memory`: keep secrets in memory only; the OS keychain is never touched.
 //!
-//! Measurement mode (works in release builds, see `perf.rs`): `--perf-tabs <N> --perf-cmd <cmd>
-//! [--perf-exit-after <secs>] [--perf-close-after <secs>]`.
+//! Measurement mode (works in release builds, see `perf.rs`): `--perf-tabs <N> | --perf-panes <N>
+//! --perf-cmd <cmd> [--perf-exit-after <secs>] [--perf-close-after <secs>]`.
 //!
 //! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
