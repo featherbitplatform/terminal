@@ -828,6 +828,56 @@ mod pool {
         assert_eq!(pool.connected_profiles(), vec![w.bastion]);
     }
 
+    /// Two panes of one password profile starting together (a restored split): one dial, one
+    /// password question (to the pane that started it), two working shells on one connection.
+    #[tokio::test]
+    async fn two_shells_same_profile_share_one_connection_and_one_password_prompt() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let mut p = ssh("bastion-pw", HOST, vec![]);
+        if let ProfileKind::Ssh(s) = &mut p.kind {
+            s.auth = AuthMethod::Password;
+        }
+        let id = p.id;
+        let store = ProfileStore { profiles: vec![p] };
+        let pool = w.pool();
+        // Each pane brings its own prompter, like the app's per-window UiPrompter.
+        let first = Script::new(true, vec![answer(PASSWORD, false)]);
+        let second = Script::new(true, vec![answer(PASSWORD, false)]);
+        let launch = |prompter: Arc<Script>| {
+            let (tx, rx): (EventSink, _) = unbounded_channel();
+            let terminal = Arc::new(parking_lot::Mutex::new(fbterm_term::Terminal::new(
+                SIZE, 1000,
+            )));
+            let pool = &pool;
+            let store = &store;
+            async move {
+                let h = tokio::time::timeout(
+                    STEP,
+                    pool.open_shell_prompting(store, &id, terminal, tx, prompter),
+                )
+                .await
+                .expect("open_shell timed out")
+                .expect("open_shell");
+                (h, rx)
+            }
+        };
+        let ((a, _ra), (b, _rb)) = tokio::join!(launch(first.clone()), launch(second.clone()));
+        assert_ne!(a.id, b.id);
+        assert_eq!(first.host_key_calls() + second.host_key_calls(), 1);
+        let secrets = first.secret_calls.lock().len() + second.secret_calls.lock().len();
+        assert_eq!(secrets, 1, "exactly one password request for both panes");
+        let (ca, cb) = (ssh_connection(&a).await, ssh_connection(&b).await);
+        assert_eq!(ca, cb, "both panes must ride the same TCP connection");
+        // `$((1+1))` keeps the echoed command line from matching the expected output.
+        run(&a, "echo pane-a-$((1+1))");
+        run(&b, "echo pane-b-$((1+1))");
+        wait_for(&a, "pane-a-2").await;
+        wait_for(&b, "pane-b-2").await;
+    }
+
     #[tokio::test]
     async fn connection_closes_after_last_tab() {
         if !enabled() {
