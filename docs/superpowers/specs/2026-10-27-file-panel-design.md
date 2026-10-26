@@ -1,6 +1,6 @@
 # File panel: design
 
-Status: draft for the owner's review, 2026-10-27. Milestone 4 of
+Status: approved by the owner, 2026-10-27. Milestone 4 of
 `2026-10-23-featherbit-terminal-design.md` (section 5.8), which this document refines. Where they
 differ, this document wins for the file panel.
 
