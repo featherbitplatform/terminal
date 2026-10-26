@@ -25,14 +25,15 @@ relaunching the app.
 5. Panes, split sizes and zoom restore on relaunch, and every pane of the visible tab reconnects
    at once.
 6. Search works across panes.
+7. Tiles can be rearranged: a tab can be merged into another as a tile, a tile can be moved within
+   its tab, and a tile can be turned back into a tab, choosing where it lands each time.
 
 ## 3. Non-goals and anti-goals
 
 - **No typing into several panes at once** (no broadcast input). The owner ruled it out.
 - **No separate saved layouts** or layout presets: the arrangement simply restores on relaunch,
   like tabs today.
-- Not in this version (left for later, not ruled out): dragging panes to rearrange them, moving a
-  pane to another tab or window, turning a pane into a tab.
+- Not in this version (left for later, not ruled out): moving tabs or tiles between windows.
 - Anti-goals, a failure even if tiling works:
   - Tabs without splits must behave exactly as today (one pane, same look, same shortcuts, same
     restore).
@@ -56,6 +57,25 @@ relaunching the app.
 | Close | Cmd+W closes the focused pane; closing the last pane closes the tab. A pane whose program exits stays open with its notice, as tabs do today. |
 | Tab title and color | The tab shows the focused pane's profile name, state and accent. |
 | Shortcuts | All of the above are actions in `fbterm-config/src/keys.rs`, shown in the palette and the Settings Keyboard section, rebindable. |
+
+Rearranging *(owner-approved, 2026-10-26)*:
+
+- **Merge a tab into another:** drag a tab from the tab bar onto another tab's content. While
+  hovering, a violet preview shows where it will land; dropping makes the dragged tab's pane
+  (or all its panes, keeping their arrangement) a tile of the target tab, and the dragged tab
+  disappears from the bar.
+- **Drop on a tile's edge** (left, right, top, bottom): that tile is split in half and the new
+  tile takes the half on that side.
+- **Drop on the outer edge of the tab's area:** the new tile takes a whole full-height column or
+  full-width row on that side; the existing tiles shrink proportionally to make room.
+- **Move a tile within its tab:** pick it up by a small handle that appears when hovering the
+  tile (or by dragging with a modifier held; builder's call which, possibly both) and drop it
+  with the same two kinds of targets.
+- **Tile back to a tab:** drag a tile onto the tab bar; it becomes its own tab at that position.
+- **Keyboard:** the palette offers "Merge tab into...", "Move tile..." and "Move tile to new tab",
+  with the same choices of target (which tile, which side, or a whole row or column).
+- Sessions keep running through every rearrangement: no reconnect, scrollback intact; each moved
+  pane gets the new size of its rectangle.
 
 Search:
 
