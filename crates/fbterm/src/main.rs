@@ -10,7 +10,10 @@
 //!
 //! Debug builds only (ignored in release builds):
 //! - `FBTERM_OPEN_TABS=<name>,<name>`: also open these profiles (by name) in the first window.
-//!   Runs with this set (or `FBTERM_SCREENSHOT`) never write `state.toml`.
+//!   Runs with this set (or `FBTERM_SPLITS`, `FBTERM_SCREENSHOT`) never write `state.toml`.
+//! - `FBTERM_SPLITS=<layout>`: replace the first window's first tab with split panes of these
+//!   profiles (by name): `|` side by side, `/` stacked, binding left to right with equal
+//!   halves, e.g. `A|B/C` (`A` beside `B`, both above `C`).
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
@@ -56,6 +59,7 @@ mod shortcuts;
 mod tab_look;
 mod tabs;
 mod theme;
+mod tiles;
 mod tooltip;
 mod ui;
 mod visibility;

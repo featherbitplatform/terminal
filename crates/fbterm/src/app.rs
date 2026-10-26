@@ -77,7 +77,11 @@ impl<T> std::fmt::Debug for Delivered<T> {
 #[derive(Debug, Clone)]
 pub enum Message {
     Session(SessionId, SessionEvent),
-    Terminal(window::Id, TerminalOutput),
+    Terminal(window::Id, PaneId, TerminalOutput),
+    /// Focus, divider drags and the area of a window's panes.
+    Tiles(window::Id, crate::tiles::TilesMsg),
+    /// A pane's resize quiet period passed; applies if no newer resize came (its generation).
+    ResizeSettled(PaneId, u64),
     /// Tab-bar and shortcut actions act on the focused window.
     NewTab,
     CloseTab(usize),
@@ -211,7 +215,14 @@ pub struct App {
     /// The refresh rate of the display each terminal window is on, where known.
     pub(crate) display_rates: HashMap<window::Id, Option<u32>>,
     pub windows: BTreeMap<window::Id, WindowState>,
-    pub(crate) grids: HashMap<window::Id, GridSize>,
+    /// Each pane's grid as its view last laid it out.
+    pub(crate) grids: HashMap<PaneId, GridSize>,
+    /// The area each terminal window lays its panes out in, as last drawn.
+    pub(crate) areas: HashMap<window::Id, iced::Size>,
+    /// Session resizes waiting for their quiet period: generation and grid, by pane.
+    pub(crate) pending_resizes: HashMap<PaneId, (u64, GridSize)>,
+    /// Counts pane resizes, so only the last of a burst reaches the session.
+    pub(crate) resize_generation: u64,
     /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
     /// Open quick-launch palettes, by window.
@@ -436,6 +447,9 @@ impl App {
             display_rates: HashMap::new(),
             windows: BTreeMap::new(),
             grids: HashMap::new(),
+            areas: HashMap::new(),
+            pending_resizes: HashMap::new(),
+            resize_generation: 0,
             focused: None,
             palettes: Palettes::new(),
             find_box: None,
@@ -446,6 +460,7 @@ impl App {
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
             recency: Recency::from(saved.recency),
             state_saving_enabled: debug_env("FBTERM_OPEN_TABS").is_none()
+                && debug_env("FBTERM_SPLITS").is_none()
                 && debug_env("FBTERM_SCREENSHOT").is_none()
                 && crate::perf::opts().is_none(),
             quitting: false,
@@ -486,6 +501,7 @@ impl App {
             None => app.restore_windows(&plan),
         };
         task = task.chain(app.open_debug_tabs());
+        task = task.chain(app.open_debug_splits());
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
         task = task.chain(app.open_debug_settings());
@@ -600,7 +616,12 @@ impl App {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Session(id, event) => self.session_event(id, event),
-            Message::Terminal(wid, output) => self.terminal_output(wid, output),
+            Message::Terminal(wid, pane, output) => self.terminal_output(wid, pane, output),
+            Message::Tiles(wid, msg) => self.tiles_msg(wid, msg),
+            Message::ResizeSettled(pane, generation) => {
+                self.resize_settled(pane, generation);
+                Task::none()
+            }
             Message::NewTab => self.action(None, Action::NewTab),
             Message::CloseTab(i) => match self.focused_window() {
                 Some(wid) => self.close_tab(wid, i),
@@ -720,6 +741,12 @@ impl App {
                     .get(&id)
                     .map(|w| crate::memory::weak_terminals(w.tabs.iter().flat_map(|t| &t.panes)))
                     .unwrap_or_default();
+                let gone: Vec<PaneId> = self
+                    .windows
+                    .get(&id)
+                    .map(|w| w.tabs.iter().flat_map(|t| &t.panes).map(|p| p.id).collect())
+                    .unwrap_or_default();
+                self.forget_panes(&gone);
                 let was_terminal = self.windows.remove(&id).is_some();
                 visibility::unwatch(id);
                 display_rate::unwatch(id);
@@ -735,7 +762,7 @@ impl App {
                     self.close_find_all();
                 }
                 self.prompts.remove_window(id);
-                self.grids.remove(&id);
+                self.areas.remove(&id);
                 if self.export_notice.as_ref().is_some_and(|n| n.window == id) {
                     self.export_notice = None;
                 }

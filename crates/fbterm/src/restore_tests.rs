@@ -691,9 +691,11 @@ fn remote_history_clear_never_requests_release() {
     assert_eq!(term.lock().history_len(), 0);
     // The app handles output for the window of the tab whose history was cleared.
     let wid = *app.windows.keys().next().unwrap();
+    let pane = app.windows[&wid].tabs[0].focused;
     let size = term.lock().size();
     let _ = app.update(Message::Terminal(
         wid,
+        pane,
         fbterm_term::TerminalOutput::Resized(size),
     ));
     assert_eq!(

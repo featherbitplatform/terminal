@@ -11,18 +11,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use iced::{Rectangle, Size};
 
 /// Fewest columns a pane may be squeezed to.
-#[allow(dead_code)]
 pub const MIN_COLS: u16 = 20;
 /// Fewest rows a pane may be squeezed to.
-#[allow(dead_code)]
 pub const MIN_ROWS: u16 = 5;
 /// Logical pixels between two panes: the visible line is 1 px centred, the rest is hit area.
-#[allow(dead_code)]
 pub const DIVIDER: f32 = 4.0;
 
-#[allow(dead_code)]
 const MIN_RATIO: f32 = 0.05;
-#[allow(dead_code)]
 const MAX_RATIO: f32 = 0.95;
 #[allow(dead_code)]
 const EPS: f32 = 0.5;
@@ -75,10 +70,8 @@ pub enum Drop {
 }
 
 /// From the root: `false` = first child, `true` = second. Names a split.
-#[allow(dead_code)]
 pub type Path = Vec<bool>;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Divider {
     pub path: Path,
@@ -319,6 +312,29 @@ impl Layout {
         self.set_ratio(path, 0.5);
     }
 
+    /// The axis and the rectangle of the split at `path`, laid out in `area`.
+    pub fn split_area(&self, area: Rectangle, path: &Path) -> Option<(Axis, Rectangle)> {
+        let mut node = self;
+        let mut area = area;
+        for &second in path {
+            let Layout::Split {
+                axis,
+                ratio,
+                first,
+                second: s,
+            } = node
+            else {
+                return None;
+            };
+            let (a, _, b) = cut(area, *axis, *ratio);
+            (node, area) = if second { (&**s, b) } else { (&**first, a) };
+        }
+        match node {
+            Layout::Split { axis, .. } => Some((*axis, area)),
+            Layout::Pane(_) => None,
+        }
+    }
+
     /// The pane next to `from` in `dir`: overlapping on the other axis, nearest edge first;
     /// ties go to the earliest in `recent`, then reading order.
     pub fn neighbour(
@@ -375,7 +391,6 @@ impl Layout {
     }
 }
 
-#[allow(dead_code)]
 enum Node {
     Pane(PaneId, Rectangle),
     Divider(Path, Axis, Rectangle),
@@ -388,7 +403,6 @@ fn span(a: f32, alen: f32, b: f32, blen: f32) -> f32 {
 }
 
 /// Cuts `area` into first, divider and second.
-#[allow(dead_code)]
 fn cut(area: Rectangle, axis: Axis, ratio: f32) -> (Rectangle, Rectangle, Rectangle) {
     let total = match axis {
         Axis::Row => area.width,
@@ -604,6 +618,21 @@ mod tests {
             join(Axis::Row, 0.5, pane(2), pane(3)),
         );
         assert_eq!(l.neighbour(a, p(1), Dir::Right, &[p(3)]), Some(p(2)));
+    }
+
+    #[test]
+    fn split_area_follows_the_path() {
+        let l = join(
+            Axis::Row,
+            0.5,
+            pane(1),
+            join(Axis::Column, 0.5, pane(2), pane(3)),
+        );
+        assert_eq!(l.split_area(area(), &vec![]), Some((Axis::Row, area())));
+        let (axis, r) = l.split_area(area(), &vec![true]).unwrap();
+        assert_eq!(axis, Axis::Column);
+        assert!(near(r.x, 502.0) && near(r.width, 498.0) && near(r.height, 600.0));
+        assert_eq!(l.split_area(area(), &vec![false]), None);
     }
 
     #[test]

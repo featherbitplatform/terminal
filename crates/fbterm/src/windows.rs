@@ -91,6 +91,8 @@ impl App {
             return Task::none();
         };
         let freed = crate::memory::weak_terminals(closed.tab.panes.iter());
+        let gone: Vec<_> = closed.tab.panes.iter().map(|p| p.id).collect();
+        self.forget_panes(&gone);
         drop(closed.tab);
         self.save_state();
         self.release_closed(freed);

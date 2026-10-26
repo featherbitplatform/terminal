@@ -214,13 +214,8 @@ impl App {
 
     /// The focused pane of `wid`'s active tab resized: its bar searches again, keeping its
     /// match when only the rows changed (see [`FindBar::resized`]).
-    pub(crate) fn find_resized(&mut self, wid: window::Id) -> Task<Message> {
-        let Some(pane) = self
-            .windows
-            .get_mut(&wid)
-            .and_then(WindowState::active_tab_mut)
-            .map(Tab::focused_pane_mut)
-        else {
+    pub(crate) fn find_resized(&mut self, pane: PaneId) -> Task<Message> {
+        let Some((_, pane)) = self.pane_mut(pane) else {
             return Task::none();
         };
         let Some(term) = pane.terminal().cloned() else {

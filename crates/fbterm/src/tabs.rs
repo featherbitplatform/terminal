@@ -49,7 +49,6 @@ pub struct Pane {
     /// The find bar, while open.
     pub find: Option<crate::find::FindBar>,
     /// Font size steps away from the setting (0: the setting).
-    #[allow(dead_code)] // read by per-pane zoom (tiling task 3)
     pub zoom: i8,
 }
 
@@ -146,6 +145,14 @@ impl Tab {
         match self.maximized {
             Some(id) if self.layout.contains(id) => vec![id],
             _ => self.layout.panes(),
+        }
+    }
+
+    /// The layout as drawn: the whole tree, or just the maximized pane.
+    pub fn shown_layout(&self) -> Layout {
+        match self.maximized {
+            Some(id) if self.layout.contains(id) => Layout::Pane(id),
+            _ => self.layout.clone(),
         }
     }
 

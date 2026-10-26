@@ -1,5 +1,6 @@
 //! One window's view: tab bar, notices and the active tab's terminal.
 
+use std::borrow::Cow;
 use std::path::Path;
 
 use fbterm_term::highlighted_terminal_view;
@@ -19,7 +20,7 @@ use crate::keys::{Action, Bindings};
 use crate::palette;
 use crate::shortcuts::{Mode, Shortcuts};
 use crate::tab_look::{Surroundings, look};
-use crate::tabs::{Tab, TabState};
+use crate::tabs::{Pane, Tab, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
 use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_USERS, ICON_X, icon};
@@ -68,15 +69,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };
-    // With the find bar open, keys go to the bar: the terminal is drawn (and acts) unfocused.
+    // With the focused pane's find bar open, keys go to the bar (see `App::pane_style`).
     let find = win
         .active_tab()
         .and_then(|t| t.focused_pane().find.as_ref());
-    let style = if app.app_active && app.focused == Some(id) && find.is_none() {
-        &app.style
-    } else {
-        &app.style_unfocused
-    };
+    let style = &app.style;
     // The default background and the chrome around it take the background opacity; text,
     // cursor, selection and cells with their own background stay opaque (the terminal widget
     // draws those and leaves its default background to the container below).
@@ -109,25 +106,17 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     if let Some(n) = app.export_notice.as_ref().filter(|n| n.window == id) {
         body = body.push(crate::export::notice_view(t, bar_bg, n));
     }
-    // Only the active tab builds a terminal view; background tabs render nothing.
-    let content: Element<'_, Message> = match win.active_tab().and_then(Tab::terminal) {
-        Some(term) => {
-            let highlight = find.and_then(|bar| {
-                let alt = term
-                    .lock()
-                    .mode()
-                    .contains(fbterm_term::TermMode::ALT_SCREEN);
-                app.highlight(bar, alt)
-            });
-            let view = highlighted_terminal_view(term, style, highlight, move |o| {
-                Message::Terminal(id, o)
-            });
-            match find {
-                Some(bar) => {
-                    stack![view, crate::find::bar_view::view(t, id, bar, &app.bindings)].into()
-                }
-                None => view,
-            }
+    // Only the active tab builds terminal views (one per pane on screen); background tabs
+    // render nothing.
+    let content: Element<'_, Message> = match win.active_tab() {
+        Some(tab) => {
+            let panes = tab
+                .visible_panes()
+                .into_iter()
+                .filter_map(|pid| tab.pane(pid))
+                .map(|pane| (pane.id, pane_view(app, id, tab, pane)))
+                .collect();
+            crate::tiles::tiles(t, id, tab, panes, !modal)
         }
         None if win.tabs.is_empty() => container(
             text("No shells found. Add a profile in profiles.toml.")
@@ -200,6 +189,41 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         }));
     }
     layers.into()
+}
+
+/// One pane's terminal, with its find bar over its top right while open.
+fn pane_view<'a>(
+    app: &'a App,
+    id: window::Id,
+    tab: &'a Tab,
+    pane: &'a Pane,
+) -> Element<'a, Message> {
+    let Some(term) = pane.terminal() else {
+        return text("").into();
+    };
+    let find = pane.find.as_ref();
+    let highlight = find.and_then(|bar| {
+        let alt = term
+            .lock()
+            .mode()
+            .contains(fbterm_term::TermMode::ALT_SCREEN);
+        app.highlight(bar, alt)
+    });
+    let pid = pane.id;
+    let view = highlighted_terminal_view(
+        term,
+        Cow::Owned(app.pane_style(id, tab, pane)),
+        highlight,
+        move |o| Message::Terminal(id, pid, o),
+    );
+    match find {
+        Some(bar) => stack![
+            view,
+            crate::find::bar_view::view(app.tokens, id, bar, &app.bindings)
+        ]
+        .into(),
+        None => view,
+    }
 }
 
 fn to_color(c: fbterm_config::Rgb) -> Color {

@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use fbterm_config::{Profile, ProfileKind};
 use fbterm_session::ssh::SshError;
@@ -19,7 +19,8 @@ use crate::app::{App, DEFAULT_GRID, Delivered, Message};
 use crate::layout::PaneId;
 use crate::pacing::{OUTPUT_FPS, OutputRate, Pacer};
 use crate::prompts::UiPrompter;
-use crate::tabs::{self, InputRoute, Pane, Tab, TabState, WindowState};
+use crate::tabs::{self, InputRoute, Pane, TabState, WindowState};
+use crate::tiles::TilesMsg;
 
 type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
 
@@ -127,7 +128,7 @@ impl App {
 
     /// (Re)start a pane's session: spawn a local program, or dial an SSH profile.
     pub(crate) fn start(&mut self, wid: window::Id, id: PaneId) -> Task<Message> {
-        let grid = self.grids.get(&wid).copied().unwrap_or(DEFAULT_GRID);
+        let grid = self.initial_grid(wid, id);
         tracing::info!(pane = id.0, "starting pane");
         let fresh_terminal = self.new_terminal(grid);
         let events = self.events.clone();
@@ -306,16 +307,15 @@ impl App {
     pub(crate) fn terminal_output(
         &mut self,
         wid: window::Id,
+        pane: PaneId,
         output: TerminalOutput,
     ) -> Task<Message> {
         match output {
             TerminalOutput::Input(bytes) => {
-                let Some(pane) = self
-                    .windows
-                    .get_mut(&wid)
-                    .and_then(WindowState::active_tab_mut)
-                    .map(Tab::focused_pane_mut)
-                else {
+                let Some(pane) = self.windows.get_mut(&wid).and_then(|w| {
+                    let (t, p) = w.locate(pane)?;
+                    w.tabs[t].panes.get_mut(p)
+                }) else {
                     return Task::none();
                 };
                 match tabs::route_input(&pane.state, &bytes) {
@@ -334,16 +334,9 @@ impl App {
                 }
             }
             TerminalOutput::Resized(grid) => {
-                self.grids.insert(wid, grid);
-                if let Some(s) = self
-                    .windows
-                    .get(&wid)
-                    .and_then(WindowState::active_tab)
-                    .and_then(|t| t.focused_pane().session.as_ref())
-                {
-                    s.resize(grid);
-                }
-                self.find_resized(wid)
+                self.grids.insert(pane, grid);
+                let settle = self.pane_resized(pane, grid);
+                Task::batch([settle, self.find_resized(pane)])
             }
             // The widget already put the text on the clipboard.
             TerminalOutput::Copy(_) => Task::none(),
@@ -352,6 +345,162 @@ impl App {
                 Task::none()
             }
         }
+    }
+}
+
+/// Quiet period after a pane's last resize before its session hears of it: dragging a divider
+/// or a window edge resizes on every frame, and each remote resize makes the program redraw.
+const RESIZE_SETTLE: Duration = Duration::from_millis(100);
+
+impl App {
+    /// The grid a pane's new terminal starts at. A pane that was laid out keeps its grid; a new
+    /// one (a new tab, or a split) gets the grid of its rectangle in the window's last known
+    /// area, with the cell size of the tab's focused pane (else of any laid-out pane of the
+    /// window). Before the window has laid out: `DEFAULT_GRID`.
+    pub(crate) fn initial_grid(&self, wid: window::Id, pane: PaneId) -> GridSize {
+        if let Some(g) = self.grids.get(&pane) {
+            return *g;
+        }
+        let Some(window) = self.windows.get(&wid) else {
+            return DEFAULT_GRID;
+        };
+        let Some((t, _)) = window.locate(pane) else {
+            return DEFAULT_GRID;
+        };
+        let tab = &window.tabs[t];
+        let cell = self.grids.get(&tab.focused).or_else(|| {
+            window
+                .tabs
+                .iter()
+                .flat_map(|t| &t.panes)
+                .find_map(|p| self.grids.get(&p.id))
+        });
+        let (Some(cell), Some(area)) = (cell, self.areas.get(&wid)) else {
+            return DEFAULT_GRID;
+        };
+        let rect = tab
+            .shown_layout()
+            .rects(iced::Rectangle::with_size(*area))
+            .into_iter()
+            .find(|(id, _)| *id == pane);
+        match rect {
+            Some((_, r)) => fbterm_term::grid_size_from_bounds(
+                r.size(),
+                iced::Size::new(cell.cell_width, cell.cell_height),
+            ),
+            None => DEFAULT_GRID,
+        }
+    }
+
+    /// A pane's view resized its terminal to `grid`. The session gets the latest grid once no
+    /// newer one came for `RESIZE_SETTLE` (or at once when a divider drag ends).
+    pub(crate) fn pane_resized(&mut self, pane: PaneId, grid: GridSize) -> Task<Message> {
+        self.resize_generation += 1;
+        let generation = self.resize_generation;
+        self.pending_resizes.insert(pane, (generation, grid));
+        Task::perform(
+            async { tokio::time::sleep(RESIZE_SETTLE).await },
+            move |()| Message::ResizeSettled(pane, generation),
+        )
+    }
+
+    /// The quiet period of a pane's resize `generation` passed.
+    pub(crate) fn resize_settled(&mut self, pane: PaneId, generation: u64) {
+        match self.pending_resizes.get(&pane) {
+            Some((g, grid)) if *g == generation => {
+                let grid = *grid;
+                self.pending_resizes.remove(&pane);
+                self.resize_session(pane, grid);
+            }
+            _ => {}
+        }
+    }
+
+    /// Hand every waiting resize of `wid`'s panes to its session now.
+    fn flush_resizes(&mut self, wid: window::Id) {
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        let ready: Vec<(PaneId, GridSize)> = self
+            .pending_resizes
+            .iter()
+            .filter(|(id, _)| window.locate(**id).is_some())
+            .map(|(id, (_, grid))| (*id, *grid))
+            .collect();
+        for (pane, grid) in ready {
+            self.pending_resizes.remove(&pane);
+            self.resize_session(pane, grid);
+        }
+    }
+
+    fn resize_session(&self, pane: PaneId, grid: GridSize) {
+        let session = self.windows.values().find_map(|w| {
+            let (t, p) = w.locate(pane)?;
+            w.tabs[t].panes[p].session.as_ref()
+        });
+        if let Some(s) = session {
+            s.resize(grid);
+        }
+    }
+
+    /// Panes that closed: forget their sizes.
+    pub(crate) fn forget_panes(&mut self, panes: &[PaneId]) {
+        for id in panes {
+            self.grids.remove(id);
+            self.pending_resizes.remove(id);
+        }
+    }
+
+    pub(crate) fn tiles_msg(&mut self, wid: window::Id, msg: TilesMsg) -> Task<Message> {
+        if let TilesMsg::Area(size) = msg {
+            self.areas.insert(wid, size);
+            return Task::none();
+        }
+        if let TilesMsg::EndDrag = msg {
+            self.flush_resizes(wid);
+            return Task::none();
+        }
+        let area = self.areas.get(&wid).copied();
+        let Some(tab) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(WindowState::active_tab_mut)
+        else {
+            return Task::none();
+        };
+        match msg {
+            TilesMsg::Focus(pane) => {
+                if tab.layout.contains(pane) && tab.focused != pane {
+                    tab.focused = pane;
+                    tab.recent.retain(|p| *p != pane);
+                    tab.recent.insert(0, pane);
+                }
+            }
+            TilesMsg::DragDivider { path, ratio } => {
+                if tab.maximized.is_some() {
+                    return Task::none();
+                }
+                let before = tab.layout.clone();
+                tab.layout.set_ratio(&path, ratio);
+                // Never squeeze a pane below the minimum: the divider stops there.
+                let cell = self.grids.get(&tab.focused).map_or(DEFAULT_GRID, |g| *g);
+                if let Some(area) = area
+                    && !tab.layout.fits(
+                        iced::Rectangle::with_size(area),
+                        iced::Size::new(cell.cell_width, cell.cell_height),
+                    )
+                {
+                    tab.layout = before;
+                }
+            }
+            TilesMsg::Equalize(path) => {
+                if tab.maximized.is_none() {
+                    tab.layout.equalize(&path);
+                }
+            }
+            TilesMsg::EndDrag | TilesMsg::Area(_) => {}
+        }
+        Task::none()
     }
 }
 
@@ -545,12 +694,14 @@ mod tests {
 
 #[cfg(test)]
 mod pane_tests {
-    use iced::window;
+    use fbterm_term::GridSize;
+    use iced::{Size, window};
 
-    use crate::app::App;
+    use crate::app::{App, Message};
     use crate::layout::Side;
     use crate::restore_tests::{paths_with, profile};
     use crate::tabs::{Pane, Tab, TabState, WindowState};
+    use crate::tiles::TilesMsg;
 
     /// Two panes side by side in one tab, as a split would make them.
     fn two_panes(first: Pane, second: Pane) -> Tab {
@@ -585,19 +736,67 @@ mod pane_tests {
         assert_eq!(w.tabs[1].panes[0].state, TabState::NotConnected);
     }
 
+    #[test]
+    fn split_pane_starts_at_its_rect_grid() {
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let wid = window::Id::unique();
+        let first = Pane::for_profile(&p);
+        let a = first.id;
+        let mut w = WindowState::new();
+        w.push(Tab::single(first));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+        // The lone pane filled the tiles' area and reported its grid (9x18 cells).
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Area(Size::new(984.0, 600.0))));
+        app.grids.insert(
+            a,
+            GridSize {
+                cols: 109,
+                rows: 33,
+                cell_width: 9.0,
+                cell_height: 18.0,
+            },
+        );
+        // Split by hand, as the split action will.
+        let second = Pane::for_profile(&p);
+        let b = second.id;
+        let tab = &mut app.windows.get_mut(&wid).unwrap().tabs[0];
+        tab.layout.split(a, Side::Right, b);
+        tab.panes.push(second);
+
+        let _ = app.start(wid, b);
+
+        let tab = &app.windows[&wid].tabs[0];
+        let size = tab.pane(b).unwrap().terminal().unwrap().lock().size();
+        // Its rect: (984 - 4) / 2 = 490 px wide (54 columns of 9), 600 px high (33 rows of 18).
+        assert_eq!(
+            size,
+            GridSize {
+                cols: 54,
+                rows: 33,
+                cell_width: 9.0,
+                cell_height: 18.0,
+            }
+        );
+    }
+
     #[cfg(unix)]
     mod unix {
         use std::time::{Duration, Instant};
 
         use fbterm_config::{LocalProfile, Paths, ProfileId};
         use fbterm_session::{SessionEvent, SessionHandle};
-        use fbterm_term::SharedTerminal;
+        use fbterm_term::{GridSize, SharedTerminal, TerminalOutput};
         use feathercritty::index::{Column, Line};
         use iced::window;
 
         use super::two_panes;
-        use crate::app::{App, Message};
+        use crate::app::{App, DEFAULT_GRID, Message};
+        use crate::layout::PaneId;
         use crate::tabs::{self, Pane, Tab, TabState, WindowState};
+        use crate::tiles::TilesMsg;
 
         type Sink = tokio::sync::mpsc::UnboundedSender<(
             fbterm_session::SessionId,
@@ -665,6 +864,115 @@ mod pane_tests {
             let notice = "process exited with code 1";
             assert!(screen(two.terminal().unwrap()).contains(notice));
             assert!(!screen(one.terminal().unwrap()).contains(notice));
+        }
+
+        fn app_with(first: Pane, second: Pane) -> (App, window::Id) {
+            let dir = std::env::temp_dir().join(format!("fbterm-pane-test-{}", ProfileId::new()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut app, _) = App::build(Paths { config_dir: dir }, true);
+            app.state_saving_enabled = false;
+            let wid = window::Id::unique();
+            let mut w = WindowState::new();
+            w.push(two_panes(first, second));
+            app.windows.clear();
+            app.windows.insert(wid, w);
+            (app, wid)
+        }
+
+        fn size_of(app: &App, wid: window::Id, pane: PaneId) -> GridSize {
+            let tab = &app.windows[&wid].tabs[0];
+            tab.pane(pane).unwrap().terminal().unwrap().lock().size()
+        }
+
+        fn grid(cols: u16, rows: u16) -> GridSize {
+            GridSize {
+                cols,
+                rows,
+                ..DEFAULT_GRID
+            }
+        }
+
+        fn wait_for(term: &SharedTerminal, text: &str) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !screen(term).contains(text) {
+                assert!(
+                    Instant::now() < deadline,
+                    "no {text:?} in:\n{}",
+                    screen(term)
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        #[test]
+        fn resize_goes_to_its_pane() {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let first = connected("one", shell("sleep 30", tx.clone()));
+            let second = connected("two", shell("sleep 30", tx));
+            let (a, b) = (first.id, second.id);
+            let (mut app, wid) = app_with(first, second);
+            let g = grid(100, 30);
+
+            let _ = app.update(Message::Terminal(wid, b, TerminalOutput::Resized(g)));
+            let generation = app.pending_resizes[&b].0;
+            let _ = app.update(Message::ResizeSettled(b, generation));
+
+            assert_eq!(size_of(&app, wid, b), g);
+            assert_eq!(
+                size_of(&app, wid, a),
+                DEFAULT_GRID,
+                "the other pane is untouched"
+            );
+            assert_eq!(app.grids.get(&b), Some(&g));
+            assert!(!app.grids.contains_key(&a));
+        }
+
+        #[test]
+        fn divider_drag_debounces_session_resize() {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let script = "trap 'stty size' WINCH; echo ready; while :; do sleep 0.05; done";
+            let first = connected("one", shell(script, tx.clone()));
+            let second = connected("two", shell("sleep 30", tx));
+            let a = first.id;
+            let term = first.terminal().unwrap().clone();
+            let (mut app, wid) = app_with(first, second);
+            wait_for(&term, "ready");
+
+            // Ten resizes within the quiet period: the session hears none of them yet.
+            let mut generations = Vec::new();
+            for i in 0..10 {
+                let g = grid(90 + i, 30);
+                let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(g)));
+                generations.push(app.pending_resizes[&a].0);
+                assert_eq!(size_of(&app, wid, a), DEFAULT_GRID);
+            }
+            // The timers of the older resizes find a newer one and do nothing.
+            for &stale in &generations[..9] {
+                let _ = app.update(Message::ResizeSettled(a, stale));
+                assert_eq!(size_of(&app, wid, a), DEFAULT_GRID);
+            }
+            // The last one settles: one session resize, with the last grid.
+            let _ = app.update(Message::ResizeSettled(a, generations[9]));
+            assert_eq!(size_of(&app, wid, a), grid(99, 30));
+            assert!(app.pending_resizes.is_empty());
+            wait_for(&term, "30 99");
+            for cols in 90..99 {
+                assert!(!screen(&term).contains(&format!("30 {cols}")), "{cols}");
+            }
+
+            // Releasing the divider flushes at once.
+            for i in 0..5 {
+                let g = grid(70 + i, 25);
+                let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(g)));
+            }
+            let last = app.pending_resizes[&a].0;
+            assert_eq!(size_of(&app, wid, a), grid(99, 30));
+            let _ = app.update(Message::Tiles(wid, TilesMsg::EndDrag));
+            assert_eq!(size_of(&app, wid, a), grid(74, 25));
+            assert!(app.pending_resizes.is_empty());
+            let _ = app.update(Message::ResizeSettled(a, last));
+            assert_eq!(size_of(&app, wid, a), grid(74, 25));
+            wait_for(&term, "25 74");
         }
 
         #[test]

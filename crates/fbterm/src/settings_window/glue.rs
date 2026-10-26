@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use super::{SettingsMsg, SettingsState, WRITE_DEBOUNCE, Write, fonts, thousands};
 use crate::app::{App, Message, SettingsSource};
 use crate::chrome::Chrome;
+use crate::tabs::{Pane, Tab};
 use crate::theme;
 
 /// `name` as a `'static` str: iced wants font names that live for the whole process. Each
@@ -42,6 +43,26 @@ pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
 }
 
 impl App {
+    /// The look of one pane: the global style at the pane's own font size, focused (keys go
+    /// to it, solid cursor) only for the focused pane of the focused window while its find bar
+    /// is closed. No accent border: the tiles draw the focus outline.
+    pub(crate) fn pane_style(&self, wid: window::Id, tab: &Tab, pane: &Pane) -> TerminalStyle {
+        TerminalStyle {
+            // Unzoomed: the setting as is (it may exceed the zoom range, up to 72).
+            font_size: if pane.zoom == 0 {
+                self.settings.font_size
+            } else {
+                (self.settings.font_size + f32::from(pane.zoom)).clamp(6.0, 48.0)
+            },
+            focused: self.app_active
+                && self.focused == Some(wid)
+                && tab.focused == pane.id
+                && pane.find.is_none(),
+            accent: None,
+            ..self.style.clone()
+        }
+    }
+
     pub fn settings_window(&self) -> Option<window::Id> {
         self.settings_win.as_ref().map(|(id, _)| *id)
     }
