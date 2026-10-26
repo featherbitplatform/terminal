@@ -668,8 +668,9 @@ Answered 2026-10-25: 10,000 lines is the target, the setting stays customizable 
 for large values; lowering the setting trims open tabs after a warning (both in section 2 and
 5.11).
 
-Still open:
+Answered 2026-10-26: scenario E measured 123 MB, so the main design's section 7 replaces the
+528 MB acceptance with a standing target of at most 200 MB for 20 tabs with full default
+scrollback. The scenario G miss on RSS (closing tabs leaves macOS 27's allocator cache resident)
+is accepted because it is not a leak (`dev/perf/README.md`, scenario G).
 
-1. Once scenario E passes at about 200 MB or less, should spec section 7 replace "accept the
-   528 MB worst case" with that measured number as the standing target? (Nothing blocks the work
-   meanwhile.)
+No questions are open.

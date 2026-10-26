@@ -500,8 +500,9 @@ against 11.8% (pre-change build, same session) and 104.5% (recorded baseline)); 
 0.00%. Not met on RSS: after closing 19 of the 20 full tabs resident memory stays at 122 MB (the gate
 was at most 114 MB); the owner accepted this on 2026-10-26 because it is allocator cache, not a
 leak (`dev/perf/README.md`, scenario G). And the one-tab idle base reads 2.7 MB over the recorded baseline (within
-it against a paired run). The 528 MB acceptance above stays the standing statement until the owner
-answers whether the measured number replaces it (compact-history design, section 9).
+it against a paired run). The ~300 MB target is met. Owner decision 2026-10-26: the measured
+number replaces the 2026-10-23 acceptance of the 528 MB worst case; the standing target is 20 tabs
+with full default scrollback at most 200 MB resident (scenario E), measured at 123 MB.
 
 ## 8. Repo and release
 
