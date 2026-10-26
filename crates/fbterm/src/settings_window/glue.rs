@@ -65,33 +65,39 @@ impl App {
                 Task::none()
             }
             other => {
-                let max_history = self.max_open_history();
+                // Locking every open terminal is only worth it for what reads the answer: a typed
+                // or submitted scrollback, and the debounce of a lowered one held back.
+                let wants_history = match &other {
+                    SettingsMsg::ScrollbackText(_) | SettingsMsg::ScrollbackSubmit => true,
+                    SettingsMsg::Flush(_) => self
+                        .settings_win
+                        .as_ref()
+                        .is_some_and(|(_, state)| state.holds_lower()),
+                    _ => false,
+                };
+                let max_history = wants_history.then(|| self.max_open_history());
                 let Some((_, state)) = &mut self.settings_win else {
                     return Task::none();
                 };
-                if matches!(
-                    other,
-                    SettingsMsg::ScrollbackText(_) | SettingsMsg::ScrollbackSubmit
-                ) {
-                    state.max_open_history = max_history;
+                if let Some(max) = max_history {
+                    state.max_open_history = max;
                 }
                 let effect = state.update(other);
+                let mut tasks = Vec::new();
                 if let Some(change) = effect.apply {
                     let mut next = self.settings.clone();
                     change.apply(&mut next);
-                    self.apply_settings(next, SettingsSource::Window);
+                    tasks.push(self.apply_settings(next, SettingsSource::Window));
                 }
-                match effect.write {
+                tasks.push(match effect.write {
                     Write::Not => Task::none(),
-                    Write::Now => {
-                        self.write_pending_settings();
-                        Task::none()
-                    }
+                    Write::Now => self.write_pending_settings_task(),
                     Write::After(n) => Task::perform(
                         async { tokio::time::sleep(WRITE_DEBOUNCE).await },
                         move |()| Message::Settings(SettingsMsg::Flush(n)),
                     ),
-                }
+                });
+                Task::batch(tasks)
             }
         }
     }
@@ -132,13 +138,19 @@ impl App {
     /// is not ours to hide: after writing, the file is reloaded as for any edit on disk.
     /// A change that cannot be written stays pending (a later write retries it) and is reported.
     pub(crate) fn write_pending_settings(&mut self) {
+        // Callers that drop the task are closing the window or the app: no find bar to refresh.
+        drop(self.write_pending_settings_task());
+    }
+
+    /// [`Self::write_pending_settings`], returning the find refreshes a reload may ask for.
+    fn write_pending_settings_task(&mut self) -> Task<Message> {
         let path = self.paths.settings();
         let Some((_, state)) = &mut self.settings_win else {
-            return;
+            return Task::none();
         };
         let pending = state.take_pending();
         if pending.is_empty() {
-            return;
+            return Task::none();
         }
         let external = std::fs::read_to_string(&path).ok() != self.settings_seen;
         let mut failed = Vec::new();
@@ -157,10 +169,11 @@ impl App {
             .then(|| format!("Could not save {}: {}", keys(&failed), errors.join("; ")));
         state.requeue(failed);
         if external {
-            self.reload_settings();
+            self.reload_settings()
         } else {
             self.settings_seen = std::fs::read_to_string(&path).ok();
             self.refresh_settings_notice();
+            Task::none()
         }
     }
 
@@ -183,18 +196,18 @@ impl App {
 
     /// `settings.toml` changed on disk: apply it, or keep the previous settings and say why.
     /// An open Settings window shows the new values (or turns read-only while it does not load).
-    pub(crate) fn settings_file_changed(&mut self) {
+    pub(crate) fn settings_file_changed(&mut self) -> Task<Message> {
         let path = self.paths.settings();
         let text = std::fs::read_to_string(&path).ok();
         if text == self.settings_seen {
-            return;
+            return Task::none();
         }
-        self.reload_settings();
+        self.reload_settings()
     }
 
     /// Load `settings.toml` and apply it (or keep the previous settings and show why), and
     /// remember its text as seen.
-    fn reload_settings(&mut self) {
+    fn reload_settings(&mut self) -> Task<Message> {
         let path = self.paths.settings();
         self.settings_seen = std::fs::read_to_string(&path).ok();
         if let Some(old) = self.settings_notice.take() {
@@ -206,12 +219,13 @@ impl App {
                     tracing::warn!(warning = %w, "settings.toml values clamped");
                     self.show_settings_notice(w.to_string());
                 }
-                self.apply_settings(new, SettingsSource::File);
+                let task = self.apply_settings(new, SettingsSource::File);
                 tracing::info!("settings.toml reloaded");
                 if let Some((_, state)) = &mut self.settings_win {
                     state.read_only = None;
                     state.sync(&self.settings);
                 }
+                task
             }
             Err(e) => {
                 tracing::warn!(error = %e, "settings.toml not applied");
@@ -220,6 +234,7 @@ impl App {
                     state.read_only = Some(e);
                     state.sync(&self.settings);
                 }
+                Task::none()
             }
         }
     }
@@ -241,9 +256,15 @@ impl App {
     /// `background_opacity` is read each frame too; a window can only show through if it was
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
-    pub(crate) fn apply_settings(&mut self, new: Settings, source: SettingsSource) {
+    ///
+    /// Returns the find refreshes a scrollback lowering asks for.
+    pub(crate) fn apply_settings(
+        &mut self,
+        new: Settings,
+        source: SettingsSource,
+    ) -> Task<Message> {
         if new == self.settings {
-            return;
+            return Task::none();
         }
         if new.font_family != self.settings.font_family || new.font_size != self.settings.font_size
         {
@@ -264,9 +285,11 @@ impl App {
                 }
             }
         }
-        if new.scrollback_lines != self.settings.scrollback_lines {
-            self.apply_scrollback(new.scrollback_lines, source);
-        }
+        let task = if new.scrollback_lines != self.settings.scrollback_lines {
+            self.apply_scrollback(new.scrollback_lines, source)
+        } else {
+            Task::none()
+        };
         let backdrop =
             |s: &Settings| Chrome::current().backdrop(s.background_opacity, s.background_blur);
         let (old_b, new_b) = (backdrop(&self.settings), backdrop(&new));
@@ -289,21 +312,27 @@ impl App {
         if rate_changed {
             self.update_output_rate();
         }
+        task
     }
 
     /// Set every open terminal's scrollback limit. If any lost lines, release the freed memory
-    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines.
-    fn apply_scrollback(&mut self, lines: usize, source: SettingsSource) {
-        let mut trimmed = 0;
-        for tab in self.windows.values().flat_map(|w| w.tabs.iter()) {
-            if let Some(term) = tab.terminal()
-                && term.lock().set_scrollback(lines) > 0
-            {
-                trimmed += 1;
+    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines. A tab
+    /// that lost lines and has a find bar open searches again, so the bar does not keep
+    /// counting or stepping to matches that are gone.
+    fn apply_scrollback(&mut self, lines: usize, source: SettingsSource) -> Task<Message> {
+        let mut trimmed_tabs = Vec::new();
+        for (wid, window) in &self.windows {
+            for (index, tab) in window.tabs.iter().enumerate() {
+                if let Some(term) = tab.terminal()
+                    && term.lock().set_scrollback(lines) > 0
+                {
+                    trimmed_tabs.push((*wid, index));
+                }
             }
         }
+        let trimmed = trimmed_tabs.len();
         if trimmed == 0 {
-            return;
+            return Task::none();
         }
         crate::memory::release_freed();
         if source == SettingsSource::File {
@@ -323,6 +352,11 @@ impl App {
             };
             self.show_settings_notice(line);
         }
+        Task::batch(
+            trimmed_tabs
+                .into_iter()
+                .map(|(wid, index)| self.find_output(wid, index)),
+        )
     }
 
     /// The refresh rate `max_fps = "display"` follows: the fastest display a terminal window is

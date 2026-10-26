@@ -602,7 +602,7 @@ fn confirmed_lowering_from_the_settings_window_sets_no_notice() {
         ..app.settings.clone()
     };
     let before = crate::memory::requests();
-    app.apply_settings(new, crate::app::SettingsSource::Window);
+    let _ = app.apply_settings(new, crate::app::SettingsSource::Window);
     assert_eq!(term.lock().history_len(), 100);
     assert!(app.settings_notice.is_none());
     assert_eq!(crate::memory::requests(), before + 1);

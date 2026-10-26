@@ -806,7 +806,7 @@ impl App {
                     self.profiles_file_changed();
                 }
                 if changed.settings {
-                    self.settings_file_changed();
+                    return self.settings_file_changed();
                 }
                 Task::none()
             }

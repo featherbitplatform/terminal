@@ -509,17 +509,43 @@ fn cancel_restores_saved_value() {
 }
 
 #[test]
-fn lower_value_without_long_tab_saves_directly() {
+fn lower_value_without_long_tab_saves_when_the_quiet_period_passes() {
     let mut s = with_tab(3_000);
     let e = s.update(SettingsMsg::ScrollbackText("5000".into()));
+    assert_eq!(e.apply, None, "not per keystroke");
+    assert_eq!(s.values.scrollback_lines, 10_000);
+    let Write::After(n) = e.write else {
+        panic!("a quiet period is scheduled: {e:?}");
+    };
+    let e = s.update(SettingsMsg::Flush(n));
     assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(5_000)));
+    assert_eq!(e.write, Write::Now);
     assert_eq!(s.pending_lower, None);
     assert_eq!(s.values.scrollback_lines, 5_000);
-    // A tab holding exactly the new value loses nothing either.
+    // Enter applies at once, and a tab holding exactly the new value loses nothing either.
     let mut s = with_tab(5_000);
-    let e = s.update(SettingsMsg::ScrollbackText("5000".into()));
+    let e = s.update(SettingsMsg::ScrollbackSubmit);
+    assert_eq!(e.apply, None, "10000 is the saved value");
+    s.update(SettingsMsg::ScrollbackText("5000".into()));
+    let e = s.update(SettingsMsg::ScrollbackSubmit);
     assert!(e.apply.is_some());
     assert_eq!(s.pending_lower, None);
+}
+
+#[test]
+fn typing_through_a_lower_value_no_tab_exceeds_never_applies() {
+    let mut s = with_tab(300);
+    for typed in ["2", "20", "200", "2000"] {
+        let e = s.update(SettingsMsg::ScrollbackText(typed.into()));
+        assert_eq!(e.apply, None, "{typed} must not apply");
+        assert_eq!(s.values.scrollback_lines, 10_000);
+    }
+    // Earlier keystrokes' quiet periods are stale; raising applies at once.
+    let e = s.update(SettingsMsg::Flush(0));
+    assert_eq!(e.apply, None);
+    let e = s.update(SettingsMsg::ScrollbackText("20000".into()));
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(20_000)));
+    assert!(!s.holds_lower());
 }
 
 #[test]

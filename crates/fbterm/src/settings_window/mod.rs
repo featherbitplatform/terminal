@@ -158,6 +158,10 @@ pub struct SettingsState {
     /// A lower scrollback typed but not saved, because an open tab holds more lines than it
     /// and applying it would cut them: the window asks (Apply / Cancel) first.
     pub pending_lower: Option<usize>,
+    /// A lower scrollback typed that no open tab exceeds, with the change number of its
+    /// debounce: it applies when that quiet period passes (`Flush`) or on Enter, never per
+    /// keystroke, so `2` on the way to `20000` cannot cut output scrolling in that moment.
+    held_lower: Option<(usize, u64)>,
     /// The most history lines any open tab holds (set by the app when the window opens and
     /// before a typed scrollback is evaluated).
     pub max_open_history: usize,
@@ -198,6 +202,7 @@ impl SettingsState {
             opacity_text: String::new(),
             scrollback_text: String::new(),
             pending_lower: None,
+            held_lower: None,
             max_open_history: 0,
             fonts,
             read_only,
@@ -223,6 +228,7 @@ impl SettingsState {
         self.opacity_text = percent_text(values.background_opacity);
         self.scrollback_text = values.scrollback_lines.to_string();
         self.pending_lower = None;
+        self.held_lower = None;
         if !self.fonts.iter().any(|f| f.family == values.font_family) {
             let installed = self
                 .fonts
@@ -252,6 +258,11 @@ impl SettingsState {
 
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// A lowered scrollback is typed and waiting for its quiet period.
+    pub fn holds_lower(&self) -> bool {
+        self.held_lower.is_some()
     }
 
     /// The option the font list shows as chosen.
@@ -375,12 +386,19 @@ impl SettingsState {
             | SettingsMsg::Close
             | SettingsMsg::OpenFile
             | SettingsMsg::RevealFolder => Effect::NONE,
-            SettingsMsg::Flush(n) => Effect {
-                apply: None,
-                write: if n == self.generation && self.has_pending() {
-                    Write::Now
-                } else {
-                    Write::Not
+            SettingsMsg::Flush(n) => match self.held_lower {
+                Some((v, at)) if at == n => {
+                    self.held_lower = None;
+                    // The tabs may have grown since it was typed.
+                    self.set_scrollback(v, false)
+                }
+                _ => Effect {
+                    apply: None,
+                    write: if n == self.generation && self.has_pending() {
+                        Write::Now
+                    } else {
+                        Write::Not
+                    },
                 },
             },
             SettingsMsg::Release => Effect {
@@ -520,6 +538,7 @@ impl SettingsState {
                 self.scrollback_text = s;
                 // Whatever was asked about is not what the field holds any more.
                 self.pending_lower = None;
+                self.held_lower = None;
                 match parsed {
                     Some(v) if (SCROLLBACK_RANGE.0..=SCROLLBACK_RANGE.1).contains(&v) => {
                         self.set_scrollback(v, true)
@@ -540,11 +559,13 @@ impl SettingsState {
                             .clamp(SCROLLBACK_RANGE.0, SCROLLBACK_RANGE.1);
                         self.scrollback_text = v.to_string();
                         self.pending_lower = None;
+                        self.held_lower = None;
                         self.set_scrollback(v, false)
                     }
                     Err(_) => {
                         self.scrollback_text = self.values.scrollback_lines.to_string();
                         self.pending_lower = None;
+                        self.held_lower = None;
                         self.flush_now()
                     }
                 }
@@ -558,6 +579,7 @@ impl SettingsState {
             },
             SettingsMsg::ScrollbackCancel => {
                 self.pending_lower = None;
+                self.held_lower = None;
                 self.scrollback_text = self.values.scrollback_lines.to_string();
                 Effect::NONE
             }
@@ -566,11 +588,21 @@ impl SettingsState {
 
     /// A scrollback value from the field. A value below the saved one that would cut an open
     /// tab's history is not saved: it waits for the user's confirmation (so typing `5` on the
-    /// way to `50000` never trims anything, and Enter keeps the question open).
+    /// way to `50000` never trims anything, and Enter keeps the question open). A typed lower
+    /// value nothing exceeds waits for the debounce (`held_lower`); raising applies at once.
     fn set_scrollback(&mut self, v: usize, debounce: bool) -> Effect {
         if v < self.values.scrollback_lines && self.max_open_history > v {
             self.pending_lower = Some(v);
             return Effect::NONE;
+        }
+        if debounce && v < self.values.scrollback_lines {
+            // Nothing would be cut now, but this may be a prefix of a larger number: wait.
+            self.generation += 1;
+            self.held_lower = Some((v, self.generation));
+            return Effect {
+                apply: None,
+                write: Write::After(self.generation),
+            };
         }
         self.change(SettingChange::ScrollbackLines(v), debounce)
     }
