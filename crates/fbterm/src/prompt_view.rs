@@ -196,6 +196,11 @@ pub fn view<'a>(
             .into()
         }
     };
+    modal(t, body)
+}
+
+/// `body` on a card over a dimmed window, taking every click.
+pub(crate) fn modal<'a>(t: &'static Tokens, body: Element<'a, Message>) -> Element<'a, Message> {
     let card = container(body)
         .width(CARD_WIDTH)
         .padding(20)
@@ -217,11 +222,11 @@ pub fn view<'a>(
     opaque(backdrop)
 }
 
-fn header<'a>(
+pub(crate) fn header<'a>(
     t: &'static Tokens,
     glyph: &'static str,
     tint: Color,
-    title: &'a str,
+    title: impl text::IntoFragment<'a>,
 ) -> Element<'a, Message> {
     row![
         ui::icon(glyph, 18.0, tint),
@@ -232,7 +237,7 @@ fn header<'a>(
     .into()
 }
 
-fn buttons(items: Vec<Element<'_, Message>>) -> Element<'_, Message> {
+pub(crate) fn buttons(items: Vec<Element<'_, Message>>) -> Element<'_, Message> {
     let mut r = row![Space::new().width(Length::Fill)]
         .spacing(8)
         .align_y(Alignment::Center);

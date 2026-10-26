@@ -207,6 +207,7 @@ fn actions() -> Vec<PaletteItem> {
         (Action::ExportTab, "Export tab to file…"),
         (Action::EditProfiles, "Edit profiles"),
         (Action::Settings, "Settings"),
+        (Action::EditSchemes, "Color schemes"),
         (Action::OpenSettingsFile, "Open settings file"),
         (Action::RevealConfigFolder, "Reveal config folder"),
         (Action::Quit, "Quit"),
@@ -690,6 +691,7 @@ mod tests {
                 "Export tab to file\u{2026}",
                 "Edit profiles",
                 "Settings",
+                "Color schemes",
                 "Open settings file",
                 "Reveal config folder",
                 "Quit"
@@ -836,7 +838,7 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 18);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 19);
     }
 
     #[test]

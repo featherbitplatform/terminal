@@ -41,6 +41,19 @@ pub(crate) fn load(dir: &std::path::Path) -> (SchemeSet, Vec<String>) {
 /// The first entry of the profile editor's scheme list: no override.
 pub(crate) const USE_GLOBAL: &str = "Use global scheme";
 
+/// What a scheme list shows for an id that names no known scheme.
+pub(crate) const NOT_FOUND: &str = "Scheme not found";
+
+/// The entry of `choices` for `id` (`None`: `Use global scheme`), if it is listed.
+pub(crate) fn chosen(choices: &[SchemeChoice], id: Option<&str>) -> Option<SchemeChoice> {
+    choices.iter().find(|c| c.id.as_deref() == id).cloned()
+}
+
+/// What a scheme list shows for `id`: the scheme's name, or [`NOT_FOUND`].
+pub(crate) fn shown(choices: &[SchemeChoice], id: Option<&str>) -> String {
+    chosen(choices, id).map_or_else(|| NOT_FOUND.to_owned(), |c| c.name)
+}
+
 /// One entry of a scheme list: a scheme (`id`), or "use the global scheme" (`None`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemeChoice {
@@ -143,6 +156,9 @@ impl App {
         self.schemes = set;
         self.scheme_errors = errors;
         tracing::info!(schemes = self.schemes.all().len(), "schemes reloaded");
+        if let Some((_, state)) = &mut self.schemes_win {
+            state.refresh(&self.schemes);
+        }
         let now = self.pane_colors();
         let task = self.reapply_schemes(|p| before.get(&p.id) != now.get(&p.id));
         self.refresh_scheme_notices();

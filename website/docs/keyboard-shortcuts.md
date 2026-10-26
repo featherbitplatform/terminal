@@ -107,6 +107,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Find in this tab | Open the same search restricted to the panes of the current tab. |
 | Edit profiles | Open the profile editor. |
 | Settings | Open the Settings window. |
+| Color schemes | Open the Color schemes window to duplicate, rename, edit and delete color schemes. It also opens from **Edit schemes…** in Settings and in the profile editor. |
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
 | Reveal config folder | Show the config folder in your file manager, with `settings.toml` selected on macOS when it exists. The folder is created if it is missing. |
 | Export tab to file… | Save the active tab's text to a file; see [Exporting a tab](#exporting-a-tab). |
@@ -164,7 +165,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |
 | `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Find in this tab (all panes of the tab), merge this tab into another, move the focused tile, move it to a tab of its own (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
-| `new_window`, `edit_profiles`, `settings` | New window, the profile editor, Settings |
+| `new_window`, `edit_profiles`, `settings`, `edit_schemes` | New window, the profile editor, Settings, the Color schemes window (no default shortcut) |
 | `find`, `find_all`, `find_next`, `find_previous` | Find in pane, find in all tabs, older and newer match in the find bar |
 | `palette`, `open_settings_file`, `reveal_config_folder`, `quit` | The palette, the palette actions of the same names, quit |
 

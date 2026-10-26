@@ -10,7 +10,7 @@ use super::ssh_view::{auth, jumps};
 use super::{ACCENTS, Draft, DraftKind, EditorMsg, EditorState};
 use crate::app::Message;
 use crate::schemes::SchemeChoice;
-use crate::settings_window::view::{menu_style, pick_style};
+use crate::settings_window::view::{fixed_choice, menu_style, pick_style};
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -256,24 +256,39 @@ fn field<'a>(
     .into()
 }
 
-/// The profile's scheme list: `Use global scheme` or one scheme.
+/// The profile's scheme list (`Use global scheme` or one scheme; a still value when read-only)
+/// and the way to the Color schemes window.
 fn scheme_pick<'a>(
     t: &'static Tokens,
     d: &'a Draft,
     schemes: Vec<SchemeChoice>,
+    editable: bool,
 ) -> Element<'a, Message> {
-    let selected = schemes.iter().find(|c| c.id == d.color_scheme).cloned();
-    pick_list(schemes, selected, |c: SchemeChoice| {
-        msg(EditorMsg::ColorScheme(c.id))
-    })
-    .placeholder("Scheme not found")
-    .font(UI_FONT)
-    .text_size(13)
-    .padding(Padding::from([7.0, 10.0]))
-    .width(240)
-    .style(move |_, status| pick_style(t, status))
-    .menu_style(move |_| menu_style(t))
-    .into()
+    let current = d.color_scheme.as_deref();
+    let picker: Element<'a, Message> = if editable {
+        let selected = crate::schemes::chosen(&schemes, current);
+        pick_list(schemes, selected, |c: SchemeChoice| {
+            msg(EditorMsg::ColorScheme(c.id))
+        })
+        .placeholder(crate::schemes::NOT_FOUND)
+        .font(UI_FONT)
+        .text_size(13)
+        .padding(Padding::from([7.0, 10.0]))
+        .width(240)
+        .style(move |_, status| pick_style(t, status))
+        .menu_style(move |_| menu_style(t))
+        .into()
+    } else {
+        fixed_choice(t, crate::schemes::shown(&schemes, current), 240.0)
+    };
+    let edit = button(text("Edit schemes\u{2026}").font(UI_FONT).size(12.5))
+        .on_press(msg(EditorMsg::EditSchemes))
+        .padding(Padding::from([5.0, 8.0]))
+        .style(move |_, s| ui::ghost(t, s));
+    row![picker, edit]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
 }
 
 pub(super) fn input<'a>(
@@ -341,7 +356,11 @@ fn form<'a>(
             .spacing(6),
         ]
         .spacing(24),
-        column![ui::label(t, "Color scheme"), scheme_pick(t, d, schemes)].spacing(6),
+        column![
+            ui::label(t, "Color scheme"),
+            scheme_pick(t, d, schemes, editable)
+        ]
+        .spacing(6),
     ]
     .spacing(14)
     .width(Length::Fill);

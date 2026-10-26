@@ -17,7 +17,8 @@ mod glue;
 pub mod view;
 
 pub use fonts::FontChoice;
-pub(crate) use glue::terminal_style;
+pub(crate) use fonts::{BUNDLED as BUNDLED_FONT, choices as font_choices, installed_monospace};
+pub(crate) use glue::{intern, terminal_style};
 
 /// Quiet period after the last slider or typing change before the file is written.
 pub const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -30,6 +31,8 @@ pub enum SettingsMsg {
     Close,
     OpenFile,
     RevealFolder,
+    /// Open the Color schemes window.
+    EditSchemes,
     /// The quiet period after change number `n` passed.
     Flush(u64),
     /// A slider was let go: write now.
@@ -182,7 +185,7 @@ pub struct SettingsState {
     generation: u64,
 }
 
-fn size_text(v: f32) -> String {
+pub(crate) fn size_text(v: f32) -> String {
     format!("{v}")
 }
 
@@ -387,7 +390,8 @@ impl SettingsState {
             SettingsMsg::Open
             | SettingsMsg::Close
             | SettingsMsg::OpenFile
-            | SettingsMsg::RevealFolder => Effect::NONE,
+            | SettingsMsg::RevealFolder
+            | SettingsMsg::EditSchemes => Effect::NONE,
             SettingsMsg::Flush(n) => match self.held_lower {
                 Some((v, at)) if at == n => {
                     self.held_lower = None;

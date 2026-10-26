@@ -17,7 +17,7 @@ use crate::theme;
 
 /// `name` as a `'static` str: iced wants font names that live for the whole process. Each
 /// distinct name is allocated once, however often the setting changes.
-fn intern(name: &str) -> &'static str {
+pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut names = NAMES.get_or_init(Default::default).lock();
     if let Some(n) = names.get(name) {
@@ -96,6 +96,10 @@ impl App {
             SettingsMsg::RevealFolder => {
                 crate::config_files::reveal_config_folder(&self.paths);
                 Task::none()
+            }
+            SettingsMsg::EditSchemes => {
+                let current = self.settings.color_scheme.clone();
+                self.open_schemes(Some(current))
             }
             other => {
                 // Locking every open terminal is only worth it for what reads the answer: a typed

@@ -13,6 +13,7 @@ use crate::find::all::FindAllMsg;
 use crate::keys::{self, Action, Bindings};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
+use crate::schemes_window::SchemesMsg;
 use crate::settings_window::SettingsMsg;
 
 /// How a [`Shortcuts`] wrapper treats keys.
@@ -41,6 +42,9 @@ pub(crate) enum Mode {
     /// The Settings window: Cmd+W closes it, the profile editor and Quit work; other shortcuts
     /// do nothing.
     Settings,
+    /// The Color schemes window: Cmd+W closes it, Cmd+S saves, Settings, the profile editor and
+    /// Quit work; other shortcuts do nothing.
+    Schemes,
     /// The Settings window recording a new chord: every key press goes to the recorder (plain
     /// Escape cancels), none reaches a field or acts as a shortcut.
     Recording,
@@ -168,6 +172,20 @@ fn key_message(
             Action::Quit | Action::EditProfiles if !repeat => Some(Message::Shortcut(w, action)),
             _ => None,
         }),
+        Mode::Schemes => {
+            if mods == keyboard::Modifiers::COMMAND
+                && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("s"))
+            {
+                return Some((!repeat).then_some(Message::Schemes(SchemesMsg::Save)));
+            }
+            shortcut.map(|action| match action {
+                Action::CloseTab if !repeat => Some(Message::Schemes(SchemesMsg::Close)),
+                Action::Quit | Action::Settings | Action::EditProfiles if !repeat => {
+                    Some(Message::Shortcut(w, action))
+                }
+                _ => None,
+            })
+        }
         Mode::Recording => Some(recording_key(key, mods, repeat)),
     }
 }
@@ -643,6 +661,32 @@ mod tests {
                 Some(Some(Message::Shortcut(_, Action::FindAll)))
             ));
         }
+    }
+
+    #[test]
+    fn the_schemes_window_closes_saves_and_reaches_the_others() {
+        assert!(matches!(
+            press(Mode::Schemes, "w", false),
+            Some(Some(Message::Schemes(SchemesMsg::Close)))
+        ));
+        assert!(matches!(
+            press(Mode::Schemes, ",", true),
+            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
+        ));
+        assert!(matches!(press(Mode::Schemes, "t", false), Some(None)));
+        let s = keyboard::Key::Character("s".into());
+        assert!(matches!(
+            key_message(
+                &defaults(),
+                Mode::Schemes,
+                window::Id::unique(),
+                &s,
+                keyboard::Modifiers::COMMAND,
+                false,
+                None
+            ),
+            Some(Some(Message::Schemes(SchemesMsg::Save)))
+        ));
     }
 
     #[test]

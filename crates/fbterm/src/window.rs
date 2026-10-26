@@ -73,6 +73,21 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             bindings: &app.bindings,
         });
     }
+    if let Some((sid, state)) = &app.schemes_win
+        && *sid == id
+    {
+        let mut content = column![];
+        if Chrome::current().draws_title_bar() {
+            content = content.push(crate::ui::window_header(t, id));
+        }
+        let content = content.push(crate::schemes_window::view::view(t, state, &app.style));
+        return Element::new(Shortcuts {
+            content: content.into(),
+            window: id,
+            mode: Mode::Schemes,
+            bindings: &app.bindings,
+        });
+    }
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };

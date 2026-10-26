@@ -24,6 +24,14 @@ impl App {
                 self.save_profiles();
                 Task::none()
             }
+            EditorMsg::EditSchemes => {
+                let current = self
+                    .editor
+                    .as_ref()
+                    .and_then(|(_, ed)| ed.selected_draft())
+                    .and_then(|d| d.color_scheme.clone());
+                self.open_schemes(current)
+            }
             EditorMsg::Reload => {
                 self.reload_profiles(true);
                 Task::none()
@@ -171,7 +179,7 @@ impl App {
     /// The profile store changed: open palettes list the new names, panes take new names,
     /// accents and color schemes (they keep their sessions; they refer to profiles by id), and
     /// the panes whose scheme changed are recolored.
-    fn profiles_changed(&mut self) {
+    pub(crate) fn profiles_changed(&mut self) {
         let items = palette::items(&self.profiles);
         for state in self.palettes.values_mut() {
             state.set_items(items.clone(), &self.recency);

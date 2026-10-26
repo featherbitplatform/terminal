@@ -60,6 +60,8 @@ pub enum EditorMsg {
     Reload,
     /// Open the file picker for the key path.
     PickKey,
+    /// Open the Color schemes window.
+    EditSchemes,
     KeyPicked(Option<PathBuf>),
 
     Select(ProfileId),
@@ -551,6 +553,16 @@ impl EditorState {
         if changed {
             self.dirty = true;
             self.notice = None;
+        }
+    }
+
+    /// The scheme `id` was deleted and the saved profiles no longer use it: drafts that still
+    /// name it follow the global scheme too.
+    pub fn forget_scheme(&mut self, id: &str) {
+        for d in &mut self.drafts {
+            if d.color_scheme.as_deref() == Some(id) {
+                d.color_scheme = None;
+            }
         }
     }
 

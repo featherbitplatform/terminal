@@ -29,6 +29,7 @@ use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
 };
 use crate::restore;
+use crate::schemes_window::{SchemesMsg, SchemesState};
 use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::settings_window::{SettingsMsg, SettingsState};
 use crate::tabs::{Pane, TabState, WindowState};
@@ -148,6 +149,8 @@ pub enum Message {
     },
     Editor(EditorMsg),
     Settings(SettingsMsg),
+    /// The Color schemes window.
+    Schemes(SchemesMsg),
     /// Exporting a tab to a file.
     Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
@@ -191,6 +194,7 @@ pub(crate) enum ShotWindow {
     Terminal,
     Editor,
     Settings,
+    Schemes,
 }
 
 pub struct App {
@@ -241,6 +245,8 @@ pub struct App {
     pub editor: Option<(window::Id, EditorState)>,
     /// The Settings window, when open.
     pub settings_win: Option<(window::Id, SettingsState)>,
+    /// The Color schemes window, when open.
+    pub schemes_win: Option<(window::Id, SchemesState)>,
     /// Connection dialogs waiting per window.
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
@@ -283,7 +289,7 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings` (debug aid): capture that window instead.
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes` (debug aid): capture that window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
     /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
@@ -472,6 +478,7 @@ impl App {
             find_box: None,
             editor: None,
             settings_win: None,
+            schemes_win: None,
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
@@ -498,6 +505,7 @@ impl App {
             screenshot_window: match debug_env("FBTERM_SCREENSHOT_WINDOW") {
                 Some(w) if w == "editor" => ShotWindow::Editor,
                 Some(w) if w == "settings" => ShotWindow::Settings,
+                Some(w) if w == "schemes" => ShotWindow::Schemes,
                 _ => ShotWindow::Terminal,
             },
             shooting: false,
@@ -522,6 +530,7 @@ impl App {
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
         task = task.chain(app.open_debug_settings());
+        task = task.chain(app.open_debug_schemes());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
         (app, task)
@@ -563,6 +572,9 @@ impl App {
         }
         if self.settings_window() == Some(id) {
             return "Settings · fbterm".into();
+        }
+        if self.schemes_window() == Some(id) {
+            return "Color schemes · fbterm".into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title()),
@@ -621,6 +633,7 @@ impl App {
         match self.screenshot_window {
             ShotWindow::Editor if self.editor.is_none() => return false,
             ShotWindow::Settings if self.settings_win.is_none() => return false,
+            ShotWindow::Schemes if self.schemes_win.is_none() => return false,
             _ => {}
         }
         self.windows
@@ -746,6 +759,9 @@ impl App {
                     self.write_pending_settings();
                     self.settings_win = None;
                 }
+                if self.schemes_window() == Some(id) {
+                    self.schemes_win = None;
+                }
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
                 // stop saving.
@@ -800,7 +816,11 @@ impl App {
                 if was_terminal {
                     self.save_state();
                 }
-                if self.windows.is_empty() && self.editor.is_none() && self.settings_win.is_none() {
+                if self.windows.is_empty()
+                    && self.editor.is_none()
+                    && self.settings_win.is_none()
+                    && self.schemes_win.is_none()
+                {
                     iced::exit()
                 } else if self.quitting {
                     Task::none()
@@ -827,6 +847,7 @@ impl App {
             Message::Editor(msg) => self.editor_msg(msg),
             Message::Export(msg) => self.export_msg(msg),
             Message::Settings(msg) => self.settings_msg(msg),
+            Message::Schemes(msg) => self.schemes_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
@@ -942,6 +963,7 @@ impl App {
         let target = match self.screenshot_window {
             ShotWindow::Editor => self.editor_window(),
             ShotWindow::Settings => self.settings_window(),
+            ShotWindow::Schemes => self.schemes_window(),
             ShotWindow::Terminal => self.windows.keys().next().copied(),
         };
         let Some(wid) = target else {

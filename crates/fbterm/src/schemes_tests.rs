@@ -29,7 +29,7 @@ const PROFILES_CHANGED: Changed = Changed {
     schemes: false,
 };
 
-fn rgb(v: u32) -> Rgb {
+pub(crate) fn rgb(v: u32) -> Rgb {
     Rgb {
         r: (v >> 16) as u8,
         g: (v >> 8) as u8,
@@ -38,7 +38,7 @@ fn rgb(v: u32) -> Rgb {
 }
 
 /// A user scheme: Graphite's colors on background `bg`.
-fn user_scheme(name: &str, bg: u32) -> Scheme {
+pub(crate) fn user_scheme(name: &str, bg: u32) -> Scheme {
     let graphite = fbterm_config::schemes::builtins().remove(0);
     Scheme {
         id: new_user_id(),
@@ -53,7 +53,7 @@ fn user_scheme(name: &str, bg: u32) -> Scheme {
     }
 }
 
-fn with_scheme(p: &Profile, id: &str) -> Profile {
+pub(crate) fn with_scheme(p: &Profile, id: &str) -> Profile {
     Profile {
         color_scheme: Some(id.into()),
         ..p.clone()
@@ -62,7 +62,7 @@ fn with_scheme(p: &Profile, id: &str) -> Profile {
 
 /// An app over `profiles`, `settings.toml` text and user `schemes`, with one window whose
 /// only tab shows one pane per profile, each with a placeholder terminal (no session).
-fn app_with(
+pub(crate) fn app_with(
     profiles: &[Profile],
     settings: &str,
     schemes: &[Scheme],
@@ -96,16 +96,16 @@ fn app_with(
     (app, paths, wid, ids)
 }
 
-fn pane(app: &App, wid: window::Id, id: PaneId) -> &Pane {
+pub(crate) fn pane(app: &App, wid: window::Id, id: PaneId) -> &Pane {
     app.windows[&wid].tabs[0].pane(id).unwrap()
 }
 
-fn style(app: &App, wid: window::Id, id: PaneId) -> TerminalStyle {
+pub(crate) fn style(app: &App, wid: window::Id, id: PaneId) -> TerminalStyle {
     let tab = &app.windows[&wid].tabs[0];
     app.pane_style(wid, tab, tab.pane(id).unwrap())
 }
 
-fn term(app: &App, wid: window::Id, id: PaneId) -> SharedTerminal {
+pub(crate) fn term(app: &App, wid: window::Id, id: PaneId) -> SharedTerminal {
     pane(app, wid, id).terminal().unwrap().clone()
 }
 
@@ -126,19 +126,19 @@ fn background_reply(term: &SharedTerminal) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
-fn answers(term: &SharedTerminal, bg: Rgb) -> bool {
+pub(crate) fn answers(term: &SharedTerminal, bg: Rgb) -> bool {
     let Rgb { r, g, b } = bg;
     background_reply(term).contains(&format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"))
 }
 
-fn builtin(id: &str) -> Scheme {
+pub(crate) fn builtin(id: &str) -> Scheme {
     fbterm_config::schemes::builtins()
         .into_iter()
         .find(|s| s.id == id)
         .unwrap()
 }
 
-fn generation(app: &App, wid: window::Id, id: PaneId) -> u64 {
+pub(crate) fn generation(app: &App, wid: window::Id, id: PaneId) -> u64 {
     term(app, wid, id).lock().generation()
 }
 
