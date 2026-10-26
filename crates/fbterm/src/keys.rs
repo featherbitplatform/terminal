@@ -521,10 +521,47 @@ mod tests {
             None
         );
         assert_eq!(s(true, &Key::Named(Named::ArrowLeft), CMD), None);
-        // `=` and `+` are one key for zoom in.
-        assert_eq!(s(true, &k("="), CMD), Some(Action::ZoomIn));
-        assert_eq!(s(false, &k("="), ctrl_shift()), Some(Action::ZoomIn));
-        assert_eq!(s(false, &k("+"), ctrl_shift()), Some(Action::ZoomIn));
+        // The plus key zooms in however it is typed.
+        for mods in [CMD, cmd_shift()] {
+            for key in ["=", "+"] {
+                assert_eq!(
+                    s(true, &k(key), mods),
+                    Some(Action::ZoomIn),
+                    "{key} {mods:?}"
+                );
+            }
+        }
+        // Off macOS: Shift+= (US), and a layout's own plus key with or without Shift.
+        for (key, mods) in [
+            ("=", ctrl_shift()),
+            ("+", ctrl_shift()),
+            ("+", Modifiers::CTRL),
+        ] {
+            assert_eq!(
+                s(false, &k(key), mods),
+                Some(Action::ZoomIn),
+                "{key} {mods:?}"
+            );
+        }
+        assert_eq!(
+            s(false, &k("="), Modifiers::CTRL),
+            None,
+            "Ctrl+= is the program's"
+        );
+        assert_eq!(s(true, &k("="), Modifiers::CTRL), None);
+        assert_eq!(s(true, &k("="), cmd_shift() | Modifiers::ALT), None);
+        // The label is the default chord's own.
+        assert_eq!(chord_for(true, Action::ZoomIn).unwrap().label(true), "⌘=");
+        assert_eq!(
+            chord_for(false, Action::ZoomIn).unwrap().label(false),
+            "Ctrl+Shift+="
+        );
+        // A rebound zoom in is only that chord: the plus key no longer zooms.
+        let mut o = fbterm_config::keys::Overrides::new();
+        o.insert(Action::ZoomIn, Chord::parse("cmd+alt+z").unwrap());
+        let b = Bindings::new(true, &o);
+        assert_eq!(shortcut(&b, &k("="), CMD, None), None);
+        assert_eq!(shortcut(&b, &k("z"), cmd_alt, None), Some(Action::ZoomIn));
         assert_eq!(s(true, &k("-"), CMD), Some(Action::ZoomOut));
         assert_eq!(s(false, &k("0"), ctrl_shift()), Some(Action::ZoomReset));
         assert_eq!(

@@ -10,7 +10,7 @@ These are the defaults. Every application shortcut can be changed or removed in 
 
 Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings.
 
-On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled by the terminal view and are not in this table. Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
+On macOS the shortcuts use `Cmd`, and `Option` only for moving between panes; never `Ctrl`. Copy and paste are handled by the terminal view and are not in this table. Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
 
 ## Windows and tabs
 
@@ -39,9 +39,9 @@ A tab can be split into panes, each with its own session. Splitting opens the fo
 | Reset zoom | `Cmd+0` | `Ctrl+Shift+0` |
 | Maximize pane (press again to restore) | `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` |
 
-Closing a pane closes its session, without asking. Moving focus goes to the nearest pane in that direction; when two are equally near, the one you used more recently. Zoom changes the text size of the focused pane only, one point per press, and `+` counts as `=`; reset returns it to the font size in Settings. A maximized pane fills the tab while the others keep running out of sight; moving focus or splitting shows them again. Maximize does nothing in a tab with one pane.
+Closing a pane closes its session, without asking. Moving focus goes to the nearest pane in that direction; when two are equally near, the one you used more recently. Zoom changes the text size of the focused pane only, one point per press, and the plus key zooms in however you type it (`Cmd+=`, `Cmd+Shift+=` or a `+` key of your own layout; `Ctrl+Shift+` the same elsewhere, where a bare `Ctrl+=` still goes to the program); reset returns it to the font size in Settings. A maximized pane fills the tab while the others keep running out of sight; moving focus or splitting shows them again. Maximize does nothing in a tab with one pane.
 
-Move tile, Merge tab into and Find in this tab have names for the [`[keys]` table](#the-keys-table) but do nothing yet.
+Move tile, Move tile to new tab, Merge tab into and Find in this tab have names for the [`[keys]` table](#the-keys-table) but do nothing yet.
 
 ### The title bar on macOS
 

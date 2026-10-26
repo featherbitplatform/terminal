@@ -96,7 +96,8 @@ impl App {
         drop(pane);
         self.save_state();
         self.release_closed(freed);
-        // A maximized pane that closed shows the others again.
+        // Takes the pending redraw of the panes now shown (a maximized pane that closed shows
+        // the others again).
         self.shown(wid)
     }
 

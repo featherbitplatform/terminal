@@ -1033,6 +1033,44 @@ mod pane_tests {
             assert!(flag_pending(&w, 1, c), "its flag is left set");
         }
 
+        /// Zooming changes the font the pane's view is drawn with; the view then measures a
+        /// bigger cell on its next layout and event (the redraw every message causes), and the
+        /// smaller grid it reports reaches the session through the resize debounce.
+        #[test]
+        fn zoom_resizes_the_panes_grid_and_session() {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let script = "trap 'stty size' WINCH; echo ready; while :; do sleep 0.05; done";
+            let first = connected("one", shell(script, tx.clone()));
+            let second = connected("two", shell("sleep 30", tx));
+            let a = first.id;
+            let term = first.terminal().unwrap().clone();
+            let (mut app, wid) = app_with(first, second);
+            wait_for(&term, "ready");
+            // The pane's view fills 800 x 400 px with 8 x 16 px cells.
+            let bounds = iced::Size::new(800.0, 400.0);
+            let cell = |font: f32| iced::Size::new(font * 8.0 / 13.0, (font * 1.2).ceil());
+            let font = |app: &App| {
+                let t = app.windows[&wid].active_tab().unwrap();
+                app.pane_style(wid, t, t.pane(a).unwrap()).font_size
+            };
+            let before = fbterm_term::grid_size_from_bounds(bounds, cell(font(&app)));
+
+            let _ = app.update(Message::Shortcut(wid, Action::ZoomIn));
+            let zoomed = font(&app);
+            assert_eq!(zoomed, app.settings.font_size + 1.0);
+            // What the view reports after measuring the bigger cell.
+            let after = fbterm_term::grid_size_from_bounds(bounds, cell(zoomed));
+            assert!(
+                after.cols < before.cols && after.rows < before.rows,
+                "{before:?} -> {after:?}"
+            );
+            let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(after)));
+            let generation = app.pending_resizes[&a].0;
+            let _ = app.update(Message::ResizeSettled(a, generation));
+            assert_eq!(size_of(&app, wid, a), after);
+            wait_for(&term, &format!("{} {}", after.rows, after.cols));
+        }
+
         #[test]
         fn unmaximizing_takes_the_redraws_left_pending() {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();

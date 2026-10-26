@@ -325,9 +325,9 @@ const NAMED: [(ChordKey, &str); 15] = [
 /// The symbols a press with Shift held may report instead of their key on some platforms:
 /// `}` for `]`, `{` for `[` and `<` for `,`. Only these fold, as they always have: the key a
 /// press reports is the layout's own unshifted key, so folding other symbols would make, for
-/// example, `&` (the 1 key on AZERTY) count as `7`. `+` folds to `=` so zoom in answers to the
-/// key combination that types a plus.
-const SHIFTED: [(char, char); 4] = [('{', '['), ('}', ']'), ('<', ','), ('+', '=')];
+/// example, `&` (the 1 key on AZERTY) count as `7`. (`+` and `=` are one key for shortcuts, see
+/// [`Chord::same_plus_key`].)
+const SHIFTED: [(char, char); 3] = [('{', '['), ('}', ']'), ('<', ',')];
 
 impl ChordKey {
     /// A character key, lowercase; `None` for whitespace and control characters.
@@ -444,6 +444,19 @@ impl Chord {
             shift,
             cmd,
         }
+    }
+
+    /// Whether `self` and `other` are the plus key, however it is typed: `=` with Shift (US
+    /// layouts), `=` alone, or a layout's own `+` key, with the same Ctrl and Alt. With Cmd the
+    /// Shift state does not matter (Cmd+= and Cmd+plus both zoom in); without it a `+` or a
+    /// Shift+`=` stand together and a bare `=` is only itself, so Ctrl+= keeps reaching programs.
+    pub fn same_plus_key(self, other: Chord) -> bool {
+        let plus = |c: Chord| matches!(c.key, ChordKey::Char('+' | '='));
+        let shifted = |c: Chord| c.shift || c.key == ChordKey::Char('+');
+        plus(self)
+            && plus(other)
+            && (self.ctrl, self.alt, self.cmd) == (other.ctrl, other.alt, other.cmd)
+            && (self.cmd || shifted(self) == shifted(other))
     }
 
     /// Read a chord as written in `settings.toml`: `Ok(None)` for `"none"` (unbound).
@@ -648,7 +661,8 @@ pub fn reserved(mac: bool, chord: Chord) -> Option<&'static str> {
 
 /// The built-in chord for `action` on macOS (`mac`) or the other platforms, if it has one.
 ///
-/// macOS chords use Cmd (with Shift where noted) and never Ctrl or Option. Elsewhere chords
+/// macOS chords use Cmd (with Shift where noted) and never Ctrl; Option only with the arrows
+/// that move pane focus. Elsewhere chords
 /// are Ctrl+Shift, so plain Ctrl keys keep reaching the terminal; the exceptions are Ctrl+,
 /// for Settings (the comma has no control code of its own), Ctrl+Alt+F for find in all tabs,
 /// Ctrl+Shift+Alt+D for split down, Ctrl+Alt+arrow for pane focus, and Ctrl+G / Ctrl+Shift+G,
@@ -877,10 +891,18 @@ impl Bindings {
     }
 
     /// The action `chord` triggers, if any.
+    ///
+    /// The plus key matches however it is typed (see [`Chord::same_plus_key`]), for whichever
+    /// action has a plus chord, so a rebound zoom keeps that.
     pub fn action(&self, chord: Chord) -> Option<Action> {
-        Action::ALL
+        let exact = Action::ALL
             .into_iter()
-            .find(|a| self.chord(*a) == Some(chord))
+            .find(|a| self.chord(*a) == Some(chord));
+        exact.or_else(|| {
+            Action::ALL
+                .into_iter()
+                .find(|a| self.chord(*a).is_some_and(|c| c.same_plus_key(chord)))
+        })
     }
 
     /// Whether `action` has its default chord.
@@ -1381,6 +1403,16 @@ mod tests {
             assert_eq!(default_chord(false, a), None);
         }
         // `+` is the same key as `=` with Shift held.
-        assert_eq!(c("ctrl+shift+plus"), c("ctrl+shift+="));
+        let plus = |a: &str, b: &str| c(a).same_plus_key(c(b));
+        assert!(plus("ctrl+shift+plus", "ctrl+shift+="));
+        assert!(plus("ctrl+plus", "ctrl+shift+="));
+        assert!(
+            !plus("ctrl+=", "ctrl+shift+="),
+            "bare Ctrl+= stays with programs"
+        );
+        assert!(plus("cmd+=", "cmd+shift+="));
+        assert!(plus("cmd+plus", "cmd+="));
+        assert!(!plus("cmd+=", "alt+cmd+="));
+        assert!(!plus("cmd+-", "cmd+="));
     }
 }
