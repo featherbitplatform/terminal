@@ -42,9 +42,8 @@ impl App {
             Action::ZoomReset => self.on_window(wid, |app, wid| app.zoom_pane(wid, Zoom::Reset)),
             Action::MaximizePane => self.on_window(wid, App::toggle_maximize),
             // Declared for their chords and the Settings list; later tasks give them behaviour.
-            Action::FindInTab | Action::MergeTab | Action::MoveTile | Action::TileToTab => {
-                Task::none()
-            }
+            Action::FindInTab => self.on_window(wid, App::find_in_tab),
+            Action::MergeTab | Action::MoveTile | Action::TileToTab => Task::none(),
             Action::NextTab => self.with_focused(WindowState::next),
             Action::PrevTab => self.with_focused(WindowState::prev),
             Action::SelectTab(n) => self.with_focused(|w| w.select_number(n)),
@@ -136,15 +135,20 @@ impl App {
                 return Task::none();
             }
             PaletteMsg::Close => None,
-            PaletteMsg::Submit => state.selected_item().cloned(),
+            PaletteMsg::Submit { .. } => state.selected_item().cloned(),
             PaletteMsg::Pick(position) => state.at(position).cloned(),
         };
-        if matches!(msg, PaletteMsg::Submit | PaletteMsg::Pick(_)) && chosen.is_none() {
+        if matches!(msg, PaletteMsg::Submit { .. } | PaletteMsg::Pick(_)) && chosen.is_none() {
             // Nothing matches: Enter does nothing, the palette stays open.
             return Task::none();
         }
         self.palettes.remove(&wid);
         match chosen {
+            Some(PaletteItem::Profile { id, .. })
+                if msg == (PaletteMsg::Submit { split: true }) =>
+            {
+                self.open_in_split(wid, id, Side::Right)
+            }
             Some(PaletteItem::Profile { id, .. }) => self.open_tab(wid, id),
             Some(PaletteItem::Action { action, .. }) => self.run_palette_action(wid, action),
             None => Task::none(),

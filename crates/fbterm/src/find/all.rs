@@ -95,6 +95,8 @@ pub struct FindAll {
     pub regex: bool,
     pub input: iced::widget::Id,
     pub invalid: Option<fbterm_term::PatternError>,
+    /// Search only this tab's panes (Find in this tab); `None` searches every tab.
+    pub scope: Option<TabId>,
     seq: u64,
     cancel: Arc<AtomicBool>,
     /// Panes still being searched, with how to label their results.
@@ -113,6 +115,7 @@ impl FindAll {
             regex,
             input: iced::widget::Id::unique(),
             invalid: None,
+            scope: None,
             seq: 0,
             cancel: Arc::new(AtomicBool::new(false)),
             pending: HashMap::new(),
@@ -298,7 +301,11 @@ impl FindAll {
             return Some(e.to_string());
         }
         if self.query.is_empty() {
-            return Some("Type to search every tab".into());
+            return Some(if self.scope.is_some() {
+                "Type to search this tab".into()
+            } else {
+                "Type to search every tab".into()
+            });
         }
         if self.groups.is_empty() {
             return Some(if self.searching() {

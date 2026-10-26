@@ -52,7 +52,9 @@ fn palette_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<Palette
     match key {
         keyboard::Key::Named(Named::ArrowUp) => Some(PaletteMsg::Up),
         keyboard::Key::Named(Named::ArrowDown) => Some(PaletteMsg::Down),
-        keyboard::Key::Named(Named::Enter) => Some(PaletteMsg::Submit),
+        keyboard::Key::Named(Named::Enter) => Some(PaletteMsg::Submit {
+            split: mods.shift(),
+        }),
         keyboard::Key::Named(Named::Escape) => Some(PaletteMsg::Close),
         keyboard::Key::Character(c) if mods.control() && !mods.shift() && !mods.logo() => {
             match c.as_str() {
@@ -70,7 +72,7 @@ fn find_all_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<FindAl
     palette_key(key, mods).map(|m| match m {
         PaletteMsg::Up => FindAllMsg::Up,
         PaletteMsg::Down => FindAllMsg::Down,
-        PaletteMsg::Submit => FindAllMsg::Submit,
+        PaletteMsg::Submit { .. } => FindAllMsg::Submit,
         _ => FindAllMsg::Close,
     })
 }
@@ -551,6 +553,32 @@ mod tests {
         assert_eq!(typed("a", none).as_deref(), Some("a"));
         assert_eq!(typed("a", keyboard::Modifiers::CTRL), None);
         assert_eq!(typed("\u{8}", none), None);
+    }
+
+    #[test]
+    fn shift_enter_in_the_palette_asks_for_a_split() {
+        assert!(matches!(
+            key(
+                keyboard::key::Named::Enter,
+                keyboard::Modifiers::SHIFT,
+                Mode::Palette
+            ),
+            Some(Some(Message::Palette(
+                _,
+                PaletteMsg::Submit { split: true }
+            )))
+        ));
+        assert!(matches!(
+            key(
+                keyboard::key::Named::Enter,
+                keyboard::Modifiers::empty(),
+                Mode::Palette
+            ),
+            Some(Some(Message::Palette(
+                _,
+                PaletteMsg::Submit { split: false }
+            )))
+        ));
     }
 
     #[test]

@@ -101,6 +101,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Maximize pane | Let the focused pane fill the tab, or restore the others. |
 | Find in tab | Open the active tab's find bar. |
 | Find in all tabs | Open the search over every tab. |
+| Find in this tab | Open the same search restricted to the panes of the current tab. |
 | Edit profiles | Open the profile editor. |
 | Settings | Open the Settings window. |
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
@@ -174,7 +175,7 @@ Edits to the table apply while the app runs, like every setting. An entry that n
 - **Wrapped lines** are searched as one line, so a match can continue on the next row. A match never spans a real line break.
 - While the bar is open, keys go to the bar and never to the program in the tab. The tab keeps running; new output is searched too, and the count follows it.
 
-**Find in all tabs** opens a box in the middle of the window, like the palette. It searches every tab of every window, including tabs that are not shown and tabs that are disconnected (they keep their history). Results appear tab by tab as each tab's search finishes, grouped under the tab's name and accent (and its window, when several are open), one row per match with the line around it. Each tab lists up to 50 matches and the box up to 500 in all, with a note when there are more. `Enter` (or a click) on a match brings its window forward, selects the tab, closes the box and opens that tab's find bar on the same query with that match current.
+**Find in all tabs** opens a box in the middle of the window, like the palette. It searches every tab of every window, including tabs that are not shown and tabs that are disconnected (they keep their history). Results appear tab by tab as each tab's search finishes, grouped under the tab's name and accent (and its window, when several are open), one row per match with the line around it. Each tab lists up to 50 matches and the box up to 500 in all, with a note when there are more. `Enter` (or a click) on a match brings its window forward, selects the tab, closes the box and opens that tab's find bar on the same query with that match current. In a tab with several panes each pane is its own group, labelled with the pane's title, and `Enter` also focuses that pane. **Find in this tab** from the palette opens the same box limited to the current tab's panes. In the palette, `Shift+Enter` on a profile opens it in a split to the right of the focused pane; clicking a row or plain `Enter` opens a new tab.
 
 ## Exporting a tab
 

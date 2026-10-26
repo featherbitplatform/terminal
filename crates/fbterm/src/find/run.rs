@@ -12,7 +12,7 @@ use super::all::{FindAll, FindAllMsg, Jump, TabSearch, Target};
 use super::{FindBar, FindMsg, REFRESH_AFTER, SearchRun, Step};
 use crate::app::{App, Message};
 use crate::layout::PaneId;
-use crate::tabs::{Tab, WindowState};
+use crate::tabs::{Tab, TabId, WindowState};
 
 /// Run `run` for `pane` on a worker thread.
 fn spawn(pane: PaneId, terminal: SharedTerminal, run: SearchRun) -> Task<Message> {
@@ -233,14 +233,20 @@ impl App {
             .map_or(Task::none(), |r| spawn(id, term, r))
     }
 
-    /// Every pane of every window with a terminal, in window, tab, then pane reading order.
-    fn find_targets(&self) -> Vec<Target> {
+    /// Every pane of every window with a terminal, in window, tab, then pane reading order;
+    /// with `scope`, only the panes of that tab.
+    pub(crate) fn find_targets(&self, scope: Option<TabId>) -> Vec<Target> {
         let several = self.windows.len() > 1;
         self.windows
             .iter()
             .enumerate()
             .flat_map(|(w, (wid, window))| {
-                window.tabs.iter().enumerate().flat_map(move |(i, tab)| {
+                let tabs = window
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .filter(move |(_, tab)| scope.is_none_or(|s| s == tab.id));
+                tabs.flat_map(move |(i, tab)| {
                     let split = tab.panes.len() > 1;
                     tab.layout
                         .panes()
@@ -273,17 +279,45 @@ impl App {
 
     /// Open the box in `wid` with `query` and search at once.
     pub(crate) fn open_find_all(&mut self, wid: window::Id, query: String) -> Task<Message> {
+        self.open_find_all_in(wid, query, None)
+    }
+
+    /// Like [`Self::open_find_all`], searching only the panes of tab `scope` when given.
+    pub(crate) fn open_find_all_in(
+        &mut self,
+        wid: window::Id,
+        query: String,
+        scope: Option<TabId>,
+    ) -> Task<Message> {
         if !self.windows.contains_key(&wid) {
             return Task::none();
         }
         self.close_find_all();
         self.palettes.remove(&wid);
         let mut state = FindAll::new(wid, query, false);
-        let runs = state.search(self.find_targets());
+        state.scope = scope;
+        let runs = state.search(self.find_targets(scope));
         let input = state.input.clone();
         self.find_box = Some(state);
         let focus = operation::focus(input.clone()).chain(operation::move_cursor_to_end(input));
         Task::batch([focus, spawn_all(runs)])
+    }
+
+    /// Find in this tab: the box, searching only the active tab's panes. Again closes it.
+    pub(crate) fn find_in_tab(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(WindowState::active_tab) else {
+            return Task::none();
+        };
+        let scope = Some(tab.id);
+        if self
+            .find_box
+            .as_ref()
+            .is_some_and(|s| s.window == wid && s.scope == scope)
+        {
+            self.close_find_all();
+            return Task::none();
+        }
+        self.open_find_all_in(wid, String::new(), scope)
     }
 
     pub(crate) fn find_all(&mut self, wid: window::Id, msg: FindAllMsg) -> Task<Message> {
@@ -295,8 +329,9 @@ impl App {
             }
             return self.open_find_all(wid, String::new());
         }
+        let scope = self.find_box.as_ref().and_then(|s| s.scope);
         let targets = match msg {
-            FindAllMsg::Query(_) | FindAllMsg::ToggleRegex => self.find_targets(),
+            FindAllMsg::Query(_) | FindAllMsg::ToggleRegex => self.find_targets(scope),
             _ => Vec::new(),
         };
         let Some(state) = self.find_box.as_mut().filter(|s| s.window == wid) else {
@@ -521,7 +556,7 @@ mod tests {
         let _ = app.open_find_all(wid, "needle 2".into());
         assert!(app.find_box.as_ref().unwrap().searching());
         // Deliver every tab's result as the worker threads would.
-        let targets = app.find_targets();
+        let targets = app.find_targets(None);
         let seq = app.find_box.as_ref().unwrap().seq();
         for t in targets {
             let req = fbterm_term::SearchRequest {
@@ -555,5 +590,128 @@ mod tests {
             .expect("its bar opens");
         assert_eq!(bar.query, "needle 2");
         assert!(bar.searching(), "searching for the match to make current");
+    }
+
+    /// One window with one tab of two panes (each with its own text) and one single-pane tab.
+    fn app_with_split() -> (App, window::Id, Vec<PaneId>) {
+        let (mut app, wid, ids) = app_with_tabs(2);
+        let w = app.windows.get_mut(&wid).unwrap();
+        let tab = &mut w.tabs[0];
+        let mut second = Pane::new(tab.focused_pane().profile, String::from("right"), None);
+        let term = app.new_terminal(crate::app::DEFAULT_GRID);
+        term.lock().feed(b"needle right\r\n");
+        second.placeholder = Some(term);
+        let id = second.id;
+        let w = app.windows.get_mut(&wid).unwrap();
+        let tab = &mut w.tabs[0];
+        tab.layout
+            .split(tab.focused, crate::layout::Side::Right, id);
+        tab.panes.push(second);
+        (app, wid, vec![ids[0], id, ids[1]])
+    }
+
+    fn deliver(app: &mut App, query: &str) {
+        let seq = app.find_box.as_ref().unwrap().seq();
+        for t in app.find_targets(app.find_box.as_ref().unwrap().scope) {
+            let req = fbterm_term::SearchRequest {
+                pattern: fbterm_term::SearchPattern::new(&fbterm_term::SearchQuery::new(
+                    query, false,
+                ))
+                .unwrap()
+                .unwrap(),
+                below: None,
+                limit: super::super::all::PER_TAB + 1,
+                snippets: true,
+            };
+            let out = fbterm_term::search(
+                &t.terminal,
+                &req,
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+            app.found_all(seq, t.pane, out);
+        }
+    }
+
+    #[test]
+    fn find_all_lists_each_pane() {
+        let (mut app, wid, ids) = app_with_split();
+        let _ = app.open_find_all(wid, "needle".into());
+        deliver(&mut app, "needle");
+        let groups = app.find_box.as_ref().unwrap().groups();
+        let panes: Vec<PaneId> = groups.iter().map(|g| g.pane).collect();
+        assert_eq!(panes, ids, "one group per pane, in reading order");
+        assert!(groups[0].pane_label.is_some() && groups[1].pane_label.is_some());
+        assert_eq!(groups[0].name, groups[1].name, "the tab name is shared");
+        assert!(
+            groups[2].pane_label.is_none(),
+            "a single-pane tab has no pane label"
+        );
+    }
+
+    #[test]
+    fn find_in_tab_searches_only_its_panes() {
+        let (mut app, wid, ids) = app_with_split();
+        let _ = app.update(Message::Shortcut(wid, crate::keys::Action::FindInTab));
+        let state = app.find_box.as_ref().expect("the box opens");
+        assert_eq!(state.scope, Some(app.windows[&wid].tabs[0].id));
+        let _ = app.find_all(wid, FindAllMsg::Query("needle".into()));
+        assert_eq!(
+            app.find_box.as_ref().unwrap().scope,
+            Some(app.windows[&wid].tabs[0].id)
+        );
+        deliver(&mut app, "needle");
+        let panes: Vec<PaneId> = app
+            .find_box
+            .as_ref()
+            .unwrap()
+            .groups()
+            .iter()
+            .map(|g| g.pane)
+            .collect();
+        assert_eq!(panes, ids[..2], "the other tab is left out");
+    }
+
+    #[test]
+    fn jump_focuses_the_pane() {
+        let (mut app, wid, ids) = app_with_split();
+        // Look at the other tab, with the first tab's focus on its left pane.
+        app.windows.get_mut(&wid).unwrap().active = 1;
+        let jump = Jump {
+            window: wid,
+            tab: app.windows[&wid].tabs[0].id,
+            pane: ids[1],
+            at: fbterm_term::StablePoint { line: 0, col: 0 },
+            query: "needle".into(),
+            regex: false,
+        };
+        let _ = app.jump(jump);
+        let w = &app.windows[&wid];
+        assert_eq!(w.active, 0);
+        assert_eq!(w.tabs[0].focused, ids[1]);
+        assert!(w.tabs[0].pane(ids[1]).unwrap().find.is_some());
+        assert!(w.tabs[0].pane(ids[0]).unwrap().find.is_none());
+    }
+
+    #[test]
+    fn jump_to_closed_pane_is_ignored() {
+        let (mut app, wid, ids) = app_with_split();
+        let before = app.windows[&wid].active;
+        let jump = Jump {
+            window: wid,
+            tab: app.windows[&wid].tabs[0].id,
+            pane: PaneId::next(),
+            at: fbterm_term::StablePoint { line: 0, col: 0 },
+            query: "needle".into(),
+            regex: false,
+        };
+        let _ = app.jump(jump);
+        let w = &app.windows[&wid];
+        assert_eq!(w.active, before);
+        assert_eq!(w.tabs[0].focused, ids[0]);
+        assert!(
+            w.tabs
+                .iter()
+                .all(|t| t.panes.iter().all(|p| p.find.is_none()))
+        );
     }
 }

@@ -14,6 +14,9 @@ use crate::app::Message;
 use crate::keys::{Action, Bindings};
 use crate::theme::{Tokens, UI_FONT};
 
+/// The footer line: what Shift+Enter does.
+pub const SPLIT_HINT: &str = "Shift+Enter opens in a split";
+
 /// Rows shown at once.
 const VISIBLE_ROWS: usize = 10;
 const ROW_HEIGHT: f32 = 36.0;
@@ -26,7 +29,10 @@ pub enum PaletteMsg {
     Query(String),
     Up,
     Down,
-    Submit,
+    /// Enter; with `split` (Shift+Enter) a profile opens in a split instead of a new tab.
+    Submit {
+        split: bool,
+    },
     Pick(usize),
     Close,
 }
@@ -99,6 +105,7 @@ fn actions() -> Vec<PaletteItem> {
         (Action::SplitDown, "Split down"),
         (Action::MaximizePane, "Maximize pane"),
         (Action::Find, "Find in tab"),
+        (Action::FindInTab, "Find in this tab"),
         (Action::FindAll, "Find in all tabs"),
         (Action::ExportTab, "Export tab to file…"),
         (Action::EditProfiles, "Edit profiles"),
@@ -353,9 +360,18 @@ pub fn view<'a>(
             background: Some(t.border.into()),
             ..container::Style::default()
         });
-    let card = container(column![input, divider, list])
+    let footer = container(
+        text(SPLIT_HINT)
+            .font(UI_FONT)
+            .size(11.5)
+            .color(t.text_muted),
+    )
+    .width(Length::Fill)
+    .padding(Padding::from([6.0, 14.0]))
+    .align_x(Alignment::End);
+    let card = container(column![input, divider, list, footer])
         .width(CARD_WIDTH)
-        .max_height(ROW_HEIGHT * VISIBLE_ROWS as f32 + 60.0)
+        .max_height(ROW_HEIGHT * VISIBLE_ROWS as f32 + 90.0)
         .clip(true)
         .style(move |_| container::Style {
             background: Some(t.raised.into()),
@@ -538,6 +554,7 @@ mod tests {
                 "Split down",
                 "Maximize pane",
                 "Find in tab",
+                "Find in this tab",
                 "Find in all tabs",
                 "Export tab to file\u{2026}",
                 "Edit profiles",
@@ -547,6 +564,11 @@ mod tests {
                 "Quit"
             ]
         );
+    }
+
+    #[test]
+    fn the_footer_names_shift_enter() {
+        assert_eq!(SPLIT_HINT, "Shift+Enter opens in a split");
     }
 
     #[test]
@@ -682,7 +704,7 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 14);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 15);
     }
 
     #[test]

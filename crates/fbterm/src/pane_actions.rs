@@ -1,5 +1,6 @@
 //! What the pane actions do: split, close, directional focus, per-pane zoom and maximize.
 
+use fbterm_config::ProfileId;
 use iced::{Rectangle, Size, Task, window};
 
 use crate::app::{App, Message};
@@ -22,6 +23,28 @@ impl App {
     /// focused. Refused (silently) when a pane would end up below the minimum size. Splitting a
     /// maximized pane shows the others again first.
     pub(crate) fn split_pane(&mut self, wid: window::Id, side: Side) -> Task<Message> {
+        self.split_with(wid, side, None)
+    }
+
+    /// Split the focused pane with a new pane of `profile` on `side` of it (the palette's
+    /// Shift+Enter).
+    pub(crate) fn open_in_split(
+        &mut self,
+        wid: window::Id,
+        profile: ProfileId,
+        side: Side,
+    ) -> Task<Message> {
+        self.split_with(wid, side, Some(profile))
+    }
+
+    /// The shared split: the new pane copies the focused pane's profile unless `profile` is
+    /// given.
+    fn split_with(
+        &mut self,
+        wid: window::Id,
+        side: Side,
+        profile: Option<ProfileId>,
+    ) -> Task<Message> {
         let area = self.areas.get(&wid).copied();
         let Some(tab) = self
             .windows
@@ -31,11 +54,19 @@ impl App {
             return Task::none();
         };
         let focused = tab.focused;
-        let new = {
-            let from = tab.focused_pane();
-            Pane {
-                accent_style: from.accent_style,
-                ..Pane::new(from.profile, from.name.clone(), from.accent)
+        let new = match profile {
+            Some(id) => {
+                let Some(p) = self.profiles.get(id) else {
+                    return Task::none();
+                };
+                Pane::for_profile(p)
+            }
+            None => {
+                let from = tab.focused_pane();
+                Pane {
+                    accent_style: from.accent_style,
+                    ..Pane::new(from.profile, from.name.clone(), from.accent)
+                }
             }
         };
         let id = new.id;
@@ -52,6 +83,16 @@ impl App {
             return Task::none();
         }
         let unhidden = tab.maximized.take().is_some();
+        if let Some(id) = profile {
+            self.recency.bump(id, crate::app::unix_now());
+        }
+        let Some(tab) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(WindowState::active_tab_mut)
+        else {
+            return Task::none();
+        };
         tab.layout = layout;
         tab.panes.push(new);
         // Start it before it takes focus, so its grid comes from its own rectangle and the
@@ -243,6 +284,36 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_opens_profile_in_split() {
+        use crate::palette::PaletteMsg;
+        let p = profile("a");
+        let other = profile("b");
+        let (mut app, _) = App::build(paths_with(&[p.clone(), other.clone()]), true);
+        app.state_saving_enabled = false;
+        let wid = window::Id::unique();
+        let first = Pane::for_profile(&p);
+        let a = first.id;
+        let mut w = WindowState::new();
+        w.push(Tab::single(first));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Area(big())));
+        app.grids.insert(a, grid(big()));
+        let _ = app.open_palette(wid, "b".into());
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Submit { split: true }));
+        let t = tab(&app, wid);
+        assert_eq!(app.windows[&wid].tabs.len(), 1, "no new tab");
+        assert_eq!(t.panes.len(), 2);
+        assert_eq!(t.layout.panes()[0], a, "to the right of the focused pane");
+        assert_eq!(t.focused_pane().profile, other.id);
+        assert!(!app.palettes.contains_key(&wid));
+        // Plain Enter still opens a tab.
+        let _ = app.open_palette(wid, "b".into());
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Submit { split: false }));
+        assert_eq!(app.windows[&wid].tabs.len(), 2);
+    }
+
+    #[test]
     fn split_right_adds_pane_of_same_profile() {
         let p = profile("a");
         let (mut app, wid, a) = app_with(&p, big());
@@ -399,12 +470,7 @@ mod tests {
         let (mut app, wid, _) = app_with(&p, big());
         act(&mut app, wid, Action::SplitRight);
         let before = tab(&app, wid).layout.clone();
-        for a in [
-            Action::FindInTab,
-            Action::MergeTab,
-            Action::MoveTile,
-            Action::TileToTab,
-        ] {
+        for a in [Action::MergeTab, Action::MoveTile, Action::TileToTab] {
             act(&mut app, wid, a);
         }
         assert_eq!(tab(&app, wid).layout, before);
