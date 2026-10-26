@@ -1,6 +1,7 @@
 //! Color schemes for the terminal widget.
 
 use fbterm_config::Rgb;
+use fbterm_config::schemes::SchemeColors;
 
 use crate::Terminal;
 
@@ -80,6 +81,18 @@ impl ColorScheme {
     }
 }
 
+impl From<&SchemeColors> for ColorScheme {
+    fn from(c: &SchemeColors) -> Self {
+        Self {
+            foreground: c.foreground,
+            background: c.background,
+            cursor: c.cursor,
+            selection: c.selection,
+            ansi: c.ansi,
+        }
+    }
+}
+
 /// `over * alpha + under * (1 - alpha)`, per channel.
 pub fn blend(over: Rgb, under: Rgb, alpha: f32) -> Rgb {
     let mix = |o: u8, u: u8| (f32::from(o) * alpha + f32::from(u) * (1.0 - alpha)).round() as u8;
@@ -138,6 +151,13 @@ mod tests {
             let ratio = contrast_ratio(*c, s.background);
             assert!(ratio >= 4.5, "ansi {i} {c} has contrast {ratio:.2}");
         }
+    }
+
+    #[test]
+    fn graphite_matches_the_builtin_scheme() {
+        let builtin = fbterm_config::schemes::builtins().remove(0);
+        assert_eq!(builtin.id, "graphite");
+        assert_eq!(ColorScheme::from(&builtin.colors), ColorScheme::graphite());
     }
 
     #[test]
