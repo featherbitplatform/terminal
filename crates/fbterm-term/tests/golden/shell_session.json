@@ -1,0 +1,197 @@
+{
+  "initial": {
+    "find_bar": [
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 126,
+          "count": 7,
+          "hits": [
+            "195:18-195:22",
+            "169:32-169:36",
+            "139:32-139:36",
+            "108:32-108:36",
+            "78:32-78:36",
+            "47:32-47:36",
+            "17:31-17:35"
+          ],
+          "resume": null
+        },
+        "query": "error",
+        "visible": [
+          "169:32-169:36",
+          "195:18-195:22"
+        ]
+      },
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 126,
+          "count": 8,
+          "hits": [
+            "178:24-178:31",
+            "156:24-156:31",
+            "134:24-134:31",
+            "113:24-113:31",
+            "91:24-91:31",
+            "69:24-69:31",
+            "48:24-48:31",
+            "26:24-26:31"
+          ],
+          "resume": null
+        },
+        "query": "id=\\d{5}",
+        "visible": [
+          "178:24-178:31"
+        ]
+      },
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 126,
+          "count": 0,
+          "hits": [],
+          "resume": null
+        },
+        "query": "日本",
+        "visible": []
+      }
+    ],
+    "selections": {
+      "history": "host:~/proj2$ ls -la rs34\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs35\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40595\nuser@host:~/proj0$ ls -la rs36",
+      "history_into_screen": "user@host:~/proj2$ ls -la rs30\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub30\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40510\nuser@host:~/proj3$ ls -la rs31\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub31\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nbash: foo31: command not found, error code 127\nuser@host:~/proj0$ ls -la rs32\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub32\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs33\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub33\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs34\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs35\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40595\nuser@host:~/proj0$ ls -la rs36\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub36\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs37\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37\n-rw-r--r--  1 user user  220 Oct 25 12:00",
+      "row_reversed": "r@host:~/proj3$ ls -la rs39",
+      "screen": "-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs37\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs38\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub38\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nbash: foo38: command not found, error code 127\nuser@host:~/proj3$ ls -la rs39\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub39\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj0$ ls -la rs40\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub40\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40680\nuser@host:~/proj1$ ls -la rs41\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub41\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs42\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub42\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs43\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub43\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj0$ ls -la rs44\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub44\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\noverwritten line, error gone\nuser@host:~$"
+    }
+  },
+  "narrow": {
+    "find_bar": [
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 80,
+          "count": 7,
+          "hits": [
+            "195:18-195:22",
+            "169:32-169:36",
+            "139:32-139:36",
+            "108:32-108:36",
+            "78:32-78:36",
+            "47:32-47:36",
+            "17:31-17:35"
+          ],
+          "resume": null
+        },
+        "query": "error",
+        "visible": [
+          "169:32-169:36",
+          "195:18-195:22"
+        ]
+      },
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 80,
+          "count": 8,
+          "hits": [
+            "178:24-178:31",
+            "156:24-156:31",
+            "134:24-134:31",
+            "113:24-113:31",
+            "91:24-91:31",
+            "69:24-69:31",
+            "48:24-48:31",
+            "26:24-26:31"
+          ],
+          "resume": null
+        },
+        "query": "id=\\d{5}",
+        "visible": [
+          "178:24-178:31"
+        ]
+      },
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 80,
+          "count": 0,
+          "hits": [],
+          "resume": null
+        },
+        "query": "日本",
+        "visible": []
+      }
+    ],
+    "selections": {
+      "history": "host:~/proj2$ ls -la rs34\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs35\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40595\nuser@host:~/proj0$ ls -la rs36",
+      "history_into_screen": "user@host:~/proj2$ ls -la rs30\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub30\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40510\nuser@host:~/proj3$ ls -la rs31\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub31\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nbash: foo31: command not found, error code 127\nuser@host:~/proj0$ ls -la rs32\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub32\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs33\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub33\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs34\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs35\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40595\nuser@host:~/proj0$ ls -la rs36\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub36\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs37\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37\n-rw-r--r--  1 user user  220 Oct 25 12:00",
+      "row_reversed": "r@host:~/proj3$ ls -la rs39",
+      "screen": "-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs37\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs38\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub38\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nbash: foo38: command not found, error code 127\nuser@host:~/proj3$ ls -la rs39\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub39\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj0$ ls -la rs40\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub40\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40680\nuser@host:~/proj1$ ls -la rs41\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub41\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs42\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub42\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs43\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub43\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj0$ ls -la rs44\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub44\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\noverwritten line, error gone\nuser@host:~$"
+    }
+  },
+  "restored": {
+    "find_bar": [
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 126,
+          "count": 7,
+          "hits": [
+            "195:18-195:22",
+            "169:32-169:36",
+            "139:32-139:36",
+            "108:32-108:36",
+            "78:32-78:36",
+            "47:32-47:36",
+            "17:31-17:35"
+          ],
+          "resume": null
+        },
+        "query": "error",
+        "visible": [
+          "169:32-169:36",
+          "195:18-195:22"
+        ]
+      },
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 126,
+          "count": 8,
+          "hits": [
+            "178:24-178:31",
+            "156:24-156:31",
+            "134:24-134:31",
+            "113:24-113:31",
+            "91:24-91:31",
+            "69:24-69:31",
+            "48:24-48:31",
+            "26:24-26:31"
+          ],
+          "resume": null
+        },
+        "query": "id=\\d{5}",
+        "visible": [
+          "178:24-178:31"
+        ]
+      },
+      {
+        "matches": {
+          "alt_screen": false,
+          "cols": 126,
+          "count": 0,
+          "hits": [],
+          "resume": null
+        },
+        "query": "日本",
+        "visible": []
+      }
+    ],
+    "selections": {
+      "history": "host:~/proj2$ ls -la rs34\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs35\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40595\nuser@host:~/proj0$ ls -la rs36",
+      "history_into_screen": "user@host:~/proj2$ ls -la rs30\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub30\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40510\nuser@host:~/proj3$ ls -la rs31\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub31\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nbash: foo31: command not found, error code 127\nuser@host:~/proj0$ ls -la rs32\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub32\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs33\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub33\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs34\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub34\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs35\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub35\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40595\nuser@host:~/proj0$ ls -la rs36\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub36\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs37\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37\n-rw-r--r--  1 user user  220 Oct 25 12:00",
+      "row_reversed": "r@host:~/proj3$ ls -la rs39",
+      "screen": "-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj1$ ls -la rs37\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub37\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs38\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub38\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nbash: foo38: command not found, error code 127\nuser@host:~/proj3$ ls -la rs39\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub39\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj0$ ls -la rs40\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub40\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\ncol1\t   col2\t   col3\t   id=40680\nuser@host:~/proj1$ ls -la rs41\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub41\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj2$ ls -la rs42\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub42\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj3$ ls -la rs43\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub43\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\nuser@host:~/proj0$ ls -la rs44\ntotal 8\ndrwxr-xr-x  3 user user 4096 Oct 25 12:00 sub44\n-rw-r--r--  1 user user  220 Oct 25 12:00 notes.txt\noverwritten line, error gone\nuser@host:~$"
+    }
+  }
+}

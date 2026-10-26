@@ -1,0 +1,7 @@
+/target
+/website/node_modules
+/website/build
+.superpowers/
+*.dmg
+/website/.docusaurus
+.DS_Store
