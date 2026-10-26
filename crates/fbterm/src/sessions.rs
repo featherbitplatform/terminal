@@ -460,6 +460,9 @@ impl App {
             self.flush_resizes(wid);
             return Task::none();
         }
+        if let TilesMsg::Focus(pane) = msg {
+            return self.focus_pane(wid, pane);
+        }
         let area = self.areas.get(&wid).copied();
         let Some(tab) = self
             .windows
@@ -469,13 +472,6 @@ impl App {
             return Task::none();
         };
         match msg {
-            TilesMsg::Focus(pane) => {
-                if tab.layout.contains(pane) && tab.focused != pane {
-                    tab.focused = pane;
-                    tab.recent.retain(|p| *p != pane);
-                    tab.recent.insert(0, pane);
-                }
-            }
             TilesMsg::DragDivider { path, ratio } => {
                 if tab.maximized.is_some() {
                     return Task::none();
@@ -498,7 +494,7 @@ impl App {
                     tab.layout.equalize(&path);
                 }
             }
-            TilesMsg::EndDrag | TilesMsg::Area(_) => {}
+            TilesMsg::Focus(_) | TilesMsg::EndDrag | TilesMsg::Area(_) => {}
         }
         Task::none()
     }
@@ -794,6 +790,7 @@ mod pane_tests {
 
         use super::two_panes;
         use crate::app::{App, DEFAULT_GRID, Message};
+        use crate::keys::Action;
         use crate::layout::PaneId;
         use crate::tabs::{self, Pane, Tab, TabState, WindowState};
         use crate::tiles::TilesMsg;
@@ -975,32 +972,92 @@ mod pane_tests {
             wait_for(&term, "25 74");
         }
 
+        /// Wait until every session in `ids` has reported a `Dirty`, so each has its flag set.
+        fn wait_for_dirty(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<(
+                fbterm_session::SessionId,
+                SessionEvent,
+            )>,
+            ids: &[fbterm_session::SessionId],
+        ) {
+            let mut seen = std::collections::HashSet::new();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ids.iter().all(|id| seen.contains(id)) {
+                match rx.try_recv() {
+                    Ok((id, SessionEvent::Dirty)) => {
+                        seen.insert(id);
+                    }
+                    Ok(_) => {}
+                    Err(_) if Instant::now() > deadline => panic!("no Dirty from every session"),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+        }
+
+        fn flag_pending(w: &WindowState, tab: usize, pane: PaneId) -> bool {
+            w.tabs[tab]
+                .pane(pane)
+                .and_then(|p| p.session.as_ref())
+                .unwrap()
+                .take_dirty()
+        }
+
         #[test]
         fn dirty_takes_only_visible_panes() {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-            let hidden = connected("busy", shell("echo hi; sleep 30", tx));
-            let c = hidden.id;
-            let first = Pane::new(ProfileId::new(), "a", None);
-            let second = Pane::new(ProfileId::new(), "b", None);
-            let (a, b) = (first.id, second.id);
+            let busy = |name, tx: &Sink| connected(name, shell("echo hi; sleep 30", tx.clone()));
+            let (first, second, hidden) = (busy("a", &tx), busy("b", &tx), busy("c", &tx));
+            let (a, b, c) = (first.id, second.id, hidden.id);
+            let sessions: Vec<_> = [&first, &second, &hidden]
+                .iter()
+                .map(|p| p.session.as_ref().unwrap().id)
+                .collect();
             let mut w = WindowState::new();
             w.push(two_panes(first, second));
             w.push(Tab::single(hidden));
             w.active = 0;
-            // Wait for the background pane's Dirty.
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match rx.try_recv() {
-                    Ok((_, SessionEvent::Dirty)) => break,
-                    _ if Instant::now() > deadline => panic!("no Dirty"),
-                    _ => std::thread::sleep(Duration::from_millis(10)),
-                }
-            }
+            wait_for_dirty(&mut rx, &sessions);
+
+            // A pane hidden by a maximized one leaves its flag pending, like a background tab.
+            w.tabs[0].maximized = Some(a);
+            assert!(!tabs::on_dirty(&w, b), "a pane the maximized one hides");
+            assert!(flag_pending(&w, 0, b), "its flag is left set");
+            assert!(tabs::on_dirty(&w, a));
+            assert!(!flag_pending(&w, 0, a), "the shown pane took its flag");
+
+            // Un-maximized, every pane of the tab is visible.
+            w.tabs[0].maximized = None;
             assert!(tabs::on_dirty(&w, a));
             assert!(tabs::on_dirty(&w, b));
             assert!(!tabs::on_dirty(&w, c), "a pane of a background tab");
-            let session = w.tabs[1].panes[0].session.as_ref().unwrap();
-            assert!(session.take_dirty(), "its flag is left set");
+            assert!(flag_pending(&w, 1, c), "its flag is left set");
+        }
+
+        #[test]
+        fn unmaximizing_takes_the_redraws_left_pending() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let first = connected("one", shell("echo hi; sleep 30", tx.clone()));
+            let second = connected("two", shell("echo hi; sleep 30", tx));
+            let (a, b) = (first.id, second.id);
+            let sessions = [
+                first.session.as_ref().unwrap().id,
+                second.session.as_ref().unwrap().id,
+            ];
+            let (mut app, wid) = app_with(first, second);
+            wait_for_dirty(&mut rx, &sessions);
+
+            let toggle = |app: &mut App| {
+                let _ = app.update(Message::Shortcut(wid, Action::MaximizePane));
+            };
+            toggle(&mut app);
+            assert_eq!(app.windows[&wid].tabs[0].maximized, Some(a));
+            // Maximizing took the shown pane's flag and left the hidden one's.
+            toggle(&mut app);
+            assert_eq!(app.windows[&wid].tabs[0].maximized, None);
+            assert!(
+                !flag_pending(&app.windows[&wid], 0, b),
+                "showing the pane took its pending redraw"
+            );
         }
     }
 }

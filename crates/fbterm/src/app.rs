@@ -266,7 +266,6 @@ pub struct App {
     /// Whether one of our windows has focus at all (the app is in front).
     pub app_active: bool,
     pub style: TerminalStyle,
-    pub style_unfocused: TerminalStyle,
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
@@ -473,10 +472,6 @@ impl App {
             settings_notice,
             pending_release: Vec::new(),
             app_active: true,
-            style_unfocused: TerminalStyle {
-                focused: false,
-                ..style.clone()
-            },
             style,
             screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
             screenshot_window: match debug_env("FBTERM_SCREENSHOT_WINDOW") {

@@ -298,7 +298,6 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
     let _ = app.update(Message::ConfigChanged(changed));
     assert_eq!(app.settings.font_size, 18.0);
     assert_eq!(app.style.font_size, 18.0);
-    assert_eq!(app.style_unfocused.font_size, 18.0);
     assert_eq!(
         app.tokens,
         crate::theme::tokens(fbterm_config::ThemeMode::Light)

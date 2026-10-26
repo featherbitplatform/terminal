@@ -98,7 +98,6 @@ pub struct Tab {
     /// The pane filling the whole tab, while one is maximized.
     pub maximized: Option<PaneId>,
     /// Panes by most recent focus, latest first.
-    #[allow(dead_code)] // read by directional focus (tiling task 4)
     pub recent: Vec<PaneId>,
 }
 
@@ -120,9 +119,58 @@ impl Tab {
         self.panes.iter().find(|p| p.id == id)
     }
 
-    #[allow(dead_code)] // used by the pane actions (tiling task 4)
+    #[allow(dead_code)] // used by tab merge and tile moves (tiling task 10)
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|p| p.id == id)
+    }
+
+    /// Focus `pane`: the one way focus changes, so `recent` stays right (clicks, directional
+    /// focus, a find jump, the refocus after a close). A pane the maximized one hides is shown
+    /// by un-maximizing; the caller then runs `App::shown` for the panes that
+    /// came back. Returns whether anything changed (false for a pane not in this tab).
+    pub fn focus(&mut self, pane: PaneId) -> bool {
+        if !self.layout.contains(pane) {
+            return false;
+        }
+        let unhidden = self.maximized.is_some_and(|m| m != pane);
+        if unhidden {
+            self.maximized = None;
+        }
+        if self.focused == pane {
+            return unhidden;
+        }
+        self.focused = pane;
+        self.recent.retain(|p| *p != pane);
+        self.recent.insert(0, pane);
+        true
+    }
+
+    /// Take `id` out of the tab and focus the pane focused before it (else the first in reading
+    /// order) if it had focus. `None` for a pane not in the tab and for the last pane: closing
+    /// the tab then is the caller's job.
+    pub fn close_pane(&mut self, id: PaneId) -> Option<Pane> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        let at = self.panes.iter().position(|p| p.id == id)?;
+        self.layout.remove(id)?;
+        let pane = self.panes.remove(at);
+        self.recent.retain(|p| *p != id);
+        if self.maximized == Some(id) {
+            self.maximized = None;
+        }
+        if self.focused == id {
+            let next = self
+                .recent
+                .iter()
+                .copied()
+                .find(|p| self.layout.contains(*p))
+                .or_else(|| self.layout.panes().first().copied());
+            if let Some(next) = next {
+                self.focus(next);
+            }
+        }
+        Some(pane)
     }
 
     pub fn focused_pane(&self) -> &Pane {
@@ -477,6 +525,66 @@ mod tests {
         assert_eq!(tab.visible_panes(), vec![b]);
         tab.maximized = None;
         assert_eq!(tab.visible_panes(), vec![a, b]);
+    }
+
+    /// A tab of three panes: `a` | (`b` over `c`), `a` focused.
+    fn three() -> (Tab, [PaneId; 3]) {
+        let (first, second, third) = (pane("a"), pane("b"), pane("c"));
+        let (a, b, c) = (first.id, second.id, third.id);
+        let mut tab = Tab::single(first);
+        tab.layout.split(a, crate::layout::Side::Right, b);
+        tab.layout.split(b, crate::layout::Side::Bottom, c);
+        tab.panes.extend([second, third]);
+        (tab, [a, b, c])
+    }
+
+    #[test]
+    fn focus_records_recency_and_shows_the_pane() {
+        let (mut tab, [a, b, c]) = three();
+        assert!(!tab.focus(a), "already focused");
+        assert!(tab.focus(c));
+        assert_eq!((tab.focused, tab.recent.clone()), (c, vec![c, a]));
+        assert!(tab.focus(b));
+        assert!(tab.focus(c));
+        assert_eq!(tab.recent, vec![c, b, a]);
+        assert!(!tab.focus(PaneId::next()), "not in this tab");
+        // A pane hidden by maximize is shown again by focusing another.
+        tab.maximized = Some(c);
+        assert!(tab.focus(a));
+        assert_eq!(tab.maximized, None);
+        assert_eq!(tab.visible_panes().len(), 3);
+    }
+
+    #[test]
+    fn closing_a_pane_refocuses_the_most_recent_and_prunes() {
+        let (mut tab, [a, b, c]) = three();
+        tab.focus(c);
+        tab.focus(b);
+        // Close b: c was focused last.
+        let gone = tab.close_pane(b).expect("b is in the tab");
+        assert_eq!(gone.id, b);
+        assert_eq!(tab.focused, c);
+        assert_eq!(tab.recent, vec![c, a]);
+        assert_eq!(tab.layout.panes(), vec![a, c]);
+        assert_eq!(tab.panes.len(), 2);
+        // Closing a pane that is not focused keeps the focus.
+        assert!(tab.close_pane(a).is_some());
+        assert_eq!(tab.focused, c);
+        // The last pane stays: closing the tab is the caller's job.
+        assert!(tab.close_pane(c).is_none());
+        assert_eq!(tab.panes.len(), 1);
+        assert!(tab.close_pane(PaneId::next()).is_none());
+    }
+
+    #[test]
+    fn closing_the_maximized_pane_shows_the_others() {
+        let (mut tab, [a, b, _]) = three();
+        tab.focus(b);
+        tab.maximized = Some(b);
+        tab.close_pane(b);
+        assert_eq!(tab.maximized, None);
+        assert_eq!(tab.focused, a);
+        assert_eq!(tab.visible_panes().len(), 2);
     }
 
     #[test]

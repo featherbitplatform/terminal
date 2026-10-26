@@ -5,7 +5,9 @@ use iced::{Task, window};
 use crate::app::{App, Message};
 use crate::editor::EditorMsg;
 use crate::keys::Action;
+use crate::layout::{Dir, Side};
 use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState};
+use crate::pane_actions::Zoom;
 use crate::settings_window::SettingsMsg;
 use crate::tabs::WindowState;
 
@@ -21,13 +23,28 @@ impl App {
                 Some(wid) => self.open_palette(wid, String::new()),
                 None => self.open_window(self.default_profile()),
             },
-            Action::CloseTab => match wid {
-                Some(wid) => {
-                    let active = self.windows.get(&wid).map_or(0, |w| w.active);
-                    self.close_tab(wid, active)
-                }
-                None => Task::none(),
-            },
+            // The focused pane; the last pane of a tab closes the tab.
+            Action::CloseTab => self.on_window(wid, App::close_focused_pane),
+            Action::SplitRight => self.on_window(wid, |app, wid| app.split_pane(wid, Side::Right)),
+            Action::SplitDown => self.on_window(wid, |app, wid| app.split_pane(wid, Side::Bottom)),
+            Action::FocusLeft => {
+                self.on_window(wid, |app, wid| app.focus_direction(wid, Dir::Left))
+            }
+            Action::FocusRight => {
+                self.on_window(wid, |app, wid| app.focus_direction(wid, Dir::Right))
+            }
+            Action::FocusUp => self.on_window(wid, |app, wid| app.focus_direction(wid, Dir::Up)),
+            Action::FocusDown => {
+                self.on_window(wid, |app, wid| app.focus_direction(wid, Dir::Down))
+            }
+            Action::ZoomIn => self.on_window(wid, |app, wid| app.zoom_pane(wid, Zoom::In)),
+            Action::ZoomOut => self.on_window(wid, |app, wid| app.zoom_pane(wid, Zoom::Out)),
+            Action::ZoomReset => self.on_window(wid, |app, wid| app.zoom_pane(wid, Zoom::Reset)),
+            Action::MaximizePane => self.on_window(wid, App::toggle_maximize),
+            // Declared for their chords and the Settings list; later tasks give them behaviour.
+            Action::FindInTab | Action::MergeTab | Action::MoveTile | Action::TileToTab => {
+                Task::none()
+            }
             Action::NextTab => self.with_focused(WindowState::next),
             Action::PrevTab => self.with_focused(WindowState::prev),
             Action::SelectTab(n) => self.with_focused(|w| w.select_number(n)),
@@ -70,6 +87,18 @@ impl App {
                 Some(wid) => self.find(wid, crate::find::FindMsg::Previous),
                 None => Task::none(),
             },
+        }
+    }
+
+    /// Run `f` on the window an action is for, if there is one.
+    fn on_window(
+        &mut self,
+        wid: Option<window::Id>,
+        f: impl FnOnce(&mut Self, window::Id) -> Task<Message>,
+    ) -> Task<Message> {
+        match wid {
+            Some(wid) => f(self, wid),
+            None => Task::none(),
         }
     }
 

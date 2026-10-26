@@ -121,9 +121,13 @@ fn key_message(
     let shortcut = keys::shortcut(bindings, key, mods, text).filter(|a| !a.is_find_navigation());
     match mode {
         Mode::Normal => shortcut.map(|action| {
-            // Holding a key repeats tab switching only.
-            (!repeat || matches!(action, Action::NextTab | Action::PrevTab))
-                .then_some(Message::Shortcut(w, action))
+            // Holding a key repeats tab switching and zooming only.
+            (!repeat
+                || matches!(
+                    action,
+                    Action::NextTab | Action::PrevTab | Action::ZoomIn | Action::ZoomOut
+                ))
+            .then_some(Message::Shortcut(w, action))
         }),
         Mode::Blocked { toggles } => shortcut.map(|action| {
             (toggles && matches!(action, Action::Palette | Action::FindAll) && !repeat)

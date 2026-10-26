@@ -93,6 +93,15 @@ fn ratio_at(axis: Axis, split: Rectangle, p: Point, grab: f32) -> f32 {
     (pos - grab - start - DIVIDER / 2.0) / room
 }
 
+/// Events that end a divider drag without its button release: the pointer leaving the window
+/// or the window losing focus.
+fn cancels_drag(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused)
+    )
+}
+
 /// Whole logical pixels, so the panes' text sits on the pixel grid like a lone pane's.
 fn snap(r: Rectangle) -> Rectangle {
     let (x, y) = (r.x.round(), r.y.round());
@@ -312,6 +321,13 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                     self.publish(shell, TilesMsg::EndDrag);
                     shell.capture_event();
                     return;
+                }
+                // The release can go missing (the pointer left the window, or the window lost
+                // focus mid-drag): end the drag so the resizes flush. Not captured: the panes
+                // see these events too.
+                e if state.drag.is_some() && cancels_drag(e) => {
+                    state.drag = None;
+                    self.publish(shell, TilesMsg::EndDrag);
                 }
                 _ => {}
             }
@@ -557,5 +573,16 @@ mod tests {
         l.set_ratio(&vec![], r);
         let d = &l.dividers(split)[0];
         assert!((d.rect.center().x - 260.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn a_drag_ends_when_the_pointer_or_focus_is_lost() {
+        assert!(cancels_drag(&Event::Mouse(mouse::Event::CursorLeft)));
+        assert!(cancels_drag(&Event::Window(window::Event::Unfocused)));
+        assert!(!cancels_drag(&Event::Window(window::Event::Focused)));
+        assert!(!cancels_drag(&Event::Mouse(mouse::Event::CursorEntered)));
+        assert!(!cancels_drag(&Event::Mouse(mouse::Event::ButtonPressed(
+            mouse::Button::Left
+        ))));
     }
 }

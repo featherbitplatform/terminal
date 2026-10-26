@@ -46,6 +46,7 @@ mod layout;
 mod memory;
 mod pacing;
 mod palette;
+mod pane_actions;
 mod perf;
 mod prompt_view;
 mod prompts;

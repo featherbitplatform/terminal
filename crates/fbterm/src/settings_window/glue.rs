@@ -291,10 +291,6 @@ impl App {
         if new.font_family != self.settings.font_family || new.font_size != self.settings.font_size
         {
             self.style = terminal_style(&new);
-            self.style_unfocused = TerminalStyle {
-                focused: false,
-                ..self.style.clone()
-            };
         }
         if new.theme != self.settings.theme {
             self.theme = theme::graphite_theme(new.theme);

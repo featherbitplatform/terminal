@@ -346,7 +346,7 @@ impl App {
             return Task::none();
         };
         let selected = window.select(index);
-        window.tabs[index].focused = jump.pane;
+        let moved = window.tabs[index].focus(jump.pane);
         let pane = &mut window.tabs[index].panes[p];
         let Some(term) = pane.terminal().cloned() else {
             return Task::none();
@@ -360,7 +360,7 @@ impl App {
         pane.find = Some(bar);
         let id = pane.id;
         self.focused = Some(jump.window);
-        let shown = if selected {
+        let shown = if selected || moved {
             self.save_state();
             self.shown(jump.window)
         } else {

@@ -4,7 +4,7 @@ title: Keyboard shortcuts
 sidebar_label: Keyboard shortcuts
 ---
 
-Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it. The exceptions are `Ctrl+,` for Settings and `Ctrl+Alt+F` for find in all tabs.
+Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ctrl+Shift`, so plain `Ctrl` keys (such as `Ctrl+T`, `Ctrl+W` and `Ctrl+P`) keep reaching your shell and the programs running in it. The exceptions are `Ctrl+,` for Settings, `Ctrl+Alt+F` for find in all tabs and `Ctrl+Alt` with an arrow key to move between panes.
 
 These are the defaults. Every application shortcut can be changed or removed in the **Keyboard** section of the Settings window (see [Changing shortcuts](#changing-shortcuts)); the tables below list the defaults, and the Settings window, the palette and the tab-bar tooltips always show the shortcuts in force.
 
@@ -17,12 +17,31 @@ On macOS the shortcuts never use `Ctrl` or `Option`. Copy and paste are handled 
 | Action | macOS | Linux and Windows |
 | --- | --- | --- |
 | New tab | `Cmd+T` | `Ctrl+Shift+T` |
-| Close tab | `Cmd+W` | `Ctrl+Shift+W` |
+| Close pane (the last pane closes the tab) | `Cmd+W` | `Ctrl+Shift+W` |
 | Next tab | `Cmd+Shift+]` | `Ctrl+Shift+]` |
 | Previous tab | `Cmd+Shift+[` | `Ctrl+Shift+[` |
 | Select tab 1 to 9 | `Cmd+1` to `Cmd+9` | `Ctrl+Shift+1` to `Ctrl+Shift+9` |
 | New window | `Cmd+N` | `Ctrl+Shift+N` |
 | Quit (saves the layout first) | `Cmd+Q` | `Ctrl+Shift+Q` |
+
+## Panes
+
+A tab can be split into panes, each with its own session. Splitting opens the focused pane's profile in a new pane beside or below it and moves focus there. A split is refused, silently, when a pane would end up smaller than 20 columns by 5 rows. These shortcuts act on the focused pane.
+
+| Action | macOS | Linux and Windows |
+| --- | --- | --- |
+| Split right | `Cmd+D` | `Ctrl+Shift+D` |
+| Split down | `Cmd+Shift+D` | `Ctrl+Shift+Alt+D` |
+| Close pane | `Cmd+W` | `Ctrl+Shift+W` |
+| Focus the pane to the left, right, above, below | `Cmd+Option+Left`, `Right`, `Up`, `Down` | `Ctrl+Alt+Left`, `Right`, `Up`, `Down` |
+| Zoom in | `Cmd+=` | `Ctrl+Shift+=` |
+| Zoom out | `Cmd+-` | `Ctrl+Shift+-` |
+| Reset zoom | `Cmd+0` | `Ctrl+Shift+0` |
+| Maximize pane (press again to restore) | `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` |
+
+Closing a pane closes its session, without asking. Moving focus goes to the nearest pane in that direction; when two are equally near, the one you used more recently. Zoom changes the text size of the focused pane only, one point per press, and `+` counts as `=`; reset returns it to the font size in Settings. A maximized pane fills the tab while the others keep running out of sight; moving focus or splitting shows them again. Maximize does nothing in a tab with one pane.
+
+Move tile, Merge tab into and Find in this tab have names for the [`[keys]` table](#the-keys-table) but do nothing yet.
 
 ### The title bar on macOS
 
@@ -76,7 +95,10 @@ These actions are listed after your profiles, each with its shortcut when it has
 | --- | --- |
 | New tab | Choose a profile to open in a new tab. |
 | New window | Open a new window. |
-| Close tab | Close the active tab. |
+| Close pane | Close the focused pane; the last pane closes the tab. |
+| Split right | Open the focused pane's profile in a new pane to its right. |
+| Split down | Open the focused pane's profile in a new pane below it. |
+| Maximize pane | Let the focused pane fill the tab, or restore the others. |
 | Find in tab | Open the active tab's find bar. |
 | Find in all tabs | Open the search over every tab. |
 | Edit profiles | Open the profile editor. |
@@ -101,7 +123,7 @@ You can also click a row. The palette shows ten rows at a time.
 
 ## Changing shortcuts
 
-Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear button in the tab bar) and scroll to **Keyboard**. It lists every action with its shortcut, grouped into Tabs, Windows, Search and App.
+Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear button in the tab bar) and scroll to **Keyboard**. It lists every action with its shortcut, grouped into Tabs, Panes, Windows, Search and App.
 
 - **Change one:** click its shortcut, then press the new one. While you record, keys go to the recorder only: they never reach a terminal and never run a shortcut. `Escape` cancels and keeps the old shortcut.
 - **Already in use:** if another action has that shortcut, the row names it and offers **Take over** (the other action is then left without a shortcut) or **Cancel**. Two actions never share a shortcut.
@@ -130,8 +152,12 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 
 | Name | Action |
 | --- | --- |
-| `new_tab`, `close_tab`, `next_tab`, `previous_tab` | Tabs |
+| `new_tab`, `close_tab`, `next_tab`, `previous_tab` | New tab, close pane (the tab when it is the last), next and previous tab |
 | `export_tab` | Export tab to file (no default shortcut) |
+| `split_right`, `split_down`, `maximize_pane` | Split the focused pane, maximize it |
+| `focus_left`, `focus_right`, `focus_up`, `focus_down` | Move focus to the neighbouring pane |
+| `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |
+| `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Reserved for tiling features that are not available yet (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
 | `new_window`, `edit_profiles`, `settings` | New window, the profile editor, Settings |
 | `find`, `find_all`, `find_next`, `find_previous` | Find in tab, find in all tabs, older and newer match in the find bar |
