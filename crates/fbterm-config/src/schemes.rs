@@ -267,16 +267,28 @@ pub fn new_user_id() -> String {
 /// The largest scheme file read: a real one is well under 2 KiB.
 pub const MAX_FILE_BYTES: u64 = 64 * 1024;
 
+/// Read at most `MAX_FILE_BYTES` from `reader`; `None` when there is more, however the
+/// size was reported (a file can grow after its length was checked).
+fn read_capped(reader: impl std::io::Read) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    reader.take(MAX_FILE_BYTES + 1).read_to_end(&mut buf)?;
+    Ok((buf.len() as u64 <= MAX_FILE_BYTES).then_some(buf))
+}
+
 /// Read one scheme file. The result is never marked built-in.
 pub fn read_file(path: &Path) -> Result<Scheme, ConfigError> {
     let err = |m: String| ConfigError::new(path, None, m);
-    let len = std::fs::metadata(path)
-        .map_err(|e| err(e.to_string()))?
-        .len();
-    if len > MAX_FILE_BYTES {
-        return Err(err("Not a color scheme file (too large).".into()));
+    let meta = std::fs::metadata(path).map_err(|e| err(e.to_string()))?;
+    // A pipe, device or socket reports no size and can be endless: never read one.
+    if !meta.is_file() {
+        return Err(err("Not a color scheme file.".into()));
     }
-    let bytes = std::fs::read(path).map_err(|e| err(e.to_string()))?;
+    let file = std::fs::File::open(path).map_err(|e| err(e.to_string()))?;
+    let bytes = read_capped(file).map_err(|e| err(e.to_string()))?;
+    let Some(bytes) = bytes else {
+        return Err(err("Not a color scheme file (too large).".into()));
+    };
     let text =
         String::from_utf8(bytes).map_err(|_| err("Not a color scheme file (not text).".into()))?;
     let file: SchemeFile = toml::from_str(&text).map_err(|e| {
@@ -438,5 +450,23 @@ impl SchemeSet {
 
     pub fn all(&self) -> &[Scheme] {
         &self.schemes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn growing_read_is_bounded() {
+        // An endless reader stops one byte past the cap.
+        assert!(read_capped(std::io::repeat(b' ')).unwrap().is_none());
+        let at_cap = vec![b'a'; MAX_FILE_BYTES as usize];
+        assert_eq!(
+            read_capped(&at_cap[..]).unwrap().unwrap().len(),
+            at_cap.len()
+        );
+        let over = vec![b'a'; MAX_FILE_BYTES as usize + 1];
+        assert!(read_capped(&over[..]).unwrap().is_none());
     }
 }

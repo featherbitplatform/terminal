@@ -255,3 +255,14 @@ fn oversized_file_in_schemes_dir_is_skipped() {
     assert!(errors.iter().any(|e| e.to_string().contains("too large")));
     assert_eq!(set.all().len(), 4);
 }
+
+#[cfg(unix)]
+#[test]
+fn fifo_or_device_is_refused() {
+    // /dev/zero reports length 0 and never ends: it must be refused, not read.
+    let err = fbterm_config::schemes::read_file(std::path::Path::new("/dev/zero")).unwrap_err();
+    assert!(
+        err.to_string().contains("Not a color scheme file."),
+        "{err}"
+    );
+}
