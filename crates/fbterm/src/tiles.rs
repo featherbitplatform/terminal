@@ -121,10 +121,11 @@ fn nearest_side(rect: Rectangle, p: Point) -> (Side, f32) {
     .expect("four sides")
 }
 
-/// The rectangle `pane` would get if dropped at `at`.
+/// The rectangle `pane` would get if dropped at `at`; `None` when the drop is impossible or
+/// would leave the arrangement as it is.
 fn preview(layout: &Layout, area: Rectangle, pane: PaneId, at: Drop) -> Option<Rectangle> {
     let mut moved = layout.clone();
-    if !moved.move_pane(pane, at) {
+    if !moved.move_pane(pane, at) || moved == *layout {
         return None;
     }
     moved
@@ -246,12 +247,24 @@ struct Drag {
     grab: f32,
 }
 
+/// What happens to an event after the tile-drag logic saw it.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    /// Consumed: the panes do not see it.
+    Consumed,
+    /// On to divider handling and the panes.
+    PassOn,
+    /// The release of a modifier click that never travelled: the panes get the held-back
+    /// press at this point, then the release.
+    Replay(Point),
+}
+
 /// A tile picked up: by its handle, or with the pick modifier from inside its pane.
 struct TileDrag {
     pane: PaneId,
     origin: Point,
-    /// Picked by the handle (the press was the tiles'); else the pane's view had the press
-    /// too and gets the release.
+    /// Picked by the handle; else with the pick modifier, the press held back from the pane's
+    /// view until it is clear whether it is a drag or a click.
     by_handle: bool,
     /// The pointer travelled past `PICK_SLOP`: the tile is being carried.
     carrying: bool,
@@ -299,8 +312,7 @@ impl Tiles<'_> {
         Some((id, handle_rect(snap(rect)).contains(p)))
     }
 
-    /// Handles the tile-drag side of `event`. True when the event is consumed and goes no
-    /// further (the panes do not see it).
+    /// Handles the tile-drag side of `event`: what then happens to it.
     fn tile_event(
         &self,
         state: &mut State,
@@ -308,7 +320,20 @@ impl Tiles<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
         shell: &mut Shell<'_, Message>,
-    ) -> bool {
+    ) -> Flow {
+        // A drag of a pane no longer shown (closed, or the tab is down to one pane) is over.
+        if state
+            .tile
+            .as_ref()
+            .is_some_and(|t| !self.movable() || !self.ids.contains(&t.pane))
+        {
+            state.tile = None;
+            state.swallow_escape = false;
+        }
+        if !self.several() {
+            state.hover = None;
+            return Flow::PassOn;
+        }
         match event {
             Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
                 if is_escape(key) && state.tile.as_ref().is_some_and(|t| !t.cancelled) =>
@@ -321,14 +346,14 @@ impl Tiles<'_> {
                 state.swallow_escape = true;
                 shell.request_redraw();
                 shell.capture_event();
-                true
+                Flow::Consumed
             }
             Event::Keyboard(keyboard::Event::KeyReleased { key, .. })
                 if is_escape(key) && state.swallow_escape =>
             {
                 state.swallow_escape = false;
                 shell.capture_event();
-                true
+                Flow::Consumed
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) if state.tile.is_some() => {
                 let tile = state.tile.as_mut().expect("checked");
@@ -338,7 +363,9 @@ impl Tiles<'_> {
                         shell.request_redraw();
                     }
                     if tile.carrying {
-                        let target = drop_target(&self.layout, bounds, p, Some(tile.pane));
+                        // A drop that would leave the arrangement as it is is no target.
+                        let target = drop_target(&self.layout, bounds, p, Some(tile.pane))
+                            .filter(|at| preview(&self.layout, bounds, tile.pane, *at).is_some());
                         if target != tile.target {
                             tile.target = target;
                             shell.request_redraw();
@@ -346,7 +373,7 @@ impl Tiles<'_> {
                     }
                 }
                 shell.capture_event();
-                true
+                Flow::Consumed
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
                 if state.tile.is_some() =>
@@ -361,19 +388,24 @@ impl Tiles<'_> {
                         },
                     );
                 }
+                state.hover = cursor
+                    .position_over(bounds)
+                    .and_then(|p| self.hover_at(bounds, p));
                 shell.request_redraw();
-                if tile.by_handle {
-                    shell.capture_event();
-                    return true;
+                if !tile.by_handle && !tile.carrying && !tile.cancelled {
+                    // A modifier click that never travelled: the pane's view gets it after
+                    // all (a link opens, a program reading the mouse sees its click).
+                    return Flow::Replay(tile.origin);
                 }
-                // The pane's view had the press: it gets the release, which ends its click.
-                false
+                shell.capture_event();
+                Flow::Consumed
             }
-            e if state.tile.is_some() && cancels_drag(e) => {
+            e if (state.tile.is_some() || state.swallow_escape) && cancels_drag(e) => {
                 state.tile = None;
                 state.hover = None;
+                state.swallow_escape = false;
                 shell.request_redraw();
-                false
+                Flow::PassOn
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 let hover = cursor
@@ -383,15 +415,15 @@ impl Tiles<'_> {
                     state.hover = hover;
                     shell.request_redraw();
                 }
-                false
+                Flow::PassOn
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 if state.hover.take().is_some() {
                     shell.request_redraw();
                 }
-                false
+                Flow::PassOn
             }
-            _ => false,
+            _ => Flow::PassOn,
         }
     }
 
@@ -553,8 +585,26 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(m)) = event {
             state.modifiers = *m;
         }
-        if self.several() && self.tile_event(state, event, bounds, cursor, shell) {
-            return;
+        match self.tile_event(state, event, bounds, cursor, shell) {
+            Flow::Consumed => return,
+            Flow::PassOn => {}
+            Flow::Replay(origin) => {
+                let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+                self.update_children(
+                    tree,
+                    &press,
+                    layout,
+                    mouse::Cursor::Available(origin),
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
+                self.update_children(
+                    tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+                );
+                return;
+            }
         }
         if self.several() {
             match event {
@@ -594,7 +644,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                                 }
                                 let on_handle = self.movable()
                                     && state.drag.is_none()
-                                    && state.hover == Some((id, true));
+                                    && self.hover_at(bounds, p) == Some((id, true));
                                 if on_handle {
                                     state.tile = Some(TileDrag {
                                         pane: id,
@@ -609,25 +659,18 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                                     return;
                                 }
                                 if self.movable() && pick_modifier(state.modifiers) {
-                                    // The pane's view sees the press first: a link under the
-                                    // pointer or a program reading the mouse keeps it.
-                                    let modifiers = state.modifiers;
-                                    self.update_children(
-                                        tree, event, layout, cursor, renderer, clipboard, shell,
-                                        viewport,
-                                    );
-                                    if !shell.is_event_captured() {
-                                        let state = tree.state.downcast_mut::<State>();
-                                        state.modifiers = modifiers;
-                                        state.tile = Some(TileDrag {
-                                            pane: id,
-                                            origin: p,
-                                            by_handle: false,
-                                            carrying: false,
-                                            target: None,
-                                            cancelled: false,
-                                        });
-                                    }
+                                    // Held back from the pane's view: travelling past the slop
+                                    // carries the tile, a click without travel is replayed to
+                                    // the view on release (links, programs reading the mouse).
+                                    state.tile = Some(TileDrag {
+                                        pane: id,
+                                        origin: p,
+                                        by_handle: false,
+                                        carrying: false,
+                                        target: None,
+                                        cancelled: false,
+                                    });
+                                    shell.capture_event();
                                     return;
                                 }
                             }
@@ -1028,6 +1071,11 @@ mod tests {
         assert_eq!((r.x, r.width), (8.0, 1000.0));
         assert_eq!(r.y + r.height, 604.0);
         assert!((r.height - 298.0).abs() <= 1.0, "{r:?}");
+        // Back where it is (beside the other pane on the same side): no preview.
+        assert_eq!(
+            preview(&l, area(), PaneId(1), Drop::Tile(PaneId(2), Side::Left)),
+            None
+        );
         // On its own tile: no move, no preview.
         assert_eq!(
             preview(&l, area(), PaneId(1), Drop::Tile(PaneId(1), Side::Left)),
@@ -1057,5 +1105,380 @@ mod tests {
         assert!(!cancels_drag(&Event::Mouse(mouse::Event::ButtonPressed(
             mouse::Button::Left
         ))));
+    }
+
+    /// The real press path: `Tiles::update` over two terminal views, headless.
+    mod press_path {
+        use std::sync::Arc;
+
+        use fbterm_term::{SharedTerminal, Terminal, TerminalOutput, TerminalStyle};
+        use iced::advanced::clipboard;
+        use iced::keyboard::key::{Code, Named, Physical};
+        use parking_lot::Mutex;
+
+        use super::*;
+
+        const SIZE: Size = Size::new(1000.0, 600.0);
+
+        fn pick_mods() -> keyboard::Modifiers {
+            if cfg!(target_os = "macos") {
+                keyboard::Modifiers::LOGO
+            } else {
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT
+            }
+        }
+
+        fn mods(m: keyboard::Modifiers) -> Event {
+            Event::Keyboard(keyboard::Event::ModifiersChanged(m))
+        }
+
+        fn press() -> Event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        }
+
+        fn release() -> Event {
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+        }
+
+        fn moved(x: f32, y: f32) -> Event {
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(x, y),
+            })
+        }
+
+        fn escape(pressed: bool) -> Event {
+            let key = keyboard::Key::Named(Named::Escape);
+            let physical_key = Physical::Code(Code::Escape);
+            Event::Keyboard(if pressed {
+                keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(),
+                }
+            })
+        }
+
+        fn term() -> SharedTerminal {
+            Arc::new(Mutex::new(Terminal::new(crate::app::DEFAULT_GRID, 100)))
+        }
+
+        /// What one event did: the messages published and whether it was captured.
+        struct Step {
+            messages: Vec<Message>,
+            captured: bool,
+        }
+
+        /// Runs `steps` (an event and the pointer position) through tiles of two panes side by
+        /// side (pane 1 over x 0..498, pane 2 over x 502..1000) showing `terms`. `setup` runs
+        /// after a first event has sized the terminals to their panes.
+        fn drive(
+            terms: &[SharedTerminal; 2],
+            setup: impl FnOnce(),
+            steps: &[(Event, Point)],
+        ) -> Vec<Step> {
+            let style: TerminalStyle =
+                crate::settings_window::terminal_style(&fbterm_config::Settings::default());
+            let wid = window::Id::unique();
+            let ids = vec![PaneId(1), PaneId(2)];
+            let children = ids
+                .iter()
+                .zip(terms)
+                .map(|(id, t)| {
+                    let id = *id;
+                    fbterm_term::terminal_view(t, &style, move |o| Message::Terminal(wid, id, o))
+                })
+                .collect();
+            let mut element: Element<'_, Message> = Element::new(Tiles {
+                t: &crate::theme::DARK,
+                window: wid,
+                layout: two(),
+                focused: PaneId(1),
+                ids,
+                children,
+                outline: true,
+            });
+            let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+                iced::Font::DEFAULT,
+                Pixels(16.0),
+            ));
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, SIZE),
+            );
+            let viewport = Rectangle::with_size(SIZE);
+            let mut run = |event: &Event, at: Point| {
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    &mut tree,
+                    event,
+                    Placed::new(&node),
+                    mouse::Cursor::Available(at),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                let captured = shell.is_event_captured();
+                Step { messages, captured }
+            };
+            run(
+                &Event::Mouse(mouse::Event::CursorEntered),
+                Point::new(-10.0, -10.0),
+            );
+            setup();
+            steps.iter().map(|(e, at)| run(e, *at)).collect()
+        }
+
+        fn drops(steps: &[Step]) -> Vec<(PaneId, Drop)> {
+            steps
+                .iter()
+                .flat_map(|s| &s.messages)
+                .filter_map(|m| match m {
+                    Message::Tiles(_, TilesMsg::DropTile { pane, at }) => Some((*pane, *at)),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn urls(steps: &[Step]) -> Vec<String> {
+            steps
+                .iter()
+                .flat_map(|s| &s.messages)
+                .filter_map(|m| match m {
+                    Message::Terminal(_, _, TerminalOutput::OpenUrl(u)) => Some(u.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn resized(messages: &[Message], pane: PaneId) -> Option<fbterm_term::GridSize> {
+            messages.iter().rev().find_map(|m| match m {
+                Message::Terminal(_, p, TerminalOutput::Resized(g)) if *p == pane => Some(*g),
+                _ => None,
+            })
+        }
+
+        /// After a drop the tiles lay the moved pane out at its new rectangle, and its view
+        /// reports the new grid (which the app hands to the session through `pane_resized`).
+        #[test]
+        fn a_moved_tile_reports_its_new_grid() {
+            let terms = [term(), term()];
+            let style: TerminalStyle =
+                crate::settings_window::terminal_style(&fbterm_config::Settings::default());
+            let wid = window::Id::unique();
+            let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+                iced::Font::DEFAULT,
+                Pixels(16.0),
+            ));
+            let tiles = |layout: Layout| -> Element<'_, Message> {
+                let ids = vec![PaneId(1), PaneId(2)];
+                let children = ids
+                    .iter()
+                    .zip(&terms)
+                    .map(|(id, t)| {
+                        let id = *id;
+                        fbterm_term::terminal_view(t, &style, move |o| {
+                            Message::Terminal(wid, id, o)
+                        })
+                    })
+                    .collect();
+                Element::new(Tiles {
+                    t: &crate::theme::DARK,
+                    window: wid,
+                    layout,
+                    focused: PaneId(1),
+                    ids,
+                    children,
+                    outline: true,
+                })
+            };
+            let viewport = Rectangle::with_size(SIZE);
+            let mut tree = None::<Tree>;
+            let mut show = |layout: Layout| {
+                let mut element = tiles(layout);
+                let tree = match &mut tree {
+                    Some(t) => {
+                        t.diff(&element);
+                        t
+                    }
+                    None => tree.insert(Tree::new(&element)),
+                };
+                let node = element.as_widget_mut().layout(
+                    tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, SIZE),
+                );
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                element.as_widget_mut().update(
+                    tree,
+                    &moved(-10.0, -10.0),
+                    Placed::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                messages
+            };
+            let before = resized(&show(two()), PaneId(1)).expect("sized to its pane");
+            let mut after_layout = two();
+            assert!(after_layout.move_pane(PaneId(1), Drop::Edge(Side::Bottom)));
+            let after = resized(&show(after_layout), PaneId(1)).expect("resized after the move");
+            // From the left half to the bottom row: about twice as wide, about half as tall.
+            assert!(
+                after.cols > before.cols && after.rows < before.rows,
+                "{before:?} -> {after:?}"
+            );
+            assert_eq!(
+                terms[0].lock().size(),
+                after,
+                "the terminal took the new grid"
+            );
+        }
+
+        #[test]
+        fn modifier_drag_over_a_shell_moves_the_tile() {
+            let terms = [term(), term()];
+            terms[0].lock().feed(b"$ ls\r\nsome output\r\n$ ");
+            let (from, to) = (Point::new(100.0, 300.0), Point::new(900.0, 300.0));
+            let steps = drive(
+                &terms,
+                || {},
+                &[
+                    (mods(pick_mods()), from),
+                    (moved(from.x, from.y), from),
+                    (press(), from),
+                    (moved(102.0, 300.0), Point::new(102.0, 300.0)),
+                    (moved(to.x, to.y), to),
+                    (release(), to),
+                ],
+            );
+            assert!(
+                steps[2].captured,
+                "the press is held back from the terminal"
+            );
+            assert_eq!(
+                drops(&steps),
+                vec![(PaneId(1), Drop::Tile(PaneId(2), Side::Right))]
+            );
+            assert!(
+                terms[0].lock().selection().is_none(),
+                "no text was selected"
+            );
+        }
+
+        #[test]
+        fn modifier_click_without_travel_reaches_the_terminal() {
+            let terms = [term(), term()];
+            let at = Point::new(3.0, 3.0);
+            let near = Point::new(5.0, 4.0);
+            let steps = drive(
+                &terms,
+                || {
+                    terms[0]
+                        .lock()
+                        .feed(b"\x1b]8;;https://example.com/\x1b\\link\x1b]8;;\x1b\\ text");
+                },
+                &[
+                    (mods(pick_mods()), at),
+                    (press(), at),
+                    // Within the slop: still a click.
+                    (moved(near.x, near.y), near),
+                    (release(), near),
+                ],
+            );
+            assert!(drops(&steps).is_empty());
+            assert_eq!(urls(&steps), vec!["https://example.com/".to_string()]);
+        }
+
+        #[test]
+        fn plain_drag_still_selects() {
+            let terms = [term(), term()];
+            let (from, to) = (Point::new(20.0, 10.0), Point::new(300.0, 60.0));
+            let steps = drive(
+                &terms,
+                || {
+                    terms[0]
+                        .lock()
+                        .feed(b"first line of text\r\nsecond line of text")
+                },
+                &[(press(), from), (moved(to.x, to.y), to), (release(), to)],
+            );
+            assert!(drops(&steps).is_empty());
+            assert!(
+                terms[0].lock().selection().is_some(),
+                "the drag selected text"
+            );
+        }
+
+        #[test]
+        fn escape_cancels_a_tile_drag_and_never_reaches_the_terminal() {
+            let terms = [term(), term()];
+            let (from, to) = (Point::new(100.0, 300.0), Point::new(900.0, 300.0));
+            let steps = drive(
+                &terms,
+                || {},
+                &[
+                    (mods(pick_mods()), from),
+                    (press(), from),
+                    (moved(to.x, to.y), to),
+                    (escape(true), to),
+                    (escape(false), to),
+                    (moved(800.0, 300.0), Point::new(800.0, 300.0)),
+                    (release(), Point::new(800.0, 300.0)),
+                ],
+            );
+            assert!(drops(&steps).is_empty(), "nothing moved");
+            for i in [3, 4] {
+                assert!(steps[i].captured, "Escape step {i} was swallowed");
+                assert!(
+                    !steps[i]
+                        .messages
+                        .iter()
+                        .any(|m| matches!(m, Message::Terminal(_, _, TerminalOutput::Input(_)))),
+                    "no Escape bytes for the terminal"
+                );
+            }
+            assert!(terms[0].lock().selection().is_none());
+        }
+
+        #[test]
+        fn handle_drag_moves_the_tile_and_a_handle_click_does_not() {
+            let terms = [term(), term()];
+            // Pane 1's handle: centred on x 249, top 0..14.
+            let grip = Point::new(249.0, 6.0);
+            let below = Point::new(249.0, 580.0);
+            let steps = drive(
+                &terms,
+                || {},
+                &[
+                    (moved(grip.x, grip.y), grip),
+                    (press(), grip),
+                    (release(), grip),
+                    (press(), grip),
+                    (moved(below.x, below.y), below),
+                    (release(), below),
+                ],
+            );
+            assert!(steps[1].captured && steps[2].captured);
+            assert_eq!(drops(&steps), vec![(PaneId(1), Drop::Edge(Side::Bottom))]);
+        }
     }
 }

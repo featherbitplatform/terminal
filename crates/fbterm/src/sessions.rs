@@ -500,7 +500,9 @@ impl App {
             TilesMsg::DropTile { pane, at } => {
                 // Only the arrangement changes: sessions and terminals stay with their panes,
                 // and each moved pane's view reports its new grid through the resize path.
-                if tab.maximized.is_none() && tab.layout.move_pane(pane, at) {
+                let before = tab.layout.clone();
+                if tab.maximized.is_none() && tab.layout.move_pane(pane, at) && tab.layout != before
+                {
                     self.save_state();
                 }
                 return Task::none();
@@ -1135,6 +1137,54 @@ mod pane_tests {
             assert!(std::sync::Arc::ptr_eq(moved, &term), "the same terminal");
             assert_eq!(moved.lock().term().grid().history_size(), history);
             assert!(screen(moved).contains("ready"));
+        }
+
+        /// After a drop, the grid each moved pane's view reports goes through the debounced
+        /// resize path to its session (the view's side is `a_moved_tile_reports_its_new_grid`).
+        #[test]
+        fn dropped_tile_resizes_its_session() {
+            use crate::layout::{Drop, Side};
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let script = "trap 'stty size' WINCH; echo ready; while :; do sleep 0.05; done";
+            let first = connected("one", shell(script, tx.clone()));
+            let second = connected("two", shell(script, tx));
+            let (a, b) = (first.id, second.id);
+            let (ta, tb) = (
+                first.terminal().unwrap().clone(),
+                second.terminal().unwrap().clone(),
+            );
+            let (mut app, wid) = app_with(first, second);
+            wait_for(&ta, "ready");
+            wait_for(&tb, "ready");
+            let area = iced::Size::new(984.0, 600.0);
+            let _ = app.update(Message::Tiles(wid, TilesMsg::Area(area)));
+
+            let _ = app.update(Message::Tiles(
+                wid,
+                TilesMsg::DropTile {
+                    pane: a,
+                    at: Drop::Edge(Side::Bottom),
+                },
+            ));
+
+            // What each view reports once laid out at its new rectangle (8 x 16 px cells).
+            let cell = iced::Size::new(8.0, 16.0);
+            let rects = app.windows[&wid].tabs[0]
+                .layout
+                .rects(iced::Rectangle::with_size(area));
+            for (pane, rect) in rects {
+                let g = fbterm_term::grid_size_from_bounds(rect.size(), cell);
+                let _ = app.update(Message::Terminal(wid, pane, TerminalOutput::Resized(g)));
+                // Not yet: the session hears it once the quiet period passes.
+                assert_eq!(size_of(&app, wid, pane), DEFAULT_GRID, "{pane:?}");
+                let generation = app.pending_resizes[&pane].0;
+                let _ = app.update(Message::ResizeSettled(pane, generation));
+                assert_eq!(size_of(&app, wid, pane), g, "{pane:?}");
+                let term = if pane == a { &ta } else { &tb };
+                wait_for(term, &format!("{} {}", g.rows, g.cols));
+            }
+            assert!(app.pending_resizes.is_empty());
+            assert_eq!(app.windows[&wid].tabs[0].layout.panes(), vec![b, a]);
         }
 
         #[test]
