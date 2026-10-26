@@ -68,6 +68,9 @@ mod tabs;
 mod theme;
 mod tiles;
 mod tooltip;
+mod tunnels;
+#[cfg(test)]
+mod tunnels_tests;
 mod ui;
 mod visibility;
 mod watch;

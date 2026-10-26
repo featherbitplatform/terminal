@@ -53,7 +53,7 @@ const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 
 /// Names one tunnel: its profile and its name within that profile.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct TunnelKey {
     pub profile: ProfileId,
     pub name: String,
@@ -82,6 +82,25 @@ pub struct TunnelHandle {
 }
 
 impl TunnelHandle {
+    /// A handle with no tunnel behind it, already stopped: stands in for a real one where code
+    /// that keeps handles is tested without a network.
+    pub fn inert() -> Self {
+        let (stop, _) = watch::channel(false);
+        let (_, done) = watch::channel(());
+        Self {
+            stop,
+            gate: Arc::new(Mutex::new(false)),
+            port: Arc::new(AtomicU32::new(0)),
+            done,
+        }
+    }
+
+    /// Whether the tunnel's task has ended and released what it held (see
+    /// [`TunnelHandle::stopped`]), without waiting.
+    pub fn is_stopped(&self) -> bool {
+        self.done.has_changed().is_err()
+    }
+
     /// Stop the tunnel. Nothing more is reported once this returns; the listener, the remote
     /// forward, live clients and the connection are released by the tunnel's task right after.
     pub fn stop(&self) {
@@ -1039,6 +1058,14 @@ where
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+
+    #[tokio::test]
+    async fn inert_handle_is_already_stopped() {
+        let handle = TunnelHandle::inert();
+        assert!(handle.is_stopped());
+        assert_eq!(handle.port(), None);
+        handle.stop_and_wait().await;
+    }
 
     /// What the SOCKS side ended with (whether it opened something) and what it was asked
     /// to open.

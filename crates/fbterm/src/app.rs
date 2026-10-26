@@ -3,12 +3,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use fbterm_config::{
     ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, Settings, discover_shells,
 };
 use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
+use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
 use fbterm_term::{GridSize, SearchOutcome, TerminalOutput, TerminalStyle};
@@ -34,6 +36,7 @@ use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::settings_window::{SettingsMsg, SettingsState};
 use crate::tabs::{Pane, TabState, WindowState};
 use crate::theme;
+use crate::tunnels::{Tunnels, tunnel_stream};
 use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
 
@@ -168,6 +171,8 @@ pub enum Message {
     SaveState(u64),
     /// `profiles.toml`, `settings.toml` and/or a file in `schemes/` changed on disk.
     ConfigChanged(Changed),
+    /// A tunnel's state changed (see [`crate::tunnels`]).
+    Tunnel(TunnelKey, TunnelState),
 }
 
 /// Where a settings change came from. The scrollback notice is for edits made in
@@ -212,6 +217,10 @@ pub struct App {
     pub(crate) secrets: Arc<dyn fbterm_secrets::SecretStore>,
     pub(crate) fallback: Option<Arc<FallbackStore>>,
     pub(crate) pool: Arc<SshPool>,
+    /// Every tunnel that has run, with its state (see [`crate::tunnels`]).
+    pub(crate) tunnels: Tunnels,
+    /// `tunnel_max_retries`, shared with running tunnels so a change applies to them at once.
+    pub(crate) tunnel_retries: Arc<AtomicU32>,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
     pub(crate) visibility: visibility::Changes,
@@ -446,7 +455,10 @@ impl App {
 
         let style = crate::settings_window::terminal_style(&settings);
         let (events, rx) = unbounded_channel();
+        let tunnel_retries = Arc::new(AtomicU32::new(settings.tunnel_max_retries));
         let mut app = Self {
+            tunnels: Tunnels::new(pool.clone()),
+            tunnel_retries,
             bindings: Bindings::current(&settings.keys.map),
             theme: theme::graphite_theme(settings.theme),
             tokens: theme::tokens(settings.theme),
@@ -609,6 +621,8 @@ impl App {
             window::close_events().map(Message::WindowClosed),
             window::close_requests().map(Message::CloseRequested),
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
+            Subscription::run_with(self.tunnels.receiver.clone(), tunnel_stream)
+                .map(|(key, state)| Message::Tunnel(key, state)),
             Subscription::run_with(self.visibility.clone(), visibility::stream)
                 .map(|(id, visible)| Message::WindowVisible(id, visible)),
             Subscription::run_with(self.display.clone(), display_rate::stream)
@@ -782,6 +796,9 @@ impl App {
                     .unwrap_or_default();
                 self.forget_panes(&gone);
                 let was_terminal = self.windows.remove(&id).is_some();
+                if was_terminal {
+                    self.sync_all_shell_tunnels();
+                }
                 visibility::unwatch(id);
                 display_rate::unwatch(id);
                 if self.display_rates.remove(&id).is_some() {
@@ -885,6 +902,7 @@ impl App {
                 }
                 Task::batch(tasks)
             }
+            Message::Tunnel(key, state) => self.tunnel_event(key, state),
             Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {

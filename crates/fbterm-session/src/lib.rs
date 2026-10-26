@@ -109,6 +109,23 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// A handle with no session behind it, writing nowhere: stands in for a connected session
+    /// where code that keeps handles is tested without a program or a network.
+    pub fn inert(terminal: SharedTerminal) -> Self {
+        Self {
+            id: SessionId::next(),
+            terminal,
+            commands: tokio::sync::mpsc::unbounded_channel().0,
+            dirty_pending: Arc::new(AtomicBool::new(false)),
+            bell_pending: Arc::new(AtomicBool::new(false)),
+            detached: Arc::new(AtomicBool::new(false)),
+            closer: Box::new(|| {}),
+            auth_warnings: Vec::new(),
+            ended: Ended::default(),
+            connection: parking_lot::Mutex::new(None),
+        }
+    }
+
     /// Warnings from authenticating this session's connection; empty for local sessions.
     /// Read it once when the handle is installed (once per tab), not from events.
     pub fn auth_warnings(&self) -> &[AuthWarning] {

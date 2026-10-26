@@ -145,6 +145,7 @@ impl App {
         let gone: Vec<_> = closed.tab.panes.iter().map(|p| p.id).collect();
         self.forget_panes(&gone);
         drop(closed.tab);
+        self.sync_all_shell_tunnels();
         self.save_state();
         self.release_closed(freed);
         if closed.window_empty {

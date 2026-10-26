@@ -348,6 +348,9 @@ impl App {
         if new.keys.map != self.settings.keys.map {
             self.bindings = crate::keys::Bindings::current(&new.keys.map);
         }
+        // Running tunnels read the limit at each reconnect attempt.
+        self.tunnel_retries
+            .store(new.tunnel_max_retries, std::sync::atomic::Ordering::Relaxed);
         let rate_changed = new.max_fps != self.settings.max_fps;
         let scheme_changed = new.color_scheme != self.settings.color_scheme;
         let before = scheme_changed.then(|| self.pane_colors());

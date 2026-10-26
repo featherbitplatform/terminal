@@ -199,6 +199,7 @@ impl App {
             }
         }
         self.schemes_moved(&before);
+        self.tunnels_profiles_changed();
     }
 
     pub(crate) fn prompt_msg(&mut self, msg: PromptMsg) -> Task<Message> {
