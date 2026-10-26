@@ -133,6 +133,7 @@ impl App {
                 group: None,
                 accent: None,
                 accent_style: Default::default(),
+                color_scheme: None,
                 kind: ProfileKind::Local(LocalProfile {
                     program: shell.clone().into(),
                     args: vec!["-c".into(), o.cmd.clone()],

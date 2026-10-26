@@ -29,6 +29,8 @@ pub enum Action {
     EditProfiles,
     /// The Settings window: Cmd+, on macOS, Ctrl+, elsewhere.
     Settings,
+    /// The Color schemes window (no chord by default).
+    EditSchemes,
     /// Create `settings.toml` if missing and open it with the system's default app (no chord
     /// by default).
     OpenSettingsFile,
@@ -107,7 +109,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 39] = [
+    pub const ALL: [Action; 40] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -138,6 +140,7 @@ impl Action {
         Action::NewWindow,
         Action::EditProfiles,
         Action::Settings,
+        Action::EditSchemes,
         Action::Find,
         Action::FindAll,
         Action::FindNext,
@@ -170,6 +173,7 @@ impl Action {
             Self::Quit => "quit",
             Self::EditProfiles => "edit_profiles",
             Self::Settings => "settings",
+            Self::EditSchemes => "edit_schemes",
             Self::OpenSettingsFile => "open_settings_file",
             Self::RevealConfigFolder => "reveal_config_folder",
             Self::ExportTab => "export_tab",
@@ -212,6 +216,7 @@ impl Action {
             Self::Quit => "Quit".into(),
             Self::EditProfiles => "Edit profiles".into(),
             Self::Settings => "Settings".into(),
+            Self::EditSchemes => "Color schemes".into(),
             Self::OpenSettingsFile => "Open settings file".into(),
             Self::RevealConfigFolder => "Reveal config folder".into(),
             Self::ExportTab => "Export tab to file".into(),
@@ -257,7 +262,9 @@ impl Action {
             | Self::MaximizePane
             | Self::MoveTile
             | Self::TileToTab => ActionGroup::Panes,
-            Self::NewWindow | Self::EditProfiles | Self::Settings => ActionGroup::Windows,
+            Self::NewWindow | Self::EditProfiles | Self::Settings | Self::EditSchemes => {
+                ActionGroup::Windows
+            }
             Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious | Self::FindInTab => {
                 ActionGroup::Search
             }
@@ -713,6 +720,7 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
         Action::SelectTab(_)
         | Action::OpenSettingsFile
         | Action::RevealConfigFolder
+        | Action::EditSchemes
         | Action::ExportTab
         | Action::FindInTab
         | Action::MergeTab
@@ -1373,6 +1381,18 @@ mod tests {
         assert_eq!(Action::MaximizePane.group(), ActionGroup::Panes);
         assert_eq!(ActionGroup::ALL[1], ActionGroup::Panes, "after Tabs");
         assert_eq!(ActionGroup::Panes.title(), "Panes");
+    }
+
+    #[test]
+    fn edit_schemes_is_listed_without_a_chord() {
+        let a = Action::EditSchemes;
+        assert!(Action::ALL.contains(&a));
+        assert_eq!(a.name(), "edit_schemes");
+        assert_eq!(Action::from_name("edit_schemes"), Some(a));
+        assert_eq!(a.title(), "Color schemes");
+        assert_eq!(a.group(), ActionGroup::Windows);
+        assert_eq!(default_chord(true, a), None);
+        assert_eq!(default_chord(false, a), None);
     }
 
     #[test]

@@ -11,6 +11,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
+use crate::schemes::SchemeChoice;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -24,6 +25,7 @@ fn msg(m: SettingsMsg) -> Message {
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
+    schemes: Vec<SchemeChoice>,
     notice: Option<&'a str>,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
@@ -43,7 +45,11 @@ pub fn view<'a>(
         body = body.push(read_only_banner(t, err));
     }
     body = body
-        .push(section(t, "Appearance", appearance(t, state, editable)))
+        .push(section(
+            t,
+            "Appearance",
+            appearance(t, state, schemes, editable),
+        ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
         .push(keyboard(t, state, editable));
     let page = scrollable(
@@ -185,6 +191,7 @@ fn setting<'a>(
 fn appearance<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
+    schemes: Vec<SchemeChoice>,
     editable: bool,
 ) -> Vec<Element<'a, Message>> {
     let v = &state.values;
@@ -215,6 +222,34 @@ fn appearance<'a>(
     .width(240)
     .style(move |_, status| pick_style(t, status))
     .menu_style(move |_| menu_style(t));
+    let current = Some(v.color_scheme.as_str());
+    let picker: Element<'a, Message> = if editable {
+        let selected = crate::schemes::chosen(&schemes, current);
+        pick_list(schemes, selected, |c: SchemeChoice| {
+            msg(SettingsMsg::ColorScheme(c.id.unwrap_or_default()))
+        })
+        .placeholder(crate::schemes::NOT_FOUND)
+        .font(UI_FONT)
+        .text_size(12.5)
+        .padding(Padding::from([6.0, 10.0]))
+        .width(200)
+        .style(move |_, status| pick_style(t, status))
+        .menu_style(move |_| menu_style(t))
+        .into()
+    } else {
+        fixed_choice(t, crate::schemes::shown(&schemes, current), 200.0)
+    };
+    let scheme = row![
+        picker,
+        small_button(
+            t,
+            "Edit schemes\u{2026}",
+            msg(SettingsMsg::EditSchemes),
+            ui::secondary
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
     let size = row![
         slider(FONT_SIZE_RANGE.0..=FONT_SIZE_RANGE.1, v.font_size, |x| msg(
             SettingsMsg::FontSize(x)
@@ -259,6 +294,7 @@ fn appearance<'a>(
     vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
+        setting(t, "Color scheme", None, false, scheme),
         setting(t, "Font size", None, false, size),
         setting(
             t,
@@ -702,6 +738,34 @@ fn footer<'a>(
     .into()
 }
 
+/// A list drawn as its chosen value only, for a read-only window.
+pub(crate) fn fixed_choice<'a>(
+    t: &'static Tokens,
+    value: String,
+    width: f32,
+) -> Element<'a, Message> {
+    container(
+        text(value)
+            .font(UI_FONT)
+            .size(12.5)
+            .color(t.text_secondary)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding(Padding::from([6.0, 10.0]))
+    .width(width)
+    .clip(true)
+    .style(move |_| container::Style {
+        background: Some(t.surface.into()),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 fn unit<'a>(t: &'static Tokens, s: &'a str) -> Element<'a, Message> {
     container(text(s).font(UI_FONT).size(12).color(t.text_muted))
         .width(32)
@@ -802,7 +866,7 @@ fn well(t: &Tokens) -> container::Style {
 }
 
 /// `editable` false: drawn muted (a slider has no disabled state of its own).
-fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -> slider::Style {
+pub(crate) fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -> slider::Style {
     let active = !matches!(status, slider::Status::Active);
     if !editable {
         return slider::Style {
@@ -873,7 +937,7 @@ fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::S
     }
 }
 
-fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
+pub(crate) fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
     let border = match status {
         pick_list::Status::Opened { .. } => t.accent_edge,
         pick_list::Status::Hovered => t.text_muted,
@@ -892,7 +956,7 @@ fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
     }
 }
 
-fn menu_style(t: &Tokens) -> iced::overlay::menu::Style {
+pub(crate) fn menu_style(t: &Tokens) -> iced::overlay::menu::Style {
     iced::overlay::menu::Style {
         background: Background::Color(t.raised),
         border: Border {

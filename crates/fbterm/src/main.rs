@@ -17,11 +17,13 @@
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
-//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings`: capture the profile editor or the Settings
-//!   window instead.
+//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes`: capture the profile editor, the
+//!   Settings window or the Color schemes window instead.
 //! - `FBTERM_OPEN_EDITOR=<profile name>`: open the profile editor at startup, that profile
 //!   selected.
 //! - `FBTERM_OPEN_SETTINGS=1`: open the Settings window at startup.
+//! - `FBTERM_OPEN_SCHEMES=1`: open the Color schemes window at startup (any other value: the
+//!   name of the scheme to select).
 //! - `FBTERM_DEMO_PROMPT=hostkey|password|changed`: show a sample connection dialog in the first
 //!   window (nothing waits for the answer).
 //! - `FBTERM_DEMO_TOOLTIP=new|profiles|close`: keep that tab-bar button's tooltip showing (for
@@ -54,6 +56,10 @@ mod redact;
 mod restore;
 #[cfg(test)]
 mod restore_tests;
+mod schemes;
+#[cfg(test)]
+mod schemes_tests;
+mod schemes_window;
 mod sessions;
 mod settings_window;
 mod shortcuts;

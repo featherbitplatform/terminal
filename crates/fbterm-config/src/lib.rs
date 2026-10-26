@@ -3,6 +3,7 @@
 pub mod keys;
 pub mod paths;
 pub mod profile;
+pub mod schemes;
 pub mod settings;
 pub mod settings_edit;
 pub mod shells;

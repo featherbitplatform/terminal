@@ -63,6 +63,7 @@ fn local_profile(program: PathBuf) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             args: discovered_args(&program),
             program,

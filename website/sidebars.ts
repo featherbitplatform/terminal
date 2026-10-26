@@ -6,6 +6,7 @@ const sidebars: SidebarsConfig = {
     'install-macos',
     'profiles',
     'tiling',
+    'color-schemes',
     'keyboard-shortcuts',
     'files',
   ],

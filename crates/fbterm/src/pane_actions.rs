@@ -65,6 +65,7 @@ impl App {
                 let from = tab.focused_pane();
                 Pane {
                     accent_style: from.accent_style,
+                    scheme: from.scheme.clone(),
                     ..Pane::new(from.profile, from.name.clone(), from.accent)
                 }
             }

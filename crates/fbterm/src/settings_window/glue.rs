@@ -17,7 +17,7 @@ use crate::theme;
 
 /// `name` as a `'static` str: iced wants font names that live for the whole process. Each
 /// distinct name is allocated once, however often the setting changes.
-fn intern(name: &str) -> &'static str {
+pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut names = NAMES.get_or_init(Default::default).lock();
     if let Some(n) = names.get(name) {
@@ -28,7 +28,8 @@ fn intern(name: &str) -> &'static str {
     leaked
 }
 
-/// The look of terminals for `settings`.
+/// The look of terminals for `settings`, before a pane's color scheme applies (see
+/// [`App::pane_style`]).
 pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
     TerminalStyle {
         scheme: ColorScheme::graphite(),
@@ -43,16 +44,27 @@ pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
 }
 
 impl App {
-    /// The look of one pane: the global style at the pane's own font size, focused (keys go
-    /// to it, solid cursor) only for the focused pane of the focused window while its find bar
-    /// is closed. No accent border: the tiles draw the focus outline.
+    /// The look of one pane: the colors of its scheme ([`App::scheme_for`]), the scheme's font
+    /// and size where it sets them (else the settings'), at the pane's own zoom; focused (keys
+    /// go to it, solid cursor) only for the focused pane of the focused window while its find
+    /// bar is closed. No accent border: the tiles draw the focus outline.
     pub(crate) fn pane_style(&self, wid: window::Id, tab: &Tab, pane: &Pane) -> TerminalStyle {
+        let scheme = self.scheme_for(pane);
+        let (lo, hi) = fbterm_config::settings::FONT_SIZE_RANGE;
+        let base = scheme
+            .font_size
+            .map_or(self.settings.font_size, |s| s.clamp(lo, hi));
         TerminalStyle {
-            // Unzoomed: the setting as is (it may exceed the zoom range, up to 72).
+            scheme: ColorScheme::from(&scheme.colors),
+            font: match &scheme.font_family {
+                Some(family) => Font::with_name(intern(family)),
+                None => self.style.font,
+            },
+            // Unzoomed: the size as is (it may exceed the zoom range, up to 72).
             font_size: if pane.zoom == 0 {
-                self.settings.font_size
+                base
             } else {
-                (self.settings.font_size + f32::from(pane.zoom)).clamp(6.0, 48.0)
+                (base + f32::from(pane.zoom)).clamp(6.0, 48.0)
             },
             focused: self.app_active
                 && self.focused == Some(wid)
@@ -84,6 +96,10 @@ impl App {
             SettingsMsg::RevealFolder => {
                 crate::config_files::reveal_config_folder(&self.paths);
                 Task::none()
+            }
+            SettingsMsg::EditSchemes => {
+                let current = self.settings.color_scheme.clone();
+                self.open_schemes(Some(current))
             }
             other => {
                 // Locking every open terminal is only worth it for what reads the answer: a typed
@@ -275,6 +291,8 @@ impl App {
     /// see [`SettingsSource`]).
     /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
     /// protocol flags programs have set, turning it on affects their requests from then on.
+    /// `color_scheme` recolors the open panes that follow it (those without a scheme of their
+    /// own, or whose own is not found).
     /// `background_opacity` is read each frame too; a window can only show through if it was
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
@@ -331,9 +349,14 @@ impl App {
             self.bindings = crate::keys::Bindings::current(&new.keys.map);
         }
         let rate_changed = new.max_fps != self.settings.max_fps;
+        let scheme_changed = new.color_scheme != self.settings.color_scheme;
+        let before = scheme_changed.then(|| self.pane_colors());
         self.settings = new;
         if rate_changed {
             self.update_output_rate();
+        }
+        if let Some(before) = before {
+            self.schemes_moved(&before);
         }
         task
     }

@@ -1,10 +1,10 @@
 //! Watching the configuration directory for hand edits, as an iced subscription.
 //!
 //! The directory is watched, not the files: editors save by writing a temp file and renaming
-//! it over the original, which a watch on the file itself would lose.
+//! it over the original, which a watch on the file itself would lose. Its `schemes/` folder
+//! (one file per color scheme) is watched the same way.
 
-use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use iced::futures::Stream;
@@ -19,11 +19,25 @@ pub const DEBOUNCE: Duration = Duration::from_millis(250);
 pub struct Changed {
     pub profiles: bool,
     pub settings: bool,
+    /// A file in `schemes/` (or the folder itself).
+    pub schemes: bool,
 }
 
 impl Changed {
-    fn note(&mut self, name: &std::ffi::OsStr) {
-        match name.to_str() {
+    /// Note an event on `path`, from the watch on `dir` (the config directory) or on its
+    /// `schemes/` folder. Scheme files are told apart by their folder, not their name: a scheme
+    /// may be called `profiles.toml`.
+    /// The watcher may spell paths differently from `dir` (symlinks resolved), so a folder
+    /// named `schemes` other than `dir` itself counts too.
+    fn note(&mut self, dir: &Path, path: &Path) {
+        let schemes = dir.join("schemes");
+        let is_schemes =
+            |p: &Path| p == schemes || (p != dir && p.file_name().is_some_and(|n| n == "schemes"));
+        if is_schemes(path) || path.parent().is_some_and(is_schemes) {
+            self.schemes = true;
+            return;
+        }
+        match path.file_name().and_then(|n| n.to_str()) {
             Some("profiles.toml") => self.profiles = true,
             Some("settings.toml") => self.settings = true,
             _ => {}
@@ -31,7 +45,7 @@ impl Changed {
     }
 
     fn any(self) -> bool {
-        self.profiles || self.settings
+        self.profiles || self.settings || self.schemes
     }
 }
 
@@ -39,10 +53,14 @@ impl Changed {
 #[derive(Debug, Clone, Hash)]
 pub struct ConfigDir(pub PathBuf);
 
-type Watching = Option<(notify::RecommendedWatcher, UnboundedReceiver<OsString>)>;
+type Watching = Option<(
+    PathBuf,
+    notify::RecommendedWatcher,
+    UnboundedReceiver<PathBuf>,
+)>;
 
-fn start(dir: &PathBuf) -> Watching {
-    if let Err(e) = std::fs::create_dir_all(dir) {
+fn start(dir: &Path) -> Watching {
+    if let Err(e) = std::fs::create_dir_all(dir.join("schemes")) {
         tracing::warn!(dir = %dir.display(), error = %e, "config changes will not be picked up");
         return None;
     }
@@ -54,8 +72,8 @@ fn start(dir: &PathBuf) -> Watching {
             if matches!(event.kind, EventKind::Access(_)) {
                 return;
             }
-            for name in event.paths.iter().filter_map(|p| p.file_name()) {
-                let _ = tx.send(name.to_os_string());
+            for path in event.paths {
+                let _ = tx.send(path);
             }
         }) {
             Ok(w) => w,
@@ -68,24 +86,63 @@ fn start(dir: &PathBuf) -> Watching {
         tracing::warn!(dir = %dir.display(), error = %e, "config changes will not be picked up");
         return None;
     }
-    Some((watcher, rx))
+    let schemes = dir.join("schemes");
+    if let Err(e) = watcher.watch(&schemes, RecursiveMode::NonRecursive) {
+        tracing::warn!(dir = %schemes.display(), error = %e, "scheme changes will not be picked up");
+    }
+    Some((dir.to_path_buf(), watcher, rx))
 }
 
-/// Debounced change reports for `profiles.toml` and `settings.toml` in the directory.
+/// Debounced change reports for `profiles.toml`, `settings.toml` and `schemes/` in the
+/// directory.
 pub fn config_stream(dir: &ConfigDir) -> impl Stream<Item = Changed> + use<> {
     iced::futures::stream::unfold(start(&dir.0), |state| async move {
-        let (watcher, mut rx) = state?;
+        let (dir, watcher, mut rx) = state?;
         loop {
             let mut changed = Changed::default();
             // Wait for the first relevant event, then until things go quiet.
             let first = rx.recv().await?;
-            changed.note(&first);
+            changed.note(&dir, &first);
             while let Ok(next) = tokio::time::timeout(DEBOUNCE, rx.recv()).await {
-                changed.note(&next?);
+                changed.note(&dir, &next?);
             }
             if changed.any() {
-                return Some((changed, Some((watcher, rx))));
+                return Some((changed, Some((dir, watcher, rx))));
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scheme_files_are_told_apart_by_their_folder() {
+        let dir = Path::new("/cfg");
+        let mut c = Changed::default();
+        c.note(dir, Path::new("/cfg/schemes/profiles.toml"));
+        assert_eq!(
+            c,
+            Changed {
+                schemes: true,
+                ..Changed::default()
+            }
+        );
+        let mut c = Changed::default();
+        c.note(dir, Path::new("/cfg/profiles.toml"));
+        c.note(dir, Path::new("/cfg/settings.toml"));
+        c.note(dir, Path::new("/cfg/state.toml"));
+        assert_eq!(
+            c,
+            Changed {
+                profiles: true,
+                settings: true,
+                schemes: false,
+            }
+        );
+        let mut c = Changed::default();
+        c.note(dir, Path::new("/cfg/schemes"));
+        assert!(c.schemes);
+    }
 }

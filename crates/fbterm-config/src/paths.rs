@@ -28,4 +28,9 @@ impl Paths {
     pub fn state(&self) -> PathBuf {
         self.config_dir.join("state.toml")
     }
+
+    /// Directory holding one TOML file per user color scheme.
+    pub fn schemes(&self) -> PathBuf {
+        self.config_dir.join("schemes")
+    }
 }
