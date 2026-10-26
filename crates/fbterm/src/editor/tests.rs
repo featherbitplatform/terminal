@@ -76,6 +76,7 @@ fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Ssh(SshProfile {
             host: host.into(),
             port: 22,
@@ -93,6 +94,7 @@ fn local(name: &str) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             program: "/bin/zsh".into(),
             args: vec!["-l".into()],

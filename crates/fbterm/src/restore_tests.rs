@@ -26,6 +26,7 @@ pub(crate) fn profile(name: &str) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             program: "/nonexistent/fbterm-test-shell".into(),
             args: vec![],

@@ -16,6 +16,7 @@ pub enum SettingChange {
     FontSize(f32),
     ScrollbackLines(usize),
     Theme(ThemeMode),
+    ColorScheme(String),
     KittyKeyboard(bool),
     BackgroundOpacity(f32),
     BackgroundBlur(bool),
@@ -35,6 +36,7 @@ impl SettingChange {
             Self::FontSize(_) => "font_size",
             Self::ScrollbackLines(_) => "scrollback_lines",
             Self::Theme(_) => "theme",
+            Self::ColorScheme(_) => "color_scheme",
             Self::KittyKeyboard(_) => "kitty_keyboard",
             Self::BackgroundOpacity(_) => "background_opacity",
             Self::BackgroundBlur(_) => "background_blur",
@@ -50,6 +52,7 @@ impl SettingChange {
             Self::FontSize(v) => settings.font_size = *v,
             Self::ScrollbackLines(v) => settings.scrollback_lines = *v,
             Self::Theme(v) => settings.theme = *v,
+            Self::ColorScheme(v) => settings.color_scheme.clone_from(v),
             Self::KittyKeyboard(v) => settings.kitty_keyboard = *v,
             Self::BackgroundOpacity(v) => settings.background_opacity = *v,
             Self::BackgroundBlur(v) => settings.background_blur = *v,
@@ -63,7 +66,7 @@ impl SettingChange {
 
     fn value(&self) -> Value {
         match self {
-            Self::FontFamily(v) => Value::from(v.as_str()),
+            Self::FontFamily(v) | Self::ColorScheme(v) => Value::from(v.as_str()),
             Self::FontSize(v) | Self::BackgroundOpacity(v) => Value::from(short_f64(*v)),
             Self::ScrollbackLines(v) => Value::from(i64::try_from(*v).unwrap_or(i64::MAX)),
             Self::Theme(ThemeMode::Dark) => Value::from("dark"),

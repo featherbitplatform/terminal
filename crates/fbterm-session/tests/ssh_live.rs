@@ -45,6 +45,7 @@ fn profile(auth: AuthMethod) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Ssh(SshProfile {
             host: HOST.into(),
             port: PORT,
@@ -597,6 +598,7 @@ mod pool {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: host.into(),
                 port: PORT,

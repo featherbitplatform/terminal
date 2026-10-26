@@ -453,6 +453,7 @@ mod tests {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Local(LocalProfile {
                 program: "/bin/sh".into(),
                 args: vec![],

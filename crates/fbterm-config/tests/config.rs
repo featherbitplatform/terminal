@@ -16,6 +16,7 @@ fn ssh(name: &str, jump: Vec<ProfileId>) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Ssh(SshProfile {
             host: format!("{name}.example.com"),
             port: 22,
@@ -37,6 +38,7 @@ fn local(name: &str) -> Profile {
             b: 0xff,
         }),
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             program: "/bin/zsh".into(),
             args: vec!["-l".into()],
@@ -632,4 +634,55 @@ fn a_key_override_on_a_reserved_chord_falls_back_with_a_notice() {
         w.message
     );
     assert_eq!(w.line, Some(2));
+}
+
+#[test]
+fn color_scheme_defaults_to_graphite() {
+    assert_eq!(Settings::default().color_scheme, "graphite");
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "").unwrap();
+    assert_eq!(Settings::load(&path).unwrap().color_scheme, "graphite");
+}
+
+#[test]
+fn color_scheme_write_field_round_trips() {
+    let path = tmp("settings.toml");
+    Settings::write_field(&path, &SettingChange::ColorScheme("harbor".into())).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\ncolor_scheme = \"harbor\"\n"), "{text}");
+    assert!(
+        text.contains("# Terminal color scheme for every session"),
+        "{text}"
+    );
+    assert!(text.contains("# Color theme:"), "comments kept");
+    assert_eq!(Settings::load(&path).unwrap().color_scheme, "harbor");
+}
+
+#[test]
+fn profile_color_scheme_round_trips_and_is_omitted_when_none() {
+    let path = tmp("profiles.toml");
+    let mut themed = local("themed");
+    themed.color_scheme = Some("ember".into());
+    let store = ProfileStore {
+        profiles: vec![local("plain"), themed],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("color_scheme").count(), 1, "{text}");
+    assert!(text.contains("color_scheme = \"ember\""));
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn old_profiles_file_loads_without_color_scheme() {
+    let path = tmp("profiles.toml");
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"local\"\nprogram = \"/bin/sh\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        ProfileStore::load(&path).unwrap().profiles[0].color_scheme,
+        None
+    );
 }

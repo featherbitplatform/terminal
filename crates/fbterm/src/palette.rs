@@ -813,6 +813,7 @@ mod tests {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: host.into(),
                 port: 22,

@@ -137,6 +137,8 @@ pub struct Draft {
     pub group: String,
     pub accent: Option<Rgb>,
     pub accent_style: AccentStyle,
+    /// Carried through unchanged until the form edits it.
+    pub color_scheme: Option<String>,
     pub kind: DraftKind,
 }
 
@@ -180,6 +182,7 @@ impl Draft {
             group: p.group.clone().unwrap_or_default(),
             accent: p.accent,
             accent_style: p.accent_style,
+            color_scheme: p.color_scheme.clone(),
             kind,
         }
     }
@@ -224,6 +227,7 @@ impl Draft {
             } else {
                 AccentStyle::default()
             },
+            color_scheme: self.color_scheme.clone(),
             kind,
         }
     }
@@ -443,6 +447,7 @@ impl EditorState {
             group: String::new(),
             accent: None,
             accent_style: AccentStyle::default(),
+            color_scheme: None,
             kind,
         };
         let id = draft.id;

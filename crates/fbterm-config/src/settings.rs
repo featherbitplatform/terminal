@@ -97,6 +97,9 @@ pub struct Settings {
     pub font_size: f32,
     pub scrollback_lines: usize,
     pub theme: ThemeMode,
+    /// Id of the terminal color scheme used by every session without its own (a built-in id or
+    /// `user-<uuid>`). Not validated here: the app reports ids it does not know.
+    pub color_scheme: String,
     /// Let programs turn on the kitty keyboard protocol (off: requests are ignored and keys keep
     /// their legacy encoding).
     pub kitty_keyboard: bool,
@@ -119,6 +122,7 @@ impl Default for Settings {
             font_size: 13.0,
             scrollback_lines: 10_000,
             theme: ThemeMode::Dark,
+            color_scheme: "graphite".into(),
             kitty_keyboard: false,
             background_opacity: 1.0,
             background_blur: false,
@@ -311,6 +315,9 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 
 # Color theme: "dark" or "light".
 #theme = "dark"
+
+# Terminal color scheme for every session (a scheme id; see the Color schemes window).
+#color_scheme = "graphite"
 
 # Let programs turn on the kitty keyboard protocol (true or false).
 #kitty_keyboard = false
