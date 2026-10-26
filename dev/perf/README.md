@@ -338,7 +338,7 @@ first A run began at load 8.0 after the build).
 |---|---|---|---|
 | E | RSS <= 200 MB | 123.0 MB | pass |
 | F | F - B <= 50 MB | 15.2 MB | pass |
-| G | RSS <= D + one full tab + 15 MB = 97.8 + 1.1 + 15 = 113.9 MB | 122.2 MB (footprint 80.8 MB against 51.5 + 1.1 + 15 = 67.6) | **fail**, 8.3 MB over on RSS |
+| G | RSS <= D + one full tab + 15 MB = 97.8 + 1.1 + 15 = 113.9 MB | 122.2 MB (footprint 80.8 MB against 51.5 + 1.1 + 15 = 67.6) | **fail** on RSS (8.3 MB over), accepted: allocator cache, no leak |
 | A RSS | within 5 MB of baseline | 104.5 MB against 136.2 recorded (141.0 paired) | pass (lower) |
 | A CPU | within 1 point of a core | 11.7% against 2.1% recorded; 11.8% paired | **fail against the recorded 2.1%, pass against the paired 11.8%** |
 | B RSS / CPU | within 2 MB / 0.00% | 101.3 MB against 100.5 recorded (+0.8; 104.2 paired); 0.00% | pass |
@@ -347,11 +347,22 @@ first A run began at load 8.0 after the build).
 
 Readings:
 
-- G is the one clear miss. Closing 19 tabs leaves RSS at 122.2 MB, almost where E was (123.0 MB),
-  and footprint does not fall either (77.0 in E, 80.8 in G). With a full tab now costing about
-  1.1 MB, the gate's allowance is 113.9 MB, so the 24 MB of RSS above D that remain after the
-  closes is outside it. What that 24 MB is was not investigated (it is not history: B, with 20
-  empty tabs, is only 3.5 MB over D).
+- G is the one miss on RSS, accepted by the owner on 2026-10-26 on the condition that it is not a
+  leak, which the investigation establishes. Closing 19 tabs leaves RSS at 122.2 MB, almost where
+  E was (123.0 MB), and footprint does not fall either (77.0 in E, 80.8 in G); the gate's
+  allowance with a full tab at about 1.1 MB is 113.9 MB. Findings:
+  - Every closed terminal is dropped, and the release call runs right after.
+  - Live malloc after closing the 19 tabs is 13.2 MB, against 13.1 MB for an app that only ever
+    had one full tab.
+  - The remaining ~25 MB is the macOS 27 allocator keeping freed pages dirty:
+    `malloc_zone_pressure_relief` returns nothing, and RSS also counts pages malloc has marked
+    reusable.
+  - A repetition test (`crates/fbterm-term/tests/memory_release.rs`) shows +0 live bytes per
+    create-and-drop cycle of 20 full terminals.
+  - The `leaks` residue is an OS framework object (an XPC connection) that is also present with
+    one tab, independent of tabs.
+
+  Verdict: fail on RSS, accepted: allocator cache, no leak.
 - The recorded A CPU of 2.1% came from runs whose window was probably not drawing (two of three
   runs read 0.1-2.3%; the baseline caveats above say so). The paired pre-change build, measured
   with the window visible, is 11.8% in all three runs, the same as the new build's 11.7% and

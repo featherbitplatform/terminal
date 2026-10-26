@@ -496,9 +496,10 @@ frames per second and 8-9% at 60 (`dev/perf/README.md`).
 every scrollback full, about 100-character lines: 123 MB resident (528 MB before; 524 MB in the
 2026-10-25 re-measurement), about 1.1 MB per full tab instead of 21 MB; short lines 116.5 MB;
 one visible log stream and a `yes` flood cost the same CPU as before (11.7% and 102% of a core
-against 11.8% and 104.5% measured with the pre-change build in the same session); idle CPU stays
-0.00%. Not met: after closing 19 of the 20 full tabs resident memory stays at 122 MB (the gate
-was at most 114 MB), and the one-tab idle base reads 2.7 MB over the recorded baseline (within
+against 11.8% (pre-change build, same session) and 104.5% (recorded baseline)); idle CPU stays
+0.00%. Not met on RSS: after closing 19 of the 20 full tabs resident memory stays at 122 MB (the gate
+was at most 114 MB); the owner accepted this on 2026-10-26 because it is allocator cache, not a
+leak (`dev/perf/README.md`, scenario G). And the one-tab idle base reads 2.7 MB over the recorded baseline (within
 it against a paired run). The 528 MB acceptance above stays the standing statement until the owner
 answers whether the measured number replaces it (compact-history design, section 9).
 
