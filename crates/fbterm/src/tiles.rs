@@ -1794,6 +1794,9 @@ mod tests {
             assert_eq!(urls(&steps), vec!["https://example.com/".to_string()]);
         }
 
+        // Off macOS the pick chord includes Shift, which bypasses mouse reporting by design, so
+        // a reporting program never sees the replayed click there: nothing to observe.
+        #[cfg(target_os = "macos")]
         #[test]
         fn replayed_click_presses_and_releases_at_the_same_cell() {
             let terms = [term(), term()];
