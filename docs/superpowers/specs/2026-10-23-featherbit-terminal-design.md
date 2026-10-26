@@ -150,7 +150,8 @@ or tunnel) closes; closing a tab never drops a tunnel that is still running.
 
 **Windows and restore** *(builder's call)*: multi-window from the start (iced daemon/multi-window
 mode); the palette opens over the focused window. On relaunch the app restores windows, tabs and
-pane layout, reconnecting only the visible pane of each window and the rest on first focus.
+pane layout, reconnecting every pane of the visible tab of each window at once (they are all on
+screen) and the panes of other tabs when their tab is first shown.
 
 ### 5.4 Profiles and credentials
 
@@ -186,8 +187,21 @@ palette does; profiles rank above actions.
 
 - Tabs show profile name, connection state (connecting / connected / disconnected) and the profile
   accent color.
-- Tiling (milestone 2): split a tab into panes horizontally/vertically, resize, move focus by
-  keyboard, close a pane. Any pane can hold any profile.
+- Tiling *(milestone 2, done 2026-10-26; design and decisions in `2026-10-26-tiling-design.md`)*:
+  a tab is a tree of panes split side by side or top and bottom, to any depth; each pane is its own
+  session and holds any profile, local or SSH, in any mix. As built: the focused pane has a thin
+  accent outline and the others are dimmed (a tab with one pane has neither); dividers drag, and a
+  double-click on one shares its split equally; a split or drag never leaves a pane under 20
+  columns by 5 rows; focus moves by click or by direction (the nearest pane whose edge overlaps,
+  ties to the most recently focused); each pane zooms on its own; Maximize shows one pane alone
+  while the others keep running; closing a pane gives its space to its sibling, and closing a tab
+  with several live panes asks first. Tiles rearrange: a tab drags from the tab bar onto another
+  tab's content to merge as tiles, a tile moves by a hover handle (or a drag with Cmd, Ctrl+Shift
+  elsewhere) within its tab, onto another tile's edge or the tab's outer edge, and onto the tab
+  bar to become a tab; the palette offers the same as "Merge tab into...", "Move tile..." and
+  "Move tile to new tab". Sessions keep running through every rearrangement. Layout, ratios,
+  zoom and focus are saved in `state.toml` (an old file loads as single-pane tabs). Search covers
+  panes (see 5.12). A tab shows an indicator when any of its panes is disconnected or exited.
 - Disconnected SSH sessions keep their scrollback and show an inline "disconnected, press Enter to
   reconnect" notice *(builder's call)*.
 
@@ -270,8 +284,11 @@ Jump-chain references are exported together with the profiles they point to.
 ### 5.11 Keyboard defaults *(builder's call)*
 
 Cmd on macOS, Ctrl+Shift elsewhere: new tab (opens the palette), close, next/prev tab, tab 1..9,
-palette (Cmd+Shift+P), split right/down, focus pane by direction, toggle file panel, find in
-scrollback. All rebindable (see 5.11.1). *(Owner's decision, 2026-10-24)* Settings is Cmd+,
+palette (Cmd+Shift+P), split right (Cmd+D, Ctrl+Shift+D elsewhere) and down (Cmd+Shift+D,
+Ctrl+Shift+Alt+D), focus pane by direction (Cmd+Option+arrow, Ctrl+Alt+arrow), zoom the focused
+pane (Cmd+=, Cmd+-, Cmd+0; Ctrl+Shift+ the same keys elsewhere), maximize pane (Cmd+Shift+Enter,
+Ctrl+Shift+Enter), toggle file panel, find in scrollback. Find in this tab, Merge tab into,
+Move tile and Move tile to new tab have no default chord. All rebindable (see 5.11.1). *(Owner's decision, 2026-10-24)* Settings is Cmd+,
 on macOS and Ctrl+, elsewhere (the one Ctrl chord without Shift); the profile editor is
 Cmd+Shift+, (Ctrl+Shift+, elsewhere). Tab-bar buttons show their action and chord in a tooltip,
 derived from the same table.
@@ -322,7 +339,7 @@ derived from the same table.
 
 ### 5.12 Search *(owner's decisions, 2026-10-24; done)*
 
-- **Find in tab:** Cmd+F (Ctrl+Shift+F elsewhere) opens a slim bar at the top of the active tab's
+- **Find in pane:** Cmd+F (Ctrl+Shift+F elsewhere) opens a slim bar at the top of the focused pane's
   terminal (floating at the top right, so the grid and the pty keep their size). Incremental
   search over the whole scrollback and screen; all matches in view tinted violet, the current
   one in the accent; Enter / Shift+Enter and Cmd+G / Cmd+Shift+G (Ctrl+G / Ctrl+Shift+G
@@ -338,7 +355,9 @@ derived from the same table.
   and 500 overall with "more matches" notes, streaming in tab by tab. Enter focuses the window,
   selects the tab, closes the box and opens that tab's find bar on the same query with the chosen
   match current. Every tab of every window, hidden and disconnected ones included.
-- Both are palette actions ("Find in tab", "Find in all tabs").
+- Both are palette actions ("Find in pane", "Find in all tabs"); in a tab with panes each pane has
+  its own bar and results of find in all tabs name the pane, and "Find in this tab" limits that box
+  to the current tab's panes.
 - Builder's notes on the implementation: the search uses the `regex` crate over each logical line
   (rows joined across soft wraps), walking the scrollback newest first in 1000-row chunks with
   the terminal locked one chunk at a time (about 0.5 ms), on tokio's blocking pool, cancellable
@@ -429,7 +448,8 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    file, Graphite theme, CI (macOS + Linux + Windows build/test), unsigned macOS `.dmg` (Apple
    Silicon and Intel) on GitHub releases, docs site skeleton on GitHub Pages.
 2. Tiling, per-profile accent, color schemes, find in scrollback (find in scrollback done
-   2026-10-24, with a search over all tabs; see 5.12).
+   2026-10-24, with a search over all tabs; see 5.12; tiling done 2026-10-26, see 5.6 and
+   `2026-10-26-tiling-design.md`; measurements in `dev/perf/README.md`, scenario H).
 3. Tunnels.
 4. File panel.
 5. Export/import, optional main-password vault.

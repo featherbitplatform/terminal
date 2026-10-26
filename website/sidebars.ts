@@ -5,6 +5,7 @@ const sidebars: SidebarsConfig = {
     'intro',
     'install-macos',
     'profiles',
+    'tiling',
     'keyboard-shortcuts',
     'files',
   ],

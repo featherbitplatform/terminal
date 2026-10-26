@@ -1402,7 +1402,8 @@ mod tests {
             assert_eq!(default_chord(true, a), None);
             assert_eq!(default_chord(false, a), None);
         }
-        // `+` is the same key as `=` with Shift held.
+        // The plus key zooms in however it is typed: `plus` and `=` are one chord, with or
+        // without Shift, except that a bare `Ctrl+=` is not one (it stays with programs).
         let plus = |a: &str, b: &str| c(a).same_plus_key(c(b));
         assert!(plus("ctrl+shift+plus", "ctrl+shift+="));
         assert!(plus("ctrl+plus", "ctrl+shift+="));

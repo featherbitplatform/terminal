@@ -39,9 +39,9 @@ A tab can be split into panes, each with its own session. Splitting opens the fo
 | Reset zoom | `Cmd+0` | `Ctrl+Shift+0` |
 | Maximize pane (press again to restore) | `Cmd+Shift+Enter` | `Ctrl+Shift+Enter` |
 
-Closing a pane closes its session, without asking. Moving focus goes to the nearest pane in that direction; when two are equally near, the one you used more recently. Zoom changes the text size of the focused pane only, one point per press, and the plus key zooms in however you type it (`Cmd+=`, `Cmd+Shift+=` or a `+` key of your own layout; `Ctrl+Shift+` the same elsewhere, where a bare `Ctrl+=` still goes to the program); reset returns it to the font size in Settings. A maximized pane fills the tab while the others keep running out of sight; moving focus or splitting shows them again. Maximize does nothing in a tab with one pane.
+Closing a pane closes its session, without asking. Moving focus goes to the nearest pane in that direction; when two are equally near, the one you used more recently. Zoom changes the text size of the focused pane only, one point per press, and the plus key zooms in however you type it (`Cmd+=`, `Cmd+Shift+=` or a `+` key of your own layout; elsewhere `Ctrl+Shift+=` or `Ctrl+Shift` with a `+` key, while a bare `Ctrl+=` still goes to the program); reset returns it to the font size in Settings. A maximized pane fills the tab while the others keep running out of sight; moving focus or splitting shows them again. Maximize does nothing in a tab with one pane.
 
-Move tile, Move tile to new tab, Merge tab into and Find in this tab have names for the [`[keys]` table](#the-keys-table) but do nothing yet.
+Move tile, Move tile to new tab, Merge tab into and Find in this tab have no shortcut by default; they are in the palette and can be bound in Settings or in the [`[keys]` table](#the-keys-table). The page [Split panes](tiling) covers splitting, rearranging, maximize and restore in full.
 
 ### The title bar on macOS
 
@@ -99,6 +99,9 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Split right | Open the focused pane's profile in a new pane to its right. |
 | Split down | Open the focused pane's profile in a new pane below it. |
 | Maximize pane | Let the focused pane fill the tab, or restore the others. |
+| Merge tab into… | Choose another tab, then where this tab's panes land in it. |
+| Move tile… | Choose where the focused pane goes within its tab. |
+| Move tile to new tab | Turn the focused pane into a tab of its own, at the end of the bar. |
 | Find in pane | Open the focused pane's find bar. |
 | Find in all tabs | Open the search over every tab. |
 | Find in this tab | Open the same search restricted to the panes of the current tab. |
@@ -159,7 +162,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `split_right`, `split_down`, `maximize_pane` | Split the focused pane, maximize it |
 | `focus_left`, `focus_right`, `focus_up`, `focus_down` | Move focus to the neighbouring pane |
 | `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |
-| `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Reserved for tiling features that are not available yet (no default shortcut) |
+| `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Find in this tab (all panes of the tab), merge this tab into another, move the focused tile, move it to a tab of its own (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
 | `new_window`, `edit_profiles`, `settings` | New window, the profile editor, Settings |
 | `find`, `find_all`, `find_next`, `find_previous` | Find in pane, find in all tabs, older and newer match in the find bar |
@@ -169,7 +172,7 @@ Edits to the table apply while the app runs, like every setting. An entry that n
 
 ## Search in detail
 
-**Find in pane** opens a slim bar over the top right of the focused pane. Typing searches the tab's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again. `Shift+Enter` from the newest match wraps to the oldest match loaded so far: with more than a thousand matches that is not the oldest in the history until you have moved past them with `Enter`. Up to 10,000 matches are kept loaded; past that, `Enter` wraps to the newest.
+**Find in pane** opens a slim bar over the top right of the focused pane. Typing searches the pane's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again. `Shift+Enter` from the newest match wraps to the oldest match loaded so far: with more than a thousand matches that is not the oldest in the history until you have moved past them with `Enter`. Up to 10,000 matches are kept loaded; past that, `Enter` wraps to the newest.
 
 - **Case:** the search ignores case unless the query has an uppercase letter.
 - **Plain text or regular expression:** plain text by default (every character matches itself). The `.*` button switches to regular expressions; an invalid one shows `Invalid pattern`. Queries longer than 512 characters show `Query too long`.
