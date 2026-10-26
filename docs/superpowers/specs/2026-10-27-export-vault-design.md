@@ -1,6 +1,6 @@
 # Profile export/import and the secrets vault: design
 
-Status: draft for the owner's review, 2026-10-27. Milestone 5 of
+Status: approved by the owner, 2026-10-27. Milestone 5 of
 `2026-10-23-featherbit-terminal-design.md` (sections 4 "Saved passwords", 5.4 and 5.9), which this
 document refines. Where they differ, this document wins.
 
