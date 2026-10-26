@@ -619,7 +619,7 @@ impl App {
             }
             Message::NewTab => self.action(None, Action::NewTab),
             Message::CloseTab(i) => match self.focused_window() {
-                Some(wid) => self.close_tab(wid, i),
+                Some(wid) => self.close_tab_asking(wid, i),
                 None => Task::none(),
             },
             Message::PerfCloseOthers(wid) => self.perf_close_others(wid),
@@ -707,7 +707,7 @@ impl App {
                 self.focused = Some(wid);
                 match msg {
                     TabBarMsg::Select(i) => self.with_window(wid, |w| w.select(i)),
-                    TabBarMsg::Close(i) => self.close_tab(wid, i),
+                    TabBarMsg::Close(i) => self.close_tab_asking(wid, i),
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),

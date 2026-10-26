@@ -839,15 +839,17 @@ fn tab_button<'a>(
         },
         demo_tip,
     );
-    let inner = row![
-        stripe,
-        dot(state_color(t, tab.state())),
-        container(label).width(Length::Fill).clip(true),
-        close
-    ]
-    .spacing(8)
-    .height(Length::Fill)
-    .align_y(Alignment::Center);
+    let mut inner = row![stripe, dot(state_color(t, tab.state()))];
+    // A background pane that lost its session: a second dot, the theme's warning color.
+    if tab.trouble() {
+        inner = inner.push(dot(t.warning));
+    }
+    let inner = inner
+        .push(container(label).width(Length::Fill).clip(true))
+        .push(close)
+        .spacing(8)
+        .height(Length::Fill)
+        .align_y(Alignment::Center);
     button(inner)
         .on_press(Message::TabBar(window, TabBarMsg::Select(index)))
         .width(Length::Fixed(196.0))

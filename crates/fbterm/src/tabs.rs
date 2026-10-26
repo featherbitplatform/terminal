@@ -231,6 +231,24 @@ impl Tab {
     pub fn state(&self) -> &TabState {
         &self.focused_pane().state
     }
+
+    /// A pane other than the focused one lost its session (the tab's dot shows the focused
+    /// pane only), so the tab button warns about it.
+    pub fn trouble(&self) -> bool {
+        self.panes.iter().any(|p| {
+            p.id != self.focused
+                && matches!(p.state, TabState::Disconnected(_) | TabState::Exited(_))
+        })
+    }
+
+    /// How many panes hold a live or starting session: the tab asks before closing when more
+    /// than one does.
+    pub fn live_panes(&self) -> usize {
+        self.panes
+            .iter()
+            .filter(|p| matches!(p.state, TabState::Connected | TabState::Connecting))
+            .count()
+    }
 }
 
 /// What to do with input the terminal widget produced for a tab.
@@ -457,6 +475,28 @@ impl WindowState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tab_shows_trouble_in_background_pane() {
+        let mut tab = Tab::single(Pane::new(ProfileId::new(), "a", None));
+        assert!(!tab.trouble());
+        let second = Pane::new(ProfileId::new(), "b", None);
+        let (a, b) = (tab.focused, second.id);
+        tab.layout.split(a, crate::layout::Side::Right, b);
+        tab.panes.push(second);
+        tab.pane_mut(b).unwrap().state = TabState::Connected;
+        assert!(!tab.trouble());
+        tab.pane_mut(b).unwrap().state = TabState::Disconnected("x".into());
+        assert!(tab.trouble());
+        tab.pane_mut(b).unwrap().state = TabState::Exited(Some(1));
+        assert!(tab.trouble());
+        // The focused pane's own trouble shows in the state dot, not here.
+        tab.pane_mut(b).unwrap().state = TabState::Connected;
+        tab.pane_mut(a).unwrap().state = TabState::Exited(None);
+        assert!(!tab.trouble());
+        tab.focus(b);
+        assert!(tab.trouble());
+    }
 
     fn pane(name: &str) -> Pane {
         Pane::new(ProfileId::new(), name, None)

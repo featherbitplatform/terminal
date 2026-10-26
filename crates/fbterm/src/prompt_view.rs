@@ -1,5 +1,5 @@
-//! The connection dialog drawn over a terminal window: trust a host key, a changed host key,
-//! or a password / key passphrase.
+//! The dialog drawn over a terminal window: trust a host key, a changed host key, a password /
+//! key passphrase, or confirm closing a split tab.
 
 use fbterm_secrets::SecretKind;
 use iced::widget::{Space, button, checkbox, column, container, opaque, row, text, text_input};
@@ -114,6 +114,26 @@ pub fn view<'a>(
             .spacing(14)
             .into()
         }
+        Dialog::CloseTab { panes, .. } => column![
+            header(t, ui::ICON_SHIELD_ALERT, t.warning, "Close this tab?"),
+            text(format!("Its {panes} panes and their sessions will close."))
+                .font(UI_FONT)
+                .size(13)
+                .color(t.text_secondary),
+            buttons(vec![
+                ui::text_button(t, "Cancel", Some(msg(PromptMsg::Cancel(window))), ui::secondary)
+                    .into(),
+                ui::text_button(
+                    t,
+                    "Close tab",
+                    Some(msg(PromptMsg::CloseTab(window))),
+                    ui::primary,
+                )
+                .into(),
+            ]),
+        ]
+        .spacing(14)
+        .into(),
         Dialog::Secret {
             profile,
             kind,

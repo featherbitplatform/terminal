@@ -220,6 +220,15 @@ impl App {
                 self.prompts.submit(w);
                 self.focus_prompt(w)
             }
+            PromptMsg::CloseTab(w) => {
+                let tab = self.prompts.confirm_close(w);
+                let index = tab.and_then(|id| self.windows.get(&w)?.find(id));
+                let close = match index {
+                    Some(i) => self.close_tab(w, i),
+                    None => Task::none(),
+                };
+                Task::batch([close, self.focus_prompt(w)])
+            }
             PromptMsg::Input(w, v) => {
                 if let Some(Dialog::Secret { value, .. }) = self.prompts.front_mut(w) {
                     *value = v.0;

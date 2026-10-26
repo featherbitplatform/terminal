@@ -83,6 +83,26 @@ impl App {
         self.start(wid, id)
     }
 
+    /// The tab's close button: a tab with several live panes asks first (`Dialog::CloseTab`),
+    /// anything else closes at once. The pane shortcut and bulk closes call `close_tab` directly.
+    pub(crate) fn close_tab_asking(&mut self, wid: window::Id, index: usize) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
+            return Task::none();
+        };
+        if tab.live_panes() < 2 {
+            return self.close_tab(wid, index);
+        }
+        let (id, panes) = (tab.id, tab.panes.len());
+        if !self.prompts.has_close(wid, id) {
+            self.prompts.push(
+                wid,
+                None,
+                crate::prompts::Dialog::CloseTab { tab: id, panes },
+            );
+        }
+        Task::none()
+    }
+
     pub(crate) fn close_tab(&mut self, wid: window::Id, index: usize) -> Task<Message> {
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();

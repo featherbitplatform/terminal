@@ -808,3 +808,108 @@ fn restored_arrangement_is_saved_back_unchanged() {
     let back = SavedState::load_or_default(&app.paths.state());
     assert_eq!(back.windows[0].tabs, state.windows[0].tabs);
 }
+
+/// An app with one window: a plain tab `a`, then a split tab of `a` and `b`, both panes set to
+/// `states`. Returns the app, the window and the split tab's id.
+fn app_with_split_tab(states: [TabState; 2]) -> (App, iced::window::Id, crate::tabs::TabId) {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![
+                SavedTab::Profile(a.id),
+                split_tab(leaf(&a, 0), leaf(&b, 0), 0),
+            ],
+            active: 0,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    app.state_saving_enabled = false;
+    let wid = *app.windows.keys().next().unwrap();
+    let tab = &mut app.windows.get_mut(&wid).unwrap().tabs[1];
+    let order = tab.layout.panes();
+    for (id, state) in order.into_iter().zip(states) {
+        let pane = tab.pane_mut(id).unwrap();
+        pane.state = state;
+        // A started pane draws into a terminal; this one is held by the pane alone.
+        pane.placeholder.get_or_insert_with(|| {
+            std::sync::Arc::new(parking_lot::Mutex::new(fbterm_term::Terminal::new(
+                crate::app::DEFAULT_GRID,
+                100,
+            )))
+        });
+    }
+    let id = tab.id;
+    (app, wid, id)
+}
+
+fn click_close(app: &mut App, wid: iced::window::Id, index: usize) {
+    let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Close(index)));
+}
+
+#[test]
+fn closing_split_tab_asks_first() {
+    let (mut app, wid, id) = app_with_split_tab([TabState::Connected, TabState::Connecting]);
+    click_close(&mut app, wid, 1);
+    assert_eq!(app.windows[&wid].tabs.len(), 2, "nothing closed yet");
+    assert!(matches!(
+        app.prompts.front(wid),
+        Some(crate::prompts::Dialog::CloseTab { tab, panes: 2 }) if *tab == id
+    ));
+}
+
+#[test]
+fn cancel_keeps_the_tab() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    click_close(&mut app, wid, 1);
+    let before = crate::memory::requests();
+    let _ = app.update(Message::Prompt(crate::prompts::PromptMsg::Cancel(wid)));
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 2);
+    assert_eq!(crate::memory::requests(), before);
+}
+
+#[test]
+fn confirm_closes_all_panes_and_releases_once() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    click_close(&mut app, wid, 1);
+    let before = crate::memory::requests();
+    let _ = app.update(Message::Prompt(crate::prompts::PromptMsg::CloseTab(wid)));
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 1);
+    assert_eq!(
+        crate::memory::requests() + app.pending_release.len(),
+        before + 1,
+        "one release request for both panes, now or once they are let go"
+    );
+}
+
+#[test]
+fn single_pane_tab_closes_without_asking() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    click_close(&mut app, wid, 0);
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 1);
+}
+
+#[test]
+fn split_tab_with_one_live_pane_closes_without_asking() {
+    let (mut app, wid, _) =
+        app_with_split_tab([TabState::Connected, TabState::Disconnected("gone".into())]);
+    click_close(&mut app, wid, 1);
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 1);
+}
+
+#[test]
+fn cmd_w_on_a_split_tab_closes_the_pane_without_asking() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Select(1)));
+    let _ = app.close_focused_pane(wid);
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs[1].panes.len(), 1);
+}
