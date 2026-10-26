@@ -348,3 +348,17 @@ fn keys(changes: &[fbterm_config::SettingChange]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::thousands;
+
+    #[test]
+    fn thousands_separates_groups_of_three() {
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(999), "999");
+        assert_eq!(thousands(2_000), "2,000");
+        assert_eq!(thousands(100_000), "100,000");
+        assert_eq!(thousands(1_000_000), "1,000,000");
+    }
+}

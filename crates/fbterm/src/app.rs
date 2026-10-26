@@ -158,10 +158,6 @@ pub enum Message {
     SaveState(u64),
     /// `profiles.toml` and/or `settings.toml` changed on disk.
     ConfigChanged(Changed),
-    /// After a tab or window closed: request the memory release once nothing holds the closed
-    /// tabs' terminals any more (the session task may outlive the tab briefly); the count is
-    /// how many times this has waited.
-    ReleaseWhenFree(Vec<crate::memory::WeakTerminal>, u32),
 }
 
 /// Where a settings change came from. The scrollback notice is for edits made in
@@ -252,6 +248,9 @@ pub struct App {
     pub(crate) settings_seen: Option<String>,
     /// The banner line for a `settings.toml` that failed to load.
     pub(crate) settings_notice: Option<String>,
+    /// Terminals of tabs the user closed that a session task still holds; the release is
+    /// requested when `SessionEvent::Released` shows the last holder let go (`windows.rs`).
+    pub(crate) pending_release: Vec<Vec<crate::memory::WeakTerminal>>,
     /// Whether one of our windows has focus at all (the app is in front).
     pub app_active: bool,
     pub style: TerminalStyle,
@@ -456,6 +455,7 @@ impl App {
             profiles_seen,
             settings_seen,
             settings_notice,
+            pending_release: Vec::new(),
             app_active: true,
             style_unfocused: TerminalStyle {
                 focused: false,
@@ -755,7 +755,8 @@ impl App {
                 } else if self.quitting {
                     Task::none()
                 } else {
-                    self.release_when_free(freed, 0)
+                    self.release_closed(freed);
+                    Task::none()
                 }
             }
             Message::Shortcut(wid, action) => self.action(Some(wid), action),
@@ -810,9 +811,6 @@ impl App {
                 Task::none()
             }
             Message::CloseRequested(id) => self.close_requested(id),
-            Message::ReleaseWhenFree(terminals, waited) => {
-                self.release_when_free(terminals, waited)
-            }
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
                 if let Some(path) = &self.screenshot {

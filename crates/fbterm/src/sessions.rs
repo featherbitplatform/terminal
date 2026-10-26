@@ -265,6 +265,11 @@ impl App {
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {
+        if event == SessionEvent::Released {
+            // The session of a tab the user closed: no tab is left to show it.
+            self.release_swept();
+            return Task::none();
+        }
         let Some((wid, window, index)) = self.windows.iter_mut().find_map(|(wid, w)| {
             let i = w
                 .tabs
