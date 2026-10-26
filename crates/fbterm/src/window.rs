@@ -1236,11 +1236,12 @@ fn tab_button<'a>(
         .on_press(Message::TabBar(window, TabBarMsg::Close(index)))
         .padding(3)
         .style(move |_, status| ghost(t, status));
-    // The shortcut closes the active tab only, so only its button names it.
+    // The shortcut closes the active tab only, so only its button names it, and only while the
+    // tab is one pane: in a split tab the chord closes the focused pane, the button the tab.
     let close = tip(
         t,
         close,
-        if active {
+        if active && tab.panes.len() == 1 {
             tooltip_text("Close tab", Action::CloseTab, bar.bindings)
         } else {
             "Close tab".to_owned()
