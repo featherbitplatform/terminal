@@ -332,13 +332,15 @@ enum Flow {
     PassOn,
     /// The release of a modifier click that never travelled: the panes get the held-back
     /// press at this point, then the release.
-    Replay(Point),
+    Replay(Point, keyboard::Modifiers),
 }
 
 /// A tile picked up: by its handle, or with the pick modifier from inside its pane.
 struct TileDrag {
     pane: PaneId,
     origin: Point,
+    /// The modifiers held at the press: a replayed click sees these, not the current ones.
+    mods: keyboard::Modifiers,
     /// Picked by the handle; else with the pick modifier, the press held back from the pane's
     /// view until it is clear whether it is a drag or a click.
     by_handle: bool,
@@ -470,7 +472,7 @@ impl Tiles<'_> {
                 if !tile.by_handle && !tile.carrying && !tile.cancelled {
                     // A modifier click that never travelled: the pane's view gets it after
                     // all (a link opens, a program reading the mouse sees its click).
-                    return Flow::Replay(tile.origin);
+                    return Flow::Replay(tile.origin, tile.mods);
                 }
                 shell.capture_event();
                 Flow::Consumed
@@ -604,21 +606,28 @@ impl Tiles<'_> {
         match self.tile_event(state, event, bounds, cursor, shell) {
             Flow::Consumed => return,
             Flow::PassOn => {}
-            Flow::Replay(origin) => {
+            Flow::Replay(origin, pressed_with) => {
+                // The click as it was made: the press and the release both at the press point
+                // and with the modifiers held at the press, even if they went up since.
+                let at = mouse::Cursor::Available(origin);
+                let now = state.modifiers;
+                let set =
+                    |m: keyboard::Modifiers| Event::Keyboard(keyboard::Event::ModifiersChanged(m));
                 let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
-                self.update_children(
-                    tree,
-                    &press,
-                    layout,
-                    mouse::Cursor::Available(origin),
-                    renderer,
-                    clipboard,
-                    shell,
-                    viewport,
-                );
-                self.update_children(
-                    tree, event, layout, cursor, renderer, clipboard, shell, viewport,
-                );
+                let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+                let mut feed = |event: &Event, cursor| {
+                    self.update_children(
+                        tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+                    );
+                };
+                if pressed_with != now {
+                    feed(&set(pressed_with), at);
+                }
+                feed(&press, at);
+                feed(&release, at);
+                if pressed_with != now {
+                    feed(&set(now), cursor);
+                }
                 return;
             }
         }
@@ -665,6 +674,7 @@ impl Tiles<'_> {
                                     state.tile = Some(TileDrag {
                                         pane: id,
                                         origin: p,
+                                        mods: state.modifiers,
                                         by_handle: true,
                                         carrying: false,
                                         target: None,
@@ -681,6 +691,7 @@ impl Tiles<'_> {
                                     state.tile = Some(TileDrag {
                                         pane: id,
                                         origin: p,
+                                        mods: state.modifiers,
                                         by_handle: false,
                                         carrying: false,
                                         target: None,
@@ -1758,6 +1769,70 @@ mod tests {
             );
             assert!(drops(&steps).is_empty());
             assert_eq!(urls(&steps), vec!["https://example.com/".to_string()]);
+        }
+
+        #[test]
+        fn cmd_click_link_opens_even_if_cmd_released_first() {
+            let terms = [term(), term()];
+            let at = Point::new(3.0, 3.0);
+            let steps = drive(
+                &terms,
+                || {
+                    terms[0]
+                        .lock()
+                        .feed(b"\x1b]8;;https://example.com/\x1b\\link\x1b]8;;\x1b\\ text");
+                },
+                &[
+                    (mods(pick_mods()), at),
+                    (press(), at),
+                    // The modifier goes up a moment before the button.
+                    (mods(keyboard::Modifiers::empty()), at),
+                    (release(), at),
+                ],
+            );
+            assert!(drops(&steps).is_empty());
+            assert_eq!(urls(&steps), vec!["https://example.com/".to_string()]);
+        }
+
+        #[test]
+        fn replayed_click_presses_and_releases_at_the_same_cell() {
+            let terms = [term(), term()];
+            // A first event sizes the terminals; the pointer then starts just left of a cell
+            // boundary and ends just right of it, within the slop.
+            drive(&terms, || {}, &[]);
+            let cw = terms[0].lock().size().cell_width;
+            let (from, to) = (Point::new(cw - 1.0, 3.0), Point::new(cw + 1.5, 3.0));
+            let steps = drive(
+                &terms,
+                // Mouse reporting on, SGR encoding.
+                || terms[0].lock().feed(b"\x1b[?1000h\x1b[?1006h"),
+                &[
+                    (mods(pick_mods()), from),
+                    (press(), from),
+                    (moved(to.x, to.y), to),
+                    (release(), to),
+                ],
+            );
+            let sent: Vec<String> = steps
+                .iter()
+                .flat_map(|s| &s.messages)
+                .filter_map(|m| match m {
+                    Message::Terminal(_, _, TerminalOutput::Input(b)) => {
+                        Some(String::from_utf8_lossy(b).into_owned())
+                    }
+                    _ => None,
+                })
+                .collect();
+            let cell = |tail: char| {
+                sent.iter()
+                    .find(|s| s.ends_with(tail))
+                    .map(|s| s.trim_start_matches("\x1b[<").to_string())
+                    .map(|s| s.split(';').skip(1).collect::<Vec<_>>().join(";"))
+            };
+            let (down, up) = (cell('M'), cell('m'));
+            assert!(down.is_some() && up.is_some(), "{sent:?}");
+            let strip = |s: Option<String>| s.map(|s| s.trim_end_matches(['M', 'm']).to_string());
+            assert_eq!(strip(down), strip(up), "{sent:?}");
         }
 
         #[test]
