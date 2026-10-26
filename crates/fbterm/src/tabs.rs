@@ -119,7 +119,7 @@ impl Tab {
         self.panes.iter().find(|p| p.id == id)
     }
 
-    #[allow(dead_code)] // read by tests; part of the tab's read surface
+    #[cfg(test)]
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|p| p.id == id)
     }

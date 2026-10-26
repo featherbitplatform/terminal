@@ -8,7 +8,7 @@ use iced::{Task, window};
 
 use crate::app::{App, Message, unix_now};
 use crate::chrome::Chrome;
-use crate::layout::{Drop, PaneId};
+use crate::layout::{Drop, Layout, PaneId};
 use crate::restore;
 use crate::tabs::{self, Pane, Tab, TabId, TabState, WindowState};
 
@@ -287,7 +287,7 @@ impl App {
             DragMsg::StartTab(tab) => {
                 self.carry = Some((wid, Carry::Tab(tab)));
                 self.hover = None;
-                Task::none()
+                self.show_drop_layout(wid)
             }
             DragMsg::OverTab(over) => {
                 if !matches!(self.carry_in(wid), Some(Carry::Tab(_))) {
@@ -312,7 +312,8 @@ impl App {
                         && matches!(self.carry_in(wid), Some(Carry::Tab(_))) =>
                 {
                     self.hover = None;
-                    self.with_window(wid, |w| w.select(index))
+                    let switched = self.with_window(wid, |w| w.select(index));
+                    Task::batch([switched, self.show_drop_layout(wid)])
                 }
                 _ => Task::none(),
             },
@@ -349,6 +350,70 @@ impl App {
         }
     }
 
+    /// Whether `layout` keeps every pane of `wid` at least `MIN_COLS` x `MIN_ROWS` cells in the
+    /// window's pane area, with the cell size of pane `cell_of` (the tab's focused pane, as
+    /// splits check). Before the first layout nothing is known and anything goes, as for splits.
+    pub(crate) fn fits_in(&self, wid: window::Id, cell_of: PaneId, layout: &Layout) -> bool {
+        match (self.areas.get(&wid), self.grids.get(&cell_of)) {
+            (Some(area), Some(g)) => layout.fits(
+                iced::Rectangle::with_size(*area),
+                iced::Size::new(g.cell_width, g.cell_height),
+            ),
+            _ => true,
+        }
+    }
+
+    /// The layout tab `target` of `wid` would have with tab `source` merged in at `at`, if
+    /// every pane would still fit.
+    pub(crate) fn merged_layout(
+        &self,
+        wid: window::Id,
+        source: TabId,
+        target: TabId,
+        at: Drop,
+    ) -> Option<Layout> {
+        let w = self.windows.get(&wid)?;
+        if source == target {
+            return None;
+        }
+        let (source, target) = (&w.tabs[w.find(source)?], &w.tabs[w.find(target)?]);
+        let mut merged = target.layout.clone();
+        merged.insert(source.layout.clone(), at);
+        self.fits_in(wid, target.focused, &merged).then_some(merged)
+    }
+
+    /// The layout `pane`'s tab would have with it moved to `at`, if that changes anything and
+    /// every pane would still fit.
+    pub(crate) fn moved_layout(&self, wid: window::Id, pane: PaneId, at: Drop) -> Option<Layout> {
+        let w = self.windows.get(&wid)?;
+        let tab = &w.tabs[w.locate(pane)?.0];
+        let mut moved = tab.layout.clone();
+        if !moved.move_pane(pane, at) || moved == tab.layout {
+            return None;
+        }
+        self.fits_in(wid, tab.focused, &moved).then_some(moved)
+    }
+
+    /// A tab is carried over `wid`: the tab shown, if it is another one, shows its whole
+    /// layout, so the preview over it is where the merge lands (a merge un-maximizes anyway).
+    fn show_drop_layout(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(Carry::Tab(source)) = self.carry_in(wid) else {
+            return Task::none();
+        };
+        let Some(tab) = self
+            .windows
+            .get_mut(&wid)
+            .and_then(WindowState::active_tab_mut)
+        else {
+            return Task::none();
+        };
+        if tab.id == source || tab.maximized.take().is_none() {
+            return Task::none();
+        }
+        self.save_state();
+        self.shown(wid)
+    }
+
     fn end_carry(&mut self) {
         self.carry = None;
         self.hover = None;
@@ -365,12 +430,13 @@ impl App {
         target: TabId,
         at: Drop,
     ) -> Task<Message> {
+        // Refused when it would squeeze a pane below the minimum (or is no merge at all).
+        let Some(merged) = self.merged_layout(wid, source, target, at) else {
+            return Task::none();
+        };
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();
         };
-        if source == target || window.find(target).is_none() {
-            return Task::none();
-        }
         // Taken out of the bar, not closed: its panes live on in the target.
         let Some(moved) = window.find(source).and_then(|i| window.close(i)) else {
             return Task::none();
@@ -381,7 +447,7 @@ impl App {
         };
         let tab = &mut window.tabs[index];
         tab.maximized = None;
-        tab.layout.insert(moved.layout, at);
+        tab.layout = merged;
         tab.panes.extend(moved.panes);
         tab.recent.extend(moved.recent);
         tab.focus(moved.focused);
@@ -419,6 +485,9 @@ impl App {
     /// Move the tile `pane` to `at` within its tab (the palette's "Move tile…"), showing the
     /// whole layout.
     pub(crate) fn move_tile(&mut self, wid: window::Id, pane: PaneId, at: Drop) -> Task<Message> {
+        let Some(moved) = self.moved_layout(wid, pane, at) else {
+            return Task::none();
+        };
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();
         };
@@ -426,10 +495,7 @@ impl App {
             return Task::none();
         };
         let tab = &mut window.tabs[t];
-        let before = tab.layout.clone();
-        if !tab.layout.move_pane(pane, at) || tab.layout == before {
-            return Task::none();
-        }
+        tab.layout = moved;
         tab.maximized = None;
         tab.focus(pane);
         self.save_state();
@@ -618,6 +684,13 @@ mod tests {
         drag(&mut app, DragMsg::OverTab(None));
         drag(&mut app, DragMsg::HoverElapsed(first));
         assert_eq!(app.windows[&wid].active, 1);
+        // A drag that ended: its pending hover does nothing.
+        drag(&mut app, DragMsg::OverTab(Some(0)));
+        let ended = app.hover_generation;
+        drag(&mut app, DragMsg::End);
+        drag(&mut app, DragMsg::HoverElapsed(ended));
+        assert_eq!(app.windows[&wid].active, 1);
+        drag(&mut app, DragMsg::StartTab(tb));
         drag(&mut app, DragMsg::OverTab(Some(0)));
         let second = app.hover_generation;
         drag(&mut app, DragMsg::HoverElapsed(second));
@@ -645,6 +718,161 @@ mod tests {
         assert_eq!(w.tabs[0].layout, Layout::Pane(b));
         drag(&mut app, DragMsg::Tile(None));
         assert_eq!(app.carry, None);
+    }
+
+    /// A pane area of `w` x `h` logical pixels and a 9 x 18 px cell for every pane: a pane
+    /// needs 180 x 90 px (20 x 5 cells).
+    fn small(app: &mut App, wid: window::Id, w: f32, h: f32) {
+        let _ = app.update(Message::Tiles(
+            wid,
+            crate::tiles::TilesMsg::Area(iced::Size::new(w, h)),
+        ));
+        let panes: Vec<PaneId> = app.windows[&wid]
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().map(|p| p.id))
+            .collect();
+        for p in panes {
+            app.grids.insert(
+                p,
+                fbterm_term::GridSize {
+                    cols: 20,
+                    rows: 5,
+                    cell_width: 9.0,
+                    cell_height: 18.0,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn merge_refused_when_it_would_not_fit() {
+        let p = profile("a");
+        let (mut app, wid, [_, _, b], [ta, tb]) = app_with_tabs(&p);
+        small(&mut app, wid, 400.0, 300.0);
+        // a1 | a2 beside b would leave a1 and a2 about 100 px wide each.
+        let _ = app.merge_tab(wid, ta, tb, Drop::Edge(Side::Right));
+        let _ = app.update(Message::Drag(
+            wid,
+            crate::windows::DragMsg::DropTab {
+                tab: ta,
+                at: Drop::Tile(b, Side::Left),
+            },
+        ));
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 2, "nothing merged");
+        assert_eq!(w.tabs[1].layout, Layout::Pane(b));
+        // Stacked under b they fit (400 x 150 each side).
+        let _ = app.merge_tab(wid, ta, tb, Drop::Edge(Side::Bottom));
+        assert_eq!(app.windows[&wid].tabs.len(), 1);
+    }
+
+    #[test]
+    fn tile_move_refused_when_it_would_not_fit() {
+        let p = profile("a");
+        let (mut app, wid, [a1, a2, _], _) = app_with_tabs(&p);
+        let _ = app.update(Message::Shortcut(wid, Action::SelectTab(1)));
+        small(&mut app, wid, 400.0, 150.0);
+        let before = app.windows[&wid].tabs[0].layout.clone();
+        // Stacked, each would get 75 px of the 90 px a pane needs.
+        let _ = app.update(Message::Tiles(
+            wid,
+            crate::tiles::TilesMsg::DropTile {
+                pane: a2,
+                at: Drop::Tile(a1, Side::Bottom),
+            },
+        ));
+        let _ = app.move_tile(wid, a2, Drop::Edge(Side::Top));
+        assert_eq!(app.windows[&wid].tabs[0].layout, before);
+        // Side by side the other way round fits.
+        let _ = app.move_tile(wid, a2, Drop::Edge(Side::Left));
+        assert_eq!(app.windows[&wid].tabs[0].layout.panes(), vec![a2, a1]);
+    }
+
+    #[test]
+    fn palette_lists_only_choices_that_fit() {
+        let p = profile("a");
+        let (mut app, wid, _, _) = app_with_tabs(&p);
+        // Shown without starting (a start would retitle the panes after their profile).
+        app.windows.get_mut(&wid).unwrap().active = 0;
+        small(&mut app, wid, 400.0, 150.0);
+        let _ = app.update(Message::Shortcut(wid, Action::MoveTile));
+        assert_eq!(
+            labels(&app, wid),
+            ["Next to build: left", "Whole column on the left"]
+        );
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Close));
+        // "shell" fits nowhere in "build | logs" here: no tab to merge into is listed.
+        app.windows.get_mut(&wid).unwrap().active = 1;
+        let _ = app.update(Message::Shortcut(wid, Action::MergeTab));
+        assert!(app.palettes.is_empty());
+        // In a taller area it fits stacked only.
+        small(&mut app, wid, 400.0, 300.0);
+        let _ = app.update(Message::Shortcut(wid, Action::MergeTab));
+        assert_eq!(labels(&app, wid), ["logs"]);
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Pick(0)));
+        assert_eq!(
+            labels(&app, wid),
+            [
+                "Next to build: above",
+                "Next to build: below",
+                "Next to logs: above",
+                "Next to logs: below",
+                "Whole row on top",
+                "Whole row on bottom",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_carried_tab_sees_the_whole_layout_of_a_maximized_tab() {
+        use crate::windows::DragMsg;
+        let p = profile("a");
+        let (mut app, wid, [_, a2, _], [ta, tb]) = app_with_tabs(&p);
+        app.windows.get_mut(&wid).unwrap().tabs[0].maximized = Some(a2);
+        let _ = app.update(Message::Drag(wid, DragMsg::StartTab(tb)));
+        let _ = app.update(Message::Drag(wid, DragMsg::OverTab(Some(0))));
+        let generation = app.hover_generation;
+        let _ = app.update(Message::Drag(wid, DragMsg::HoverElapsed(generation)));
+        let w = &app.windows[&wid];
+        assert_eq!(w.active_tab().map(|t| t.id), Some(ta));
+        assert_eq!(
+            w.tabs[0].maximized, None,
+            "the preview is drawn on the whole layout"
+        );
+        // Picking up another tab over a maximized one shows its layout at once.
+        let (mut app, wid, [_, _, b], [ta, _]) = app_with_tabs(&p);
+        app.windows.get_mut(&wid).unwrap().tabs[1].maximized = Some(b);
+        let _ = app.update(Message::Drag(wid, DragMsg::StartTab(ta)));
+        assert_eq!(app.windows[&wid].tabs[1].maximized, None);
+    }
+
+    #[test]
+    fn hover_switch_starts_the_shown_tabs_panes() {
+        use crate::tabs::TabState;
+        use crate::windows::DragMsg;
+        let p = profile("a");
+        let (mut app, wid, _, [_, tb]) = app_with_tabs(&p);
+        assert!(
+            app.windows[&wid].tabs[0]
+                .panes
+                .iter()
+                .all(|p| p.state == TabState::NotConnected),
+            "restored, never shown"
+        );
+        let _ = app.update(Message::Drag(wid, DragMsg::StartTab(tb)));
+        let _ = app.update(Message::Drag(wid, DragMsg::OverTab(Some(0))));
+        let generation = app.hover_generation;
+        let _ = app.update(Message::Drag(wid, DragMsg::HoverElapsed(generation)));
+        let w = &app.windows[&wid];
+        assert_eq!(w.active, 0);
+        assert!(
+            w.tabs[0]
+                .panes
+                .iter()
+                .all(|p| p.state != TabState::NotConnected),
+            "both panes of the tab shown started"
+        );
     }
 
     #[test]

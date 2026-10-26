@@ -913,3 +913,60 @@ fn cmd_w_on_a_split_tab_closes_the_pane_without_asking() {
     assert!(app.prompts.front(wid).is_none());
     assert_eq!(app.windows[&wid].tabs[1].panes.len(), 1);
 }
+
+#[test]
+fn merged_layout_survives_save_and_reload() {
+    let (a, b, c) = (profile("a"), profile("b"), profile("c"));
+    let paths = paths_with(&[a.clone(), b.clone(), c.clone()]);
+    SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![
+                split_tab(leaf(&a, 0), leaf(&b, 1), 0),
+                SavedTab::Profile(c.id),
+            ],
+            active: 1,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let wid = *app.windows.keys().next().unwrap();
+    let w = &app.windows[&wid];
+    let (target, source) = (w.tabs[0].id, w.tabs[1].id);
+    let b_pane = w.tabs[0].layout.panes()[1];
+    let _ = app.merge_tab(
+        wid,
+        source,
+        target,
+        crate::layout::Drop::Tile(b_pane, crate::layout::Side::Bottom),
+    );
+    let merged = SavedTab::Split(fbterm_config::SavedSplitTab {
+        layout: SavedLayout::Split {
+            axis: SavedAxis::Row,
+            ratio: 0.3,
+            first: Box::new(leaf(&a, 0)),
+            second: Box::new(SavedLayout::Split {
+                axis: SavedAxis::Column,
+                ratio: 0.5,
+                first: Box::new(leaf(&b, 1)),
+                second: Box::new(leaf(&c, 0)),
+            }),
+        },
+        focused: 2,
+    });
+    let on_disk = SavedState::load_or_default(&paths.state());
+    assert_eq!(on_disk.windows[0].tabs, vec![merged.clone()]);
+    assert_eq!(on_disk.windows[0].active, 0);
+
+    // Relaunched: the same arrangement, ratios and focus, saved back unchanged.
+    drop(app);
+    let (relaunched, _) = App::build(paths.clone(), true);
+    let w = relaunched.windows.values().next().unwrap();
+    assert_eq!(w.tabs.len(), 1);
+    assert_eq!(w.tabs[0].panes.len(), 3);
+    relaunched.save_state();
+    let back = SavedState::load_or_default(&paths.state());
+    assert_eq!(back.windows[0].tabs, vec![merged]);
+}

@@ -125,13 +125,24 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 .map(|pane| (pane.id, pane_view(app, id, tab, pane)))
                 .collect();
             let incoming = match carry {
-                Some(Carry::Tab(source)) => Some(crate::tiles::Incoming {
-                    tab: source,
-                    mergeable: source != tab.id,
-                }),
+                Some(Carry::Tab(source)) => {
+                    win.tabs
+                        .iter()
+                        .find(|t| t.id == source)
+                        .map(|from| crate::tiles::Incoming {
+                            tab: source,
+                            mergeable: source != tab.id,
+                            layout: from.layout.clone(),
+                        })
+                }
                 _ => None,
             };
-            crate::tiles::tiles(t, id, tab, panes, !modal, incoming)
+            // The minimum pane size is measured in the focused pane's cells, as for splits.
+            let cell = app
+                .grids
+                .get(&tab.focused)
+                .map(|g| Size::new(g.cell_width, g.cell_height));
+            crate::tiles::tiles(t, id, tab, panes, !modal, incoming, cell)
         }
         None if win.tabs.is_empty() => container(
             text("No shells found. Add a profile in profiles.toml.")
@@ -660,6 +671,10 @@ impl BarBackground<'_> {
         let buttons = tab_rects(layout, self.ids.len());
         let under = |p: Point| buttons.iter().position(|r| r.contains(p));
         let tile = matches!(self.carry, Some(Carry::Tile(_)));
+        // A tile drag that ended elsewhere (Escape) leaves no gap behind.
+        if !tile && state.gap.take().is_some() {
+            shell.request_redraw();
+        }
         let gap = |p: Option<Point>| {
             p.filter(|_| tile)
                 .and_then(|p| tab_gap(&buttons, self.hole, p))
@@ -1607,10 +1622,18 @@ mod tests {
             let id = tabs[1].id;
             let messages = drive(&tabs, None, |b| {
                 let at = b[1].center();
-                let far = Point::new(at.x, at.y + 7.0);
-                vec![(press(), at), (moved(far), far), (release(), at)]
+                let near = Point::new(at.x, at.y + 5.9);
+                let far = Point::new(at.x, at.y + 6.0);
+                vec![
+                    (press(), at),
+                    (moved(near), near),
+                    (moved(far), far),
+                    (release(), at),
+                ]
             });
+            // Exactly 6 px starts it (5.9 did not: it is the first drag message).
             assert_eq!(drags(&messages)[0], DragMsg::StartTab(id));
+            assert_eq!(drags(&messages).len(), 2, "start and end only");
             assert!(selects(&messages).is_empty(), "a drag is not a click");
 
             // While carried, the tab under the pointer is reported (not the carried one).

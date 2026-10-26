@@ -124,11 +124,23 @@ fn nearest_side(rect: Rectangle, p: Point) -> (Side, f32) {
     .expect("four sides")
 }
 
-/// The rectangle `pane` would get if dropped at `at`; `None` when the drop is impossible or
-/// would leave the arrangement as it is.
-fn preview(layout: &Layout, area: Rectangle, pane: PaneId, at: Drop) -> Option<Rectangle> {
+/// Whether every pane of `layout` keeps the minimum size in `area` with cells of `cell`
+/// (unknown before the first layout: anything goes, as for splits).
+fn fits(layout: &Layout, area: Rectangle, cell: Option<Size>) -> bool {
+    cell.is_none_or(|cell| layout.fits(area, cell))
+}
+
+/// The rectangle `pane` would get if dropped at `at`; `None` when the drop is impossible,
+/// would leave the arrangement as it is, or would squeeze a pane below the minimum size.
+fn preview(
+    layout: &Layout,
+    area: Rectangle,
+    pane: PaneId,
+    at: Drop,
+    cell: Option<Size>,
+) -> Option<Rectangle> {
     let mut moved = layout.clone();
-    if !moved.move_pane(pane, at) || moved == *layout {
+    if !moved.move_pane(pane, at) || moved == *layout || !fits(&moved, area, cell) {
         return None;
     }
     moved
@@ -138,17 +150,28 @@ fn preview(layout: &Layout, area: Rectangle, pane: PaneId, at: Drop) -> Option<R
         .map(|(_, r)| snap(r))
 }
 
-/// The rectangle a whole tab dropped at `at` takes (its panes keep their arrangement inside).
-fn incoming_preview(layout: &Layout, area: Rectangle, at: Drop) -> Option<Rectangle> {
-    // Stands in for the tab's layout: a subtree takes the same room as a single pane.
-    const PLACEHOLDER: PaneId = PaneId(u64::MAX);
+/// The rectangle a whole tab (`subtree`, its layout) dropped at `at` takes, its panes keeping
+/// their arrangement inside; `None` when a pane would end up below the minimum size.
+fn incoming_preview(
+    layout: &Layout,
+    area: Rectangle,
+    subtree: &Layout,
+    at: Drop,
+    cell: Option<Size>,
+) -> Option<Rectangle> {
     let mut merged = layout.clone();
-    merged.insert(Layout::Pane(PLACEHOLDER), at);
+    merged.insert(subtree.clone(), at);
+    if !fits(&merged, area, cell) {
+        return None;
+    }
+    let ids = subtree.panes();
     merged
         .rects(area)
         .into_iter()
-        .find(|(id, _)| *id == PLACEHOLDER)
-        .map(|(_, r)| snap(r))
+        .filter(|(id, _)| ids.contains(id))
+        .map(|(_, r)| r)
+        .reduce(|a, b| a.union(&b))
+        .map(snap)
 }
 
 /// The grab handle of a pane at `rect`: centred on its top edge, just inside it.
@@ -226,11 +249,13 @@ fn snap(r: Rectangle) -> Rectangle {
 }
 
 /// A tab carried from the tab bar while these tiles are shown.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Incoming {
     pub tab: TabId,
     /// It is another tab than the one shown, so it can be dropped here.
     pub mergeable: bool,
+    /// Its layout, which lands whole.
+    pub layout: Layout,
 }
 
 /// Lays `panes` (the views of `tab.visible_panes()`, in any order) out at their rectangles
@@ -244,6 +269,7 @@ pub fn tiles<'a>(
     panes: Vec<(PaneId, Element<'a, Message>)>,
     focused_outline: bool,
     incoming: Option<Incoming>,
+    cell: Option<Size>,
 ) -> Element<'a, Message> {
     let (ids, children) = panes.into_iter().unzip();
     Element::new(Tiles {
@@ -255,6 +281,7 @@ pub fn tiles<'a>(
         children,
         outline: focused_outline,
         incoming,
+        cell,
     })
 }
 
@@ -267,6 +294,8 @@ struct Tiles<'a> {
     children: Vec<Element<'a, Message>>,
     outline: bool,
     incoming: Option<Incoming>,
+    /// The cell size the minimum pane size is measured in (the focused pane's).
+    cell: Option<Size>,
 }
 
 struct Drag {
@@ -389,8 +418,10 @@ impl Tiles<'_> {
                     }
                     if tile.carrying {
                         // A drop that would leave the arrangement as it is is no target.
-                        let target = drop_target(&self.layout, bounds, p, Some(tile.pane))
-                            .filter(|at| preview(&self.layout, bounds, tile.pane, *at).is_some());
+                        let target =
+                            drop_target(&self.layout, bounds, p, Some(tile.pane)).filter(|at| {
+                                preview(&self.layout, bounds, tile.pane, *at, self.cell).is_some()
+                            });
                         if target != tile.target {
                             tile.target = target;
                             shell.request_redraw();
@@ -463,16 +494,21 @@ impl Tiles<'_> {
         cursor: mouse::Cursor,
         shell: &mut Shell<'_, Message>,
     ) -> bool {
-        let Some(incoming) = self.incoming else {
+        let Some(incoming) = self.incoming.as_ref() else {
             if state.incoming.take().is_some() {
                 shell.request_redraw();
             }
             return false;
         };
         state.tile = None;
+        // A target where a pane would end up below the minimum size is no target.
         let target = |p: Option<Point>| {
             p.filter(|_| incoming.mergeable)
                 .and_then(|p| drop_target(&self.layout, bounds, p, None))
+                .filter(|at| {
+                    incoming_preview(&self.layout, bounds, &incoming.layout, *at, self.cell)
+                        .is_some()
+                })
         };
         let end = |state: &mut State, shell: &mut Shell<'_, Message>| {
             state.incoming = None;
@@ -711,11 +747,10 @@ impl Tiles<'_> {
     fn draw_incoming(&self, tree: &Tree, renderer: &mut iced::Renderer, bounds: Rectangle) {
         use iced::advanced::Renderer as _;
         let state = tree.state.downcast_ref::<State>();
-        let Some(r) = self
-            .incoming
-            .and(state.incoming)
-            .and_then(|at| incoming_preview(&self.layout, bounds, at))
-        else {
+        let Some(r) = self.incoming.as_ref().and_then(|incoming| {
+            let at = state.incoming?;
+            incoming_preview(&self.layout, bounds, &incoming.layout, at, self.cell)
+        }) else {
             return;
         };
         renderer.with_layer(bounds.expand(1.0), |renderer| {
@@ -1028,7 +1063,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                     target: Some(at),
                     ..
                 }) => {
-                    if let Some(r) = preview(&self.layout, bounds, *pane, *at) {
+                    if let Some(r) = preview(&self.layout, bounds, *pane, *at, self.cell) {
                         self.draw_preview(renderer, r);
                     }
                 }
@@ -1220,19 +1255,67 @@ mod tests {
     fn preview_is_the_rect_the_tile_would_get() {
         let l = two();
         // Pane 1 dropped along the bottom: a full-width row under pane 2.
-        let r = preview(&l, area(), PaneId(1), Drop::Edge(Side::Bottom)).unwrap();
+        let r = preview(&l, area(), PaneId(1), Drop::Edge(Side::Bottom), None).unwrap();
         assert_eq!((r.x, r.width), (8.0, 1000.0));
         assert_eq!(r.y + r.height, 604.0);
         assert!((r.height - 298.0).abs() <= 1.0, "{r:?}");
         // Back where it is (beside the other pane on the same side): no preview.
         assert_eq!(
-            preview(&l, area(), PaneId(1), Drop::Tile(PaneId(2), Side::Left)),
+            preview(
+                &l,
+                area(),
+                PaneId(1),
+                Drop::Tile(PaneId(2), Side::Left),
+                None
+            ),
             None
         );
         // On its own tile: no move, no preview.
         assert_eq!(
-            preview(&l, area(), PaneId(1), Drop::Tile(PaneId(1), Side::Left)),
+            preview(
+                &l,
+                area(),
+                PaneId(1),
+                Drop::Tile(PaneId(1), Side::Left),
+                None
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn no_preview_where_a_pane_would_not_fit() {
+        let l = two();
+        // 30 px cells: a pane needs 600 px, so a full-width row fits and a half does not.
+        let wide = Some(Size::new(30.0, 20.0));
+        assert!(preview(&l, area(), PaneId(1), Drop::Edge(Side::Bottom), wide).is_some());
+        assert_eq!(
+            preview(
+                &l,
+                area(),
+                PaneId(1),
+                Drop::Tile(PaneId(2), Side::Right),
+                wide
+            ),
+            None
+        );
+        // 20 px cells: a pane needs 400 px.
+        let cell = Some(Size::new(20.0, 20.0));
+        // A carried tab of two panes side by side: along the bottom it fits, beside a tile not.
+        let tab = Layout::Split {
+            axis: Axis::Row,
+            ratio: 0.5,
+            first: Box::new(Layout::Pane(PaneId(7))),
+            second: Box::new(Layout::Pane(PaneId(8))),
+        };
+        let r = incoming_preview(&l, area(), &tab, Drop::Edge(Side::Bottom), cell).unwrap();
+        assert_eq!((r.x, r.width), (8.0, 1000.0), "the whole subtree's room");
+        assert_eq!(
+            incoming_preview(&l, area(), &tab, Drop::Tile(PaneId(2), Side::Right), cell),
+            None
+        );
+        assert!(
+            incoming_preview(&l, area(), &tab, Drop::Tile(PaneId(2), Side::Right), None).is_some()
         );
     }
 
@@ -1372,6 +1455,7 @@ mod tests {
                 children,
                 outline: true,
                 incoming,
+                cell: None,
             });
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
                 iced::Font::DEFAULT,
@@ -1470,6 +1554,7 @@ mod tests {
                     children,
                     outline: true,
                     incoming: None,
+                    cell: None,
                 })
             };
             let viewport = Rectangle::with_size(SIZE);
@@ -1553,7 +1638,13 @@ mod tests {
         fn a_carried_tab_drops_on_the_tiles() {
             let terms = [term(), term()];
             let tab = TabId::next();
-            let carried = |mergeable| Some(Incoming { tab, mergeable });
+            let carried = |mergeable| {
+                Some(Incoming {
+                    tab,
+                    mergeable,
+                    layout: Layout::Pane(PaneId(9)),
+                })
+            };
             let steps = [
                 (moved(700.0, 300.0), Point::new(700.0, 300.0)),
                 (moved(560.0, 300.0), Point::new(560.0, 300.0)),

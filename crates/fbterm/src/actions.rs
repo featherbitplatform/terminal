@@ -9,7 +9,7 @@ use crate::layout::{Dir, Side};
 use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Pick, Placing, Stage};
 use crate::pane_actions::Zoom;
 use crate::settings_window::SettingsMsg;
-use crate::tabs::WindowState;
+use crate::tabs::{TabId, WindowState};
 
 impl App {
     pub(crate) fn action(&mut self, window: Option<window::Id>, action: Action) -> Task<Message> {
@@ -194,8 +194,40 @@ impl App {
         let Some(source) = w.active_tab().map(|t| t.id) else {
             return Task::none();
         };
-        let items = palette::tab_choices(w, source);
+        // Only the tabs it fits into somewhere.
+        let items = palette::tab_choices(w, source)
+            .into_iter()
+            .filter(|item| match item {
+                PaletteItem::Choice {
+                    pick: Pick::Tab(into),
+                    ..
+                } => !self.merge_choices(wid, source, *into).is_empty(),
+                _ => false,
+            })
+            .collect();
         self.open_stage(wid, Stage::MergeInto { source }, items)
+    }
+
+    /// Where tab `source` can go in tab `into`: the drop choices that keep every pane at least
+    /// the minimum size.
+    fn merge_choices(&self, wid: window::Id, source: TabId, into: TabId) -> Vec<PaletteItem> {
+        let Some(tab) = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.find(into).map(|i| &w.tabs[i]))
+        else {
+            return Vec::new();
+        };
+        palette::drop_choices(tab, None)
+            .into_iter()
+            .filter(|item| match item {
+                PaletteItem::Choice {
+                    pick: Pick::Drop(at),
+                    ..
+                } => self.merged_layout(wid, source, into, *at).is_some(),
+                _ => false,
+            })
+            .collect()
     }
 
     /// "Move tile…": where the focused pane goes within its tab.
@@ -207,7 +239,17 @@ impl App {
             return Task::none();
         }
         let (pane, into) = (tab.focused, tab.id);
-        let items = palette::drop_choices(tab, Some(pane));
+        // Only the moves that keep every pane at least the minimum size.
+        let items = palette::drop_choices(tab, Some(pane))
+            .into_iter()
+            .filter(|item| match item {
+                PaletteItem::Choice {
+                    pick: Pick::Drop(at),
+                    ..
+                } => self.moved_layout(wid, pane, *at).is_some(),
+                _ => false,
+            })
+            .collect();
         self.open_stage(
             wid,
             Stage::Place {
@@ -222,14 +264,7 @@ impl App {
     fn palette_choice(&mut self, wid: window::Id, stage: Stage, pick: Pick) -> Task<Message> {
         match (stage, pick) {
             (Stage::MergeInto { source }, Pick::Tab(into)) => {
-                let Some(tab) = self
-                    .windows
-                    .get(&wid)
-                    .and_then(|w| w.find(into).map(|i| &w.tabs[i]))
-                else {
-                    return Task::none();
-                };
-                let items = palette::drop_choices(tab, None);
+                let items = self.merge_choices(wid, source, into);
                 let what = Placing::Tab(source);
                 self.open_stage(wid, Stage::Place { what, into }, items)
             }

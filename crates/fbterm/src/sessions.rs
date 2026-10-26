@@ -463,6 +463,30 @@ impl App {
         if let TilesMsg::Focus(pane) = msg {
             return self.focus_pane(wid, pane);
         }
+        if let TilesMsg::DropTile { pane, at } = msg {
+            // Only the arrangement changes: sessions and terminals stay with their panes, and
+            // each moved pane's view reports its new grid through the resize path. Refused
+            // while maximized and when a pane would end up below the minimum size.
+            let maximized = self
+                .windows
+                .get(&wid)
+                .and_then(WindowState::active_tab)
+                .is_none_or(|t| t.maximized.is_some());
+            if maximized {
+                return Task::none();
+            }
+            if let Some(moved) = self.moved_layout(wid, pane, at)
+                && let Some(tab) = self
+                    .windows
+                    .get_mut(&wid)
+                    .and_then(WindowState::active_tab_mut)
+                && tab.layout.contains(pane)
+            {
+                tab.layout = moved;
+                self.save_state();
+            }
+            return Task::none();
+        }
         let area = self.areas.get(&wid).copied();
         let Some(tab) = self
             .windows
@@ -497,17 +521,10 @@ impl App {
                     changed = true;
                 }
             }
-            TilesMsg::DropTile { pane, at } => {
-                // Only the arrangement changes: sessions and terminals stay with their panes,
-                // and each moved pane's view reports its new grid through the resize path.
-                let before = tab.layout.clone();
-                if tab.maximized.is_none() && tab.layout.move_pane(pane, at) && tab.layout != before
-                {
-                    self.save_state();
-                }
-                return Task::none();
-            }
-            TilesMsg::Focus(_) | TilesMsg::EndDrag | TilesMsg::Area(_) => {}
+            TilesMsg::Focus(_)
+            | TilesMsg::EndDrag
+            | TilesMsg::Area(_)
+            | TilesMsg::DropTile { .. } => {}
         }
         if changed {
             // A drag moves the divider continuously: save once it settles.
