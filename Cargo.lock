@@ -1344,8 +1344,8 @@ dependencies = [
 
 [[package]]
 name = "feathercritty"
-version = "0.26.0+fbterm.4"
-source = "git+https://github.com/featherbitplatform/feathercritty?rev=7cc656ba084e4c3a4c77a74575583721a478af02#7cc656ba084e4c3a4c77a74575583721a478af02"
+version = "0.26.0+fbterm.5"
+source = "git+https://github.com/featherbitplatform/feathercritty?rev=3c290b8c1f0c89b6e726c27e1f5eb15fb08742be#3c290b8c1f0c89b6e726c27e1f5eb15fb08742be"
 dependencies = [
  "base64",
  "bitflags 2.13.2",
