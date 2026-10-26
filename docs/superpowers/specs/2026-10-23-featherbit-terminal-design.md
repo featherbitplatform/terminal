@@ -459,6 +459,10 @@ Performance follow-up (measured 2026-10-24, `dev/perf/README.md`):
   rendered, the Metal driver holds about 300 MB more (a minimal iced app shows the same); it is
   released 10-20 s after rendering stops. So a visible stream shows about 390-430 MB in
   Activity Monitor while RSS is about 120 MB.
+- Compact scrollback: done on branch `feature/compact-history` (2026-10-26; design in
+  `2026-10-24-compact-history-design.md`, numbers in `dev/perf/README.md`): history is stored as
+  text plus attribute runs in feathercritty, `scrollback_lines` applies live to open tabs, and
+  freed memory goes back to the OS. The paragraph below is the original plan.
 - Compact scrollback, owner decision 2026-10-24: a follow-up, not in milestone 1. First step:
   trim history rows to their used length when they scroll off (about -25% at 126 columns, -50%
   or more in wide windows). Full: compress older history (text plus attribute runs), about
@@ -487,6 +491,18 @@ core. Follow-up work is listed in section 6.
 CPU warning above 60 in the Settings window). With one visible 100-lines/s stream on a 120 Hz
 display, `"display"` drew 83-84 frames per second (every chunk) at 10-13% of a core against 54
 frames per second and 8-9% at 60 (`dev/perf/README.md`).
+
+*Measured 2026-10-26 after compact scrollback (same machine, `dev/perf/README.md`):* 20 tabs with
+every scrollback full, about 100-character lines: 123 MB resident (528 MB before; 524 MB in the
+2026-10-25 re-measurement), about 1.1 MB per full tab instead of 21 MB; short lines 116.5 MB;
+one visible log stream and a `yes` flood cost the same CPU as before (11.7% and 102% of a core
+against 11.8% (pre-change build, same session) and 104.5% (recorded baseline)); idle CPU stays
+0.00%. Not met on RSS: after closing 19 of the 20 full tabs resident memory stays at 122 MB (the gate
+was at most 114 MB); the owner accepted this on 2026-10-26 because it is allocator cache, not a
+leak (`dev/perf/README.md`, scenario G). And the one-tab idle base reads 2.7 MB over the recorded baseline (within
+it against a paired run). The ~300 MB target is met. Owner decision 2026-10-26: the measured
+number replaces the 2026-10-23 acceptance of the 528 MB worst case; the standing target is 20 tabs
+with full default scrollback at most 200 MB resident (scenario E), measured at 123 MB.
 
 ## 8. Repo and release
 

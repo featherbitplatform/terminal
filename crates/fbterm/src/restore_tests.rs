@@ -18,7 +18,7 @@ fn dir() -> PathBuf {
 
 /// A profile whose program does not exist: starting its tab fails at once (state
 /// `Disconnected`), so "was started" is observable without spawning anything.
-fn profile(name: &str) -> Profile {
+pub(crate) fn profile(name: &str) -> Profile {
     Profile {
         id: ProfileId::new(),
         name: name.into(),
@@ -34,7 +34,7 @@ fn profile(name: &str) -> Profile {
     }
 }
 
-fn paths_with(profiles: &[Profile]) -> Paths {
+pub(crate) fn paths_with(profiles: &[Profile]) -> Paths {
     let paths = Paths { config_dir: dir() };
     ProfileStore {
         profiles: profiles.to_vec(),
@@ -44,7 +44,7 @@ fn paths_with(profiles: &[Profile]) -> Paths {
     paths
 }
 
-fn saved(tabs: &[&Profile], active: usize) -> SavedWindow {
+pub(crate) fn saved(tabs: &[&Profile], active: usize) -> SavedWindow {
     SavedWindow {
         tabs: tabs.iter().map(|p| p.id).collect(),
         active,
@@ -480,4 +480,248 @@ fn closing_last_tab_of_last_window_restores_default() {
     );
     let (relaunched, _) = App::build(paths, true);
     assert_eq!(relaunched.windows.len(), 1, "the default window");
+}
+
+pub(crate) fn first_terminal(app: &App) -> fbterm_term::SharedTerminal {
+    app.windows.values().next().unwrap().tabs[0]
+        .terminal()
+        .cloned()
+        .expect("started tab has a terminal")
+}
+
+pub(crate) fn fill_history(term: &fbterm_term::SharedTerminal, lines: usize) {
+    let mut t = term.lock();
+    for i in 0..lines {
+        t.feed(format!("line {i}\r\n").as_bytes());
+    }
+}
+
+#[test]
+fn toml_lowering_trims_and_sets_notice() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let term = first_terminal(&app);
+    fill_history(&term, 5_000);
+    let changed = Changed {
+        profiles: false,
+        settings: true,
+    };
+
+    // Raising applies at once and says nothing.
+    std::fs::write(paths.settings(), "scrollback_lines = 20000\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert!(app.settings_notice.is_none());
+    let before = crate::memory::requests();
+
+    // Lowering below what the tab holds trims it, says so, and releases memory.
+    std::fs::write(paths.settings(), "scrollback_lines = 2000\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(term.lock().history_len(), 2_000);
+    assert_eq!(
+        app.settings_notice.as_deref(),
+        Some("Scrollback lowered to 2,000 lines: 1 open tab lost its oldest lines.")
+    );
+    assert_eq!(app.notices.len(), 1);
+    assert_eq!(crate::memory::requests(), before + 1);
+
+    // Each further lowering trims again and updates the notice.
+    std::fs::write(paths.settings(), "scrollback_lines = 1500\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(term.lock().history_len(), 1_500);
+    assert_eq!(
+        app.settings_notice.as_deref(),
+        Some("Scrollback lowered to 1,500 lines: 1 open tab lost its oldest lines.")
+    );
+    // Lowering below a limit nothing reaches trims nothing: no notice, no release.
+    std::fs::write(paths.settings(), "scrollback_lines = 1600\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    let before = crate::memory::requests();
+    std::fs::write(paths.settings(), "scrollback_lines = 1550\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert_eq!(term.lock().history_len(), 1_500);
+    assert!(app.settings_notice.is_none(), "nothing was trimmed");
+    assert_eq!(crate::memory::requests(), before);
+
+    // New terminals use the new limit.
+    let grid = term.lock().size();
+    let fresh = app.new_terminal(grid);
+    fill_history(&fresh, 3_000);
+    assert_eq!(fresh.lock().history_len(), 1_550);
+}
+
+#[test]
+fn lowering_in_two_tabs_says_plural_with_separators() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    std::fs::write(paths.settings(), "scrollback_lines = 1000000\n").unwrap();
+    SavedState {
+        windows: vec![saved(&[&a, &b], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let wid = *app.windows.keys().next().unwrap();
+    let _ = app.update(Message::SelectTab(1));
+    for tab in &app.windows[&wid].tabs {
+        fill_history(tab.terminal().expect("both tabs have a terminal"), 300);
+    }
+    std::fs::write(paths.settings(), "scrollback_lines = 100\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(Changed {
+        profiles: false,
+        settings: true,
+    }));
+    assert_eq!(
+        app.settings_notice.as_deref(),
+        Some("Scrollback lowered to 100 lines: 2 open tabs lost their oldest lines.")
+    );
+}
+
+#[test]
+fn confirmed_lowering_from_the_settings_window_sets_no_notice() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let term = first_terminal(&app);
+    fill_history(&term, 500);
+    let new = fbterm_config::Settings {
+        scrollback_lines: 100,
+        ..app.settings.clone()
+    };
+    let before = crate::memory::requests();
+    let _ = app.apply_settings(new, crate::app::SettingsSource::Window);
+    assert_eq!(term.lock().history_len(), 100);
+    assert!(app.settings_notice.is_none());
+    assert_eq!(crate::memory::requests(), before + 1);
+}
+
+#[test]
+fn closing_tab_requests_release_after_last_reference() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    SavedState {
+        windows: vec![saved(&[&a, &b], 1)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let wid = *app.windows.keys().next().unwrap();
+    let held = app.windows[&wid].tabs[1].terminal().cloned().unwrap();
+    let before = crate::memory::requests();
+    let _ = app.close_tab(wid, 1);
+    assert_eq!(
+        crate::memory::requests(),
+        before,
+        "something still holds the terminal"
+    );
+    assert_eq!(app.pending_release.len(), 1, "waits for the session task");
+    // Another session ending changes nothing while the terminal is still held.
+    let _ = app.update(Message::Session(
+        fbterm_session::SessionId::next(),
+        fbterm_session::SessionEvent::Released,
+    ));
+    assert_eq!(
+        crate::memory::requests(),
+        before,
+        "still held: keeps waiting"
+    );
+    drop(held);
+    // The session task dropped its reference: it reports, and the release is requested once.
+    let _ = app.update(Message::Session(
+        fbterm_session::SessionId::next(),
+        fbterm_session::SessionEvent::Released,
+    ));
+    assert_eq!(crate::memory::requests(), before + 1);
+    assert!(app.pending_release.is_empty());
+    let _ = app.update(Message::Session(
+        fbterm_session::SessionId::next(),
+        fbterm_session::SessionEvent::Released,
+    ));
+    assert_eq!(crate::memory::requests(), before + 1, "no second request");
+
+    // With nothing else holding it, closing requests the release at once.
+    let (c, d) = (profile("c"), profile("d"));
+    let paths = paths_with(&[c.clone(), d.clone()]);
+    SavedState {
+        windows: vec![saved(&[&c, &d], 1)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let wid = *app.windows.keys().next().unwrap();
+    let before = crate::memory::requests();
+    let _ = app.close_tab(wid, 1);
+    assert_eq!(crate::memory::requests(), before + 1);
+}
+
+#[test]
+fn remote_history_clear_never_requests_release() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let term = first_terminal(&app);
+    let before = crate::memory::requests();
+    fill_history(&term, 500);
+    assert!(term.lock().history_len() > 0);
+    term.lock().feed(b"\x1b[3J");
+    assert_eq!(term.lock().history_len(), 0, "the program cleared it");
+    fill_history(&term, 500);
+    term.lock().feed(b"\x1bc");
+    assert_eq!(term.lock().history_len(), 0);
+    // The app handles output for the window of the tab whose history was cleared.
+    let wid = *app.windows.keys().next().unwrap();
+    let size = term.lock().size();
+    let _ = app.update(Message::Terminal(
+        wid,
+        fbterm_term::TerminalOutput::Resized(size),
+    ));
+    assert_eq!(
+        crate::memory::requests(),
+        before,
+        "no release was requested"
+    );
+}
+
+#[test]
+fn a_session_ending_without_a_user_close_requests_nothing() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    let before = crate::memory::requests();
+    for event in [
+        fbterm_session::SessionEvent::Exited(Some(0)),
+        fbterm_session::SessionEvent::Disconnected("connection reset".into()),
+        fbterm_session::SessionEvent::Released,
+    ] {
+        let _ = app.update(Message::Session(fbterm_session::SessionId::next(), event));
+    }
+    assert_eq!(crate::memory::requests(), before);
+    assert!(app.pending_release.is_empty());
 }

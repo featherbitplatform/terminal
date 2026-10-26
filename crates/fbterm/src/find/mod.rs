@@ -136,6 +136,12 @@ impl FindBar {
         self.current.and_then(|i| self.hits.get(i).copied())
     }
 
+    /// The sequence number of the search in flight (tests of other modules drive results by it).
+    #[cfg(test)]
+    pub(crate) fn pending_seq(&self) -> Option<u64> {
+        self.pending.map(|(seq, _)| seq)
+    }
+
     pub fn searching(&self) -> bool {
         self.pending.is_some()
     }

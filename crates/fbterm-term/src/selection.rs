@@ -1,6 +1,6 @@
 //! Text selection over the emulator grid.
 
-use feathercritty::grid::Dimensions;
+use feathercritty::grid::{Dimensions, RowReader};
 use feathercritty::index::{Column, Point};
 use feathercritty::term::cell::Flags;
 
@@ -53,6 +53,7 @@ impl Selection {
         let last_col = grid.columns() - 1;
         let first = start.line.max(top);
         let last = end.line.min(bottom);
+        let mut reader = RowReader::new();
         let mut out = String::new();
         let mut line = first;
         while line <= last {
@@ -66,8 +67,8 @@ impl Selection {
             } else {
                 last_col
             };
-            let row = &grid[line];
-            let wrapped = row[Column(last_col)].flags.contains(Flags::WRAPLINE);
+            let wrapped = grid.wraps(line);
+            let row = reader.row(grid, line);
             let mut seg = String::new();
             for c in from..=to {
                 let cell = &row[Column(c)];

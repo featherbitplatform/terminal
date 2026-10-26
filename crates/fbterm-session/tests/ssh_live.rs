@@ -657,7 +657,7 @@ mod pool {
         let mut out = String::new();
         for row in 0..size.rows as i32 {
             for col in 0..size.cols as usize {
-                out.push(g[Line(row)][Column(col)].c);
+                out.push(g.screen()[Line(row)][Column(col)].c);
             }
             out.push('\n');
         }

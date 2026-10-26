@@ -365,7 +365,7 @@ fn take_snapshot(snap: &mut Snapshot) {
     let colors = term.colors();
     snap.cells.clear();
     for y in 0..ROWS {
-        let row = &grid[Line(y as i32)];
+        let row = &grid.screen()[Line(y as i32)];
         for x in 0..COLS {
             let cell = &row[Column(x)];
             let mut fg = resolve(cell.fg, colors, true);

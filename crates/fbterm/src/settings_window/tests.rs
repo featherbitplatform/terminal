@@ -455,3 +455,146 @@ fn take_over_checks_the_chord_is_still_taken() {
     assert_eq!(b.chord(Action::NewTab), Some(close));
     assert_eq!(b.chord(Action::CloseTab), None);
 }
+
+/// A state whose saved scrollback is 10,000 and whose longest open tab holds `longest` lines.
+fn with_tab(longest: usize) -> SettingsState {
+    let mut s = state();
+    assert_eq!(s.values.scrollback_lines, 10_000);
+    s.max_open_history = longest;
+    s
+}
+
+#[test]
+fn lower_value_with_long_tab_asks_first() {
+    let mut s = with_tab(8_000);
+    let e = s.update(SettingsMsg::ScrollbackText("5000".into()));
+    assert_eq!(e, Effect::NONE, "nothing is applied or written yet");
+    assert_eq!(s.values.scrollback_lines, 10_000);
+    assert!(!s.has_pending());
+    assert_eq!(s.pending_lower, Some(5_000));
+    assert_eq!(
+        s.scrollback_warning().as_deref(),
+        Some("Open tabs will lose their oldest lines beyond 5,000. This can't be undone.")
+    );
+    // Enter keeps the prompt; it never applies the lower value.
+    let e = s.update(SettingsMsg::ScrollbackSubmit);
+    assert_eq!(e, Effect::NONE);
+    assert_eq!(s.pending_lower, Some(5_000));
+    assert_eq!(s.values.scrollback_lines, 10_000);
+}
+
+#[test]
+fn apply_saves_and_trims() {
+    let mut s = with_tab(8_000);
+    s.update(SettingsMsg::ScrollbackText("5000".into()));
+    let e = s.update(SettingsMsg::ScrollbackApply);
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(5_000)));
+    assert_eq!(e.write, Write::Now);
+    assert_eq!(s.values.scrollback_lines, 5_000);
+    assert_eq!(s.scrollback_text, "5000");
+    assert_eq!(s.pending_lower, None);
+    assert_eq!(s.scrollback_warning(), None);
+}
+
+#[test]
+fn cancel_restores_saved_value() {
+    let mut s = with_tab(8_000);
+    s.update(SettingsMsg::ScrollbackText("5000".into()));
+    let e = s.update(SettingsMsg::ScrollbackCancel);
+    assert_eq!(e, Effect::NONE);
+    assert_eq!(s.pending_lower, None);
+    assert_eq!(s.scrollback_text, "10000");
+    assert_eq!(s.values.scrollback_lines, 10_000);
+    assert_eq!(s.scrollback_warning(), None);
+}
+
+#[test]
+fn lower_value_without_long_tab_saves_when_the_quiet_period_passes() {
+    let mut s = with_tab(3_000);
+    let e = s.update(SettingsMsg::ScrollbackText("5000".into()));
+    assert_eq!(e.apply, None, "not per keystroke");
+    assert_eq!(s.values.scrollback_lines, 10_000);
+    let Write::After(n) = e.write else {
+        panic!("a quiet period is scheduled: {e:?}");
+    };
+    let e = s.update(SettingsMsg::Flush(n));
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(5_000)));
+    assert_eq!(e.write, Write::Now);
+    assert_eq!(s.pending_lower, None);
+    assert_eq!(s.values.scrollback_lines, 5_000);
+    // Enter applies at once, and a tab holding exactly the new value loses nothing either.
+    let mut s = with_tab(5_000);
+    let e = s.update(SettingsMsg::ScrollbackSubmit);
+    assert_eq!(e.apply, None, "10000 is the saved value");
+    s.update(SettingsMsg::ScrollbackText("5000".into()));
+    let e = s.update(SettingsMsg::ScrollbackSubmit);
+    assert!(e.apply.is_some());
+    assert_eq!(s.pending_lower, None);
+}
+
+#[test]
+fn typing_through_a_lower_value_no_tab_exceeds_never_applies() {
+    let mut s = with_tab(300);
+    for typed in ["2", "20", "200", "2000"] {
+        let e = s.update(SettingsMsg::ScrollbackText(typed.into()));
+        assert_eq!(e.apply, None, "{typed} must not apply");
+        assert_eq!(s.values.scrollback_lines, 10_000);
+    }
+    // Earlier keystrokes' quiet periods are stale; raising applies at once.
+    let e = s.update(SettingsMsg::Flush(0));
+    assert_eq!(e.apply, None);
+    let e = s.update(SettingsMsg::ScrollbackText("20000".into()));
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(20_000)));
+    assert!(!s.holds_lower());
+}
+
+#[test]
+fn typing_through_lower_value_never_trims() {
+    let mut s = with_tab(8_000);
+    for typed in ["5", "50", "500", "5000"] {
+        let e = s.update(SettingsMsg::ScrollbackText(typed.into()));
+        assert_eq!(e.apply, None, "{typed} must not apply");
+        assert_eq!(s.values.scrollback_lines, 10_000);
+        assert!(!s.has_pending());
+    }
+    let e = s.update(SettingsMsg::ScrollbackText("50000".into()));
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(50_000)));
+    assert_eq!(s.pending_lower, None);
+    assert_eq!(s.values.scrollback_lines, 50_000);
+    // A typed value that stops being a number withdraws the question.
+    let mut s = with_tab(8_000);
+    s.update(SettingsMsg::ScrollbackText("5000".into()));
+    s.update(SettingsMsg::ScrollbackText("".into()));
+    assert_eq!(s.pending_lower, None);
+}
+
+#[test]
+fn large_value_shows_note_and_saves() {
+    let mut s = state();
+    assert_eq!(s.scrollback_note(), None);
+    let e = s.update(SettingsMsg::ScrollbackText("150,000".into()));
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackLines(150_000)));
+    assert_eq!(
+        s.scrollback_note(),
+        Some("Large history: resizing a window can pause briefly while history rewraps.")
+    );
+}
+
+#[test]
+fn note_hidden_at_threshold() {
+    let mut s = state();
+    s.update(SettingsMsg::ScrollbackText("100000".into()));
+    assert_eq!(s.values.scrollback_lines, 100_000);
+    assert_eq!(s.scrollback_note(), None);
+    s.update(SettingsMsg::ScrollbackText("100001".into()));
+    assert!(s.scrollback_note().is_some());
+}
+
+#[test]
+fn thousands_separates_groups_of_three() {
+    assert_eq!(thousands(0), "0");
+    assert_eq!(thousands(999), "999");
+    assert_eq!(thousands(2_000), "2,000");
+    assert_eq!(thousands(100_000), "100,000");
+    assert_eq!(thousands(1_000_000), "1,000,000");
+}

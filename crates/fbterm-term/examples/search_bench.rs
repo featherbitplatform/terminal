@@ -1,5 +1,6 @@
-//! Scrollback search timings: one full 10,000-line tab (plain text and a regex) and the
-//! all-tabs search over 20 full tabs. Run with
+//! Scrollback read timings: search in one full 10,000-line tab (plain text and a regex) and in
+//! all 20 full tabs, export of 10,000 rows of 200 columns (plain and with colors), and the
+//! draw-list build with the view at the bottom, in the middle and at the top of the history. Run with
 //! `cargo run --release -p fbterm-term --example search_bench`.
 
 use std::sync::Arc;
@@ -7,9 +8,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use fbterm_term::{
-    GridSize, MATCH_CAP, SearchPattern, SearchQuery, SearchRequest, SharedTerminal, Terminal,
-    search,
+    ColorScheme, ExportFormat, GridSize, MATCH_CAP, SearchPattern, SearchQuery, SearchRequest,
+    SharedTerminal, Terminal, build_draw_list, export, search,
 };
+use feathercritty::grid::RowReader;
 use parking_lot::Mutex;
 
 const LINES: usize = 10_000;
@@ -65,6 +67,31 @@ fn best_of<T>(n: usize, mut f: impl FnMut() -> T) -> (Duration, T) {
         last = Some(r);
     }
     (best, last.unwrap())
+}
+
+/// A tab with 10,000 rows of 200 columns; `colors` colors each of 5 runs of 40 cells differently.
+fn wide_tab(colors: bool) -> SharedTerminal {
+    let mut t = Terminal::new(
+        GridSize {
+            cols: 200,
+            rows: 50,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        },
+        LINES,
+    );
+    for i in 0..LINES + 100 {
+        let mut line = String::new();
+        for run in 0..5 {
+            if colors {
+                line.push_str(&format!("\x1b[3{};1m", (run + i) % 7 + 1));
+            }
+            line.push_str(&format!("{:040}", (i * 31 + run) % 1_000_000_007));
+        }
+        line.push_str("\x1b[0m\r\n");
+        t.feed(line.as_bytes());
+    }
+    Arc::new(Mutex::new(t))
 }
 
 fn main() {
@@ -142,4 +169,52 @@ fn main() {
             par.as_secs_f64() * 1000.0
         );
     }
+
+    println!("export: 10,000 rows of 200 columns (to a memory buffer)");
+    for (label, colors, format) in [
+        ("plain", false, ExportFormat::Plain),
+        ("with colors", true, ExportFormat::Ansi),
+    ] {
+        let tab = wide_tab(colors);
+        let (d, bytes) = best_of(5, || {
+            let mut out = Vec::new();
+            export(&tab, format, &mut out).unwrap();
+            out.len()
+        });
+        println!(
+            "  {label:16} {:7.2} ms  {bytes} bytes",
+            d.as_secs_f64() * 1000.0
+        );
+    }
+
+    println!("draw-list build: 160x50 view, plain log content");
+    let scheme = ColorScheme::graphite();
+    let mut tab = full_tab(0);
+    for (label, offset) in [
+        ("bottom", 0i32),
+        ("middle", 5_000),
+        ("top (all history)", i32::MAX),
+    ] {
+        let (d, quads) = {
+            let mut t = tab.lock();
+            t.scroll_to_bottom();
+            if offset == i32::MAX {
+                t.scroll_to_top();
+            } else {
+                t.scroll(offset);
+            }
+            // One reader across frames, as the widget keeps it.
+            let mut reader = RowReader::new();
+            best_of(200, || {
+                let list = build_draw_list(&mut reader, &t, &scheme, true, None, None);
+                list.quads.len() + list.texts.len()
+            })
+        };
+        let shown = tab.lock().term().grid().display_offset();
+        println!(
+            "  view at {label:18} {:7.3} ms  {quads} quads+texts, display offset {shown}",
+            d.as_secs_f64() * 1000.0
+        );
+    }
+    let _ = &mut tab;
 }

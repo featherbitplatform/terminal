@@ -80,6 +80,8 @@ pub enum Message {
     /// Tab-bar and shortcut actions act on the focused window.
     NewTab,
     CloseTab(usize),
+    /// `--perf-close-after`: close every tab of the window but the active one.
+    PerfCloseOthers(window::Id),
     SelectTab(usize),
     NextTab,
     PrevTab,
@@ -156,6 +158,16 @@ pub enum Message {
     SaveState(u64),
     /// `profiles.toml` and/or `settings.toml` changed on disk.
     ConfigChanged(Changed),
+}
+
+/// Where a settings change came from. The scrollback notice is for edits made in
+/// `settings.toml` only; a change confirmed in the Settings window already told the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsSource {
+    /// `settings.toml` was edited on disk and reloaded.
+    File,
+    /// The Settings window applied it (for a lowered scrollback: after the user confirmed).
+    Window,
 }
 
 /// Size used for sessions started before their window has laid out.
@@ -236,6 +248,9 @@ pub struct App {
     pub(crate) settings_seen: Option<String>,
     /// The banner line for a `settings.toml` that failed to load.
     pub(crate) settings_notice: Option<String>,
+    /// Terminals of tabs the user closed that a session task still holds; the release is
+    /// requested when `SessionEvent::Released` shows the last holder let go (`windows.rs`).
+    pub(crate) pending_release: Vec<Vec<crate::memory::WeakTerminal>>,
     /// Whether one of our windows has focus at all (the app is in front).
     pub app_active: bool,
     pub style: TerminalStyle,
@@ -440,6 +455,7 @@ impl App {
             profiles_seen,
             settings_seen,
             settings_notice,
+            pending_release: Vec::new(),
             app_active: true,
             style_unfocused: TerminalStyle {
                 focused: false,
@@ -589,6 +605,7 @@ impl App {
                 Some(wid) => self.close_tab(wid, i),
                 None => Task::none(),
             },
+            Message::PerfCloseOthers(wid) => self.perf_close_others(wid),
             Message::SelectTab(i) => self.with_focused(|w| w.select(i)),
             Message::NextTab => self.with_focused(WindowState::next),
             Message::PrevTab => self.with_focused(WindowState::prev),
@@ -697,6 +714,11 @@ impl App {
                 }
                 // Dropping the window's tabs closes their sessions and abandons their dials;
                 // its dialogs answer "no".
+                let freed = self
+                    .windows
+                    .get(&id)
+                    .map(|w| crate::memory::weak_terminals(w.tabs.iter()))
+                    .unwrap_or_default();
                 let was_terminal = self.windows.remove(&id).is_some();
                 visibility::unwatch(id);
                 display_rate::unwatch(id);
@@ -730,7 +752,10 @@ impl App {
                 }
                 if self.windows.is_empty() && self.editor.is_none() && self.settings_win.is_none() {
                     iced::exit()
+                } else if self.quitting {
+                    Task::none()
                 } else {
+                    self.release_closed(freed);
                     Task::none()
                 }
             }
@@ -781,7 +806,7 @@ impl App {
                     self.profiles_file_changed();
                 }
                 if changed.settings {
-                    self.settings_file_changed();
+                    return self.settings_file_changed();
                 }
                 Task::none()
             }

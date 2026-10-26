@@ -34,6 +34,10 @@ pub enum SessionEvent {
     Bell,
     Exited(Option<i32>),
     Disconnected(String),
+    /// A session task that was closed on purpose has let go of its terminal. Sent only after a
+    /// close (a program ending by itself sends nothing), once the task's own reference is
+    /// dropped, so the app can tell when closing the tab freed its terminal.
+    Released,
 }
 
 /// Something about how a connection was authenticated that the user should hear about. It
@@ -176,6 +180,26 @@ pub(crate) struct Feeder {
     pub detached: Arc<AtomicBool>,
     pub ended: Ended,
     last_title: Option<String>,
+    /// Declared last so it drops after `terminal`: its notice then follows the release of
+    /// this feeder's terminal reference.
+    _released: ReleasedNotice,
+}
+
+/// Tells the app that a closed session's task dropped its terminal reference.
+struct ReleasedNotice {
+    id: SessionId,
+    events: EventSink,
+    detached: Arc<AtomicBool>,
+}
+
+impl Drop for ReleasedNotice {
+    fn drop(&mut self) {
+        // Only for a session the user closed (`SessionHandle::close` sets `detached`): one that
+        // ended by itself, from a program or the network, reports nothing here.
+        if self.detached.load(Ordering::Acquire) {
+            let _ = self.events.send((self.id, SessionEvent::Released));
+        }
+    }
 }
 
 impl Feeder {
@@ -191,6 +215,11 @@ impl Feeder {
         Self {
             id,
             terminal,
+            _released: ReleasedNotice {
+                id,
+                events: events.clone(),
+                detached: detached.clone(),
+            },
             events,
             dirty_pending,
             bell_pending,
@@ -260,5 +289,61 @@ impl Feeder {
             *self.ended.lock() = Some(end);
         }
         let _ = self.events.send((self.id, event));
+    }
+}
+
+#[cfg(test)]
+mod released_tests {
+    use super::*;
+    use fbterm_term::{GridSize, Terminal};
+
+    fn feeder(
+        detached: bool,
+    ) -> (
+        Feeder,
+        std::sync::Weak<parking_lot::Mutex<Terminal>>,
+        tokio::sync::mpsc::UnboundedReceiver<(SessionId, SessionEvent)>,
+    ) {
+        let size = GridSize {
+            cols: 10,
+            rows: 3,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        };
+        let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
+        let weak = Arc::downgrade(&terminal);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let f = Feeder::new(
+            SessionId::next(),
+            terminal,
+            tx,
+            Arc::default(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(detached)),
+            Ended::default(),
+        );
+        (f, weak, rx)
+    }
+
+    #[test]
+    fn a_closed_sessions_feeder_reports_after_it_dropped_the_terminal() {
+        let (f, weak, mut rx) = feeder(true);
+        assert!(weak.upgrade().is_some());
+        drop(f);
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "terminal gone before the notice is read"
+        );
+        assert_eq!(rx.try_recv().unwrap().1, SessionEvent::Released);
+    }
+
+    #[test]
+    fn a_session_that_ends_by_itself_reports_no_release() {
+        let (f, _weak, mut rx) = feeder(false);
+        f.send(SessionEvent::Exited(Some(0)));
+        drop(f);
+        assert_eq!(rx.try_recv().unwrap().1, SessionEvent::Exited(Some(0)));
+        assert!(rx.try_recv().is_err());
     }
 }

@@ -19,3 +19,4 @@ fbterm-config = { path = "../fbterm-config" }
 iced = { workspace = true, features = ["wgpu", "tokio", "advanced"] }
 portable-pty = { workspace = true }
 png = { workspace = true }
+serde_json = { workspace = true }

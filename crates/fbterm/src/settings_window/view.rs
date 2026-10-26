@@ -312,13 +312,7 @@ fn terminal<'a>(
     .style(move |_, status| pick_style(t, status))
     .menu_style(move |_| menu_style(t));
     vec![
-        setting(
-            t,
-            "Scrollback",
-            Some("Lines of history kept per tab. Applies to new tabs"),
-            false,
-            scrollback,
-        ),
+        scrollback_row(t, state, scrollback),
         setting(
             t,
             "Kitty keyboard protocol",
@@ -334,6 +328,74 @@ fn terminal<'a>(
         ),
         setting(t, "Redraw rate", Some(state.rate_hint()), false, rate),
     ]
+}
+
+/// The Scrollback row. While a lowered value waits, a warning with Apply and Cancel sits under
+/// it; above the threshold a quiet note does.
+fn scrollback_row<'a>(
+    t: &'static Tokens,
+    state: &'a SettingsState,
+    control: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    let row_ = setting(
+        t,
+        "Scrollback",
+        Some("Lines of history kept per tab, open ones included"),
+        false,
+        control,
+    );
+    let extra: Option<Element<'a, Message>> = if let Some(why) = state.scrollback_warning() {
+        Some(
+            container(
+                row![
+                    ui::icon(ui::ICON_WARNING, 13.0, t.warning),
+                    text(why)
+                        .font(UI_FONT)
+                        .size(12)
+                        .color(t.text)
+                        .width(Length::Fill),
+                    small_button(t, "Apply", msg(SettingsMsg::ScrollbackApply), ui::primary),
+                    small_button(
+                        t,
+                        "Cancel",
+                        msg(SettingsMsg::ScrollbackCancel),
+                        ui::secondary
+                    ),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([8.0, 12.0]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(t.raised.into()),
+                border: Border {
+                    color: t.warning,
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..container::Style::default()
+            })
+            .into(),
+        )
+    } else {
+        state.scrollback_note().map(|n| {
+            text(n)
+                .font(UI_FONT)
+                .size(12)
+                .color(t.text_muted)
+                .width(Length::Fill)
+                .into()
+        })
+    };
+    match extra {
+        Some(e) => column![
+            row_,
+            container(e).padding(Padding::from([0.0, 16.0]).bottom(12.0))
+        ]
+        .into(),
+        None => row_,
+    }
 }
 
 /// The Keyboard card: every action with its chord, by group. A click on a chord records a new

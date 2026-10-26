@@ -90,12 +90,41 @@ impl App {
         let Some(closed) = window.close(index) else {
             return Task::none();
         };
+        let freed = crate::memory::weak_terminals(std::iter::once(&closed.tab));
         drop(closed.tab);
         self.save_state();
+        self.release_closed(freed);
         if closed.window_empty {
             self.close_window(wid)
         } else {
             self.shown(wid)
+        }
+    }
+
+    /// A tab or window the user closed freed `terminals`: request the memory release once none
+    /// is held any more. The session task may still hold its reference for a moment (or, with a
+    /// background job on the PTY, for long), so a held terminal waits in `pending_release` for
+    /// `SessionEvent::Released` (see `release_swept`); nothing polls. Only user closes come
+    /// here, never output or the end of a program.
+    pub(crate) fn release_closed(&mut self, terminals: Vec<crate::memory::WeakTerminal>) {
+        if terminals.is_empty() {
+            return;
+        }
+        if terminals.iter().all(|t| t.strong_count() == 0) {
+            crate::memory::release_freed();
+        } else {
+            self.pending_release.push(terminals);
+        }
+    }
+
+    /// A closed session task let go of its terminal: request the release if that freed the
+    /// last terminal of a tab the user closed (one request however many groups finished).
+    pub(crate) fn release_swept(&mut self) {
+        let before = self.pending_release.len();
+        self.pending_release
+            .retain(|g| g.iter().any(|t| t.strong_count() > 0));
+        if self.pending_release.len() < before {
+            crate::memory::release_freed();
         }
     }
 

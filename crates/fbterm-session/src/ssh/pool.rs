@@ -1036,7 +1036,9 @@ mod tests {
         // The notice lands on the line after the existing output.
         use feathercritty::index::{Column, Line};
         let grid = term.term().grid();
-        let line: String = (0..60).map(|c| grid[Line(1)][Column(c)].c).collect();
+        let line: String = (0..60)
+            .map(|c| grid.screen()[Line(1)][Column(c)].c)
+            .collect();
         assert_eq!(line.trim_end(), "The server refused the shell.");
     }
 }

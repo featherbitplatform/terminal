@@ -6,9 +6,9 @@
 //! combining characters are drawn on their own so a fallback font cannot shift the rest of the row.
 
 use fbterm_config::Rgb;
-use feathercritty::grid::Dimensions;
+use feathercritty::grid::{Dimensions, RowReader};
 use feathercritty::index::{Column, Line, Point};
-use feathercritty::term::cell::{Flags, Hyperlink};
+use feathercritty::term::cell::{Cell, Flags, Hyperlink};
 use feathercritty::vte::ansi::CursorShape;
 use iced::advanced::renderer::{Quad, Renderer as _};
 use iced::advanced::text::{self, Renderer as _};
@@ -126,7 +126,12 @@ fn marks(term: &Terminal, highlight: &Highlight, rows: usize, cols: usize) -> Ve
 }
 
 /// Builds the draw list. Call with the terminal locked; it only reads.
+///
+/// `reader` reads the rows in view. Keep one with the widget's draw state across frames: rows
+/// on the screen are read in place, and only rows above it (the view scrolled back into the
+/// history) go through the reader's scratch row, at most one screen of them per frame.
 pub fn build(
+    reader: &mut RowReader<Cell>,
     term: &Terminal,
     scheme: &ColorScheme,
     focused: bool,
@@ -158,7 +163,7 @@ pub fn build(
     for y in 0..rows {
         let row_u16 = y as u16;
         let line = Line(y as i32 - offset as i32);
-        let row = &grid[line];
+        let row = reader.row(grid, line);
         let mut run: Option<TextRun> = None;
         let flush = |run: &mut Option<TextRun>, texts: &mut Vec<TextRun>| {
             if let Some(mut r) = run.take() {
@@ -292,7 +297,8 @@ pub fn build(
 
     if cursor_visible && !block_cursor {
         let x = cursor.point.column.0;
-        let wide = grid[cursor.point.line][Column(x)]
+        let wide = grid
+            .cell(Point::new(cursor.point.line, Column(x)))
             .flags
             .contains(Flags::WIDE_CHAR);
         let mark = match cursor.shape {
@@ -509,7 +515,7 @@ mod tests {
     #[test]
     fn build_batches_runs_by_style() {
         let t = term_with(b"ab \x1b[31mcd\x1b[0m  \x1b[1mef");
-        let list = build(&t, &scheme(), true, None, None);
+        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -531,7 +537,7 @@ mod tests {
     fn only_the_default_background_is_translucent() {
         // Green background on "ab", then default cells.
         let t = term_with(b"\x1b[42mab\x1b[0m cd");
-        let list = build(&t, &scheme(), true, None, None);
+        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
         let bg = background_fill(&list, 0.85).expect("drawn");
         assert!((bg.a - 0.85).abs() < f32::EPSILON);
         assert_eq!(
@@ -557,7 +563,7 @@ mod tests {
     #[test]
     fn build_unfocused_cursor_is_hollow() {
         let t = term_with(b"x");
-        let list = build(&t, &scheme(), false, None, None);
+        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
         assert_eq!(list.cursor.map(|c| c.2), Some(CursorMark::Hollow));
         assert!(list.quads.is_empty());
     }
@@ -565,7 +571,7 @@ mod tests {
     #[test]
     fn build_draws_wide_chars_on_their_own() {
         let t = term_with("a日b".as_bytes());
-        let list = build(&t, &scheme(), true, None, None);
+        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -577,7 +583,7 @@ mod tests {
     #[test]
     fn non_ascii_narrow_char_breaks_run() {
         let t = term_with("a❯b █▓─x".as_bytes());
-        let list = build(&t, &scheme(), true, None, None);
+        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -589,10 +595,19 @@ mod tests {
     #[test]
     fn build_underlines_hovered_link_only() {
         let t = term_with(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ x");
-        let none = build(&t, &scheme(), true, None, None);
+        let none = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
         assert!(none.lines.is_empty());
-        let link = t.term().grid()[Line(0)][Column(0)].hyperlink().unwrap();
-        let hovered = build(&t, &scheme(), true, Some(&link), None);
+        let link = t.term().grid().screen()[Line(0)][Column(0)]
+            .hyperlink()
+            .unwrap();
+        let hovered = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            Some(&link),
+            None,
+        );
         assert_eq!(hovered.lines.len(), 1);
         assert_eq!(hovered.lines[0].0.cells, 4);
     }
@@ -603,7 +618,7 @@ mod tests {
         let mut sel = crate::Selection::start(Point::new(Line(0), Column(1)));
         sel.update(Point::new(Line(0), Column(3)));
         t.set_selection(Some(sel));
-        let list = build(&t, &scheme(), false, None, None);
+        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
         assert!(list.quads.contains(&(
             Span {
                 row: 0,
@@ -634,7 +649,7 @@ mod tests {
             current_bg: strong,
             current_fg: text,
         };
-        let list = build(&t, &scheme(), false, None, Some(&h));
+        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, Some(&h));
         let quads: Vec<_> = list
             .quads
             .iter()
@@ -649,7 +664,7 @@ mod tests {
             .find(|r| r.span.row == 0 && r.span.col == 3);
         assert_eq!(current_text.map(|r| r.fg), Some(text));
         // Without a highlight nothing is tinted.
-        let plain = build(&t, &scheme(), false, None, None);
+        let plain = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
         assert!(plain.quads.iter().all(|(_, c)| *c != tint && *c != strong));
     }
 }

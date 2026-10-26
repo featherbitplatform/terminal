@@ -409,7 +409,7 @@ impl InputState {
         if button == mouse::Button::Left && link_modifier(self.modifiers) {
             // Read the link from the clicked cell: the content may have changed under a still
             // pointer since the hover was last computed.
-            if let Some(link) = term.term().grid()[point].hyperlink() {
+            if let Some(link) = term.term().grid().cell(point).hyperlink() {
                 out.push(TerminalOutput::OpenUrl(link.uri().to_owned()));
                 return Effect::CAPTURE;
             }
@@ -545,7 +545,7 @@ impl InputState {
             return Effect::NONE;
         }
         self.hover_cell = Some(point);
-        let link = grid[point].hyperlink();
+        let link = grid.cell(point).hyperlink();
         if link != self.hover {
             self.hover = link;
             return Effect {
