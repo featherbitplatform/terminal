@@ -42,9 +42,9 @@ impl App {
         for saved in plan {
             let (wid, open) = self.new_window(saved.size);
             let window = self.windows.get_mut(&wid).expect("just inserted");
-            for &profile in &saved.tabs {
-                if let Some(p) = self.profiles.get(profile) {
-                    window.tabs.push(Tab::single(Pane::for_profile(p)));
+            for tab in &saved.tabs {
+                if let Some(tab) = restore::build_tab(tab, &self.profiles) {
+                    window.tabs.push(tab);
                 }
             }
             window.active = saved.active.min(window.tabs.len().saturating_sub(1));
@@ -222,9 +222,14 @@ impl App {
             return Task::none();
         }
         self.sizes.insert(id, (size.width, size.height));
+        // Dragging a window edge resizes continuously: save once it settles.
+        self.save_state_soon()
+    }
+
+    /// Save after 500 ms without another request (window edge and divider drags).
+    pub(crate) fn save_state_soon(&mut self) -> Task<Message> {
         self.resize_count += 1;
         let n = self.resize_count;
-        // Dragging a window edge resizes continuously: save once it settles.
         Task::perform(
             async { tokio::time::sleep(Duration::from_millis(500)).await },
             move |()| Message::SaveState(n),

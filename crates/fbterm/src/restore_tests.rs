@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use fbterm_config::{
-    LocalProfile, Paths, Profile, ProfileId, ProfileKind, ProfileStore, SavedState, SavedWindow,
+    LocalProfile, Paths, Profile, ProfileId, ProfileKind, ProfileStore, SavedAxis, SavedLayout,
+    SavedSplitTab, SavedState, SavedTab, SavedWindow,
 };
 
 use crate::app::{App, Message};
@@ -46,7 +47,7 @@ pub(crate) fn paths_with(profiles: &[Profile]) -> Paths {
 
 pub(crate) fn saved(tabs: &[&Profile], active: usize) -> SavedWindow {
     SavedWindow {
-        tabs: tabs.iter().map(|p| p.id).collect(),
+        tabs: tabs.iter().map(|p| SavedTab::Profile(p.id)).collect(),
         active,
         size: (900.0, 500.0),
     }
@@ -146,7 +147,10 @@ fn layout_changes_are_saved_and_debug_runs_do_not_save() {
         window: wid,
     });
     let on_disk = SavedState::load_or_default(&paths.state());
-    assert_eq!(on_disk.windows[0].tabs, vec![a.id, b.id]);
+    assert_eq!(
+        on_disk.windows[0].tabs,
+        vec![SavedTab::Profile(a.id), SavedTab::Profile(b.id)]
+    );
     assert_eq!(on_disk.windows[0].active, 1);
     assert!(on_disk.recency.contains_key(&b.id));
 
@@ -158,7 +162,7 @@ fn layout_changes_are_saved_and_debug_runs_do_not_save() {
     let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Close(1)));
     assert_eq!(
         SavedState::load_or_default(&paths.state()).windows[0].tabs,
-        vec![a.id]
+        vec![SavedTab::Profile(a.id)]
     );
 
     // A debug aid that opens tabs must not overwrite the real layout.
@@ -725,4 +729,82 @@ fn a_session_ending_without_a_user_close_requests_nothing() {
     }
     assert_eq!(crate::memory::requests(), before);
     assert!(app.pending_release.is_empty());
+}
+
+fn leaf(p: &Profile, zoom: i8) -> SavedLayout {
+    SavedLayout::Pane {
+        profile: p.id,
+        zoom,
+    }
+}
+
+fn split_tab(first: SavedLayout, second: SavedLayout, focused: usize) -> SavedTab {
+    SavedTab::Split(SavedSplitTab {
+        layout: SavedLayout::Split {
+            axis: SavedAxis::Row,
+            ratio: 0.3,
+            first: Box::new(first),
+            second: Box::new(second),
+        },
+        focused,
+    })
+}
+
+#[test]
+fn relaunch_restores_panes_and_starts_all_visible() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    let two = split_tab(leaf(&a, 2), leaf(&b, 0), 1);
+    SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![SavedTab::Profile(b.id), two.clone(), two],
+            active: 1,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (app, _) = App::build(paths, true);
+    let w = app.windows.values().next().unwrap();
+    assert_eq!(w.tabs.len(), 3);
+    let tab = &w.tabs[1];
+    assert_eq!(tab.panes.len(), 2);
+    assert!(
+        tab.panes.iter().all(|p| p.state != TabState::NotConnected),
+        "every pane of the active tab starts"
+    );
+    assert_eq!(tab.focused_pane().profile, b.id, "focus by reading order");
+    let order = tab.layout.panes();
+    assert_eq!(tab.pane(order[0]).unwrap().zoom, 2);
+    assert!(tab.maximized.is_none());
+    assert!(
+        w.tabs[2]
+            .panes
+            .iter()
+            .all(|p| p.state == TabState::NotConnected),
+        "a background tab's panes wait"
+    );
+}
+
+#[test]
+fn restored_arrangement_is_saved_back_unchanged() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    let state = SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![
+                SavedTab::Profile(a.id),
+                split_tab(leaf(&a, 2), leaf(&b, 0), 1),
+            ],
+            active: 1,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    };
+    state.save(&paths.state()).unwrap();
+    let (app, _) = App::build(paths, true);
+    app.save_state();
+    let back = SavedState::load_or_default(&app.paths.state());
+    assert_eq!(back.windows[0].tabs, state.windows[0].tabs);
 }

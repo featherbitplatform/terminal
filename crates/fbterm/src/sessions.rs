@@ -471,6 +471,7 @@ impl App {
         else {
             return Task::none();
         };
+        let mut changed = false;
         match msg {
             TilesMsg::DragDivider { path, ratio } => {
                 if tab.maximized.is_some() {
@@ -486,15 +487,21 @@ impl App {
                         iced::Size::new(cell.cell_width, cell.cell_height),
                     )
                 {
-                    tab.layout = before;
+                    tab.layout = before.clone();
                 }
+                changed = tab.layout != before;
             }
             TilesMsg::Equalize(path) => {
                 if tab.maximized.is_none() {
                     tab.layout.equalize(&path);
+                    changed = true;
                 }
             }
             TilesMsg::Focus(_) | TilesMsg::EndDrag | TilesMsg::Area(_) => {}
+        }
+        if changed {
+            // A drag moves the divider continuously: save once it settles.
+            return self.save_state_soon();
         }
         Task::none()
     }
