@@ -105,20 +105,7 @@ pub fn blend(over: Rgb, under: Rgb, alpha: f32) -> Rgb {
 
 /// WCAG 2 contrast ratio between two colors (1.0 to 21.0).
 pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
-    fn luminance(c: Rgb) -> f32 {
-        let lin = |v: u8| {
-            let v = f32::from(v) / 255.0;
-            if v <= 0.040_45 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
-    }
-    let (la, lb) = (luminance(a), luminance(b));
-    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
+    fbterm_config::schemes::contrast_ratio(a, b)
 }
 
 #[cfg(test)]

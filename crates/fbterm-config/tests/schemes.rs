@@ -136,11 +136,12 @@ fn duplicate_user_id_is_skipped() {
     fbterm_config::schemes::write_file(&dir.join("a.toml"), &s).unwrap();
     let mut t = s.clone();
     t.name = "Second".into();
-    fbterm_config::schemes::write_file(&dir.join("b.toml"), &t).unwrap();
+    fbterm_config::schemes::write_file(&dir.join("user-dup.toml"), &t).unwrap();
     let (set, errors) = SchemeSet::load(&dir);
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].path, dir.join("b.toml"));
-    assert_eq!(set.get("user-dup").unwrap().name, "First");
+    // The copy under the wrong file name is the one skipped; the canonical file wins.
+    assert_eq!(errors[0].path, dir.join("a.toml"));
+    assert_eq!(set.get("user-dup").unwrap().name, "Second");
     assert_eq!(set.all().len(), 5);
 }
 
@@ -171,4 +172,75 @@ fn schemes_dir_is_under_config_dir() {
         config_dir: PathBuf::from("cfg"),
     };
     assert_eq!(paths.schemes(), PathBuf::from("cfg").join("schemes"));
+}
+
+#[test]
+fn user_file_with_mismatched_name_is_skipped() {
+    let dir = tmp_dir();
+    let s = user_scheme("user-x", "Misnamed");
+    fbterm_config::schemes::write_file(&dir.join("other.toml"), &s).unwrap();
+    let (set, errors) = SchemeSet::load(&dir);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].path, dir.join("other.toml"));
+    assert!(errors[0].message.contains("file name"), "{}", errors[0]);
+    assert!(set.get("user-x").is_none());
+}
+
+#[test]
+fn user_file_with_invalid_id_is_skipped() {
+    let dir = tmp_dir();
+    for id in ["My Scheme", "a.b", "UPPER"] {
+        let s = user_scheme(id, "Odd");
+        fbterm_config::schemes::write_file(&dir.join(format!("{id}.toml")), &s).unwrap();
+    }
+    let (set, errors) = SchemeSet::load(&dir);
+    assert_eq!(errors.len(), 3, "{errors:?}");
+    assert_eq!(set.all().len(), 4);
+}
+
+#[test]
+fn loaded_scheme_can_be_deleted_and_resaved() {
+    let dir = tmp_dir();
+    let s = user_scheme("user-loop", "Loop");
+    save_user(&dir, &s).unwrap();
+    let (set, _) = SchemeSet::load(&dir);
+    let loaded = set.get("user-loop").unwrap().clone();
+    save_user(&dir, &loaded).unwrap();
+    let (set, errors) = SchemeSet::load(&dir);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(set.all().len(), 5);
+    delete_user(&dir, "user-loop").unwrap();
+    let (set, errors) = SchemeSet::load(&dir);
+    assert!(errors.is_empty() && set.get("user-loop").is_none());
+}
+
+#[test]
+fn ids_that_are_not_plain_are_refused() {
+    let dir = tmp_dir();
+    for id in ["", "a/b", "a\\b", "a.b", "..", "Upper"] {
+        assert!(save_user(&dir, &user_scheme(id, "X")).is_err(), "{id:?}");
+        assert!(delete_user(&dir, id).is_err(), "{id:?}");
+    }
+}
+
+#[test]
+fn contrast_bar_checks_each_rule() {
+    let base = builtins().remove(0).colors;
+    let mut c = base;
+    c.foreground = c.ansi[8];
+    assert!(!contrast_ok(&c), "foreground against background");
+    let mut c = base;
+    c.selection = c.foreground;
+    assert!(!contrast_ok(&c), "selection against foreground");
+}
+
+#[test]
+fn bad_font_size_is_rejected() {
+    let dir = tmp_dir();
+    let path = save_user(&dir, &user_scheme("user-fs", "Fs")).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    for bad in ["nan", "-3.0", "0.0", "inf"] {
+        std::fs::write(&path, format!("font_size = {bad}\n{text}")).unwrap();
+        assert!(fbterm_config::schemes::read_file(&path).is_err(), "{bad}");
+    }
 }

@@ -183,7 +183,8 @@ pub fn builtins() -> Vec<Scheme> {
                 0x919199, 0xfd736d, 0x52cd86, 0xfac053, 0x9ccbfa, 0xbea8ff, 0x8fd6f7, 0xf5f5f7,
             ],
         ),
-        // The design system's light tokens: app canvas, ink text, violet-600 cursor;
+        // Bright black is darker than black and bright white is the ink color, as is
+        // usual on a light ground. The design system's light tokens: app canvas, ink text, violet-600 cursor;
         // status colors darkened until they pass on the light canvas.
         builtin(
             "graphite-light",
@@ -278,6 +279,13 @@ pub fn read_file(path: &Path) -> Result<Scheme, ConfigError> {
             "a scheme needs a non-empty id and name".into(),
         ));
     }
+    if file.font_size.is_some_and(|f| !f.is_finite() || f <= 0.0) {
+        return Err(ConfigError::new(
+            path,
+            None,
+            "font_size must be a positive number".into(),
+        ));
+    }
     Ok(Scheme {
         id: file.id,
         name: file.name,
@@ -312,10 +320,13 @@ fn check_user_id(dir: &Path, id: &str) -> Result<PathBuf, ConfigError> {
             format!("{id:?} is a built-in scheme"),
         ));
     }
+    // Lowercase only and length-capped, so ids name the same file on case-insensitive
+    // file systems and stay short.
     let plain = !id.is_empty()
+        && id.len() <= 100
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
     if !plain {
         return Err(ConfigError::new(
             &path,
@@ -389,7 +400,17 @@ impl SchemeSet {
                     None,
                     format!("duplicate scheme id {:?}", s.id),
                 )),
-                Ok(s) => schemes.push(s),
+                Ok(s) => match check_user_id(dir, &s.id) {
+                    Err(e) => errors.push(ConfigError::new(&path, None, e.message)),
+                    Ok(expected) if expected.file_name() != path.file_name() => {
+                        errors.push(ConfigError::new(
+                            &path,
+                            None,
+                            format!("file name must be {}.toml to match id {:?}", s.id, s.id),
+                        ));
+                    }
+                    Ok(_) => schemes.push(s),
+                },
             }
         }
         (Self { schemes }, errors)
