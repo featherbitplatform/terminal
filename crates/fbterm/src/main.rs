@@ -39,6 +39,7 @@ mod editor;
 mod export;
 mod find;
 mod keys;
+mod layout;
 mod memory;
 mod pacing;
 mod palette;
