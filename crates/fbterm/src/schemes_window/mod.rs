@@ -170,6 +170,8 @@ pub enum SchemesMsg {
     Save,
     Import,
     Imported(Option<PathBuf>),
+    /// The chosen file as read on the blocking pool (the error text names file and line).
+    ImportRead(Result<Scheme, String>),
     ImportChoice(ImportChoice),
     Export,
     Exported(Option<PathBuf>),

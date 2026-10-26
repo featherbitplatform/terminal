@@ -264,10 +264,21 @@ pub fn new_user_id() -> String {
     format!("user-{}", Uuid::new_v4())
 }
 
+/// The largest scheme file read: a real one is well under 2 KiB.
+pub const MAX_FILE_BYTES: u64 = 64 * 1024;
+
 /// Read one scheme file. The result is never marked built-in.
 pub fn read_file(path: &Path) -> Result<Scheme, ConfigError> {
+    let err = |m: String| ConfigError::new(path, None, m);
+    let len = std::fs::metadata(path)
+        .map_err(|e| err(e.to_string()))?
+        .len();
+    if len > MAX_FILE_BYTES {
+        return Err(err("Not a color scheme file (too large).".into()));
+    }
+    let bytes = std::fs::read(path).map_err(|e| err(e.to_string()))?;
     let text =
-        std::fs::read_to_string(path).map_err(|e| ConfigError::new(path, None, e.to_string()))?;
+        String::from_utf8(bytes).map_err(|_| err("Not a color scheme file (not text).".into()))?;
     let file: SchemeFile = toml::from_str(&text).map_err(|e| {
         let line = e.span().map(|s| line_of(&text, s.start));
         ConfigError::new(path, line, e.message().to_string())

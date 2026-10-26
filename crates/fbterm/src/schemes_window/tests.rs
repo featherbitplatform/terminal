@@ -652,6 +652,12 @@ fn scratch(app: &App) -> std::path::PathBuf {
     dir
 }
 
+/// What the chosen file does: read as the blocking task does, then handled.
+fn import_file(app: &mut App, path: std::path::PathBuf) {
+    let read = read_file(&path).map_err(|e| e.to_string());
+    send(app, SchemesMsg::ImportRead(read));
+}
+
 fn files_in_schemes(app: &App) -> usize {
     std::fs::read_dir(app.paths.schemes())
         .map(|d| d.count())
@@ -690,7 +696,7 @@ fn import_copies_into_schemes_dir() {
     open(&mut app, "graphite");
     let src = scratch(&app).join("in.toml");
     fbterm_config::schemes::write_file(&src, &other).unwrap();
-    send(&mut app, SchemesMsg::Imported(Some(src)));
+    import_file(&mut app, src);
     assert_eq!(read_file(&file(&app, &other.id)).unwrap(), other);
     assert_eq!(app.schemes.get(&other.id), Some(&other));
     assert_eq!(win(&app).selected, other.id);
@@ -703,18 +709,19 @@ fn import_invalid_file_shows_error() {
     let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
     open(&mut app, "graphite");
     let src = scratch(&app).join("bad.toml");
-    std::fs::write(&src, "id = \"x\"\nname = \"X\"\n[colors]\nforeground = 5\n").unwrap();
-    send(&mut app, SchemesMsg::Imported(Some(src.clone())));
+    std::fs::write(
+        &src,
+        "id = \"x\"\nname = \"X\"\n\n[colors]\nforeground = 5\n",
+    )
+    .unwrap();
+    import_file(&mut app, src.clone());
     let err = win(&app).error.clone().expect("error shown");
     assert!(err.contains("bad.toml"), "{err}");
-    assert!(err.contains(":"), "{err}");
+    assert!(err.contains("bad.toml:5"), "{err}");
     assert_eq!(files_in_schemes(&app), 0);
     assert_eq!(win(&app).selected, "graphite");
     // A file that does not exist is an error too.
-    send(
-        &mut app,
-        SchemesMsg::Imported(Some(src.with_file_name("none.toml"))),
-    );
+    import_file(&mut app, src.with_file_name("none.toml"));
     assert!(win(&app).error.as_deref().unwrap().contains("none.toml"));
 }
 
@@ -726,7 +733,7 @@ fn import_builtin_id_gets_new_id() {
     s.builtin = false;
     let src = scratch(&app).join("harbor.toml");
     fbterm_config::schemes::write_file(&src, &s).unwrap();
-    send(&mut app, SchemesMsg::Imported(Some(src)));
+    import_file(&mut app, src);
     assert!(win(&app).import.is_none(), "no question for a built-in id");
     let id = win(&app).selected.clone();
     assert!(id.starts_with("user-"), "{id}");
@@ -747,7 +754,7 @@ fn import_invalid_id_gets_new_id() {
         s.id = bad.to_owned();
         let src = scratch(&app).join("odd.toml");
         fbterm_config::schemes::write_file(&src, &s).unwrap();
-        send(&mut app, SchemesMsg::Imported(Some(src)));
+        import_file(&mut app, src);
         assert!(win(&app).error.is_none(), "{bad}: {:?}", win(&app).error);
         let id = win(&app).selected.clone();
         assert!(id.starts_with("user-"), "{bad} -> {id}");
@@ -769,7 +776,7 @@ fn import_same_id_keeps_both_with_new_id() {
     incoming.colors.background = rgb(0x505050);
     let src = scratch(&app).join("same.toml");
     fbterm_config::schemes::write_file(&src, &incoming).unwrap();
-    send(&mut app, SchemesMsg::Imported(Some(src)));
+    import_file(&mut app, src);
     assert!(win(&app).import.is_some(), "asks first");
     assert_eq!(files_in_schemes(&app), 1);
     send(&mut app, SchemesMsg::ImportChoice(ImportChoice::KeepBoth));
@@ -783,7 +790,7 @@ fn import_same_id_keeps_both_with_new_id() {
     assert_eq!(got.colors.background, rgb(0x505050));
     // Cancel imports nothing.
     let src = scratch(&app).join("same.toml");
-    send(&mut app, SchemesMsg::Imported(Some(src)));
+    import_file(&mut app, src);
     send(&mut app, SchemesMsg::ImportChoice(ImportChoice::Cancel));
     assert!(win(&app).import.is_none());
     assert_eq!(files_in_schemes(&app), 2);
@@ -800,11 +807,55 @@ fn import_same_id_replace_updates_and_reapplies() {
     incoming.colors.background = rgb(0x505050);
     let src = scratch(&app).join("same.toml");
     fbterm_config::schemes::write_file(&src, &incoming).unwrap();
-    send(&mut app, SchemesMsg::Imported(Some(src)));
+    import_file(&mut app, src);
     send(&mut app, SchemesMsg::ImportChoice(ImportChoice::Replace));
     assert_eq!(files_in_schemes(&app), 1);
     assert_eq!(read_file(&file(&app, &mine.id)).unwrap(), incoming);
     assert_eq!(app.schemes.get(&mine.id), Some(&incoming));
     assert_eq!(win(&app).selected, mine.id);
     assert_eq!(style(&app, wid, ids[0]).scheme.background, rgb(0x505050));
+}
+
+#[test]
+fn import_oversized_file_is_refused() {
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    let src = scratch(&app).join("big.toml");
+    std::fs::write(&src, " ".repeat(70 * 1024)).unwrap();
+    import_file(&mut app, src);
+    let err = win(&app).error.clone().expect("error shown");
+    assert!(
+        err.contains("Not a color scheme file (too large)."),
+        "{err}"
+    );
+    assert_eq!(files_in_schemes(&app), 0);
+}
+
+#[test]
+fn import_binary_file_is_refused() {
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    let src = scratch(&app).join("bin.toml");
+    std::fs::write(&src, [0xff, 0xfe, 0x00, 0x80, 0xc3, 0x28]).unwrap();
+    import_file(&mut app, src);
+    let err = win(&app).error.clone().expect("error shown");
+    assert!(err.contains("Not a color scheme file"), "{err}");
+    assert_eq!(files_in_schemes(&app), 0);
+}
+
+#[test]
+fn import_over_unloaded_file_with_same_id_asks() {
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    let s = user_scheme("Mine", 0x101010);
+    std::fs::create_dir_all(app.paths.schemes()).unwrap();
+    std::fs::write(file(&app, &s.id), "not a scheme").unwrap();
+    let src = scratch(&app).join("in.toml");
+    fbterm_config::schemes::write_file(&src, &s).unwrap();
+    import_file(&mut app, src);
+    assert!(win(&app).import.is_some());
+    assert_eq!(
+        std::fs::read_to_string(file(&app, &s.id)).unwrap(),
+        "not a scheme"
+    );
 }

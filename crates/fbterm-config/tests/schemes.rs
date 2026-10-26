@@ -244,3 +244,14 @@ fn bad_font_size_is_rejected() {
         assert!(fbterm_config::schemes::read_file(&path).is_err(), "{bad}");
     }
 }
+
+#[test]
+fn oversized_file_in_schemes_dir_is_skipped() {
+    let dir = tmp_dir();
+    std::fs::write(dir.join("big.toml"), " ".repeat(70 * 1024)).unwrap();
+    std::fs::write(dir.join("bin.toml"), [0xffu8, 0xfe, 0x80]).unwrap();
+    let (set, errors) = SchemeSet::load(&dir);
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    assert!(errors.iter().any(|e| e.to_string().contains("too large")));
+    assert_eq!(set.all().len(), 4);
+}

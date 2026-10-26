@@ -66,7 +66,8 @@ impl App {
                 Task::none()
             }
             SchemesMsg::Import => self.pick_import(),
-            SchemesMsg::Imported(path) => self.imported(path),
+            SchemesMsg::Imported(path) => Self::read_import(path),
+            SchemesMsg::ImportRead(result) => self.imported(result),
             SchemesMsg::ImportChoice(choice) => self.import_choice(choice),
             SchemesMsg::Export => self.pick_export(),
             SchemesMsg::Exported(path) => self.exported(path),
@@ -332,18 +333,31 @@ impl App {
         Task::none()
     }
 
-    /// Read the chosen file. A file that does not read shows its error (with file and line).
-    /// A built-in or unusable id gets a fresh one; an id that is already a user scheme asks.
-    fn imported(&mut self, path: Option<PathBuf>) -> Task<Message> {
+    /// Read the chosen file on the blocking pool.
+    fn read_import(path: Option<PathBuf>) -> Task<Message> {
         let Some(path) = path else {
             return Task::none();
         };
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || read_file(&path).map_err(|e| e.to_string()))
+                    .await
+                    .unwrap_or_else(|e| Err(e.to_string()))
+            },
+            |r| Message::Schemes(SchemesMsg::ImportRead(r)),
+        )
+    }
+
+    /// The file was read. One that does not read shows its error (with file and line). A
+    /// built-in or unusable id gets a fresh one; an id that is already a user scheme asks.
+    fn imported(&mut self, result: Result<Scheme, String>) -> Task<Message> {
+        let dir = self.paths.schemes();
         let Some((_, state)) = &mut self.schemes_win else {
             return Task::none();
         };
         state.notice = None;
         state.import = None;
-        let mut scheme = match read_file(&path) {
+        let mut scheme = match result {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(error = %e, "scheme not imported");
@@ -354,11 +368,18 @@ impl App {
         state.error = None;
         if BUILTIN_IDS.contains(&scheme.id.as_str()) || !is_plain_id(&scheme.id) {
             scheme.id = new_user_id();
-        } else if let Some(existing) = self.schemes.get(&scheme.id) {
-            state.import = Some(ImportAsk {
-                scheme,
-                existing: existing.name.clone(),
-            });
+        } else if let Some(existing) = self
+            .schemes
+            .get(&scheme.id)
+            .map(|s| s.name.clone())
+            .or_else(|| {
+                // A file that did not load (so is not in the set) would be overwritten too.
+                dir.join(format!("{}.toml", scheme.id))
+                    .exists()
+                    .then(|| scheme.id.clone())
+            })
+        {
+            state.import = Some(ImportAsk { scheme, existing });
             return Task::none();
         }
         self.install_imported(scheme)
