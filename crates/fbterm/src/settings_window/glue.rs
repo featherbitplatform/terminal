@@ -9,7 +9,7 @@ use fbterm_term::{ColorScheme, TerminalStyle};
 use iced::{Font, Task, window};
 use parking_lot::Mutex;
 
-use super::{SettingsMsg, SettingsState, WRITE_DEBOUNCE, Write, fonts};
+use super::{SettingsMsg, SettingsState, WRITE_DEBOUNCE, Write, fonts, thousands};
 use crate::app::{App, Message, SettingsSource};
 use crate::chrome::Chrome;
 use crate::theme;
@@ -65,9 +65,16 @@ impl App {
                 Task::none()
             }
             other => {
+                let max_history = self.max_open_history();
                 let Some((_, state)) = &mut self.settings_win else {
                     return Task::none();
                 };
+                if matches!(
+                    other,
+                    SettingsMsg::ScrollbackText(_) | SettingsMsg::ScrollbackSubmit
+                ) {
+                    state.max_open_history = max_history;
+                }
                 let effect = state.update(other);
                 if let Some(change) = effect.apply {
                     let mut next = self.settings.clone();
@@ -89,6 +96,17 @@ impl App {
         }
     }
 
+    /// The most history lines any open tab holds: what a lowered scrollback would cut.
+    fn max_open_history(&self) -> usize {
+        self.windows
+            .values()
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|tab| tab.terminal())
+            .map(|term| term.lock().history_len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Open the Settings window, or bring it to the front.
     pub(crate) fn open_settings(&mut self) -> Task<Message> {
         if let Some(id) = self.settings_window() {
@@ -103,6 +121,7 @@ impl App {
         let read_only = Settings::load(&self.paths.settings()).err();
         let mut state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
         state.display_hz = self.display_hz();
+        state.max_open_history = self.max_open_history();
         self.settings_win = Some((id, state));
         open.discard()
     }
@@ -327,19 +346,6 @@ impl App {
     }
 }
 
-/// `n` with a comma between thousands (`2,000`).
-fn thousands(n: usize) -> String {
-    let digits = n.to_string();
-    let mut out = String::new();
-    for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            out.push(',');
-        }
-        out.push(c);
-    }
-    out
-}
-
 /// The keys of `changes`, for a message.
 fn keys(changes: &[fbterm_config::SettingChange]) -> String {
     changes
@@ -347,18 +353,4 @@ fn keys(changes: &[fbterm_config::SettingChange]) -> String {
         .map(fbterm_config::SettingChange::key)
         .collect::<Vec<_>>()
         .join(", ")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::thousands;
-
-    #[test]
-    fn thousands_separates_groups_of_three() {
-        assert_eq!(thousands(0), "0");
-        assert_eq!(thousands(999), "999");
-        assert_eq!(thousands(2_000), "2,000");
-        assert_eq!(thousands(100_000), "100,000");
-        assert_eq!(thousands(1_000_000), "1,000,000");
-    }
 }

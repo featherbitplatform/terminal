@@ -290,3 +290,78 @@ fn clearing_a_chord_does_not_bring_back_an_entry_load_dropped() {
     assert_eq!(app.bindings.action(close), None);
     assert!(app.settings_notice.is_none());
 }
+
+/// An app with the Settings window open and one tab whose history holds `lines` lines (the
+/// default limit, 10,000, is what is saved).
+fn app_with_history(lines: usize) -> (App, Paths, fbterm_term::SharedTerminal) {
+    use crate::restore_tests::{fill_history, first_terminal, paths_with, profile, saved};
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    fbterm_config::SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let term = first_terminal(&app);
+    fill_history(&term, lines);
+    let _ = app.update(Message::Settings(SettingsMsg::Open));
+    assert!(app.settings_window().is_some());
+    (app, paths, term)
+}
+
+#[test]
+fn lowering_below_a_tabs_history_asks_before_trimming() {
+    let (mut app, paths, term) = app_with_history(500);
+    let held = term.lock().history_len();
+    assert!(held > 400);
+    for typed in ["1", "10", "100"] {
+        send(&mut app, SettingsMsg::ScrollbackText(typed.into()));
+        assert_eq!(term.lock().history_len(), held, "{typed} trimmed");
+        assert_eq!(app.settings.scrollback_lines, 10_000);
+    }
+    assert_eq!(
+        app.settings_win.as_ref().unwrap().1.pending_lower,
+        Some(100)
+    );
+    send(&mut app, SettingsMsg::ScrollbackSubmit);
+    assert_eq!(term.lock().history_len(), held);
+    assert_eq!(read(&paths), None, "nothing written");
+    // Cancel keeps everything.
+    send(&mut app, SettingsMsg::ScrollbackCancel);
+    assert_eq!(term.lock().history_len(), held);
+    assert_eq!(
+        app.settings_win.as_ref().unwrap().1.scrollback_text,
+        "10000"
+    );
+    // Apply trims, saves, and sets no notice.
+    send(&mut app, SettingsMsg::ScrollbackText("100".into()));
+    send(&mut app, SettingsMsg::ScrollbackApply);
+    assert_eq!(term.lock().history_len(), 100);
+    assert_eq!(app.settings.scrollback_lines, 100);
+    assert!(app.settings_notice.is_none());
+    assert_eq!(
+        Settings::load(&paths.settings()).unwrap().scrollback_lines,
+        100
+    );
+}
+
+#[test]
+fn lowering_above_every_tabs_history_saves_at_once() {
+    let (mut app, paths, term) = app_with_history(500);
+    let held = term.lock().history_len();
+    assert!(held > 400);
+    send(
+        &mut app,
+        SettingsMsg::ScrollbackText((held + 100).to_string()),
+    );
+    assert_eq!(app.settings.scrollback_lines, held + 100);
+    assert_eq!(term.lock().history_len(), held);
+    assert_eq!(app.settings_win.as_ref().unwrap().1.pending_lower, None);
+    send(&mut app, SettingsMsg::ScrollbackSubmit);
+    assert_eq!(
+        Settings::load(&paths.settings()).unwrap().scrollback_lines,
+        held + 100
+    );
+}

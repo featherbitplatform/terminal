@@ -18,7 +18,7 @@ fn dir() -> PathBuf {
 
 /// A profile whose program does not exist: starting its tab fails at once (state
 /// `Disconnected`), so "was started" is observable without spawning anything.
-fn profile(name: &str) -> Profile {
+pub(crate) fn profile(name: &str) -> Profile {
     Profile {
         id: ProfileId::new(),
         name: name.into(),
@@ -34,7 +34,7 @@ fn profile(name: &str) -> Profile {
     }
 }
 
-fn paths_with(profiles: &[Profile]) -> Paths {
+pub(crate) fn paths_with(profiles: &[Profile]) -> Paths {
     let paths = Paths { config_dir: dir() };
     ProfileStore {
         profiles: profiles.to_vec(),
@@ -44,7 +44,7 @@ fn paths_with(profiles: &[Profile]) -> Paths {
     paths
 }
 
-fn saved(tabs: &[&Profile], active: usize) -> SavedWindow {
+pub(crate) fn saved(tabs: &[&Profile], active: usize) -> SavedWindow {
     SavedWindow {
         tabs: tabs.iter().map(|p| p.id).collect(),
         active,
@@ -482,14 +482,14 @@ fn closing_last_tab_of_last_window_restores_default() {
     assert_eq!(relaunched.windows.len(), 1, "the default window");
 }
 
-fn first_terminal(app: &App) -> fbterm_term::SharedTerminal {
+pub(crate) fn first_terminal(app: &App) -> fbterm_term::SharedTerminal {
     app.windows.values().next().unwrap().tabs[0]
         .terminal()
         .cloned()
         .expect("started tab has a terminal")
 }
 
-fn fill_history(term: &fbterm_term::SharedTerminal, lines: usize) {
+pub(crate) fn fill_history(term: &fbterm_term::SharedTerminal, lines: usize) {
     let mut t = term.lock();
     for i in 0..lines {
         t.feed(format!("line {i}\r\n").as_bytes());

@@ -7,7 +7,9 @@
 use std::time::Duration;
 
 use fbterm_config::keys::{self as keymap, Action, Bindings, Chord};
-use fbterm_config::settings::{DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE};
+use fbterm_config::settings::{
+    DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE, SCROLLBACK_WARN_ABOVE,
+};
 use fbterm_config::{ConfigError, MaxFps, SettingChange, Settings, ThemeMode};
 
 mod fonts;
@@ -45,6 +47,10 @@ pub enum SettingsMsg {
     Blur(bool),
     ScrollbackText(String),
     ScrollbackSubmit,
+    /// Confirm lowering the scrollback below what an open tab holds: save and trim.
+    ScrollbackApply,
+    /// Drop the lowered value: the saved one comes back.
+    ScrollbackCancel,
     Kitty(bool),
     MaxFps(MaxFps),
     /// Record a new chord for an action (a click on its chord).
@@ -77,6 +83,23 @@ pub enum RecordProblem {
     NotAllowed(String),
     /// Another action has it: take it over or cancel.
     Taken { chord: Chord, other: Action },
+}
+
+/// The note under the Scrollback field above [`SCROLLBACK_WARN_ABOVE`] lines.
+pub const SCROLLBACK_NOTE: &str =
+    "Large history: resizing a window can pause briefly while history rewraps.";
+
+/// `n` with a comma between thousands (`2,000`).
+pub(crate) fn thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Fixed redraw rates offered in the list.
@@ -132,6 +155,12 @@ pub struct SettingsState {
     /// Background opacity in percent, as typed.
     pub opacity_text: String,
     pub scrollback_text: String,
+    /// A lower scrollback typed but not saved, because an open tab holds more lines than it
+    /// and applying it would cut them: the window asks (Apply / Cancel) first.
+    pub pending_lower: Option<usize>,
+    /// The most history lines any open tab holds (set by the app when the window opens and
+    /// before a typed scrollback is evaluated).
+    pub max_open_history: usize,
     pub fonts: Vec<FontChoice>,
     /// `settings.toml` does not load: the window only shows, it never writes.
     pub read_only: Option<ConfigError>,
@@ -168,6 +197,8 @@ impl SettingsState {
             font_size_text: String::new(),
             opacity_text: String::new(),
             scrollback_text: String::new(),
+            pending_lower: None,
+            max_open_history: 0,
             fonts,
             read_only,
             write_error: None,
@@ -191,6 +222,7 @@ impl SettingsState {
         self.font_size_text = size_text(values.font_size);
         self.opacity_text = percent_text(values.background_opacity);
         self.scrollback_text = values.scrollback_lines.to_string();
+        self.pending_lower = None;
         if !self.fonts.iter().any(|f| f.family == values.font_family) {
             let installed = self
                 .fonts
@@ -486,9 +518,11 @@ impl SettingsState {
                 let digits: String = s.chars().filter(|c| *c != ',' && *c != '_').collect();
                 let parsed = digits.trim().parse::<usize>().ok();
                 self.scrollback_text = s;
+                // Whatever was asked about is not what the field holds any more.
+                self.pending_lower = None;
                 match parsed {
                     Some(v) if (SCROLLBACK_RANGE.0..=SCROLLBACK_RANGE.1).contains(&v) => {
-                        self.change(SettingChange::ScrollbackLines(v), true)
+                        self.set_scrollback(v, true)
                     }
                     _ => Effect::NONE,
                 }
@@ -505,15 +539,56 @@ impl SettingsState {
                             .unwrap_or(usize::MAX)
                             .clamp(SCROLLBACK_RANGE.0, SCROLLBACK_RANGE.1);
                         self.scrollback_text = v.to_string();
-                        self.change(SettingChange::ScrollbackLines(v), false)
+                        self.pending_lower = None;
+                        self.set_scrollback(v, false)
                     }
                     Err(_) => {
                         self.scrollback_text = self.values.scrollback_lines.to_string();
+                        self.pending_lower = None;
                         self.flush_now()
                     }
                 }
             }
+            SettingsMsg::ScrollbackApply => match self.pending_lower.take() {
+                Some(v) => {
+                    self.scrollback_text = v.to_string();
+                    self.change(SettingChange::ScrollbackLines(v), false)
+                }
+                None => Effect::NONE,
+            },
+            SettingsMsg::ScrollbackCancel => {
+                self.pending_lower = None;
+                self.scrollback_text = self.values.scrollback_lines.to_string();
+                Effect::NONE
+            }
         }
+    }
+
+    /// A scrollback value from the field. A value below the saved one that would cut an open
+    /// tab's history is not saved: it waits for the user's confirmation (so typing `5` on the
+    /// way to `50000` never trims anything, and Enter keeps the question open).
+    fn set_scrollback(&mut self, v: usize, debounce: bool) -> Effect {
+        if v < self.values.scrollback_lines && self.max_open_history > v {
+            self.pending_lower = Some(v);
+            return Effect::NONE;
+        }
+        self.change(SettingChange::ScrollbackLines(v), debounce)
+    }
+
+    /// The question shown under the Scrollback field while a lowered value waits.
+    pub fn scrollback_warning(&self) -> Option<String> {
+        self.pending_lower.map(|v| {
+            format!(
+                "Open tabs will lose their oldest lines beyond {}. This can't be undone.",
+                thousands(v)
+            )
+        })
+    }
+
+    /// The quiet note under the field for a very large value.
+    pub fn scrollback_note(&self) -> Option<&'static str> {
+        let shown = self.pending_lower.unwrap_or(self.values.scrollback_lines);
+        (shown > SCROLLBACK_WARN_ABOVE).then_some(SCROLLBACK_NOTE)
     }
 
     /// Write whatever is pending now (Enter in a field that holds no new value).

@@ -135,6 +135,11 @@ pub const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
 pub const OPACITY_RANGE: (f32, f32) = (0.05, 1.0);
 /// Allowed range of `scrollback_lines`.
 pub const SCROLLBACK_RANGE: (usize, usize) = (0, 1_000_000);
+/// Above this many lines the Settings window notes that resizing can pause while history
+/// rewraps. Measured (feathercritty `benches/RESULTS.md`): a 100,000-line rewrap takes 3 to
+/// 33 ms (one first full-width pass 57 ms); the next measured size, 1,000,000, takes about
+/// 0.3 s. The owner chose to warn above 100,000.
+pub const SCROLLBACK_WARN_ABOVE: usize = 100_000;
 
 impl Settings {
     /// Load settings. A missing file gives defaults; a malformed file is an
@@ -299,7 +304,9 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Font size in points, from 6.0 to 72.0.
 #font_size = 13.0
 
-# Lines of history kept per tab, from 0 to 1000000.
+# Lines of history kept per tab, from 0 to 1000000. Applies to open tabs at once: lowering it
+# drops their oldest lines (the Settings window asks first). Above 100000, resizing a window
+# can pause briefly while history rewraps.
 #scrollback_lines = 10000
 
 # Color theme: "dark" or "light".
