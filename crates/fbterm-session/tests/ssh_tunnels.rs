@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -118,7 +119,30 @@ impl World {
         }
     }
 
+    /// Add a profile reached through `proxy` (straight to the bastion's sshd).
+    fn add_via_proxy(&mut self, name: &str, proxy: &Proxy, auth: AuthMethod) -> ProfileId {
+        let mut p = key_profile(name, HOST, vec![]);
+        if let ProfileKind::Ssh(ssh) = &mut p.kind {
+            ssh.port = proxy.port;
+            ssh.auth = auth;
+        }
+        let id = p.id;
+        self.store.profiles.push(p);
+        id
+    }
+
     fn start(&self, profile: ProfileId, def: TunnelDef) -> (TunnelHandle, Events) {
+        self.start_with(profile, def, self.trust.clone(), Arc::default())
+    }
+
+    /// Start a tunnel with its own prompter (for the first connect) and retry limit.
+    fn start_with(
+        &self,
+        profile: ProfileId,
+        def: TunnelDef,
+        prompter: Arc<dyn Prompter>,
+        retries: Arc<AtomicU32>,
+    ) -> (TunnelHandle, Events) {
         let (tx, rx) = unbounded_channel();
         let key = TunnelKey {
             profile,
@@ -129,8 +153,8 @@ impl World {
             self.store.clone(),
             key,
             def,
-            self.trust.clone(),
-            Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            prompter,
+            retries,
             tx,
         );
         (handle, Events::new(rx))
@@ -682,4 +706,305 @@ async fn connection_counts_are_reported() {
             .await,
         TunnelState::Up { connections: 0 }
     );
+}
+
+/// A TCP proxy to the bastion's sshd that a test can cut (every live connection drops, as
+/// when the server restarts) or shut (nothing listens any more: the server is unreachable).
+struct Proxy {
+    port: u16,
+    accept: tokio::task::JoinHandle<()>,
+    pipes: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>>,
+}
+
+impl Proxy {
+    async fn new() -> Self {
+        let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let pipes: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+        let tracked = pipes.clone();
+        let accept = tokio::spawn(async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let pipe = tokio::spawn(async move {
+                    if let Ok(mut server) = TcpStream::connect((HOST, PORT)).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                    }
+                });
+                tracked.lock().push(pipe.abort_handle());
+            }
+        });
+        Self {
+            port,
+            accept,
+            pipes,
+        }
+    }
+
+    /// Drop every connection made through the proxy.
+    fn cut(&self) {
+        for pipe in self.pipes.lock().drain(..) {
+            pipe.abort();
+        }
+    }
+
+    /// Stop listening, then cut: the server can no longer be reached.
+    fn shut(&self) {
+        self.accept.abort();
+        self.cut();
+    }
+}
+
+impl Drop for Proxy {
+    fn drop(&mut self) {
+        self.shut();
+    }
+}
+
+/// Trusts every host and types the password when asked, without saving it; counts the asks.
+#[derive(Default)]
+struct TypesPassword(AtomicUsize);
+
+#[async_trait]
+impl Prompter for TypesPassword {
+    async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
+        true
+    }
+    async fn ask_secret(
+        &self,
+        _name: &str,
+        kind: SecretKind,
+        _retry: bool,
+    ) -> Option<SecretAnswer> {
+        assert_eq!(kind, SecretKind::Password);
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Some(SecretAnswer {
+            value: "fb-pass".into(),
+            remember: false,
+        })
+    }
+}
+
+fn reconnecting(state: &TunnelState) -> bool {
+    matches!(state, TunnelState::Reconnecting { .. })
+}
+
+/// The very next state reported.
+async fn next_state(events: &mut Events) -> TunnelState {
+    tokio::time::timeout(STEP, events.0.recv())
+        .await
+        .expect("no state reported")
+        .expect("tunnel events ended")
+        .1
+}
+
+#[tokio::test]
+async fn server_restart_reconnects_tunnel() {
+    if !enabled() {
+        return;
+    }
+    let w = World::new();
+    let retries = Arc::new(AtomicU32::new(5));
+    let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+    let here = listener.local_addr().unwrap().port();
+    let served = tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"remote-ok\n").await;
+            let _ = s.shutdown().await;
+        }
+    });
+
+    let (l, mut el) = w.start_with(
+        w.bastion,
+        def("ssh-target", local(0, "target", PORT)),
+        w.trust.clone(),
+        retries.clone(),
+    );
+    el.up().await;
+    let port = l.port().unwrap();
+    let remote = TunnelKind::Remote {
+        bind: HOST.into(),
+        port: 0,
+        host: HOST.into(),
+        host_port: here,
+    };
+    let (r, mut er) = w.start_with(w.bastion, def("back", remote), w.trust.clone(), retries);
+    er.up().await;
+
+    // Kill the server process of the shared connection (the shell's parent), as a server
+    // restart would.
+    let shell = w.shell(w.bastion).await;
+    shell.send(b"kill -9 $PPID\r".to_vec());
+    assert_eq!(
+        el.until("Reconnecting", reconnecting).await,
+        TunnelState::Reconnecting { attempt: 1, max: 5 }
+    );
+    // The local port stays ours while reconnecting; a client meanwhile is closed at once.
+    let mut early = dial(&l).await;
+    assert!(closed_by_peer(&mut early).await);
+    assert_eq!(
+        er.until("Reconnecting", reconnecting).await,
+        TunnelState::Reconnecting { attempt: 1, max: 5 }
+    );
+
+    // Back up on a new connection, the same local port forwarding again.
+    el.up().await;
+    assert_eq!(l.port(), Some(port));
+    let mut s = dial(&l).await;
+    assert_eq!(read_n(&mut s, 4).await, b"SSH-");
+
+    // The remote forward was requested again on the new connection.
+    er.up().await;
+    let rport = r.port().expect("the server chose a port again");
+    let shell = w.shell(w.bastion).await;
+    let got = shell_value(
+        &shell,
+        "A",
+        &format!("R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{rport})"),
+    )
+    .await;
+    assert_eq!(got, "remote-ok");
+    served.abort();
+}
+
+#[tokio::test]
+async fn retries_run_out_then_fail() {
+    if !enabled() {
+        return;
+    }
+    let proxy = Proxy::new().await;
+    let mut w = World::new();
+    let auth = AuthMethod::Key {
+        path: keys_dir().join("fb_test_ed25519"),
+        passphrase: false,
+    };
+    let p = w.add_via_proxy("proxied", &proxy, auth);
+    let retries = Arc::new(AtomicU32::new(10));
+    let (t, mut e) = w.start_with(
+        p,
+        def("ssh", local(0, HOST, PORT)),
+        w.trust.clone(),
+        retries.clone(),
+    );
+    e.up().await;
+    let port = t.port().unwrap();
+
+    // The limit is read live, when the attempt is made.
+    retries.store(1, Ordering::SeqCst);
+    proxy.shut();
+    assert_eq!(
+        next_state(&mut e).await,
+        TunnelState::Reconnecting { attempt: 1, max: 1 }
+    );
+    // The one attempt finds nothing listening; its reason is the one reported.
+    match next_state(&mut e).await {
+        TunnelState::Failed(reason) => assert!(
+            reason.starts_with("connection lost: could not connect"),
+            "{reason}"
+        ),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    t.stopped().await;
+    assert!(
+        TcpStream::connect((HOST, port)).await.is_err(),
+        "port still bound"
+    );
+    w.wait_disconnected().await;
+}
+
+#[tokio::test]
+async fn zero_retries_fail_at_once() {
+    if !enabled() {
+        return;
+    }
+    let proxy = Proxy::new().await;
+    let mut w = World::new();
+    let auth = AuthMethod::Key {
+        path: keys_dir().join("fb_test_ed25519"),
+        passphrase: false,
+    };
+    let p = w.add_via_proxy("proxied", &proxy, auth);
+    let (t, mut e) = w.start_with(
+        p,
+        def("ssh", local(0, HOST, PORT)),
+        w.trust.clone(),
+        Arc::new(AtomicU32::new(0)),
+    );
+    e.up().await;
+    let cut = Instant::now();
+    proxy.cut();
+    match next_state(&mut e).await {
+        TunnelState::Failed(reason) => assert!(reason.starts_with("connection lost: "), "{reason}"),
+        other => panic!("expected Failed, got {other:?}"),
+    }
+    assert!(
+        cut.elapsed() < Duration::from_millis(900),
+        "waited for a retry"
+    );
+    t.stopped().await;
+}
+
+#[tokio::test]
+async fn reconnect_needing_input_fails() {
+    if !enabled() {
+        return;
+    }
+    let proxy = Proxy::new().await;
+    let mut w = World::new();
+    let p = w.add_via_proxy("typed", &proxy, AuthMethod::Password);
+    let typed = Arc::new(TypesPassword::default());
+    let (t, mut e) = w.start_with(
+        p,
+        def("ssh", local(0, HOST, PORT)),
+        typed.clone(),
+        Arc::new(AtomicU32::new(5)),
+    );
+    e.up().await;
+    assert_eq!(typed.0.load(Ordering::SeqCst), 1);
+
+    // The password was typed, not saved: the automatic attempt cannot ask for it.
+    proxy.cut();
+    assert_eq!(
+        next_state(&mut e).await,
+        TunnelState::Reconnecting { attempt: 1, max: 5 }
+    );
+    assert_eq!(
+        next_state(&mut e).await,
+        TunnelState::Failed("needs your input".into())
+    );
+    assert_eq!(typed.0.load(Ordering::SeqCst), 1, "a reconnect prompted");
+    t.stopped().await;
+}
+
+#[tokio::test]
+async fn stop_while_reconnecting_ends_promptly() {
+    if !enabled() {
+        return;
+    }
+    let proxy = Proxy::new().await;
+    let mut w = World::new();
+    let auth = AuthMethod::Key {
+        path: keys_dir().join("fb_test_ed25519"),
+        passphrase: false,
+    };
+    let p = w.add_via_proxy("proxied", &proxy, auth);
+    let (t, mut e) = w.start_with(
+        p,
+        def("ssh", local(0, HOST, PORT)),
+        w.trust.clone(),
+        Arc::new(AtomicU32::new(10)),
+    );
+    e.up().await;
+    let port = t.port().unwrap();
+    proxy.shut();
+    e.until("Reconnecting", reconnecting).await;
+
+    // Stopped in the middle of the backoff: it ends at once and lets go of its port.
+    let asked = Instant::now();
+    t.stop_and_wait().await;
+    assert!(asked.elapsed() < Duration::from_millis(500), "stop waited");
+    TcpListener::bind((HOST, port))
+        .await
+        .expect("the port was released");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(e.0.try_recv().is_err(), "a state arrived after stop");
 }
