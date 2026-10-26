@@ -413,8 +413,11 @@ impl client::Handler for ClientHandler {
         match forward_route(self.forwards.as_ref(), connected_address, connected_port) {
             Some(tx) => {
                 reply.accept().await;
-                // A forward stopped in between drops the channel, which closes it.
-                let _ = tx.send(channel);
+                // A forward stopped in between hands the channel back: close it (a raw
+                // channel dropped as it is would stay open on the server).
+                if let Err(unrouted) = tx.send(channel) {
+                    drop(unrouted.0.into_stream());
+                }
             }
             None => {
                 // Debug level (a server must not flood the log) and Debug-formatted (the

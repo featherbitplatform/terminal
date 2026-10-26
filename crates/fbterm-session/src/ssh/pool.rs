@@ -288,25 +288,39 @@ impl Connection {
         self.forwards.lock().remove(&(address.to_owned(), port));
     }
 
-    /// Like [`Connection::register_forward`], but the claim ends when the returned guard is
-    /// dropped, and only if it is still the registered one: a later claim on the same forward
-    /// (a restarted tunnel) is never removed by an earlier one ending. The guard does not keep
-    /// the connection open.
+    /// Like [`Connection::register_forward`], but refused (`None`) while another claim on
+    /// the same forward is live, so one tunnel can never take over or remove another's
+    /// routing. The claim ends when the returned guard is dropped, and only if it is still the
+    /// registered one. The guard does not keep the connection open.
     pub(crate) fn claim_forward(
         &self,
         address: &str,
         port: u32,
-    ) -> (ForwardClaim, mpsc::UnboundedReceiver<Channel<Msg>>) {
-        let (tx, rx) = mpsc::unbounded_channel();
-        let key = (address.to_owned(), port);
-        self.forwards.lock().insert(key.clone(), tx.clone());
-        let claim = ForwardClaim {
-            forwards: self.forwards.clone(),
-            key,
-            tx,
-        };
-        (claim, rx)
+    ) -> Option<(ForwardClaim, mpsc::UnboundedReceiver<Channel<Msg>>)> {
+        claim_in(&self.forwards, address, port)
     }
+}
+
+/// Claim `address:port` in `forwards` unless a live claim holds it (see
+/// [`Connection::claim_forward`]).
+fn claim_in(
+    forwards: &Forwards,
+    address: &str,
+    port: u32,
+) -> Option<(ForwardClaim, mpsc::UnboundedReceiver<Channel<Msg>>)> {
+    let key = (address.to_owned(), port);
+    let mut map = forwards.lock();
+    if map.get(&key).is_some_and(|tx| !tx.is_closed()) {
+        return None;
+    }
+    let (tx, rx) = mpsc::unbounded_channel();
+    map.insert(key.clone(), tx.clone());
+    let claim = ForwardClaim {
+        forwards: forwards.clone(),
+        key,
+        tx,
+    };
+    Some((claim, rx))
 }
 
 /// A registered remote forward (see [`Connection::claim_forward`]); unregisters it on drop.
@@ -1065,28 +1079,35 @@ mod tests {
     }
 
     #[test]
-    fn forward_claim_never_removes_a_newer_claim() {
+    fn forward_claims_are_exclusive_and_release_only_their_own() {
         let forwards: Forwards = Arc::default();
-        let claim = |port| {
-            let (tx, rx) = mpsc::unbounded_channel();
-            let key = ("127.0.0.1".to_owned(), port);
-            forwards.lock().insert(key.clone(), tx.clone());
-            (
-                ForwardClaim {
-                    forwards: forwards.clone(),
-                    key,
-                    tx,
-                },
-                rx,
-            )
+        let route = |port| super::super::forward_route(Some(&forwards), "127.0.0.1", port);
+        let (first, _first_rx) = claim_in(&forwards, "127.0.0.1", 4022).unwrap();
+        // A second tunnel on the same forward is refused and the first keeps its routing.
+        assert!(claim_in(&forwards, "127.0.0.1", 4022).is_none());
+        assert!(route(4022).is_some());
+        // Other ports and addresses are separate forwards.
+        let (other, _other_rx) = claim_in(&forwards, "127.0.0.1", 4023).unwrap();
+        let (any, _any_rx) = claim_in(&forwards, "0.0.0.0", 4022).unwrap();
+        drop((other, any));
+        // Released, the forward can be claimed again (a restarted tunnel).
+        drop(first);
+        assert!(route(4022).is_none());
+        let (again, _again_rx) = claim_in(&forwards, "127.0.0.1", 4022).unwrap();
+        // An entry whose receiver is gone (an old public registration) does not block a claim,
+        // and a stale guard never removes the newer claim.
+        let stale = ForwardClaim {
+            forwards: forwards.clone(),
+            key: ("127.0.0.1".to_owned(), 4022),
+            tx: mpsc::unbounded_channel().0,
         };
-        let (old, _old_rx) = claim(4022);
-        // A restart of the same tunnel claims the forward again before the old one ended.
-        let (new, _new_rx) = claim(4022);
-        drop(old);
-        assert!(super::super::forward_route(Some(&forwards), "127.0.0.1", 4022).is_some());
-        drop(new);
-        assert!(super::super::forward_route(Some(&forwards), "127.0.0.1", 4022).is_none());
+        drop(stale);
+        assert!(route(4022).is_some());
+        drop(again);
+        let (tx, rx) = mpsc::unbounded_channel();
+        forwards.lock().insert(("127.0.0.1".to_owned(), 4022), tx);
+        drop(rx);
+        assert!(claim_in(&forwards, "127.0.0.1", 4022).is_some());
         assert!(forwards.lock().is_empty());
     }
 

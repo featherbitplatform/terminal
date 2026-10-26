@@ -478,14 +478,151 @@ async fn stop_releases_connection() {
     assert_eq!(w.pool.connected_profiles(), vec![w.bastion]);
     drop(t);
     w.wait_disconnected().await;
-    // Nothing more is reported once stopped.
+    // Nothing more is reported once stopped (nothing was pending after `Up` either).
     tokio::time::sleep(Duration::from_millis(300)).await;
-    while let Ok((_, state)) = events.0.try_recv() {
-        assert!(
-            matches!(state, TunnelState::Up { .. }),
-            "reported after stop: {state:?}"
-        );
+    if let Ok((_, state)) = events.0.try_recv() {
+        panic!("reported after stop: {state:?}");
     }
+}
+
+/// A port nothing listens on right now.
+async fn free_port() -> u16 {
+    let l = TcpListener::bind((HOST, 0)).await.unwrap();
+    l.local_addr().unwrap().port()
+}
+
+#[tokio::test]
+async fn stop_and_wait_releases_port_for_restart() {
+    if !enabled() {
+        return;
+    }
+    let w = World::new();
+    // A fixed local port, with a client connected when the tunnel is restarted.
+    let port = free_port().await;
+    let d = def("fixed", local(port, "target", PORT));
+    let (t, mut events) = w.start(w.bastion, d.clone());
+    events.up().await;
+    let mut live = dial(&t).await;
+    assert_eq!(read_n(&mut live, 4).await, b"SSH-");
+    tokio::time::timeout(STEP, t.stop_and_wait())
+        .await
+        .expect("stop_and_wait did not finish");
+    // Everything is released when it returns: the connection had no other user.
+    assert!(w.pool.connected_profiles().is_empty());
+    let (t2, mut events) = w.start(w.bastion, d);
+    events.up().await;
+    assert_eq!(t2.port(), Some(port));
+    let mut s = dial(&t2).await;
+    assert_eq!(read_n(&mut s, 4).await, b"SSH-");
+    assert!(closed_by_peer(&mut live).await);
+
+    // A fixed remote port: the restart's request is granted and routed, because the old
+    // forward is cancelled and its claim released before stop_and_wait returns.
+    let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+    let here = listener.local_addr().unwrap().port();
+    let served = tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"remote-ok\n").await;
+            let _ = s.shutdown().await;
+        }
+    });
+    let remote = |port| TunnelKind::Remote {
+        bind: HOST.into(),
+        port,
+        host: HOST.into(),
+        host_port: here,
+    };
+    let (r, mut events) = w.start(w.target, def("back", remote(0)));
+    events.up().await;
+    let p = r.port().unwrap();
+    tokio::time::timeout(STEP, r.stop_and_wait())
+        .await
+        .expect("stop_and_wait did not finish");
+    // Only the restarted local tunnel's bastion connection is left.
+    assert_eq!(w.pool.connected_profiles(), vec![w.bastion]);
+    let (r2, mut events) = w.start(w.target, def("back", remote(p)));
+    events.up().await;
+    let shell = w.shell(w.target).await;
+    let got = shell_value(
+        &shell,
+        "A",
+        &format!("R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{p})"),
+    )
+    .await;
+    assert_eq!(got, "remote-ok");
+    drop(r2);
+    served.abort();
+}
+
+#[tokio::test]
+async fn second_remote_tunnel_on_same_port_is_refused_and_first_keeps_working() {
+    if !enabled() {
+        return;
+    }
+    let w = World::new();
+    let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+    let here = listener.local_addr().unwrap().port();
+    let served = tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"first-ok\n").await;
+            let _ = s.shutdown().await;
+        }
+    });
+    let remote = |port, host_port| TunnelKind::Remote {
+        bind: HOST.into(),
+        port,
+        host: HOST.into(),
+        host_port,
+    };
+    let (first, mut events) = w.start(w.target, def("first", remote(0, here)));
+    events.up().await;
+    let p = first.port().unwrap();
+    // Same server port, another tunnel of the profile: refused without touching the first.
+    let (_second, mut events2) = w.start(w.target, def("second", remote(p, 9)));
+    assert_eq!(
+        events2.failed().await,
+        format!("server refused the forward: 127.0.0.1 port {p} is already used by another tunnel")
+    );
+    let shell = w.shell(w.target).await;
+    let got = shell_value(
+        &shell,
+        "A",
+        &format!("R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{p})"),
+    )
+    .await;
+    assert_eq!(got, "first-ok");
+    drop(first);
+    served.abort();
+}
+
+#[tokio::test]
+async fn remote_forward_to_closed_local_port_closes_the_server_client() {
+    if !enabled() {
+        return;
+    }
+    let w = World::new();
+    let nothing = free_port().await;
+    let remote = TunnelKind::Remote {
+        bind: HOST.into(),
+        port: 0,
+        host: HOST.into(),
+        host_port: nothing,
+    };
+    let (t, mut events) = w.start(w.target, def("dead-end", remote));
+    events.up().await;
+    let p = t.port().unwrap();
+    // The server's client sees the channel close (end of file, cat exits 0) instead of hanging
+    // until `timeout` gives up (124).
+    let shell = w.shell(w.target).await;
+    let got = shell_value(
+        &shell,
+        "A",
+        &format!("R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{p}; echo rc=$?)"),
+    )
+    .await;
+    assert_eq!(got, "rc=0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -525,8 +662,10 @@ async fn connection_counts_are_reported() {
     })
     .await
     .unwrap_or_else(|_| panic!("never reported 12 connections: {seen:?}"));
+    // However long the clients took, no more than one update per 200 ms (plus the first).
+    let span = seen.last().unwrap().0 - seen[0].0;
     assert!(
-        seen.len() <= 6,
+        seen.len() as u128 <= span.as_millis() / 200 + 1,
         "too many updates for 12 quick clients: {seen:?}"
     );
     for pair in seen.windows(2) {

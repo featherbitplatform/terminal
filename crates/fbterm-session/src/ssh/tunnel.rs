@@ -17,8 +17,10 @@
 //!
 //! Stopping (the handle's [`TunnelHandle::stop`], or dropping it) closes the listener, cancels
 //! the remote forward, ends live client connections and releases the connection, which the
-//! pool then closes unless a shell or another tunnel still uses it. A stopped tunnel reports
-//! nothing more, so a restart under the same key never sees a stale state.
+//! pool then closes unless a shell or another tunnel still uses it; [`TunnelHandle::stopped`]
+//! says when that is done, so a restart can wait for its port. A stopped tunnel reports
+//! nothing more, so a restart under the same key never sees a stale state. Two remote tunnels
+//! of one connection never share a server port: the second is refused.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -28,7 +30,7 @@ use std::time::Duration;
 use fbterm_config::{ProfileId, ProfileStore, TunnelDef, TunnelKind};
 use parking_lot::Mutex;
 use russh::client::Msg;
-use russh::{Channel, ChannelOpenFailure};
+use russh::{Channel, ChannelOpenFailure, ChannelStream};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, mpsc, watch};
@@ -72,6 +74,8 @@ pub struct TunnelHandle {
     stop: watch::Sender<bool>,
     gate: Arc<Mutex<bool>>,
     port: Arc<AtomicU32>,
+    /// Loses its sender when the tunnel's task has ended and released everything.
+    done: watch::Receiver<()>,
 }
 
 impl TunnelHandle {
@@ -80,6 +84,21 @@ impl TunnelHandle {
     pub fn stop(&self) {
         *self.gate.lock() = true;
         self.stop.send_replace(true);
+    }
+
+    /// Resolves once the tunnel's task has ended (stopped or failed) and released what it
+    /// held: the listener is closed, the remote forward cancelled and its routing released,
+    /// live clients ended and the connection let go. A restart of the same tunnel awaits this
+    /// so the new instance finds its port free.
+    pub async fn stopped(&self) {
+        let mut done = self.done.clone();
+        while done.changed().await.is_ok() {}
+    }
+
+    /// [`TunnelHandle::stop`], then [`TunnelHandle::stopped`].
+    pub async fn stop_and_wait(&self) {
+        self.stop();
+        self.stopped().await;
     }
 
     /// The port the tunnel listens on once it is up: the local port of a local forward or
@@ -131,6 +150,7 @@ pub fn start_tunnel(
 ) -> TunnelHandle {
     let _ = retries;
     let (stop, stop_rx) = watch::channel(false);
+    let (done_tx, done) = watch::channel(());
     let gate = Arc::new(Mutex::new(false));
     let port = Arc::new(AtomicU32::new(0));
     let reporter = Reporter {
@@ -149,8 +169,17 @@ pub fn start_tunnel(
         stop: stop_rx,
         port: port.clone(),
     };
-    tokio::spawn(tunnel.run());
-    TunnelHandle { stop, gate, port }
+    tokio::spawn(async move {
+        tunnel.run().await;
+        // Everything the task held is released by now; dropping this tells `stopped`.
+        drop(done_tx);
+    });
+    TunnelHandle {
+        stop,
+        gate,
+        port,
+        done,
+    }
 }
 
 /// One tunnel's task.
@@ -267,7 +296,10 @@ impl Tunnel {
                     }
                     Err(e) => {
                         tracing::debug!(error = %e, "tunnel accept failed");
-                        tokio::time::sleep(ACCEPT_PAUSE).await;
+                        tokio::select! {
+                            () = stopped(&mut stop) => {}
+                            () = tokio::time::sleep(ACCEPT_PAUSE) => {}
+                        }
                     }
                 },
             }
@@ -294,17 +326,58 @@ impl Tunnel {
         // A fixed port is claimed before it is requested, so no connection arriving right
         // after the server's answer is refused. Port 0 can only be claimed once the server
         // has said which port it chose.
-        let early = (requested != 0).then(|| connection.claim_forward(&bind, requested));
-        let bound = request_forward(&connection, &bind, requested).await?;
+        let taken = |port: u32| {
+            format!(
+                "server refused the forward: {bind} port {port} is already used by another tunnel"
+            )
+        };
+        let early = match requested {
+            0 => None,
+            port => Some(
+                connection
+                    .claim_forward(&bind, port)
+                    .ok_or_else(|| taken(port))?,
+            ),
+        };
+        let mut stop = self.stop.clone();
+        let bound = tokio::select! {
+            biased;
+            () = stopped(&mut stop) => {
+                // The server may have granted it meanwhile: take it back (a port it chose is
+                // unknown here and stays until the connection ends; its channels are refused).
+                if requested != 0 {
+                    let _ = tokio::time::timeout(
+                        CANCEL_GRACE,
+                        connection.target().cancel_tcpip_forward(bind.as_str(), requested),
+                    )
+                    .await;
+                }
+                return Ok(());
+            }
+            bound = request_forward(&connection, &bind, requested) => bound?,
+        };
         let (claim, mut channels) = match early {
             Some(claimed) => claimed,
-            None => connection.claim_forward(&bind, bound),
+            None => match connection.claim_forward(&bind, bound) {
+                Some(claimed) => claimed,
+                None => {
+                    // Another tunnel holds the routing for the port the server just gave us
+                    // (possible only after a forward outside this app's control ended).
+                    let _ = tokio::time::timeout(
+                        CANCEL_GRACE,
+                        connection
+                            .target()
+                            .cancel_tcpip_forward(bind.as_str(), bound),
+                    )
+                    .await;
+                    return Err(taken(bound));
+                }
+            },
         };
         self.port.store(bound, Ordering::Release);
         let mut clients = Clients::new(&self.reporter);
         let closed = connection.closed();
         tokio::pin!(closed);
-        let mut stop = self.stop.clone();
         let result = loop {
             tokio::select! {
                 biased;
@@ -317,9 +390,13 @@ impl Tunnel {
             }
             clients.report(&self.reporter);
         };
-        // Refuse new channels first, then end the live ones and the server's listener.
+        // Refuse new channels first, close the ones still queued (a raw channel dropped as it
+        // is would stay open on the server), then end the live ones and the server's listener.
         drop(claim);
-        drop(channels);
+        channels.close();
+        while let Ok(queued) = channels.try_recv() {
+            drop(queued.into_stream());
+        }
         clients.end().await;
         if result.is_ok() {
             let _ = tokio::time::timeout(
@@ -474,20 +551,21 @@ impl Coalesce {
 }
 
 /// Copy between a client and its channel until both sides are done.
-async fn pipe(mut tcp: TcpStream, channel: Channel<Msg>) {
-    let mut stream = channel.into_stream();
+async fn pipe(mut tcp: TcpStream, mut stream: ChannelStream<Msg>) {
     if let Err(e) = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await {
         tracing::debug!(error = %e, "tunnel connection ended");
     }
 }
 
 /// Open a `direct-tcpip` channel to `host:port` on the server, as a SOCKS failure on error.
+/// The channel comes as a stream at once: a stream closes the channel when dropped (a raw
+/// channel would not), whichever path lets go of it.
 async fn open_direct(
     connection: &Connection,
     host: String,
     port: u16,
     peer: SocketAddr,
-) -> Result<Channel<Msg>, OpenFailure> {
+) -> Result<ChannelStream<Msg>, OpenFailure> {
     let open = connection.target().channel_open_direct_tcpip(
         host,
         u32::from(port),
@@ -500,7 +578,7 @@ async fn open_direct(
             tracing::debug!(error = %e, "the server did not open a tunnel channel");
             Err(open_failure(&e))
         }
-        Ok(Ok(channel)) => Ok(channel),
+        Ok(Ok(channel)) => Ok(channel.into_stream()),
     }
 }
 
@@ -535,13 +613,15 @@ async fn serve_socks(connection: Arc<Connection>, mut tcp: TcpStream, peer: Sock
 
 /// One connection of a remote forward: the server's channel to `host:port` here.
 async fn forward_remote(channel: Channel<Msg>, host: String, port: u16) {
+    // As a stream the channel is closed when dropped, on every path below; the server's
+    // client then sees the connection end.
+    let channel = channel.into_stream();
     let tcp = tokio::time::timeout(HOP_TIMEOUT, TcpStream::connect((host.as_str(), port))).await;
     match tcp {
         Ok(Ok(tcp)) => {
             let _ = tcp.set_nodelay(true);
             pipe(tcp, channel).await;
         }
-        // Dropping the channel closes it, which ends the server's client.
         Ok(Err(e)) => tracing::debug!(error = %e, "remote forward could not connect here"),
         Err(_) => tracing::debug!("remote forward timed out connecting here"),
     }
