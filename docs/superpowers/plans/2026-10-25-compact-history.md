@@ -54,9 +54,8 @@ task implements the section it cites; read that section before starting the task
   attribution are fine as already used); product copy has no em-dashes or emoji.
 - fbterm test runs use a temporary `FBTERM_CONFIG_DIR` and `FBTERM_SECRETS=memory`; look at the
   app only through `FBTERM_SCREENSHOT` own-window screenshots.
-- Gitflow and Conventional Commits in both repos. Commit messages end with
-  `Claude-Session: https://claude.ai/code/session_01M4sTccyz2cfJ8Qmu6GX6KC`; no `Co-Authored-By`
-  trailer.
+- Gitflow and Conventional Commits in both repos. No attribution of any kind: no
+  `Co-Authored-By` trailer and no session links in commits or PR bodies.
 - Branches: feathercritty `feature/compact-history` off `main`, merged by PR with green CI.
   fbterm `feature/compact-history` off `feature/milestone-1` (it has not merged to `develop`).
   While developing, fbterm uses an uncommitted
