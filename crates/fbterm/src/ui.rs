@@ -27,6 +27,7 @@ pub const ICON_LOCK: &str = "\u{e10b}";
 pub const ICON_SETTINGS: &str = "\u{e154}";
 pub const ICON_RESET: &str = "\u{e148}"; // rotate-ccw
 pub const ICON_WARNING: &str = "\u{e193}"; // triangle-alert
+pub const ICON_GRIP: &str = "\u{e0ea}"; // grip-horizontal
 
 /// An icon `size` pixels square. The font draws each icon on the full em square (the 24-unit
 /// SVG grid scaled to the em, baseline at the bottom), so a one-em line holds it exactly.

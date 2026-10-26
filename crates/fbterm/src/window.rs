@@ -110,10 +110,13 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     // render nothing.
     let content: Element<'_, Message> = match win.active_tab() {
         Some(tab) => {
+            // In the tab's own pane order, not the layout's: moving a tile then keeps each
+            // pane's widget state (find field, selection drag) with its pane.
+            let shown = tab.visible_panes();
             let panes = tab
-                .visible_panes()
-                .into_iter()
-                .filter_map(|pid| tab.pane(pid))
+                .panes
+                .iter()
+                .filter(|pane| shown.contains(&pane.id))
                 .map(|pane| (pane.id, pane_view(app, id, tab, pane)))
                 .collect();
             crate::tiles::tiles(t, id, tab, panes, !modal)

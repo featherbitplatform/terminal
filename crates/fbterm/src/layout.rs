@@ -2,9 +2,6 @@
 //!
 //! A tab's panes form a binary tree. `Row` places children side by side, `Column` stacks them.
 //! Between the two children of every split sits a divider of `DIVIDER` logical pixels.
-//!
-//! Items marked `allow(dead_code)` are wired in by the tile moves of a later tiling task (drop
-//! targets, `insert`, `move_pane`); each attribute goes when its item gets a caller.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -40,7 +37,6 @@ pub enum Axis {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Left and Top come with tile moves
 pub enum Side {
     Left,
     Right,
@@ -58,7 +54,6 @@ pub enum Dir {
 
 /// Where an inserted subtree lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum Drop {
     /// Beside this pane, on the given side of it.
     Tile(PaneId, Side),
@@ -170,7 +165,6 @@ impl Layout {
     }
 
     /// Inserts a whole subtree. A `Tile` target that is absent falls back to the matching edge.
-    #[allow(dead_code)]
     pub fn insert(&mut self, subtree: Layout, at: Drop) {
         match at {
             Drop::Tile(target, side) if self.contains(target) => {
@@ -186,7 +180,6 @@ impl Layout {
     }
 
     /// How many tiles sit side by side along `axis` at the top of the tree.
-    #[allow(dead_code)]
     fn top_level_siblings(&self, axis: Axis) -> usize {
         match self {
             Layout::Split {
@@ -219,7 +212,6 @@ impl Layout {
     }
 
     /// Moves a pane to a drop target. False (and no change) if the move is impossible.
-    #[allow(dead_code)]
     pub fn move_pane(&mut self, pane: PaneId, at: Drop) -> bool {
         if !self.contains(pane) || self.panes().len() < 2 {
             return false;

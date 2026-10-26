@@ -497,6 +497,14 @@ impl App {
                     changed = true;
                 }
             }
+            TilesMsg::DropTile { pane, at } => {
+                // Only the arrangement changes: sessions and terminals stay with their panes,
+                // and each moved pane's view reports its new grid through the resize path.
+                if tab.maximized.is_none() && tab.layout.move_pane(pane, at) {
+                    self.save_state();
+                }
+                return Task::none();
+            }
             TilesMsg::Focus(_) | TilesMsg::EndDrag | TilesMsg::Area(_) => {}
         }
         if changed {
@@ -1076,6 +1084,57 @@ mod pane_tests {
             let _ = app.update(Message::ResizeSettled(a, generation));
             assert_eq!(size_of(&app, wid, a), after);
             wait_for(&term, &format!("{} {}", after.rows, after.cols));
+        }
+
+        #[test]
+        fn drop_tile_moves_without_reconnect() {
+            use crate::layout::{Drop, Layout, Side};
+            use feathercritty::grid::Dimensions;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let first = connected("one", shell("seq 1 200; echo ready; sleep 30", tx.clone()));
+            let second = connected("two", shell("echo also; sleep 30", tx));
+            let (a, b) = (first.id, second.id);
+            let sessions = [
+                first.session.as_ref().unwrap().id,
+                second.session.as_ref().unwrap().id,
+            ];
+            let term = first.terminal().unwrap().clone();
+            let (mut app, wid) = app_with(first, second);
+            wait_for(&term, "ready");
+            let history = term.lock().term().grid().history_size();
+            assert!(history > 0, "the first pane has scrollback");
+
+            let _ = app.update(Message::Tiles(
+                wid,
+                TilesMsg::DropTile {
+                    pane: a,
+                    at: Drop::Tile(b, Side::Bottom),
+                },
+            ));
+
+            let tab = &app.windows[&wid].tabs[0];
+            assert_eq!(tab.layout.panes(), vec![b, a], "a now sits under b");
+            assert!(matches!(
+                tab.layout,
+                Layout::Split {
+                    axis: crate::layout::Axis::Column,
+                    ..
+                }
+            ));
+            let ids: Vec<_> = [a, b]
+                .iter()
+                .map(|p| tab.pane(*p).unwrap().session.as_ref().unwrap().id)
+                .collect();
+            assert_eq!(ids, sessions, "the same sessions, not new ones");
+            assert!(
+                [a, b]
+                    .iter()
+                    .all(|p| tab.pane(*p).unwrap().state == TabState::Connected)
+            );
+            let moved = tab.pane(a).unwrap().terminal().unwrap();
+            assert!(std::sync::Arc::ptr_eq(moved, &term), "the same terminal");
+            assert_eq!(moved.lock().term().grid().history_size(), history);
+            assert!(screen(moved).contains("ready"));
         }
 
         #[test]

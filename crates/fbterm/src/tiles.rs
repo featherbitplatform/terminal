@@ -1,20 +1,27 @@
 //! The panes of one tab on screen: each pane's view laid out at its rectangle of the layout
 //! tree, the dividers between them, and (with more than one pane) the focus outline and the
-//! dimming of the other panes. Also turns presses into pane focus and divider drags.
+//! dimming of the other panes. Also turns presses into pane focus, divider drags and tile
+//! moves: a tile is picked up by the grab handle shown at the top of the hovered pane, or
+//! anywhere in a pane with the pick modifier held (Cmd on macOS, Ctrl+Shift elsewhere), and
+//! dropped on a tile's edge or the outer edge of the content, with a preview of where it lands.
 //!
-//! A tab with one pane draws exactly its pane's view: no divider, outline or dimming.
+//! A tab with one pane draws exactly its pane's view: no divider, outline, dimming or handle.
 
 use std::time::{Duration, Instant};
 
 use iced::advanced::layout::{self, Layout as Placed};
 use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
-use iced::{Color, Element, Event, Length, Point, Rectangle, Size, Vector, mouse, window};
+use iced::{
+    Border, Color, Element, Event, Length, Pixels, Point, Rectangle, Size, Vector, keyboard, mouse,
+    window,
+};
 
 use crate::app::Message;
-use crate::layout::{Axis, DIVIDER, Layout, PaneId, Path};
+use crate::layout::{Axis, DIVIDER, Drop, Layout, PaneId, Path, Side};
 use crate::tabs::Tab;
 use crate::theme::Tokens;
+use crate::ui::{ICON_GRIP, ICONS};
 
 /// Extra grab room on each side of a divider, over the panes next to it.
 const SLOP: f32 = 2.0;
@@ -22,6 +29,14 @@ const SLOP: f32 = 2.0;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 /// Alpha of the terminal background laid over the panes that do not have focus.
 const DIM: f32 = 0.35;
+/// Depth of the band along the content's outer edge that drops a tile as a whole row or column.
+const EDGE_BAND: f32 = 24.0;
+/// How far the pointer must travel with the button held before a pick becomes a tile drag.
+const PICK_SLOP: f32 = 4.0;
+/// The grab handle at the top of a hovered pane: its size and its glyph's.
+const HANDLE_W: f32 = 28.0;
+const HANDLE_H: f32 = 14.0;
+const GRIP: f32 = 12.0;
 
 /// What a window's tiles ask of the app.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,6 +51,8 @@ pub enum TilesMsg {
     Equalize(Path),
     /// The area the panes are laid out in changed size.
     Area(Size),
+    /// A tile was dropped: move `pane` to `at`.
+    DropTile { pane: PaneId, at: Drop },
 }
 
 /// What lies under a point of the tiles.
@@ -61,6 +78,84 @@ pub fn hit(layout: &Layout, area: Rectangle, point: Point) -> Hit {
         .into_iter()
         .find(|(_, r)| r.contains(point))
         .map_or(Hit::None, |(id, _)| Hit::Pane(id))
+}
+
+/// Where a drop at `point` lands when `layout` fills `area`: within `EDGE_BAND` of the
+/// content's outer edge, that whole edge; else inside a tile, the nearest of its four edges.
+/// `dragged`: the pane being moved (a tile drag), never its own target; `None` when what is
+/// dragged is not part of this layout (a whole tab).
+pub fn drop_target(
+    layout: &Layout,
+    area: Rectangle,
+    point: Point,
+    dragged: Option<PaneId>,
+) -> Option<Drop> {
+    if !area.contains(point) {
+        return None;
+    }
+    let (side, depth) = nearest_side(area, point);
+    if depth <= EDGE_BAND {
+        return Some(Drop::Edge(side));
+    }
+    let (id, rect) = layout
+        .rects(area)
+        .into_iter()
+        .find(|(_, r)| r.contains(point))?;
+    if Some(id) == dragged {
+        return None;
+    }
+    Some(Drop::Tile(id, nearest_side(rect, point).0))
+}
+
+/// The side of `rect` nearest to `p` (the first in left, right, top, bottom order on a tie)
+/// and the distance to it.
+fn nearest_side(rect: Rectangle, p: Point) -> (Side, f32) {
+    [
+        (Side::Left, p.x - rect.x),
+        (Side::Right, rect.x + rect.width - p.x),
+        (Side::Top, p.y - rect.y),
+        (Side::Bottom, rect.y + rect.height - p.y),
+    ]
+    .into_iter()
+    .min_by(|a, b| a.1.total_cmp(&b.1))
+    .expect("four sides")
+}
+
+/// The rectangle `pane` would get if dropped at `at`.
+fn preview(layout: &Layout, area: Rectangle, pane: PaneId, at: Drop) -> Option<Rectangle> {
+    let mut moved = layout.clone();
+    if !moved.move_pane(pane, at) {
+        return None;
+    }
+    moved
+        .rects(area)
+        .into_iter()
+        .find(|(id, _)| *id == pane)
+        .map(|(_, r)| snap(r))
+}
+
+/// The grab handle of a pane at `rect`: centred on its top edge, just inside it.
+fn handle_rect(rect: Rectangle) -> Rectangle {
+    Rectangle {
+        x: (rect.center_x() - HANDLE_W / 2.0).round(),
+        y: rect.y.round(),
+        width: HANDLE_W,
+        height: HANDLE_H,
+    }
+}
+
+/// The modifier that picks up a tile from anywhere in a pane: Cmd on macOS, Ctrl+Shift
+/// elsewhere.
+fn pick_modifier(m: keyboard::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        m.logo() && !m.control() && !m.alt()
+    } else {
+        m.control() && m.shift() && !m.alt() && !m.logo()
+    }
+}
+
+fn is_escape(key: &keyboard::Key) -> bool {
+    matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape))
 }
 
 fn grab_area(rect: Rectangle, axis: Axis) -> Rectangle {
@@ -113,9 +208,9 @@ fn snap(r: Rectangle) -> Rectangle {
     }
 }
 
-/// Lays `panes` (the views of `tab.visible_panes()`, in that order) out at their rectangles
-/// of the tab's layout. `focused_outline`: draw the focus outline (when the tab shows more
-/// than one pane).
+/// Lays `panes` (the views of `tab.visible_panes()`, in any order) out at their rectangles
+/// of the tab's layout. `focused_outline`: nothing modal covers the tiles, so (when the tab
+/// shows more than one pane) the focus outline is drawn and tiles can be picked up.
 pub fn tiles<'a>(
     t: &'static Tokens,
     window: window::Id,
@@ -151,9 +246,29 @@ struct Drag {
     grab: f32,
 }
 
+/// A tile picked up: by its handle, or with the pick modifier from inside its pane.
+struct TileDrag {
+    pane: PaneId,
+    origin: Point,
+    /// Picked by the handle (the press was the tiles'); else the pane's view had the press
+    /// too and gets the release.
+    by_handle: bool,
+    /// The pointer travelled past `PICK_SLOP`: the tile is being carried.
+    carrying: bool,
+    target: Option<Drop>,
+    /// Escape dropped it: the rest of this press (moves and the release) is swallowed.
+    cancelled: bool,
+}
+
 #[derive(Default)]
 struct State {
     drag: Option<Drag>,
+    tile: Option<TileDrag>,
+    /// The pane under the pointer (whose handle shows) and whether the pointer is on the handle.
+    hover: Option<(PaneId, bool)>,
+    modifiers: keyboard::Modifiers,
+    /// The Escape that cancelled a tile drag: its release is not passed on either.
+    swallow_escape: bool,
     /// The last press on a divider, for double-click.
     last_press: Option<(Path, Instant)>,
     /// The area last reported to the app.
@@ -167,6 +282,182 @@ impl Tiles<'_> {
 
     fn publish(&self, shell: &mut Shell<'_, Message>, msg: TilesMsg) {
         shell.publish(Message::Tiles(self.window, msg));
+    }
+
+    /// Whether tiles can be picked up: more than one pane and nothing modal over them.
+    fn movable(&self) -> bool {
+        self.several() && self.outline
+    }
+
+    /// The pane under `p` and whether `p` is on its grab handle.
+    fn hover_at(&self, bounds: Rectangle, p: Point) -> Option<(PaneId, bool)> {
+        let (id, rect) = self
+            .layout
+            .rects(bounds)
+            .into_iter()
+            .find(|(_, r)| r.contains(p))?;
+        Some((id, handle_rect(snap(rect)).contains(p)))
+    }
+
+    /// Handles the tile-drag side of `event`. True when the event is consumed and goes no
+    /// further (the panes do not see it).
+    fn tile_event(
+        &self,
+        state: &mut State,
+        event: &Event,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+        shell: &mut Shell<'_, Message>,
+    ) -> bool {
+        match event {
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. })
+                if is_escape(key) && state.tile.as_ref().is_some_and(|t| !t.cancelled) =>
+            {
+                if let Some(tile) = &mut state.tile {
+                    tile.cancelled = true;
+                    tile.carrying = false;
+                    tile.target = None;
+                }
+                state.swallow_escape = true;
+                shell.request_redraw();
+                shell.capture_event();
+                true
+            }
+            Event::Keyboard(keyboard::Event::KeyReleased { key, .. })
+                if is_escape(key) && state.swallow_escape =>
+            {
+                state.swallow_escape = false;
+                shell.capture_event();
+                true
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) if state.tile.is_some() => {
+                let tile = state.tile.as_mut().expect("checked");
+                if let (false, Some(p)) = (tile.cancelled, cursor.position()) {
+                    if !tile.carrying && p.distance(tile.origin) > PICK_SLOP {
+                        tile.carrying = true;
+                        shell.request_redraw();
+                    }
+                    if tile.carrying {
+                        let target = drop_target(&self.layout, bounds, p, Some(tile.pane));
+                        if target != tile.target {
+                            tile.target = target;
+                            shell.request_redraw();
+                        }
+                    }
+                }
+                shell.capture_event();
+                true
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+                if state.tile.is_some() =>
+            {
+                let tile = state.tile.take().expect("checked");
+                if let (true, false, Some(at)) = (tile.carrying, tile.cancelled, tile.target) {
+                    self.publish(
+                        shell,
+                        TilesMsg::DropTile {
+                            pane: tile.pane,
+                            at,
+                        },
+                    );
+                }
+                shell.request_redraw();
+                if tile.by_handle {
+                    shell.capture_event();
+                    return true;
+                }
+                // The pane's view had the press: it gets the release, which ends its click.
+                false
+            }
+            e if state.tile.is_some() && cancels_drag(e) => {
+                state.tile = None;
+                state.hover = None;
+                shell.request_redraw();
+                false
+            }
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let hover = cursor
+                    .position_over(bounds)
+                    .and_then(|p| self.hover_at(bounds, p));
+                if hover != state.hover {
+                    state.hover = hover;
+                    shell.request_redraw();
+                }
+                false
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                if state.hover.take().is_some() {
+                    shell.request_redraw();
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Passes `event` on to the panes' views (the arguments of `Widget::update`).
+    #[allow(clippy::too_many_arguments)]
+    fn update_children(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Placed<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        for ((child, state), layout) in self
+            .children
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            child.as_widget_mut().update(
+                state, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+        }
+    }
+}
+
+impl Tiles<'_> {
+    fn draw_handle(&self, renderer: &mut iced::Renderer, r: Rectangle, hot: bool) {
+        use iced::advanced::Renderer as _;
+        use iced::advanced::text::{self, Renderer as _};
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: r,
+                border: Border {
+                    color: self.t.border,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                snap: true,
+                ..renderer::Quad::default()
+            },
+            self.t.raised,
+        );
+        renderer.fill_text(
+            text::Text {
+                content: ICON_GRIP.to_string(),
+                bounds: Size::new(GRIP, GRIP),
+                size: Pixels(GRIP),
+                line_height: text::LineHeight::Absolute(Pixels(GRIP)),
+                font: ICONS,
+                align_x: text::Alignment::Center,
+                align_y: iced::alignment::Vertical::Center,
+                shaping: text::Shaping::Basic,
+                wrapping: text::Wrapping::None,
+            },
+            r.center(),
+            if hot {
+                self.t.text
+            } else {
+                self.t.text_secondary
+            },
+            r,
+        );
     }
 }
 
@@ -259,6 +550,12 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
             state.area = Some(bounds.size());
             self.publish(shell, TilesMsg::Area(bounds.size()));
         }
+        if let Event::Keyboard(keyboard::Event::ModifiersChanged(m)) = event {
+            state.modifiers = *m;
+        }
+        if self.several() && self.tile_event(state, event, bounds, cursor, shell) {
+            return;
+        }
         if self.several() {
             match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -290,11 +587,51 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                                 shell.capture_event();
                                 return;
                             }
-                            Hit::Pane(id) if id != self.focused => {
-                                // Not captured: the pane's terminal still gets the press.
-                                self.publish(shell, TilesMsg::Focus(id));
+                            Hit::Pane(id) => {
+                                if id != self.focused {
+                                    // Not captured: the pane's terminal still gets the press.
+                                    self.publish(shell, TilesMsg::Focus(id));
+                                }
+                                let on_handle = self.movable()
+                                    && state.drag.is_none()
+                                    && state.hover == Some((id, true));
+                                if on_handle {
+                                    state.tile = Some(TileDrag {
+                                        pane: id,
+                                        origin: p,
+                                        by_handle: true,
+                                        carrying: false,
+                                        target: None,
+                                        cancelled: false,
+                                    });
+                                    shell.request_redraw();
+                                    shell.capture_event();
+                                    return;
+                                }
+                                if self.movable() && pick_modifier(state.modifiers) {
+                                    // The pane's view sees the press first: a link under the
+                                    // pointer or a program reading the mouse keeps it.
+                                    let modifiers = state.modifiers;
+                                    self.update_children(
+                                        tree, event, layout, cursor, renderer, clipboard, shell,
+                                        viewport,
+                                    );
+                                    if !shell.is_event_captured() {
+                                        let state = tree.state.downcast_mut::<State>();
+                                        state.modifiers = modifiers;
+                                        state.tile = Some(TileDrag {
+                                            pane: id,
+                                            origin: p,
+                                            by_handle: false,
+                                            carrying: false,
+                                            target: None,
+                                            cancelled: false,
+                                        });
+                                    }
+                                    return;
+                                }
                             }
-                            Hit::Pane(_) | Hit::None => {}
+                            Hit::None => {}
                         }
                     }
                 }
@@ -332,16 +669,9 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                 _ => {}
             }
         }
-        for ((child, state), layout) in self
-            .children
-            .iter_mut()
-            .zip(&mut tree.children)
-            .zip(layout.children())
-        {
-            child.as_widget_mut().update(
-                state, event, layout, cursor, renderer, clipboard, shell, viewport,
-            );
-        }
+        self.update_children(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
     }
 
     fn mouse_interaction(
@@ -355,6 +685,16 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
         let bounds = layout.bounds();
         if self.several() {
             let state = tree.state.downcast_ref::<State>();
+            if state.tile.as_ref().is_some_and(|t| t.carrying) {
+                return mouse::Interaction::Grabbing;
+            }
+            if state.drag.is_none()
+                && self.movable()
+                && matches!(state.hover, Some((_, true)))
+                && cursor.is_over(bounds)
+            {
+                return mouse::Interaction::Grab;
+            }
             let path = match (&state.drag, cursor.position_over(bounds)) {
                 (Some(drag), _) => Some(drag.path.clone()),
                 (None, Some(p)) => match hit(&self.layout, bounds, p) {
@@ -473,6 +813,43 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                     accent,
                 );
             }
+            let state = tree.state.downcast_ref::<State>();
+            match &state.tile {
+                Some(TileDrag {
+                    pane,
+                    carrying: true,
+                    target: Some(at),
+                    ..
+                }) => {
+                    if let Some(r) = preview(&self.layout, bounds, *pane, *at) {
+                        renderer.fill_quad(
+                            renderer::Quad {
+                                bounds: r,
+                                border: Border {
+                                    color: self.t.accent,
+                                    width: 1.0,
+                                    radius: 0.0.into(),
+                                },
+                                snap: true,
+                                ..renderer::Quad::default()
+                            },
+                            self.t.accent_soft,
+                        );
+                    }
+                }
+                None if state.drag.is_none() && self.movable() => {
+                    if let Some((id, hot)) = state.hover
+                        && let Some((_, rect)) = layout
+                            .children()
+                            .zip(&self.ids)
+                            .map(|(placed, id)| (*id, placed.bounds()))
+                            .find(|(p, _)| *p == id)
+                    {
+                        self.draw_handle(renderer, handle_rect(rect), hot);
+                    }
+                }
+                _ => {}
+            }
         });
     }
 
@@ -573,6 +950,102 @@ mod tests {
         l.set_ratio(&vec![], r);
         let d = &l.dividers(split)[0];
         assert!((d.rect.center().x - 260.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn drop_target_outer_edge() {
+        let l = two();
+        let at = |x, y, dragged| drop_target(&l, area(), Point::new(x, y), dragged);
+        // The content spans x 8..1008 and y 4..604; the band is 24 px deep.
+        assert_eq!(
+            at(10.0, 300.0, Some(PaneId(2))),
+            Some(Drop::Edge(Side::Left))
+        );
+        assert_eq!(
+            at(1000.0, 300.0, Some(PaneId(1))),
+            Some(Drop::Edge(Side::Right))
+        );
+        assert_eq!(
+            at(300.0, 10.0, Some(PaneId(2))),
+            Some(Drop::Edge(Side::Top))
+        );
+        assert_eq!(
+            at(700.0, 600.0, Some(PaneId(1))),
+            Some(Drop::Edge(Side::Bottom))
+        );
+        // Over the dragged tile itself the band still counts.
+        assert_eq!(
+            at(20.0, 300.0, Some(PaneId(1))),
+            Some(Drop::Edge(Side::Left))
+        );
+        // A corner goes to the nearer edge.
+        assert_eq!(at(12.0, 6.0, Some(PaneId(2))), Some(Drop::Edge(Side::Top)));
+        // Just past the band: the tile under the pointer.
+        assert_eq!(
+            at(33.0, 300.0, Some(PaneId(2))),
+            Some(Drop::Tile(PaneId(1), Side::Left))
+        );
+        // Outside the content: nothing.
+        assert_eq!(at(2.0, 300.0, Some(PaneId(2))), None);
+    }
+
+    #[test]
+    fn drop_target_tile_edge_nearest_side() {
+        let l = two();
+        let at = |x, y, dragged| drop_target(&l, area(), Point::new(x, y), dragged);
+        // Pane 2 spans x 510..1008, y 4..604.
+        let tile = |side| Some(Drop::Tile(PaneId(2), side));
+        assert_eq!(at(540.0, 300.0, Some(PaneId(1))), tile(Side::Left));
+        assert_eq!(at(900.0, 300.0, Some(PaneId(1))), tile(Side::Right));
+        assert_eq!(at(760.0, 60.0, Some(PaneId(1))), tile(Side::Top));
+        assert_eq!(at(760.0, 560.0, Some(PaneId(1))), tile(Side::Bottom));
+        // A whole-tab drag (nothing of this layout dragged) may target any tile.
+        assert_eq!(
+            at(100.0, 300.0, None),
+            Some(Drop::Tile(PaneId(1), Side::Left))
+        );
+    }
+
+    #[test]
+    fn drop_on_itself_is_none() {
+        let l = two();
+        assert_eq!(
+            drop_target(&l, area(), Point::new(250.0, 300.0), Some(PaneId(1))),
+            None
+        );
+        // The divider gap is no tile.
+        assert_eq!(
+            drop_target(&l, area(), Point::new(508.0, 300.0), Some(PaneId(1))),
+            None
+        );
+    }
+
+    #[test]
+    fn preview_is_the_rect_the_tile_would_get() {
+        let l = two();
+        // Pane 1 dropped along the bottom: a full-width row under pane 2.
+        let r = preview(&l, area(), PaneId(1), Drop::Edge(Side::Bottom)).unwrap();
+        assert_eq!((r.x, r.width), (8.0, 1000.0));
+        assert_eq!(r.y + r.height, 604.0);
+        assert!((r.height - 298.0).abs() <= 1.0, "{r:?}");
+        // On its own tile: no move, no preview.
+        assert_eq!(
+            preview(&l, area(), PaneId(1), Drop::Tile(PaneId(1), Side::Left)),
+            None
+        );
+    }
+
+    #[test]
+    fn handle_sits_centred_on_the_top_edge() {
+        let pane = Rectangle {
+            x: 510.0,
+            y: 4.0,
+            width: 498.0,
+            height: 600.0,
+        };
+        let h = handle_rect(pane);
+        assert_eq!((h.y, h.width, h.height), (4.0, HANDLE_W, HANDLE_H));
+        assert!((h.center_x() - pane.center_x()).abs() <= 0.5);
     }
 
     #[test]
