@@ -347,10 +347,17 @@ fn selections() -> Vec<(&'static str, Point, Point)> {
 /// Runs of cells carrying an OSC 8 link, read as the app reads them for link clicks
 /// (`grid().cell(point).hyperlink()`), over the whole history and screen: "line:first-last id uri".
 /// A link without an explicit id gets a generated "<counter>_<library name>" id; record only
-/// the counter, so the golden does not carry the generator's suffix.
-fn link_id(id: &str) -> String {
+/// the order of first appearance within this terminal ("auto:0" for the first distinct generated
+/// id, and so on): the counter is process-wide, so its raw values depend on which test ran first.
+fn link_id(id: &str, seen: &mut Vec<String>) -> String {
     match id.split_once('_') {
-        Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => format!("auto:{n}"),
+        Some((n, _)) if n.chars().all(|c| c.is_ascii_digit()) => {
+            let at = seen.iter().position(|s| s == n).unwrap_or_else(|| {
+                seen.push(n.to_owned());
+                seen.len() - 1
+            });
+            format!("auto:{at}")
+        }
         _ => format!("{id:?}"),
     }
 }
@@ -360,6 +367,7 @@ fn links_json(shared: &SharedTerminal) -> Value {
     let t = shared.lock();
     let grid = t.term().grid();
     let mut out = Vec::new();
+    let mut seen = Vec::new();
     for l in grid.topmost_line().0..=grid.bottommost_line().0 {
         let mut run: Option<(usize, usize, String)> = None;
         let flush = |run: &mut Option<(usize, usize, String)>, out: &mut Vec<Value>| {
@@ -371,7 +379,7 @@ fn links_json(shared: &SharedTerminal) -> Value {
             let desc = grid
                 .cell(Point::new(Line(l), Column(c)))
                 .hyperlink()
-                .map(|h| format!("id={} uri={}", link_id(h.id()), h.uri()));
+                .map(|h| format!("id={} uri={}", link_id(h.id(), &mut seen), h.uri()));
             match (&mut run, desc) {
                 (Some((_, b, d)), Some(n)) if *d == n => *b = c,
                 (_, Some(n)) => {
