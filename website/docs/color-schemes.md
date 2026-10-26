@@ -26,7 +26,7 @@ In a split tab each pane uses the scheme of its own profile. A tab or pane that 
 | Harbor | `harbor` | Deep teal-black with an aqua cursor. |
 | Ember | `ember` | Coal-brown with a warm orange cursor. |
 
-Built-in schemes cannot be changed or deleted; duplicate one to start your own. Each meets a readability bar: text against the background at a contrast ratio of at least 7, and the ANSI colors 1 to 6 and 9 to 14 at least 4.5.
+Built-in schemes cannot be changed or deleted; duplicate one to start your own. Each meets a readability bar: text against the background at a contrast ratio of at least 7, the ANSI colors 1 to 6 and 9 to 14 against the background at least 4.5, and the selection against the text at least 4.5.
 
 ## The Color schemes window
 
@@ -40,7 +40,7 @@ Open it with **Edit schemes…** next to the **Color scheme** row in Settings (o
 - **Export…** writes the selected scheme to a file you choose, to share it.
 - **Save** writes your changes to disk and applies them to open sessions. Until then a scheme row shows **Unsaved changes**.
 
-If the text and background of a scheme are hard to tell apart, the editor shows "Text may be hard to read on this background." The hint does not stop you from saving.
+For your own schemes, if the text against the background, any of the ANSI colors 1 to 6 and 9 to 14 against the background, or the selection against the text falls below the readability bar above, the editor shows "Text may be hard to read on this background." The hint is only a warning and never stops you from saving.
 
 ## Fonts in schemes
 
