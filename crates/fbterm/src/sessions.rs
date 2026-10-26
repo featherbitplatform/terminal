@@ -443,6 +443,27 @@ impl App {
         }
     }
 
+    /// Set a divider's ratio unless a pane would end up below the minimum size: the old
+    /// ratio stays then. Returns whether the layout changed.
+    fn set_ratio_if_fits(
+        tab: &mut crate::tabs::Tab,
+        set: impl FnOnce(&mut crate::layout::Layout),
+        area: Option<iced::Size>,
+        cell: GridSize,
+    ) -> bool {
+        let before = tab.layout.clone();
+        set(&mut tab.layout);
+        if let Some(area) = area
+            && !tab.layout.fits(
+                iced::Rectangle::with_size(area),
+                iced::Size::new(cell.cell_width, cell.cell_height),
+            )
+        {
+            tab.layout = before.clone();
+        }
+        tab.layout != before
+    }
+
     /// Panes that closed: forget their sizes.
     pub(crate) fn forget_panes(&mut self, panes: &[PaneId]) {
         for id in panes {
@@ -501,24 +522,21 @@ impl App {
                 if tab.maximized.is_some() {
                     return Task::none();
                 }
-                let before = tab.layout.clone();
-                tab.layout.set_ratio(&path, ratio);
-                // Never squeeze a pane below the minimum: the divider stops there.
-                let cell = self.grids.get(&tab.focused).map_or(DEFAULT_GRID, |g| *g);
-                if let Some(area) = area
-                    && !tab.layout.fits(
-                        iced::Rectangle::with_size(area),
-                        iced::Size::new(cell.cell_width, cell.cell_height),
-                    )
-                {
-                    tab.layout = before.clone();
-                }
-                changed = tab.layout != before;
+                changed = Self::set_ratio_if_fits(
+                    tab,
+                    |l| l.set_ratio(&path, ratio),
+                    area,
+                    self.grids.get(&tab.focused).map_or(DEFAULT_GRID, |g| *g),
+                );
             }
             TilesMsg::Equalize(path) => {
                 if tab.maximized.is_none() {
-                    tab.layout.equalize(&path);
-                    changed = true;
+                    changed = Self::set_ratio_if_fits(
+                        tab,
+                        |l| l.equalize(&path),
+                        area,
+                        self.grids.get(&tab.focused).map_or(DEFAULT_GRID, |g| *g),
+                    );
                 }
             }
             TilesMsg::Focus(_)

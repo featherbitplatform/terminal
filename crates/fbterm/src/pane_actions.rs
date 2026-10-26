@@ -386,6 +386,40 @@ mod tests {
     }
 
     #[test]
+    fn equalize_refused_when_it_would_not_fit() {
+        use crate::tiles::TilesMsg;
+        let p = profile("a");
+        let (mut app, wid, a) = app_with(&p, big());
+        // a | (b | c)
+        act(&mut app, wid, Action::SplitRight);
+        act(&mut app, wid, Action::SplitRight);
+        let focused = tab(&app, wid).focused;
+        app.grids.insert(focused, grid(big()));
+        let ratio = |app: &App| match &tab(app, wid).layout {
+            Layout::Split { ratio, .. } => *ratio,
+            Layout::Pane(_) => panic!("split"),
+        };
+        let _ = a;
+        // Narrow window; the outer divider sits left, so b | c just fit.
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Area(Size::new(700.0, 600.0))));
+        let _ = app.update(Message::Tiles(
+            wid,
+            TilesMsg::DragDivider {
+                path: vec![],
+                ratio: 0.4,
+            },
+        ));
+        assert_eq!(ratio(&app), 0.4);
+        // Halving would leave b | c 350 px, below two 20 column panes (360 px).
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Equalize(vec![])));
+        assert_eq!(ratio(&app), 0.4, "equalize keeps the old ratio");
+        // Where it fits, equalize works.
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Area(Size::new(984.0, 600.0))));
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Equalize(vec![])));
+        assert_eq!(ratio(&app), 0.5);
+    }
+
+    #[test]
     fn close_pane_keeps_tab_until_last() {
         let p = profile("a");
         let (mut app, wid, a) = app_with(&p, big());
