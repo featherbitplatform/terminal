@@ -84,7 +84,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
-            mode: Mode::Schemes,
+            mode: if state.confirm.is_some() {
+                Mode::SchemesConfirm
+            } else {
+                Mode::Schemes
+            },
             bindings: &app.bindings,
         });
     }

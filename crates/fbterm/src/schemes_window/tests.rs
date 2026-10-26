@@ -428,3 +428,219 @@ fn preview_shows_the_sample_with_a_selected_word() {
 fn fbterm_config_profile(name: &str) -> fbterm_config::Profile {
     crate::restore_tests::profile(name)
 }
+
+/// Makes a directory read-only while alive (so writes into it fail), writable again after.
+#[cfg(unix)]
+struct ReadOnly(std::path::PathBuf);
+
+#[cfg(unix)]
+impl ReadOnly {
+    fn new(dir: &std::path::Path) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        Self(dir.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ReadOnly {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_with_profiles_write_failure_keeps_scheme_and_references() {
+    let mine = user_scheme("Mine", 0x101010);
+    let a = with_scheme(&fbterm_config_profile("a"), &mine.id);
+    let settings = format!("color_scheme = \"{}\"\n", mine.id);
+    let (mut app, paths, wid, ids) = app_with(&[a], &settings, std::slice::from_ref(&mine));
+    open(&mut app, &mine.id);
+    send(&mut app, SchemesMsg::Delete);
+    {
+        // profiles.toml (and settings.toml) cannot be written; schemes/ still could be.
+        let _guard = ReadOnly::new(&paths.config_dir);
+        send(&mut app, SchemesMsg::ConfirmDelete);
+    }
+    let s = win(&app);
+    assert!(
+        s.error
+            .as_deref()
+            .is_some_and(|e| e.contains("profiles.toml")),
+        "{:?}",
+        s.error
+    );
+    assert!(s.notice.is_none());
+    // Nothing moved: the file, the set, the draft, the profiles and the global.
+    assert!(file(&app, &mine.id).exists());
+    assert_eq!(app.schemes.get(&mine.id), Some(&mine));
+    assert_eq!(s.selected, mine.id);
+    let id = Some(mine.id.as_str());
+    assert_eq!(app.profiles.profiles[0].color_scheme.as_deref(), id);
+    let store = ProfileStore::load(&paths.profiles()).unwrap();
+    assert_eq!(store.profiles[0].color_scheme.as_deref(), id);
+    assert_eq!(app.settings.color_scheme, mine.id);
+    assert_eq!(
+        Settings::load(&paths.settings()).unwrap().color_scheme,
+        mine.id
+    );
+    assert_eq!(app.scheme_for(pane(&app, wid, ids[0])).id, mine.id);
+    // Once the folder is writable again, the delete goes through.
+    send(&mut app, SchemesMsg::Delete);
+    send(&mut app, SchemesMsg::ConfirmDelete);
+    assert!(!file(&app, &mine.id).exists());
+    assert_eq!(app.settings.color_scheme, "graphite");
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_with_settings_write_failure_keeps_scheme_file() {
+    let mine = user_scheme("Mine", 0x101010);
+    let a = with_scheme(&fbterm_config_profile("a"), &mine.id);
+    let paths = crate::restore_tests::paths_with(std::slice::from_ref(&a));
+    fbterm_config::schemes::save_user(&paths.schemes(), &mine).unwrap();
+    // settings.toml is a link into a folder that turns read-only; settings are written to
+    // the link's target.
+    let elsewhere = paths.config_dir.join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let target = elsewhere.join("settings.toml");
+    std::fs::write(&target, format!("color_scheme = \"{}\"\n", mine.id)).unwrap();
+    std::os::unix::fs::symlink(&target, paths.settings()).unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    app.state_saving_enabled = false;
+    assert_eq!(app.settings.color_scheme, mine.id);
+    open(&mut app, &mine.id);
+    send(&mut app, SchemesMsg::Delete);
+    {
+        let _guard = ReadOnly::new(&elsewhere);
+        send(&mut app, SchemesMsg::ConfirmDelete);
+    }
+    let s = win(&app);
+    assert!(
+        s.error
+            .as_deref()
+            .is_some_and(|e| e.contains("settings.toml")),
+        "{:?}",
+        s.error
+    );
+    // The scheme stays, and so does the global that names it; the profile, written first,
+    // follows the global scheme (which is still this one), so nothing refers to a missing id.
+    assert!(file(&app, &mine.id).exists());
+    assert!(app.schemes.get(&mine.id).is_some());
+    assert_eq!(app.settings.color_scheme, mine.id);
+    assert_eq!(Settings::load(&target).unwrap().color_scheme, mine.id);
+    assert_eq!(app.profiles.profiles[0].color_scheme, None);
+    let store = ProfileStore::load(&paths.profiles()).unwrap();
+    assert_eq!(store.profiles[0].color_scheme, None);
+    assert!(
+        app.notices.iter().all(|n| !n.contains("not found")),
+        "{:?}",
+        app.notices
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn delete_updates_editor_drafts_only_after_save() {
+    let mine = user_scheme("Mine", 0x101010);
+    let a = with_scheme(&fbterm_config_profile("a"), &mine.id);
+    let pid = a.id;
+    let (mut app, paths, _, _) = app_with(&[a], "", std::slice::from_ref(&mine));
+    let _ = app.update(Message::Editor(EditorMsg::Open));
+    let draft_scheme = |app: &App| {
+        let (_, ed) = app.editor.as_ref().unwrap();
+        ed.draft(pid).unwrap().color_scheme.clone()
+    };
+    assert_eq!(draft_scheme(&app), Some(mine.id.clone()));
+    open(&mut app, &mine.id);
+    send(&mut app, SchemesMsg::Delete);
+    {
+        let _guard = ReadOnly::new(&paths.config_dir);
+        send(&mut app, SchemesMsg::ConfirmDelete);
+    }
+    assert!(win(&app).error.is_some());
+    assert_eq!(
+        draft_scheme(&app),
+        Some(mine.id.clone()),
+        "a failed save leaves the drafts alone"
+    );
+    send(&mut app, SchemesMsg::Delete);
+    send(&mut app, SchemesMsg::ConfirmDelete);
+    assert!(win(&app).error.is_none());
+    assert_eq!(draft_scheme(&app), None);
+}
+
+#[test]
+fn preview_resize_does_not_loop() {
+    use iced::advanced::layout::{self, Layout};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::{Shell, clipboard};
+    use iced::{Element, Event, Pixels, Rectangle, Size, mouse};
+
+    let a = fbterm_config_profile("a");
+    let (mut app, _, _, _) = app_with(&[a], "", &[]);
+    open(&mut app, "graphite");
+    let size = Size::new(520.0, 116.0);
+    let base = app.style.clone();
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    // Lay the preview out once at `size` and pass it an event: what does it publish?
+    let run = |state: &SchemesState| -> Vec<Message> {
+        let mut element: Element<'_, Message> = fbterm_term::highlighted_terminal_view(
+            &state.preview,
+            state.preview_style(&base),
+            None,
+            |out| Message::Schemes(SchemesMsg::Preview(out)),
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorEntered),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(size),
+        );
+        messages
+    };
+    let resized = |messages: &[Message]| {
+        messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::Schemes(SchemesMsg::Preview(fbterm_term::TerminalOutput::Resized(g))) => {
+                    Some(*g)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // The first layout differs from the default grid: one resize.
+    let first = resized(&run(win(&app)));
+    assert_eq!(first.len(), 1, "{first:?}");
+    let grid = first[0];
+    send(
+        &mut app,
+        SchemesMsg::Preview(fbterm_term::TerminalOutput::Resized(grid)),
+    );
+    // The rebuilt terminal has that grid, the sample and its selection...
+    {
+        let term = win(&app).preview.lock();
+        assert_eq!(term.size(), grid);
+        assert_eq!(term.selection().unwrap().text(&term), "README.md");
+    }
+    // ...so laying it out the same way again reports nothing.
+    assert!(resized(&run(win(&app))).is_empty());
+}

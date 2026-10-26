@@ -45,6 +45,9 @@ pub(crate) enum Mode {
     /// The Color schemes window: Cmd+W closes it, Cmd+S saves, Settings, the profile editor and
     /// Quit work; other shortcuts do nothing.
     Schemes,
+    /// The Color schemes window asking whether to delete a scheme: Enter deletes, Escape
+    /// cancels, and no other key reaches a field behind the question or acts as a shortcut.
+    SchemesConfirm,
     /// The Settings window recording a new chord: every key press goes to the recorder (plain
     /// Escape cancels), none reaches a field or acts as a shortcut.
     Recording,
@@ -163,13 +166,17 @@ fn key_message(
             }
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
-                Action::Quit | Action::Settings if !repeat => Some(Message::Shortcut(w, action)),
+                Action::Quit | Action::Settings | Action::EditSchemes if !repeat => {
+                    Some(Message::Shortcut(w, action))
+                }
                 _ => None,
             })
         }
         Mode::Settings => shortcut.map(|action| match action {
             Action::CloseTab if !repeat => Some(Message::Settings(SettingsMsg::Close)),
-            Action::Quit | Action::EditProfiles if !repeat => Some(Message::Shortcut(w, action)),
+            Action::Quit | Action::EditProfiles | Action::EditSchemes if !repeat => {
+                Some(Message::Shortcut(w, action))
+            }
             _ => None,
         }),
         Mode::Schemes => {
@@ -186,6 +193,15 @@ fn key_message(
                 _ => None,
             })
         }
+        Mode::SchemesConfirm => Some(match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => {
+                Some(Message::Schemes(SchemesMsg::CancelDelete))
+            }
+            keyboard::Key::Named(Named::Enter) if !repeat => {
+                Some(Message::Schemes(SchemesMsg::ConfirmDelete))
+            }
+            _ => None,
+        }),
         Mode::Recording => Some(recording_key(key, mods, repeat)),
     }
 }
@@ -661,6 +677,39 @@ mod tests {
                 Some(Some(Message::Shortcut(_, Action::FindAll)))
             ));
         }
+    }
+
+    #[test]
+    fn the_delete_question_takes_every_key() {
+        let named = |n| keyboard::Key::Named(n);
+        let at = |key: keyboard::Key| {
+            key_message(
+                &defaults(),
+                Mode::SchemesConfirm,
+                window::Id::unique(),
+                &key,
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        use keyboard::key::Named;
+        assert!(matches!(
+            at(named(Named::Escape)),
+            Some(Some(Message::Schemes(SchemesMsg::CancelDelete)))
+        ));
+        assert!(matches!(
+            at(named(Named::Enter)),
+            Some(Some(Message::Schemes(SchemesMsg::ConfirmDelete)))
+        ));
+        assert!(matches!(
+            at(keyboard::Key::Character("a".into())),
+            Some(None)
+        ));
+        assert!(matches!(
+            press(Mode::SchemesConfirm, "w", false),
+            Some(None)
+        ));
     }
 
     #[test]

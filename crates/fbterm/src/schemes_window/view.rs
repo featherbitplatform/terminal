@@ -595,7 +595,7 @@ fn footer<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messag
 fn confirm<'a>(t: &'static Tokens, ask: &'a DeleteAsk) -> Element<'a, Message> {
     let mut body = column![crate::prompt_view::header(
         t,
-        ui::ICON_SHIELD_ALERT,
+        ui::ICON_WARNING,
         t.warning,
         ask.title()
     )]

@@ -162,11 +162,13 @@ impl App {
         });
     }
 
-    /// Delete the scheme the question was about: its file, then the profiles that used it
-    /// follow the global scheme (saved to `profiles.toml`), and a global setting that named it
-    /// goes back to Graphite (saved to `settings.toml`). Open panes recolor once at the end.
+    /// Delete the scheme the question was about. References go first, the file last, and each
+    /// step stops the delete when it fails, so what is on disk always agrees with itself: the
+    /// profiles that used it follow the global scheme (saved to `profiles.toml`), then a global
+    /// setting that named it goes back to Graphite (saved to `settings.toml`), then the file is
+    /// removed. A failure leaves the scheme in place, at worst no longer used. Open panes
+    /// recolor once at the end.
     fn delete_scheme(&mut self) -> Task<Message> {
-        let dir = self.paths.schemes();
         let refused = self.profiles_error.is_some();
         let Some((_, state)) = &mut self.schemes_win else {
             return Task::none();
@@ -175,75 +177,85 @@ impl App {
             return Task::none();
         };
         state.notice = None;
+        state.error = None;
         if refused {
             // The profiles in memory are a stand-in: which of the real ones use it is unknown.
             state.error =
                 Some("profiles.toml failed to load: fix it before deleting a scheme".into());
             return Task::none();
         }
-        if let Err(e) = delete_user(&dir, &ask.id) {
-            tracing::warn!(error = %e, "scheme not deleted");
-            state.error = Some(format!("Could not delete: {e}"));
-            return Task::none();
-        }
-        tracing::info!(id = %ask.id, "scheme deleted");
-        state.error = None;
-        let next = if self.settings.color_scheme == ask.id {
-            FALLBACK.to_owned()
-        } else {
-            self.settings.color_scheme.clone()
-        };
-        state.remove(&ask.id, &next);
-        state.notice = Some(format!("Deleted \"{}\"", ask.name));
-        let mut errors = Vec::new();
-        if let Err(e) = self.forget_scheme_in_profiles(&ask.id) {
-            errors.push(format!("Could not update profiles.toml: {e}"));
-        }
         let mut tasks = Vec::new();
-        if self.settings.color_scheme == ask.id {
-            let change = SettingChange::ColorScheme(FALLBACK.into());
-            let path = self.paths.settings();
-            match Settings::write_field(&path, &change) {
-                Ok(()) => self.settings_seen = std::fs::read_to_string(&path).ok(),
-                Err(e) => errors.push(format!("Could not update settings.toml: {e}")),
+        let result = self
+            .forget_scheme_in_profiles(&ask.id)
+            .map_err(|e| format!("Could not update profiles.toml: {e}"))
+            .and_then(|()| {
+                self.forget_scheme_in_settings(&ask.id, &mut tasks)
+                    .map_err(|e| format!("Could not update settings.toml: {e}"))
+            })
+            .and_then(|()| {
+                delete_user(&self.paths.schemes(), &ask.id)
+                    .map_err(|e| format!("Could not delete: {e}"))
+            });
+        let Some((_, state)) = &mut self.schemes_win else {
+            return Task::batch(tasks);
+        };
+        match result {
+            Ok(()) => {
+                tracing::info!(id = %ask.id, "scheme deleted");
+                state.remove(&ask.id, &self.settings.color_scheme);
+                state.notice = Some(format!("Deleted \"{}\"", ask.name));
             }
-            let mut next = self.settings.clone();
-            change.apply(&mut next);
-            tasks.push(self.apply_settings(next, SettingsSource::Window));
-            if let Some((_, s)) = &mut self.settings_win {
-                s.values.color_scheme = FALLBACK.into();
+            Err(e) => {
+                tracing::warn!(error = %e, "scheme not deleted");
+                state.error = Some(e);
             }
-        }
-        if !errors.is_empty()
-            && let Some((_, state)) = &mut self.schemes_win
-        {
-            state.notice = None;
-            state.error = Some(errors.join("; "));
         }
         tasks.push(self.reload_schemes());
         Task::batch(tasks)
     }
 
-    /// Profiles that use `id` follow the global scheme from now on: saved to `profiles.toml`
-    /// like an editor save, and drafts in the profile editor follow.
+    /// Profiles that use `id` follow the global scheme from now on, saved to `profiles.toml`
+    /// like an editor save. Only once that is written do the profile editor's drafts follow.
     fn forget_scheme_in_profiles(&mut self, id: &str) -> Result<(), fbterm_config::ConfigError> {
+        let uses = |p: &fbterm_config::Profile| p.color_scheme.as_deref() == Some(id);
+        if self.profiles.profiles.iter().any(uses) {
+            let mut store = self.profiles.clone();
+            for p in store.profiles.iter_mut().filter(|p| uses(p)) {
+                p.color_scheme = None;
+            }
+            let path = self.paths.profiles();
+            store.save(&path)?;
+            self.profiles = store;
+            // Our own write is not an edit to pick up again.
+            self.profiles_seen = std::fs::read_to_string(&path).ok();
+            self.profiles_changed();
+        }
         if let Some((_, ed)) = &mut self.editor {
             ed.forget_scheme(id);
         }
-        let uses = |p: &fbterm_config::Profile| p.color_scheme.as_deref() == Some(id);
-        if !self.profiles.profiles.iter().any(uses) {
+        Ok(())
+    }
+
+    /// A global setting that names `id` goes back to Graphite: written to `settings.toml`
+    /// first, applied only once written.
+    fn forget_scheme_in_settings(
+        &mut self,
+        id: &str,
+        tasks: &mut Vec<Task<Message>>,
+    ) -> Result<(), fbterm_config::ConfigError> {
+        if self.settings.color_scheme != id {
             return Ok(());
         }
-        let mut store = self.profiles.clone();
-        for p in store.profiles.iter_mut().filter(|p| uses(p)) {
-            p.color_scheme = None;
+        let change = SettingChange::ColorScheme(FALLBACK.into());
+        let path = self.paths.settings();
+        Settings::write_field(&path, &change)?;
+        self.settings_seen = std::fs::read_to_string(&path).ok();
+        let mut next = self.settings.clone();
+        change.apply(&mut next);
+        tasks.push(self.apply_settings(next, SettingsSource::Window));
+        if let Some((_, s)) = &mut self.settings_win {
+            s.values.color_scheme = FALLBACK.into();
         }
-        let path = self.paths.profiles();
-        store.save(&path)?;
-        self.profiles = store;
-        // Our own write is not an edit to pick up again.
-        self.profiles_seen = std::fs::read_to_string(&path).ok();
-        self.profiles_changed();
         Ok(())
     }
 }

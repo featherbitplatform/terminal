@@ -340,7 +340,7 @@ impl SchemesState {
 
     /// Whether the hex field of `entry` holds a color (else it is drawn as an error).
     pub fn hex_valid(&self, entry: Entry) -> bool {
-        self.hex_text(entry).parse::<Rgb>().is_ok()
+        self.hex_text(entry).trim().parse::<Rgb>().is_ok()
     }
 
     /// The contrast hint for the selected scheme, if it is a user scheme under the bar.
