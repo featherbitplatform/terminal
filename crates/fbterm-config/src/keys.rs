@@ -215,7 +215,7 @@ impl Action {
             Self::OpenSettingsFile => "Open settings file".into(),
             Self::RevealConfigFolder => "Reveal config folder".into(),
             Self::ExportTab => "Export tab to file".into(),
-            Self::Find => "Find in tab".into(),
+            Self::Find => "Find in pane".into(),
             Self::FindAll => "Find in all tabs".into(),
             Self::FindNext => "Older match".into(),
             Self::FindPrevious => "Newer match".into(),

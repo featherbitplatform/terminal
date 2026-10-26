@@ -64,7 +64,7 @@ A page is the height of the terminal less one line, so the last line of the prev
 
 | Action | macOS | Linux and Windows |
 | --- | --- | --- |
-| Find in tab | `Cmd+F` | `Ctrl+Shift+F` |
+| Find in pane | `Cmd+F` | `Ctrl+Shift+F` |
 | Find in all tabs | `Cmd+Shift+F` | `Ctrl+Alt+F` |
 
 While the find bar is open:
@@ -99,7 +99,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Split right | Open the focused pane's profile in a new pane to its right. |
 | Split down | Open the focused pane's profile in a new pane below it. |
 | Maximize pane | Let the focused pane fill the tab, or restore the others. |
-| Find in tab | Open the active tab's find bar. |
+| Find in pane | Open the focused pane's find bar. |
 | Find in all tabs | Open the search over every tab. |
 | Find in this tab | Open the same search restricted to the panes of the current tab. |
 | Edit profiles | Open the profile editor. |
@@ -118,6 +118,7 @@ The palette searches profiles and actions as you type. These keys work while it 
 | `Up` or `Ctrl+P` | Move the selection up |
 | `Down` or `Ctrl+N` | Move the selection down |
 | `Enter` | Run the selected profile or action |
+| `Shift+Enter` | Open the selected profile in a split to the right of the focused pane (an action just runs) |
 | `Escape` | Close the palette |
 
 You can also click a row. The palette shows ten rows at a time.
@@ -161,14 +162,14 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Reserved for tiling features that are not available yet (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
 | `new_window`, `edit_profiles`, `settings` | New window, the profile editor, Settings |
-| `find`, `find_all`, `find_next`, `find_previous` | Find in tab, find in all tabs, older and newer match in the find bar |
+| `find`, `find_all`, `find_next`, `find_previous` | Find in pane, find in all tabs, older and newer match in the find bar |
 | `palette`, `open_settings_file`, `reveal_config_folder`, `quit` | The palette, the palette actions of the same names, quit |
 
 Edits to the table apply while the app runs, like every setting. An entry that names no action, a shortcut that cannot be read, is not allowed or is reserved, a shortcut another action already has, and `quit` on macOS are reported like other problems in `settings.toml`, with the file and line, and that action keeps its default; the rest of the file still applies. The Settings window writes only the lines of the actions you change there, keeping your comments (a comment above a removed line moves to the next one). An entry it could not read stays as you wrote it; an entry it could read but did not use (for example one that took another action's shortcut) is replaced when you change shortcuts there, so what runs is always what the file says.
 
 ## Search in detail
 
-**Find in tab** opens a slim bar over the top right of the active tab. Typing searches the tab's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again. `Shift+Enter` from the newest match wraps to the oldest match loaded so far: with more than a thousand matches that is not the oldest in the history until you have moved past them with `Enter`. Up to 10,000 matches are kept loaded; past that, `Enter` wraps to the newest.
+**Find in pane** opens a slim bar over the top right of the focused pane. Typing searches the tab's whole scrollback and screen as you type: every match in view is tinted, the current match is drawn in the accent color, and the view scrolls so the current match is visible. The counter reads `3 of 41` (`1 of 1000+` when there are more than a thousand; moving past the thousandth loads the older ones), `No matches` or `Invalid pattern`. Matches are numbered from the newest, so `Enter` walks back through the history and wraps around to the newest again. `Shift+Enter` from the newest match wraps to the oldest match loaded so far: with more than a thousand matches that is not the oldest in the history until you have moved past them with `Enter`. Up to 10,000 matches are kept loaded; past that, `Enter` wraps to the newest.
 
 - **Case:** the search ignores case unless the query has an uppercase letter.
 - **Plain text or regular expression:** plain text by default (every character matches itself). The `.*` button switches to regular expressions; an invalid one shows `Invalid pattern`. Queries longer than 512 characters show `Query too long`.

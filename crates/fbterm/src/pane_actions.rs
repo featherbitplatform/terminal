@@ -314,6 +314,29 @@ mod tests {
     }
 
     #[test]
+    fn shift_enter_refuses_a_split_below_the_minimum_size() {
+        use crate::palette::PaletteMsg;
+        let p = profile("a");
+        let other = profile("b");
+        let (mut app, _) = App::build(paths_with(&[p.clone(), other.clone()]), true);
+        app.state_saving_enabled = false;
+        let wid = window::Id::unique();
+        let first = Pane::for_profile(&p);
+        let a = first.id;
+        let mut w = WindowState::new();
+        w.push(Tab::single(first));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+        let tiny = Size::new(40.0, 40.0);
+        let _ = app.update(Message::Tiles(wid, TilesMsg::Area(tiny)));
+        app.grids.insert(a, grid(tiny));
+        let _ = app.open_palette(wid, "b".into());
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Submit { split: true }));
+        assert_eq!(tab(&app, wid).panes.len(), 1);
+        assert_eq!(app.windows[&wid].tabs.len(), 1);
+    }
+
+    #[test]
     fn split_right_adds_pane_of_same_profile() {
         let p = profile("a");
         let (mut app, wid, a) = app_with(&p, big());

@@ -330,6 +330,16 @@ impl App {
             return self.open_find_all(wid, String::new());
         }
         let scope = self.find_box.as_ref().and_then(|s| s.scope);
+        // The tab a scoped box searches is gone: close the box.
+        if scope.is_some_and(|id| {
+            !self
+                .windows
+                .values()
+                .any(|w| w.tabs.iter().any(|t| t.id == id))
+        }) {
+            self.close_find_all();
+            return Task::none();
+        }
         let targets = match msg {
             FindAllMsg::Query(_) | FindAllMsg::ToggleRegex => self.find_targets(scope),
             _ => Vec::new(),
@@ -713,5 +723,95 @@ mod tests {
                 .iter()
                 .all(|t| t.panes.iter().all(|p| p.find.is_none()))
         );
+    }
+
+    /// Both panes of the split tab get a bar with its own query, and its result delivered.
+    fn two_bars(app: &mut App, wid: window::Id, ids: &[PaneId]) {
+        for (id, q) in [(ids[0], "needle"), (ids[1], "right")] {
+            app.windows.get_mut(&wid).unwrap().tabs[0].focus(id);
+            let _ = app.find(wid, FindMsg::Open);
+            let _ = app.find(wid, FindMsg::Query(q.into()));
+            let pane = app.windows[&wid].tabs[0].pane(id).unwrap();
+            let bar = pane.find.as_ref().unwrap();
+            let seq = bar.pending.expect("searching").0;
+            let outcome = fbterm_term::search(
+                pane.terminal().unwrap(),
+                &fbterm_term::SearchRequest {
+                    pattern: bar.pattern().cloned().unwrap(),
+                    below: None,
+                    limit: fbterm_term::MATCH_CAP,
+                    snippets: false,
+                },
+                &std::sync::atomic::AtomicBool::new(false),
+            );
+            let _ = app.found(id, seq, outcome);
+        }
+    }
+
+    fn bar(app: &App, wid: window::Id, id: PaneId) -> &FindBar {
+        app.windows[&wid].tabs[0]
+            .pane(id)
+            .unwrap()
+            .find
+            .as_ref()
+            .unwrap()
+    }
+
+    #[test]
+    fn non_focused_pane_keeps_its_find_results() {
+        let (mut app, wid, ids) = app_with_split();
+        two_bars(&mut app, wid, &ids);
+        let (a, b) = (ids[0], ids[1]);
+        assert_eq!(bar(&app, wid, a).counter(), "1 of 1");
+        let a_counter = bar(&app, wid, a).counter();
+        assert_eq!(bar(&app, wid, b).counter(), "1 of 1");
+        // Output in B (focus is on B): only B's bar searches again.
+        let term = app.windows[&wid].tabs[0]
+            .pane(b)
+            .unwrap()
+            .terminal()
+            .unwrap()
+            .clone();
+        term.lock().feed(b"right again\r\n");
+        let _ = app.find_output(b);
+        assert!(bar(&app, wid, b).searching() || bar(&app, wid, b).refresh_scheduled);
+        assert!(!bar(&app, wid, a).searching());
+        assert!(!bar(&app, wid, a).refresh_scheduled);
+        assert_eq!(bar(&app, wid, a).counter(), a_counter);
+        assert_eq!(bar(&app, wid, a).query, "needle");
+        assert_eq!(bar(&app, wid, b).query, "right");
+        // Output for A while B has focus refreshes A's bar, not B's.
+        let _ = app.find_output(a);
+        assert!(!bar(&app, wid, a).searching(), "A saw no new output");
+    }
+
+    #[test]
+    fn resize_refreshes_only_that_panes_bar() {
+        let (mut app, wid, ids) = app_with_split();
+        two_bars(&mut app, wid, &ids);
+        let (a, b) = (ids[0], ids[1]);
+        assert!(!bar(&app, wid, a).searching() && !bar(&app, wid, b).searching());
+        let term = app.windows[&wid].tabs[0]
+            .pane(b)
+            .unwrap()
+            .terminal()
+            .unwrap()
+            .clone();
+        let mut size = term.lock().size();
+        size.cols += 7;
+        term.lock().resize(size);
+        let _ = app.find_resized(b);
+        assert!(bar(&app, wid, b).searching());
+        assert!(!bar(&app, wid, a).searching());
+    }
+
+    #[test]
+    fn a_scoped_box_closes_when_its_tab_closes() {
+        let (mut app, wid, _) = app_with_split();
+        let _ = app.find_in_tab(wid);
+        assert!(app.find_box.is_some());
+        let _ = app.close_tab(wid, 0);
+        let _ = app.find_all(wid, FindAllMsg::Query("x".into()));
+        assert!(app.find_box.is_none());
     }
 }
