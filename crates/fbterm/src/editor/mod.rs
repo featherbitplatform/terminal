@@ -60,6 +60,8 @@ pub enum EditorMsg {
     Reload,
     /// Open the file picker for the key path.
     PickKey,
+    /// Open the Color schemes window.
+    EditSchemes,
     KeyPicked(Option<PathBuf>),
 
     Select(ProfileId),
@@ -70,6 +72,8 @@ pub enum EditorMsg {
     Group(String),
     Accent(Option<Rgb>),
     AccentStyle(AccentStyle),
+    /// The profile's own scheme id, or `None` to follow the global one.
+    ColorScheme(Option<String>),
     Host(String),
     Port(String),
     User(String),
@@ -137,6 +141,8 @@ pub struct Draft {
     pub group: String,
     pub accent: Option<Rgb>,
     pub accent_style: AccentStyle,
+    /// Carried through unchanged until the form edits it.
+    pub color_scheme: Option<String>,
     pub kind: DraftKind,
 }
 
@@ -180,6 +186,7 @@ impl Draft {
             group: p.group.clone().unwrap_or_default(),
             accent: p.accent,
             accent_style: p.accent_style,
+            color_scheme: p.color_scheme.clone(),
             kind,
         }
     }
@@ -224,6 +231,7 @@ impl Draft {
             } else {
                 AccentStyle::default()
             },
+            color_scheme: self.color_scheme.clone(),
             kind,
         }
     }
@@ -443,6 +451,7 @@ impl EditorState {
             group: String::new(),
             accent: None,
             accent_style: AccentStyle::default(),
+            color_scheme: None,
             kind,
         };
         let id = draft.id;
@@ -544,6 +553,16 @@ impl EditorState {
         if changed {
             self.dirty = true;
             self.notice = None;
+        }
+    }
+
+    /// The scheme `id` was deleted and the saved profiles no longer use it: drafts that still
+    /// name it follow the global scheme too.
+    pub fn forget_scheme(&mut self, id: &str) {
+        for d in &mut self.drafts {
+            if d.color_scheme.as_deref() == Some(id) {
+                d.color_scheme = None;
+            }
         }
     }
 
@@ -708,6 +727,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::Group(v), _) => d.group = v,
         (EditorMsg::Accent(v), _) => d.accent = v,
         (EditorMsg::AccentStyle(v), _) => d.accent_style = v,
+        (EditorMsg::ColorScheme(v), _) => d.color_scheme = v,
         (EditorMsg::Host(v), DraftKind::Ssh(s)) => s.host = v,
         (EditorMsg::Port(v), DraftKind::Ssh(s)) => {
             // Digits only, a valid port or empty while typing.

@@ -249,6 +249,7 @@ impl App {
             .copied()
             .chain(self.editor_window())
             .chain(self.settings_window())
+            .chain(self.schemes_window())
             .collect();
         self.closing.extend(ids.iter().copied());
         Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
@@ -260,6 +261,7 @@ impl App {
         }
         if self.editor_window() == Some(id)
             || self.settings_window() == Some(id)
+            || self.schemes_window() == Some(id)
             || self.windows.len() > 1
         {
             self.close_window(id)

@@ -1,6 +1,7 @@
 //! Color schemes for the terminal widget.
 
 use fbterm_config::Rgb;
+use fbterm_config::schemes::SchemeColors;
 
 use crate::Terminal;
 
@@ -80,6 +81,18 @@ impl ColorScheme {
     }
 }
 
+impl From<&SchemeColors> for ColorScheme {
+    fn from(c: &SchemeColors) -> Self {
+        Self {
+            foreground: c.foreground,
+            background: c.background,
+            cursor: c.cursor,
+            selection: c.selection,
+            ansi: c.ansi,
+        }
+    }
+}
+
 /// `over * alpha + under * (1 - alpha)`, per channel.
 pub fn blend(over: Rgb, under: Rgb, alpha: f32) -> Rgb {
     let mix = |o: u8, u: u8| (f32::from(o) * alpha + f32::from(u) * (1.0 - alpha)).round() as u8;
@@ -92,20 +105,7 @@ pub fn blend(over: Rgb, under: Rgb, alpha: f32) -> Rgb {
 
 /// WCAG 2 contrast ratio between two colors (1.0 to 21.0).
 pub fn contrast_ratio(a: Rgb, b: Rgb) -> f32 {
-    fn luminance(c: Rgb) -> f32 {
-        let lin = |v: u8| {
-            let v = f32::from(v) / 255.0;
-            if v <= 0.040_45 {
-                v / 12.92
-            } else {
-                ((v + 0.055) / 1.055).powf(2.4)
-            }
-        };
-        0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
-    }
-    let (la, lb) = (luminance(a), luminance(b));
-    let (hi, lo) = if la > lb { (la, lb) } else { (lb, la) };
-    (hi + 0.05) / (lo + 0.05)
+    fbterm_config::schemes::contrast_ratio(a, b)
 }
 
 #[cfg(test)]
@@ -138,6 +138,13 @@ mod tests {
             let ratio = contrast_ratio(*c, s.background);
             assert!(ratio >= 4.5, "ansi {i} {c} has contrast {ratio:.2}");
         }
+    }
+
+    #[test]
+    fn graphite_matches_the_builtin_scheme() {
+        let builtin = fbterm_config::schemes::builtins().remove(0);
+        assert_eq!(builtin.id, "graphite");
+        assert_eq!(ColorScheme::from(&builtin.colors), ColorScheme::graphite());
     }
 
     #[test]

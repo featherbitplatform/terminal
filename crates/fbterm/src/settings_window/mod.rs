@@ -17,7 +17,8 @@ mod glue;
 pub mod view;
 
 pub use fonts::FontChoice;
-pub(crate) use glue::terminal_style;
+pub(crate) use fonts::{BUNDLED as BUNDLED_FONT, choices as font_choices, installed_monospace};
+pub(crate) use glue::{intern, terminal_style};
 
 /// Quiet period after the last slider or typing change before the file is written.
 pub const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -30,12 +31,16 @@ pub enum SettingsMsg {
     Close,
     OpenFile,
     RevealFolder,
+    /// Open the Color schemes window.
+    EditSchemes,
     /// The quiet period after change number `n` passed.
     Flush(u64),
     /// A slider was let go: write now.
     Release,
     Theme(ThemeMode),
     Font(FontChoice),
+    /// The id of the chosen global color scheme.
+    ColorScheme(String),
     FontSize(f32),
     FontSizeText(String),
     FontSizeSubmit,
@@ -180,7 +185,7 @@ pub struct SettingsState {
     generation: u64,
 }
 
-fn size_text(v: f32) -> String {
+pub(crate) fn size_text(v: f32) -> String {
     format!("{v}")
 }
 
@@ -385,7 +390,8 @@ impl SettingsState {
             SettingsMsg::Open
             | SettingsMsg::Close
             | SettingsMsg::OpenFile
-            | SettingsMsg::RevealFolder => Effect::NONE,
+            | SettingsMsg::RevealFolder
+            | SettingsMsg::EditSchemes => Effect::NONE,
             SettingsMsg::Flush(n) => match self.held_lower {
                 Some((v, at)) if at == n => {
                     self.held_lower = None;
@@ -411,6 +417,7 @@ impl SettingsState {
             },
             SettingsMsg::Theme(v) => self.change(SettingChange::Theme(v), false),
             SettingsMsg::Font(f) => self.change(SettingChange::FontFamily(f.family), false),
+            SettingsMsg::ColorScheme(id) => self.change(SettingChange::ColorScheme(id), false),
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),

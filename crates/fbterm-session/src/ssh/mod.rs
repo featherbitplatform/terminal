@@ -768,6 +768,7 @@ mod tests {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: "127.0.0.1".into(),
                 port: addr.port(),
@@ -820,6 +821,7 @@ mod tests {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: "10.0.0.5".into(),
                 port: 22,

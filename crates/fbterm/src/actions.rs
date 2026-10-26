@@ -70,6 +70,7 @@ impl App {
             Action::NewWindow => self.open_window(self.default_profile()),
             Action::EditProfiles => self.editor_msg(EditorMsg::Open),
             Action::Settings => self.settings_msg(SettingsMsg::Open),
+            Action::EditSchemes => self.open_schemes(None),
             Action::OpenSettingsFile => {
                 crate::config_files::open_settings_file(&self.paths);
                 Task::none()

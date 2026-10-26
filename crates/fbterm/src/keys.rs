@@ -166,7 +166,7 @@ pub fn modifiers(chord: Chord) -> Modifiers {
 mod tests {
     use super::*;
 
-    const ALL: [Action; 39] = [
+    const ALL: [Action; 40] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -185,6 +185,7 @@ mod tests {
         Action::Quit,
         Action::EditProfiles,
         Action::Settings,
+        Action::EditSchemes,
         Action::OpenSettingsFile,
         Action::RevealConfigFolder,
         Action::ExportTab,
