@@ -1,6 +1,6 @@
 # Tunnels: design
 
-Status: draft for the owner's review, 2026-10-27. Milestone 3 of
+Status: approved by the owner, 2026-10-27. Milestone 3 of
 `2026-10-23-featherbit-terminal-design.md` (sections 5.3 "Connection model" and 5.7), which this
 document refines. Where they differ, this document wins for tunnels.
 
@@ -67,11 +67,11 @@ approved)*, and stored in `profiles.toml` with the profile.
 reconnecting (with the attempt number); failed, with the reason. "With the shell" tunnels that are waiting for a shell show as off with
 a note that they start with the shell.
 
-**Panel.** A window like Settings, opened from the palette and from a small tunnels indicator in
+**Panel.** *(Approved by the owner 2026-10-27, with a search bar.)* A window like Settings, opened from the palette and from a small tunnels indicator in
 the tab bar that shows how many tunnels are up *(my guess, approved)*. It lists tunnels grouped
 by profile: name, kind, the addresses in plain form (`localhost:5432 → db.internal:5432 via
 bastion`), state, and an on/off switch (for "with the shell" tunnels the switch starts or stops
-it now, and the mode applies again the next time a shell opens). A failed tunnel offers Retry.
+it now, and the mode applies again the next time a shell opens). A failed tunnel offers Retry. A search bar at the top filters the list as you type, matching tunnel names and profile names (fuzzy, like the palette).
 
 **Palette.** Each tunnel appears as an action `Tunnel: <profile> / <name>`, toggling it, with its
 state shown on the row.
