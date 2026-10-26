@@ -310,6 +310,17 @@ pub fn write_file(path: &Path, scheme: &Scheme) -> Result<(), ConfigError> {
     atomic_write(path, text.as_bytes())
 }
 
+/// Whether `id` can name a scheme file: lowercase letters, digits, `-` and `_`, at most 100
+/// characters. Lowercase only and length-capped, so ids name the same file on case-insensitive
+/// file systems and stay short.
+pub fn is_plain_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 100
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
 /// Ids become file names, so only plain characters are allowed.
 fn check_user_id(dir: &Path, id: &str) -> Result<PathBuf, ConfigError> {
     let path = dir.join(format!("{id}.toml"));
@@ -320,13 +331,7 @@ fn check_user_id(dir: &Path, id: &str) -> Result<PathBuf, ConfigError> {
             format!("{id:?} is a built-in scheme"),
         ));
     }
-    // Lowercase only and length-capped, so ids name the same file on case-insensitive
-    // file systems and stay short.
-    let plain = !id.is_empty()
-        && id.len() <= 100
-        && id
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
+    let plain = is_plain_id(id);
     if !plain {
         return Err(ConfigError::new(
             &path,

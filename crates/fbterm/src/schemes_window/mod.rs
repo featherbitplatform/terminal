@@ -127,10 +127,6 @@ impl Entry {
 }
 
 /// The answer to an import whose id is already taken.
-#[allow(
-    dead_code,
-    reason = "import is declared here and wired with import and export"
-)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImportChoice {
     Replace,
@@ -141,12 +137,15 @@ pub enum ImportChoice {
 /// What the Color schemes window asks for. `Open`, `Close`, `Duplicate`, `Delete`,
 /// `ConfirmDelete`, `Save`, the import and export messages and `Preview` are the app's; the
 /// rest edit the window's state.
-#[allow(
-    dead_code,
-    reason = "the import and export messages are declared here and wired with import and export"
-)]
 #[derive(Debug, Clone)]
 pub enum SchemesMsg {
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "windows open through open_schemes; the message is for tests and callers that only have a message"
+        )
+    )]
     Open,
     Close,
     Select(String),
@@ -200,6 +199,28 @@ impl DeleteAsk {
                 "{n} profiles use it and will switch to the global scheme."
             )),
         }
+    }
+}
+
+/// The import question: a file whose id is already a user scheme.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImportAsk {
+    /// The scheme as read from the file.
+    pub scheme: Scheme,
+    /// The name of the scheme it would replace.
+    pub existing: String,
+}
+
+impl ImportAsk {
+    pub fn title(&self) -> String {
+        format!("\"{}\" is already installed", self.scheme.name)
+    }
+
+    pub fn body(&self) -> String {
+        format!(
+            "Replace \"{}\" with the imported scheme, or keep both?",
+            self.existing
+        )
     }
 }
 
@@ -266,6 +287,8 @@ pub struct SchemesState {
     pub renaming: bool,
     /// The delete question, while it is asked.
     pub confirm: Option<DeleteAsk>,
+    /// The import question, while it is asked.
+    pub import: Option<ImportAsk>,
     /// The outcome of the last action (`Saved`), shown in the footer.
     pub notice: Option<String>,
     /// What went wrong with the last action, shown in the footer.
@@ -287,6 +310,7 @@ impl SchemesState {
             hex: Vec::new(),
             renaming: false,
             confirm: None,
+            import: None,
             notice: None,
             error: None,
             installed,
@@ -420,7 +444,7 @@ impl SchemesState {
     }
 
     /// Select `id`: its hex fields show its colors.
-    fn select(&mut self, id: String) {
+    pub(super) fn select(&mut self, id: String) {
         self.selected = id;
         self.renaming = false;
         self.sync_hex();
@@ -449,6 +473,7 @@ impl SchemesState {
             }
             SchemesMsg::Edit(entry) => self.editing = entry,
             SchemesMsg::CancelDelete => self.confirm = None,
+            SchemesMsg::ImportChoice(ImportChoice::Cancel) => self.import = None,
             SchemesMsg::RenameEnd => self.renaming = false,
             msg if !self.editable() => drop(msg),
             SchemesMsg::RenameStart => self.renaming = true,

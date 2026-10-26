@@ -9,7 +9,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::{DeleteAsk, Entry, SchemesMsg, SchemesState};
+use super::{DeleteAsk, Entry, ImportAsk, ImportChoice, SchemesMsg, SchemesState};
 use crate::app::Message;
 use crate::settings_window::view::{menu_style, pick_style, slider_style};
 use crate::theme::{Tokens, UI_FONT};
@@ -49,9 +49,10 @@ pub fn view<'a>(
                 text_color: Some(t.text),
                 ..container::Style::default()
             });
-    match &state.confirm {
-        Some(ask) => stack![page, confirm(t, ask)].into(),
-        None => page.into(),
+    match (&state.confirm, &state.import) {
+        (Some(ask), _) => stack![page, confirm(t, ask)].into(),
+        (None, Some(ask)) => stack![page, import_question(t, ask)].into(),
+        (None, None) => page.into(),
     }
 }
 
@@ -564,8 +565,18 @@ fn footer<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messag
     }
     container(
         row![
-            ui::text_button(t, "Import\u{2026}", None, ui::secondary),
-            ui::text_button(t, "Export\u{2026}", None, ui::secondary),
+            ui::text_button(
+                t,
+                "Import\u{2026}",
+                Some(msg(SchemesMsg::Import)),
+                ui::secondary
+            ),
+            ui::text_button(
+                t,
+                "Export\u{2026}",
+                Some(msg(SchemesMsg::Export)),
+                ui::secondary
+            ),
             messages,
             ui::text_button(
                 t,
@@ -619,5 +630,42 @@ fn confirm<'a>(t: &'static Tokens, ask: &'a DeleteAsk) -> Element<'a, Message> {
         )
         .into(),
     ]));
+    crate::prompt_view::modal(t, body.into())
+}
+
+/// The question for an import whose id is taken: Replace, Keep both (the default, which loses
+/// nothing) or Cancel.
+fn import_question<'a>(t: &'static Tokens, ask: &'a ImportAsk) -> Element<'a, Message> {
+    let body = column![
+        crate::prompt_view::header(t, ui::ICON_WARNING, t.warning, ask.title()),
+        text(ask.body())
+            .font(UI_FONT)
+            .size(13)
+            .color(t.text_secondary),
+        crate::prompt_view::buttons(vec![
+            ui::text_button(
+                t,
+                "Cancel",
+                Some(msg(SchemesMsg::ImportChoice(ImportChoice::Cancel))),
+                ui::secondary,
+            )
+            .into(),
+            ui::text_button(
+                t,
+                "Replace",
+                Some(msg(SchemesMsg::ImportChoice(ImportChoice::Replace))),
+                ui::secondary,
+            )
+            .into(),
+            ui::text_button(
+                t,
+                "Keep both",
+                Some(msg(SchemesMsg::ImportChoice(ImportChoice::KeepBoth))),
+                ui::primary,
+            )
+            .into(),
+        ]),
+    ]
+    .spacing(14);
     crate::prompt_view::modal(t, body.into())
 }

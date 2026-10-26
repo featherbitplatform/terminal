@@ -13,7 +13,7 @@ use crate::find::all::FindAllMsg;
 use crate::keys::{self, Action, Bindings};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
-use crate::schemes_window::SchemesMsg;
+use crate::schemes_window::{ImportChoice, SchemesMsg};
 use crate::settings_window::SettingsMsg;
 
 /// How a [`Shortcuts`] wrapper treats keys.
@@ -48,6 +48,10 @@ pub(crate) enum Mode {
     /// The Color schemes window asking whether to delete a scheme: Enter deletes, Escape
     /// cancels, and no other key reaches a field behind the question or acts as a shortcut.
     SchemesConfirm,
+    /// The Color schemes window asking what to do with an imported scheme whose id is taken:
+    /// Enter keeps both, Escape cancels, and no other key reaches a field behind the question
+    /// or acts as a shortcut.
+    SchemesImport,
     /// The Settings window recording a new chord: every key press goes to the recorder (plain
     /// Escape cancels), none reaches a field or acts as a shortcut.
     Recording,
@@ -200,6 +204,15 @@ fn key_message(
             keyboard::Key::Named(Named::Enter) if !repeat => {
                 Some(Message::Schemes(SchemesMsg::ConfirmDelete))
             }
+            _ => None,
+        }),
+        Mode::SchemesImport => Some(match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => Some(Message::Schemes(
+                SchemesMsg::ImportChoice(ImportChoice::Cancel),
+            )),
+            keyboard::Key::Named(Named::Enter) if !repeat => Some(Message::Schemes(
+                SchemesMsg::ImportChoice(ImportChoice::KeepBoth),
+            )),
             _ => None,
         }),
         Mode::Recording => Some(recording_key(key, mods, repeat)),
@@ -710,6 +723,40 @@ mod tests {
             press(Mode::SchemesConfirm, "w", false),
             Some(None)
         ));
+    }
+
+    #[test]
+    fn the_import_question_takes_enter_and_escape_only() {
+        let at = |key: keyboard::Key| {
+            key_message(
+                &defaults(),
+                Mode::SchemesImport,
+                window::Id::unique(),
+                &key,
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        use keyboard::key::Named;
+        let named = |n| keyboard::Key::Named(n);
+        assert!(matches!(
+            at(named(Named::Escape)),
+            Some(Some(Message::Schemes(SchemesMsg::ImportChoice(
+                ImportChoice::Cancel
+            ))))
+        ));
+        assert!(matches!(
+            at(named(Named::Enter)),
+            Some(Some(Message::Schemes(SchemesMsg::ImportChoice(
+                ImportChoice::KeepBoth
+            ))))
+        ));
+        assert!(matches!(
+            at(keyboard::Key::Character("a".into())),
+            Some(None)
+        ));
+        assert!(matches!(press(Mode::SchemesImport, "w", false), Some(None)));
     }
 
     #[test]

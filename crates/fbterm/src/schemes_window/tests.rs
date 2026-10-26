@@ -4,7 +4,7 @@
 use fbterm_config::schemes::{Scheme, SchemeSet, read_file};
 use fbterm_config::{ProfileStore, Settings};
 
-use super::{CONTRAST_HINT, DeleteAsk, Entry, SchemesMsg, SchemesState};
+use super::{CONTRAST_HINT, DeleteAsk, Entry, ImportChoice, SchemesMsg, SchemesState};
 use crate::app::{App, Message};
 use crate::editor::EditorMsg;
 use crate::keys::Action;
@@ -643,4 +643,168 @@ fn preview_resize_does_not_loop() {
     }
     // ...so laying it out the same way again reports nothing.
     assert!(resized(&run(win(&app))).is_empty());
+}
+
+/// A scratch directory inside the app's config directory, for files outside `schemes/`.
+fn scratch(app: &App) -> std::path::PathBuf {
+    let dir = app.paths.schemes().parent().unwrap().join("scratch");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+fn files_in_schemes(app: &App) -> usize {
+    std::fs::read_dir(app.paths.schemes())
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn export_writes_a_loadable_file() {
+    let mine = user_scheme("Mine", 0x101010);
+    let (mut app, _, _, _) = app_with(
+        &[fbterm_config_profile("a")],
+        "",
+        std::slice::from_ref(&mine),
+    );
+    open(&mut app, &mine.id);
+    let out = scratch(&app).join("mine.toml");
+    send(&mut app, SchemesMsg::Exported(Some(out.clone())));
+    assert_eq!(read_file(&out).unwrap(), mine);
+    assert_eq!(win(&app).notice.as_deref(), Some("Exported"));
+    // A built-in exports too.
+    send(&mut app, SchemesMsg::Select("harbor".into()));
+    let out = scratch(&app).join("harbor.toml");
+    send(&mut app, SchemesMsg::Exported(Some(out.clone())));
+    let back = read_file(&out).unwrap();
+    assert_eq!(back.id, "harbor");
+    assert_eq!(back.colors, builtin("harbor").colors);
+    // Cancelling the dialog does nothing.
+    send(&mut app, SchemesMsg::Exported(None));
+    assert!(win(&app).error.is_none());
+}
+
+#[test]
+fn import_copies_into_schemes_dir() {
+    let other = user_scheme("Elsewhere", 0x303030);
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    let src = scratch(&app).join("in.toml");
+    fbterm_config::schemes::write_file(&src, &other).unwrap();
+    send(&mut app, SchemesMsg::Imported(Some(src)));
+    assert_eq!(read_file(&file(&app, &other.id)).unwrap(), other);
+    assert_eq!(app.schemes.get(&other.id), Some(&other));
+    assert_eq!(win(&app).selected, other.id);
+    assert!(win(&app).error.is_none());
+    assert!(win(&app).import.is_none());
+}
+
+#[test]
+fn import_invalid_file_shows_error() {
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    let src = scratch(&app).join("bad.toml");
+    std::fs::write(&src, "id = \"x\"\nname = \"X\"\n[colors]\nforeground = 5\n").unwrap();
+    send(&mut app, SchemesMsg::Imported(Some(src.clone())));
+    let err = win(&app).error.clone().expect("error shown");
+    assert!(err.contains("bad.toml"), "{err}");
+    assert!(err.contains(":"), "{err}");
+    assert_eq!(files_in_schemes(&app), 0);
+    assert_eq!(win(&app).selected, "graphite");
+    // A file that does not exist is an error too.
+    send(
+        &mut app,
+        SchemesMsg::Imported(Some(src.with_file_name("none.toml"))),
+    );
+    assert!(win(&app).error.as_deref().unwrap().contains("none.toml"));
+}
+
+#[test]
+fn import_builtin_id_gets_new_id() {
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    let mut s = builtin("harbor");
+    s.builtin = false;
+    let src = scratch(&app).join("harbor.toml");
+    fbterm_config::schemes::write_file(&src, &s).unwrap();
+    send(&mut app, SchemesMsg::Imported(Some(src)));
+    assert!(win(&app).import.is_none(), "no question for a built-in id");
+    let id = win(&app).selected.clone();
+    assert!(id.starts_with("user-"), "{id}");
+    let got = app.schemes.get(&id).expect("loaded");
+    assert!(!got.builtin);
+    assert_eq!(got.colors, builtin("harbor").colors);
+    assert_eq!(got.name, "Harbor");
+    // The built-in is untouched.
+    assert!(app.schemes.get("harbor").unwrap().builtin);
+}
+
+#[test]
+fn import_invalid_id_gets_new_id() {
+    let (mut app, _, _, _) = app_with(&[fbterm_config_profile("a")], "", &[]);
+    open(&mut app, "graphite");
+    for bad in ["Has Upper", "bad/slash", &"a".repeat(101)] {
+        let mut s = user_scheme("Odd", 0x404040);
+        s.id = bad.to_owned();
+        let src = scratch(&app).join("odd.toml");
+        fbterm_config::schemes::write_file(&src, &s).unwrap();
+        send(&mut app, SchemesMsg::Imported(Some(src)));
+        assert!(win(&app).error.is_none(), "{bad}: {:?}", win(&app).error);
+        let id = win(&app).selected.clone();
+        assert!(id.starts_with("user-"), "{bad} -> {id}");
+        assert_eq!(app.schemes.get(&id).unwrap().name, "Odd");
+    }
+    assert_eq!(files_in_schemes(&app), 3);
+}
+
+#[test]
+fn import_same_id_keeps_both_with_new_id() {
+    let mine = user_scheme("Mine", 0x101010);
+    let (mut app, _, _, _) = app_with(
+        &[fbterm_config_profile("a")],
+        "",
+        std::slice::from_ref(&mine),
+    );
+    open(&mut app, "graphite");
+    let mut incoming = mine.clone();
+    incoming.colors.background = rgb(0x505050);
+    let src = scratch(&app).join("same.toml");
+    fbterm_config::schemes::write_file(&src, &incoming).unwrap();
+    send(&mut app, SchemesMsg::Imported(Some(src)));
+    assert!(win(&app).import.is_some(), "asks first");
+    assert_eq!(files_in_schemes(&app), 1);
+    send(&mut app, SchemesMsg::ImportChoice(ImportChoice::KeepBoth));
+    assert!(win(&app).import.is_none());
+    assert_eq!(files_in_schemes(&app), 2);
+    assert_eq!(app.schemes.get(&mine.id), Some(&mine));
+    let id = win(&app).selected.clone();
+    assert_ne!(id, mine.id);
+    let got = app.schemes.get(&id).unwrap();
+    assert_eq!(got.name, "Mine (imported)");
+    assert_eq!(got.colors.background, rgb(0x505050));
+    // Cancel imports nothing.
+    let src = scratch(&app).join("same.toml");
+    send(&mut app, SchemesMsg::Imported(Some(src)));
+    send(&mut app, SchemesMsg::ImportChoice(ImportChoice::Cancel));
+    assert!(win(&app).import.is_none());
+    assert_eq!(files_in_schemes(&app), 2);
+}
+
+#[test]
+fn import_same_id_replace_updates_and_reapplies() {
+    let mine = user_scheme("Mine", 0x101010);
+    let a = with_scheme(&fbterm_config_profile("a"), &mine.id);
+    let (mut app, _, wid, ids) = app_with(&[a], "", std::slice::from_ref(&mine));
+    open(&mut app, "graphite");
+    let mut incoming = mine.clone();
+    incoming.name = "Mine v2".into();
+    incoming.colors.background = rgb(0x505050);
+    let src = scratch(&app).join("same.toml");
+    fbterm_config::schemes::write_file(&src, &incoming).unwrap();
+    send(&mut app, SchemesMsg::Imported(Some(src)));
+    send(&mut app, SchemesMsg::ImportChoice(ImportChoice::Replace));
+    assert_eq!(files_in_schemes(&app), 1);
+    assert_eq!(read_file(&file(&app, &mine.id)).unwrap(), incoming);
+    assert_eq!(app.schemes.get(&mine.id), Some(&incoming));
+    assert_eq!(win(&app).selected, mine.id);
+    assert_eq!(style(&app, wid, ids[0]).scheme.background, rgb(0x505050));
 }

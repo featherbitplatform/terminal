@@ -86,6 +86,8 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             window: id,
             mode: if state.confirm.is_some() {
                 Mode::SchemesConfirm
+            } else if state.import.is_some() {
+                Mode::SchemesImport
             } else {
                 Mode::Schemes
             },

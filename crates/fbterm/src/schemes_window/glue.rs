@@ -1,12 +1,16 @@
 //! The app side of the Color schemes window: opening it, and the actions that touch files and
-//! open sessions (save, duplicate, delete).
+//! open sessions (save, duplicate, delete, import, export).
 
-use fbterm_config::schemes::{delete_user, save_user};
+use std::path::PathBuf;
+
+use fbterm_config::schemes::{
+    BUILTIN_IDS, Scheme, delete_user, is_plain_id, new_user_id, read_file, save_user, write_file,
+};
 use fbterm_config::{SettingChange, Settings};
 use fbterm_term::TerminalOutput;
 use iced::{Task, window};
 
-use super::{DeleteAsk, SchemesMsg, SchemesState};
+use super::{DeleteAsk, ImportAsk, ImportChoice, SchemesMsg, SchemesState};
 use crate::app::{App, Message, SettingsSource};
 use crate::chrome::Chrome;
 
@@ -61,13 +65,12 @@ impl App {
                 }
                 Task::none()
             }
-            // Task 6: import and export.
-            SchemesMsg::Import
-            | SchemesMsg::Imported(_)
-            | SchemesMsg::ImportChoice(_)
-            | SchemesMsg::Export
-            | SchemesMsg::Exported(_)
-            | SchemesMsg::Preview(_) => Task::none(),
+            SchemesMsg::Import => self.pick_import(),
+            SchemesMsg::Imported(path) => self.imported(path),
+            SchemesMsg::ImportChoice(choice) => self.import_choice(choice),
+            SchemesMsg::Export => self.pick_export(),
+            SchemesMsg::Exported(path) => self.exported(path),
+            SchemesMsg::Preview(_) => Task::none(),
             other => {
                 if let Some((_, state)) = &mut self.schemes_win {
                     state.update(other);
@@ -258,4 +261,164 @@ impl App {
         }
         Ok(())
     }
+
+    /// Open the Open dialog for a scheme file, parented to the window.
+    fn pick_import(&mut self) -> Task<Message> {
+        let Some(id) = self.schemes_window() else {
+            return Task::none();
+        };
+        window::run(id, |w| {
+            rfd::AsyncFileDialog::new()
+                .set_title("Import color scheme")
+                .add_filter("Color scheme (.toml)", &["toml"])
+                .set_parent(w)
+        })
+        .then(|d| {
+            Task::perform(
+                async move { d.pick_file().await.map(|f| f.path().to_path_buf()) },
+                |path| Message::Schemes(SchemesMsg::Imported(path)),
+            )
+        })
+    }
+
+    /// Open the Save dialog for the selected scheme, parented to the window.
+    fn pick_export(&mut self) -> Task<Message> {
+        let Some((id, state)) = &mut self.schemes_win else {
+            return Task::none();
+        };
+        let Some(d) = state.selected_draft() else {
+            return Task::none();
+        };
+        let name = export_file_name(&d.name);
+        let id = *id;
+        window::run(id, move |w| {
+            rfd::AsyncFileDialog::new()
+                .set_title("Export color scheme")
+                .set_file_name(name)
+                .add_filter("Color scheme (.toml)", &["toml"])
+                .set_parent(w)
+        })
+        .then(|d| {
+            Task::perform(
+                async move { d.save_file().await.map(|f| f.path().to_path_buf()) },
+                |path| Message::Schemes(SchemesMsg::Exported(path)),
+            )
+        })
+    }
+
+    /// Write the selected scheme (a built-in too) to the chosen path.
+    fn exported(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        let Some((_, state)) = &mut self.schemes_win else {
+            return Task::none();
+        };
+        let Some(scheme) = state.selected_draft().cloned() else {
+            return Task::none();
+        };
+        match write_file(&path, &scheme) {
+            Ok(()) => {
+                tracing::info!(id = %scheme.id, "scheme exported");
+                state.error = None;
+                state.notice = Some("Exported".into());
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "scheme not exported");
+                state.notice = None;
+                state.error = Some(format!("Could not export: {e}"));
+            }
+        }
+        Task::none()
+    }
+
+    /// Read the chosen file. A file that does not read shows its error (with file and line).
+    /// A built-in or unusable id gets a fresh one; an id that is already a user scheme asks.
+    fn imported(&mut self, path: Option<PathBuf>) -> Task<Message> {
+        let Some(path) = path else {
+            return Task::none();
+        };
+        let Some((_, state)) = &mut self.schemes_win else {
+            return Task::none();
+        };
+        state.notice = None;
+        state.import = None;
+        let mut scheme = match read_file(&path) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "scheme not imported");
+                state.error = Some(format!("Could not import: {e}"));
+                return Task::none();
+            }
+        };
+        state.error = None;
+        if BUILTIN_IDS.contains(&scheme.id.as_str()) || !is_plain_id(&scheme.id) {
+            scheme.id = new_user_id();
+        } else if let Some(existing) = self.schemes.get(&scheme.id) {
+            state.import = Some(ImportAsk {
+                scheme,
+                existing: existing.name.clone(),
+            });
+            return Task::none();
+        }
+        self.install_imported(scheme)
+    }
+
+    fn import_choice(&mut self, choice: ImportChoice) -> Task<Message> {
+        let Some((_, state)) = &mut self.schemes_win else {
+            return Task::none();
+        };
+        let Some(ask) = state.import.take() else {
+            return Task::none();
+        };
+        let mut scheme = ask.scheme;
+        match choice {
+            ImportChoice::Cancel => return Task::none(),
+            ImportChoice::Replace => {}
+            ImportChoice::KeepBoth => {
+                scheme.id = new_user_id();
+                scheme.name = format!("{} (imported)", scheme.name.trim());
+            }
+        }
+        self.install_imported(scheme)
+    }
+
+    /// Copy `scheme` into `schemes/`, load the set again (which recolors the panes that use a
+    /// replaced scheme) and select it.
+    fn install_imported(&mut self, scheme: Scheme) -> Task<Message> {
+        let dir = self.paths.schemes();
+        let Some((_, state)) = &mut self.schemes_win else {
+            return Task::none();
+        };
+        if let Err(e) = save_user(&dir, &scheme) {
+            tracing::warn!(error = %e, "imported scheme not saved");
+            state.error = Some(format!("Could not import: {e}"));
+            return Task::none();
+        }
+        tracing::info!(id = %scheme.id, "scheme imported");
+        state.notice = Some(format!("Imported \"{}\"", scheme.name.trim()));
+        let task = self.reload_schemes();
+        if let Some((_, state)) = &mut self.schemes_win
+            && state.draft(&scheme.id).is_some()
+        {
+            state.select(scheme.id);
+        }
+        task
+    }
+}
+
+/// The suggested file name of an export: the scheme's name as plain characters.
+fn export_file_name(name: &str) -> String {
+    let stem: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{}.toml", if stem.is_empty() { "scheme" } else { &stem })
 }
