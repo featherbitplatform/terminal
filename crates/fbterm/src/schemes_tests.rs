@@ -357,6 +357,7 @@ fn new_ssh_or_restarted_terminal_gets_pane_scheme() {
             user: "sample".into(),
             auth: AuthMethod::Agent,
             jump: vec![],
+            tunnels: Vec::new(),
         }),
     };
     let local = profile("local");

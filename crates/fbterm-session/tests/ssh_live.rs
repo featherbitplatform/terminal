@@ -52,6 +52,7 @@ fn profile(auth: AuthMethod) -> Profile {
             user: USER.into(),
             auth,
             jump: vec![],
+            tunnels: Vec::new(),
         }),
     }
 }
@@ -608,6 +609,7 @@ mod pool {
                     passphrase: false,
                 },
                 jump,
+                tunnels: Vec::new(),
             }),
         }
     }

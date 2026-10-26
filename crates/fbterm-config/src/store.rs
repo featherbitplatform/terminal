@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::profile::{Profile, ProfileId, ProfileKind, SshProfile};
+use crate::profile::{Profile, ProfileId, ProfileKind, SshProfile, TunnelKind};
 
 /// Failure to read, parse or write a configuration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +44,9 @@ pub enum ValidationError {
     JumpNotSsh { profile: String },
     JumpCycle { profile: String },
     EmptyHost(String),
+    EmptyTunnelName { profile: String },
+    DuplicateTunnel { profile: String, name: String },
+    TunnelPort { profile: String, name: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -61,6 +64,18 @@ impl fmt::Display for ValidationError {
             }
             Self::JumpCycle { profile } => write!(f, "profile {profile:?} has a jump cycle"),
             Self::EmptyHost(n) => write!(f, "profile {n:?} has an empty host"),
+            Self::EmptyTunnelName { profile } => {
+                write!(f, "profile {profile:?} has a tunnel without a name")
+            }
+            Self::DuplicateTunnel { profile, name } => {
+                write!(f, "profile {profile:?} has two tunnels named {name:?}")
+            }
+            Self::TunnelPort { profile, name } => {
+                write!(
+                    f,
+                    "tunnel {name:?} of profile {profile:?} needs a port above 0"
+                )
+            }
         }
     }
 }
@@ -152,6 +167,32 @@ impl ProfileStore {
             };
             if ssh.host.trim().is_empty() {
                 errors.push(ValidationError::EmptyHost(p.name.clone()));
+            }
+            let mut tunnel_names = HashSet::new();
+            let mut reported_tunnels = HashSet::new();
+            for t in &ssh.tunnels {
+                let name = t.name.trim();
+                if name.is_empty() {
+                    errors.push(ValidationError::EmptyTunnelName {
+                        profile: p.name.clone(),
+                    });
+                } else if !tunnel_names.insert(name) && reported_tunnels.insert(name) {
+                    errors.push(ValidationError::DuplicateTunnel {
+                        profile: p.name.clone(),
+                        name: t.name.clone(),
+                    });
+                }
+                // A remote bind may use 0: the server picks the port.
+                let zero = matches!(
+                    t.kind,
+                    TunnelKind::Local { port: 0, .. } | TunnelKind::Socks { port: 0, .. }
+                );
+                if zero {
+                    errors.push(ValidationError::TunnelPort {
+                        profile: p.name.clone(),
+                        name: t.name.clone(),
+                    });
+                }
             }
             for &j in &ssh.jump {
                 match self.get(j) {

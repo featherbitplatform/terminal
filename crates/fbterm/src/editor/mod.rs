@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use fbterm_config::{
     AccentStyle, AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind,
-    ProfileStore, Rgb, SshProfile, ValidationError,
+    ProfileStore, Rgb, SshProfile, TunnelDef, ValidationError,
 };
 use fbterm_secrets::{SecretKind, SecretStore};
 
@@ -110,6 +110,8 @@ pub struct SshDraft {
     pub key_path: String,
     pub key_passphrase: bool,
     pub jump: Vec<ProfileId>,
+    /// Carried through unchanged until the form edits them.
+    pub tunnels: Vec<TunnelDef>,
     /// Typed secret for the chosen auth; empty keeps whatever the keychain has.
     pub secret: String,
 }
@@ -176,6 +178,7 @@ impl Draft {
                     key_path,
                     key_passphrase,
                     jump: s.jump.clone(),
+                    tunnels: s.tunnels.clone(),
                     secret: String::new(),
                 })
             }
@@ -215,6 +218,7 @@ impl Draft {
                     AuthChoice::Agent => AuthMethod::Agent,
                 },
                 jump: s.jump.clone(),
+                tunnels: s.tunnels.clone(),
             }),
         };
         Profile {
@@ -477,6 +481,7 @@ impl EditorState {
                 key_path: String::new(),
                 key_passphrase: false,
                 jump: Vec::new(),
+                tunnels: Vec::new(),
                 secret: String::new(),
             }),
         )

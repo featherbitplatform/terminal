@@ -111,6 +111,8 @@ pub struct Settings {
     pub background_blur: bool,
     /// Most redraws per second caused by program output.
     pub max_fps: MaxFps,
+    /// Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
+    pub tunnel_max_retries: u32,
     /// Keyboard shortcuts changed from their defaults (the `[keys]` table).
     pub keys: KeyOverrides,
 }
@@ -127,6 +129,7 @@ impl Default for Settings {
             background_opacity: 1.0,
             background_blur: false,
             max_fps: MaxFps::default(),
+            tunnel_max_retries: 10,
             keys: KeyOverrides::default(),
         }
     }
@@ -137,6 +140,8 @@ pub const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
 /// Allowed range of `background_opacity`. Not quite zero: fully clear pixels can let clicks
 /// through to what is behind the window and leave nothing of it visible.
 pub const OPACITY_RANGE: (f32, f32) = (0.05, 1.0);
+/// Allowed range of `tunnel_max_retries`.
+pub const TUNNEL_RETRIES_RANGE: (u32, u32) = (0, 100);
 /// Allowed range of `scrollback_lines`.
 pub const SCROLLBACK_RANGE: (usize, usize) = (0, 1_000_000);
 /// Above this many lines the Settings window notes that resizing can pause while history
@@ -219,6 +224,18 @@ impl Settings {
                 ),
             ));
             self.scrollback_lines = used;
+        }
+        let (lo, hi) = TUNNEL_RETRIES_RANGE;
+        if !(lo..=hi).contains(&self.tunnel_max_retries) {
+            let used = self.tunnel_max_retries.clamp(lo, hi);
+            problems.push((
+                "tunnel_max_retries".into(),
+                format!(
+                    "tunnel_max_retries {} is out of range ({lo} to {hi}), using {used}",
+                    self.tunnel_max_retries
+                ),
+            ));
+            self.tunnel_max_retries = used;
         }
         let (lo, hi) = OPACITY_RANGE;
         if !(lo..=hi).contains(&self.background_opacity) {
@@ -333,6 +350,9 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Caps redraws caused by program output; typing always redraws immediately. Higher values
 # use more CPU while output streams.
 #max_fps = 60
+
+# Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
+#tunnel_max_retries = 10
 
 # Keyboard shortcuts changed from their defaults, by action. The Keyboard section of the
 # Settings window lists every action with its chord and changes them for you.

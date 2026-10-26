@@ -822,6 +822,7 @@ mod tests {
                 user: "root".into(),
                 auth: AuthMethod::Password,
                 jump,
+                tunnels: Vec::new(),
             }),
         };
         let bastion = ssh("bastion", "b.example.com", vec![]);

@@ -23,6 +23,7 @@ fn ssh(name: &str, jump: Vec<ProfileId>) -> Profile {
             user: "root".into(),
             auth: AuthMethod::Agent,
             jump,
+            tunnels: Vec::new(),
         }),
     }
 }
@@ -685,4 +686,183 @@ fn old_profiles_file_loads_without_color_scheme() {
         ProfileStore::load(&path).unwrap().profiles[0].color_scheme,
         None
     );
+}
+
+fn ssh_mut(p: &mut Profile) -> &mut SshProfile {
+    match &mut p.kind {
+        ProfileKind::Ssh(s) => s,
+        _ => panic!("expected ssh"),
+    }
+}
+
+fn local_tunnel(name: &str, port: u16) -> TunnelDef {
+    TunnelDef {
+        name: name.into(),
+        kind: TunnelKind::Local {
+            bind: "127.0.0.1".into(),
+            port,
+            host: "db.internal".into(),
+            host_port: 5432,
+        },
+        start: StartMode::OnDemand,
+    }
+}
+
+#[test]
+fn tunnels_round_trip_and_are_omitted_when_empty() {
+    let path = tmp("profiles.toml");
+    let mut with = ssh("with", vec![]);
+    ssh_mut(&mut with).tunnels = vec![
+        local_tunnel("db", 5432),
+        TunnelDef {
+            name: "web".into(),
+            kind: TunnelKind::Remote {
+                bind: "0.0.0.0".into(),
+                port: 8080,
+                host: "localhost".into(),
+                host_port: 3000,
+            },
+            start: StartMode::WithShell,
+        },
+        TunnelDef {
+            name: "proxy".into(),
+            kind: TunnelKind::Socks {
+                bind: "127.0.0.1".into(),
+                port: 1080,
+            },
+            start: StartMode::OnDemand,
+        },
+    ];
+    let store = ProfileStore {
+        profiles: vec![ssh("without", vec![]), with],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("tunnels").count(), 3, "{text}");
+    assert_eq!(text.matches("start = ").count(), 1, "{text}");
+    assert!(text.contains("start = \"with_shell\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn tunnel_defaults_bind_loopback_and_on_demand() {
+    let path = tmp("profiles.toml");
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"agent\" }\ntunnels = [\n  { name = \"db\", kind = \"local\", port = 5432, host = \"db.internal\", host_port = 5432 },\n  { name = \"s\", kind = \"socks\", port = 1080 },\n]\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("expected ssh")
+    };
+    assert_eq!(s.tunnels[0], local_tunnel("db", 5432));
+    assert_eq!(
+        s.tunnels[1].kind,
+        TunnelKind::Socks {
+            bind: "127.0.0.1".into(),
+            port: 1080
+        }
+    );
+    assert_eq!(s.tunnels[1].start, StartMode::OnDemand);
+    assert!(!s.tunnels[0].non_loopback());
+}
+
+#[test]
+fn old_profiles_load_without_tunnels() {
+    let path = tmp("profiles.toml");
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"agent\" }\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("expected ssh")
+    };
+    assert!(s.tunnels.is_empty());
+}
+
+#[test]
+fn duplicate_tunnel_name_is_invalid() {
+    let mut a = ssh("a", vec![]);
+    ssh_mut(&mut a).tunnels = vec![local_tunnel("db", 1), local_tunnel("db", 2)];
+    let errs = ProfileStore { profiles: vec![a] }.validate();
+    assert_eq!(
+        errs,
+        vec![ValidationError::DuplicateTunnel {
+            profile: "a".into(),
+            name: "db".into()
+        }]
+    );
+}
+
+#[test]
+fn empty_tunnel_name_is_invalid() {
+    let mut a = ssh("a", vec![]);
+    ssh_mut(&mut a).tunnels = vec![local_tunnel("  ", 1)];
+    let errs = ProfileStore { profiles: vec![a] }.validate();
+    assert_eq!(
+        errs,
+        vec![ValidationError::EmptyTunnelName {
+            profile: "a".into()
+        }]
+    );
+}
+
+#[test]
+fn local_port_zero_is_invalid() {
+    let mut a = ssh("a", vec![]);
+    ssh_mut(&mut a).tunnels = vec![
+        local_tunnel("db", 0),
+        TunnelDef {
+            name: "proxy".into(),
+            kind: TunnelKind::Socks {
+                bind: "127.0.0.1".into(),
+                port: 0,
+            },
+            start: StartMode::OnDemand,
+        },
+        TunnelDef {
+            name: "rev".into(),
+            kind: TunnelKind::Remote {
+                bind: "127.0.0.1".into(),
+                port: 0,
+                host: "localhost".into(),
+                host_port: 80,
+            },
+            start: StartMode::OnDemand,
+        },
+    ];
+    let errs = ProfileStore { profiles: vec![a] }.validate();
+    assert_eq!(
+        errs,
+        vec![
+            ValidationError::TunnelPort {
+                profile: "a".into(),
+                name: "db".into()
+            },
+            ValidationError::TunnelPort {
+                profile: "a".into(),
+                name: "proxy".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn tunnel_max_retries_defaults_clamps_and_writes() {
+    assert_eq!(Settings::default().tunnel_max_retries, 10);
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "tunnel_max_retries = 500\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.tunnel_max_retries, 100);
+    assert!(warning.unwrap().message.contains("tunnel_max_retries"));
+    std::fs::write(&path, "tunnel_max_retries = 0\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.tunnel_max_retries, 0);
+    assert!(warning.is_none());
+    Settings::write_field(&path, &SettingChange::TunnelMaxRetries(7)).unwrap();
+    assert_eq!(Settings::load(&path).unwrap().tunnel_max_retries, 7);
+    assert!(SETTINGS_TEMPLATE.contains("#tunnel_max_retries = 10"));
 }

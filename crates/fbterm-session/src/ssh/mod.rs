@@ -775,6 +775,7 @@ mod tests {
                 user: "u".into(),
                 auth: fbterm_config::AuthMethod::Password,
                 jump: vec![],
+                tunnels: Vec::new(),
             }),
         };
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -828,6 +829,7 @@ mod tests {
                 user: "u".into(),
                 auth: fbterm_config::AuthMethod::Agent,
                 jump: vec![],
+                tunnels: Vec::new(),
             }),
         };
         match in_hop(&p, timed_out("no answer".into())) {

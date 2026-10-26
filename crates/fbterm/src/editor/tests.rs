@@ -83,6 +83,7 @@ fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
             user: "fb".into(),
             auth: AuthMethod::Agent,
             jump,
+            tunnels: Vec::new(),
         }),
     }
 }
