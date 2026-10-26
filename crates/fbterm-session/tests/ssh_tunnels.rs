@@ -709,27 +709,47 @@ async fn connection_counts_are_reported() {
 }
 
 /// A TCP proxy to the bastion's sshd that a test can cut (every live connection drops, as
-/// when the server restarts) or shut (nothing listens any more: the server is unreachable).
+/// when the server restarts), cut on this side only (the server notices later, as when the
+/// network drops) or shut (nothing listens any more: the server is unreachable).
 struct Proxy {
     port: u16,
     accept: tokio::task::JoinHandle<()>,
-    pipes: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>>,
+    pipes: Arc<parking_lot::Mutex<Vec<Pipe>>>,
+}
+
+/// One proxied connection.
+struct Pipe {
+    task: tokio::task::AbortHandle,
+    /// Closes the client side and keeps the server side open for the given time.
+    linger: tokio::sync::watch::Sender<Option<Duration>>,
 }
 
 impl Proxy {
     async fn new() -> Self {
         let listener = TcpListener::bind((HOST, 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let pipes: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> = Arc::default();
+        let pipes: Arc<parking_lot::Mutex<Vec<Pipe>>> = Arc::default();
         let tracked = pipes.clone();
         let accept = tokio::spawn(async move {
             while let Ok((mut client, _)) = listener.accept().await {
-                let pipe = tokio::spawn(async move {
-                    if let Ok(mut server) = TcpStream::connect((HOST, PORT)).await {
-                        let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                let (linger, mut lingering) = tokio::sync::watch::channel(None);
+                let task = tokio::spawn(async move {
+                    let Ok(mut server) = TcpStream::connect((HOST, PORT)).await else {
+                        return;
+                    };
+                    let copied = tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut client, &mut server) => None,
+                        r = lingering.wait_for(Option::is_some) => r.ok().and_then(|l| *l),
+                    };
+                    if let Some(linger) = copied {
+                        drop(client);
+                        tokio::time::sleep(linger).await;
                     }
                 });
-                tracked.lock().push(pipe.abort_handle());
+                tracked.lock().push(Pipe {
+                    task: task.abort_handle(),
+                    linger,
+                });
             }
         });
         Self {
@@ -742,7 +762,15 @@ impl Proxy {
     /// Drop every connection made through the proxy.
     fn cut(&self) {
         for pipe in self.pipes.lock().drain(..) {
-            pipe.abort();
+            pipe.task.abort();
+        }
+    }
+
+    /// Drop every connection here; the server keeps its side (and what it holds for it, a
+    /// remote forward's port say) for `linger` more.
+    fn cut_here(&self, linger: Duration) {
+        for pipe in self.pipes.lock().drain(..) {
+            pipe.linger.send_replace(Some(linger));
         }
     }
 
@@ -1007,4 +1035,110 @@ async fn stop_while_reconnecting_ends_promptly() {
         .expect("the port was released");
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(e.0.try_recv().is_err(), "a state arrived after stop");
+}
+
+#[tokio::test]
+async fn fixed_port_remote_forward_survives_reconnect() {
+    if !enabled() {
+        return;
+    }
+    let proxy = Proxy::new().await;
+    let mut w = World::new();
+    let auth = AuthMethod::Key {
+        path: keys_dir().join("fb_test_ed25519"),
+        passphrase: false,
+    };
+    let p = w.add_via_proxy("proxied", &proxy, auth);
+    let listener = TcpListener::bind((HOST, 0)).await.unwrap();
+    let here = listener.local_addr().unwrap().port();
+    let served = tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let _ = s.write_all(b"fixed-ok\n").await;
+            let _ = s.shutdown().await;
+        }
+    });
+    // A fixed server port, distinct per test run.
+    let fixed = 40000 + u16::try_from(std::process::id() % 10000).unwrap();
+    let remote = TunnelKind::Remote {
+        bind: HOST.into(),
+        port: fixed,
+        host: HOST.into(),
+        host_port: here,
+    };
+    let (t, mut e) = w.start_with(
+        p,
+        def("fixed", remote),
+        w.trust.clone(),
+        Arc::new(AtomicU32::new(5)),
+    );
+    e.up().await;
+    assert_eq!(t.port(), Some(fixed));
+
+    // The link drops here while the server's old session keeps the port for 2.5 s more: the
+    // first attempt (after 1 s) is refused, the second (after 2 s more) gets the port back.
+    proxy.cut_here(Duration::from_millis(2500));
+    assert_eq!(
+        next_state(&mut e).await,
+        TunnelState::Reconnecting { attempt: 1, max: 5 }
+    );
+    assert_eq!(
+        next_state(&mut e).await,
+        TunnelState::Reconnecting { attempt: 2, max: 5 }
+    );
+    assert_eq!(next_state(&mut e).await, TunnelState::Up { connections: 0 });
+    assert_eq!(t.port(), Some(fixed));
+    let shell = w.shell(p).await;
+    let got = shell_value(
+        &shell,
+        "F",
+        &format!("R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{fixed})"),
+    )
+    .await;
+    assert_eq!(got, "fixed-ok");
+    served.abort();
+}
+
+#[tokio::test]
+async fn refused_re_forward_fails_with_its_reason_when_retries_run_out() {
+    if !enabled() {
+        return;
+    }
+    let proxy = Proxy::new().await;
+    let mut w = World::new();
+    let auth = AuthMethod::Key {
+        path: keys_dir().join("fb_test_ed25519"),
+        passphrase: false,
+    };
+    let p = w.add_via_proxy("proxied", &proxy, auth);
+    let fixed = 50000 + u16::try_from(std::process::id() % 10000).unwrap();
+    let remote = TunnelKind::Remote {
+        bind: HOST.into(),
+        port: fixed,
+        host: HOST.into(),
+        host_port: 9,
+    };
+    let (_t, mut e) = w.start_with(
+        p,
+        def("fixed", remote),
+        w.trust.clone(),
+        Arc::new(AtomicU32::new(1)),
+    );
+    e.up().await;
+    // The old session holds the port longer than the one attempt waits.
+    proxy.cut_here(Duration::from_secs(5));
+    assert_eq!(
+        next_state(&mut e).await,
+        TunnelState::Reconnecting { attempt: 1, max: 1 }
+    );
+    match next_state(&mut e).await {
+        TunnelState::Failed(reason) => assert_eq!(
+            reason,
+            format!(
+                "connection lost: server refused the forward: 127.0.0.1 port {fixed} is taken \
+                 or not allowed"
+            )
+        ),
+        other => panic!("expected Failed, got {other:?}"),
+    }
 }

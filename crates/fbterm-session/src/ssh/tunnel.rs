@@ -38,7 +38,9 @@ use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 
-use super::pool::Connection;
+use futures_util::FutureExt;
+
+use super::pool::{Connection, ForwardClaim};
 use super::{HOP_TIMEOUT, NoPrompt, Prompter, SshError, SshPool};
 
 /// Connection counts are reported at most this often (zero is always reported at once).
@@ -219,8 +221,58 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
     let _ = stop.wait_for(|s| *s).await;
 }
 
+/// What a tunnel offers on this side. A local or SOCKS listener lives as long as the tunnel,
+/// across reconnects, so its port stays ours.
+enum Front {
+    Local {
+        listener: TcpListener,
+        host: String,
+        host_port: u16,
+    },
+    Socks {
+        listener: TcpListener,
+    },
+    Remote {
+        bind: String,
+        port: u16,
+        host: String,
+        host_port: u16,
+    },
+}
+
+impl Front {
+    fn listener(&self) -> Option<&TcpListener> {
+        match self {
+            Self::Local { listener, .. } | Self::Socks { listener } => Some(listener),
+            Self::Remote { .. } => None,
+        }
+    }
+}
+
+/// A connection with what the tunnel set up on it, ready to serve.
+struct Ready {
+    connection: Arc<Connection>,
+    /// The server's forward, for a remote tunnel.
+    forward: Option<Forward>,
+}
+
+/// A remote forward the server granted, and its routing here.
+struct Forward {
+    bind: String,
+    bound: u32,
+    claim: ForwardClaim,
+    channels: mpsc::UnboundedReceiver<Channel<Msg>>,
+}
+
+/// Why one reconnect attempt did not give a tunnel ready to serve.
+enum Attempt {
+    Stopped,
+    NeedsInput,
+    Failed(String),
+}
+
 impl Tunnel {
-    async fn run(mut self) {
+    async fn run(self) {
         let mut stop = self.stop.clone();
         let prompter = self.prompter.clone();
         let first = tokio::select! {
@@ -228,30 +280,65 @@ impl Tunnel {
             () = stopped(&mut stop) => return,
             c = self.connect(prompter) => c,
         };
-        let mut connection = match first {
+        let connection = match first {
             Ok(c) => c,
             Err(e) => return self.reporter.send(TunnelState::Failed(e.to_string())),
         };
-        // A local or SOCKS listener lives as long as the tunnel, across reconnects.
-        let listener = match &self.def.kind {
-            TunnelKind::Local { bind, port, .. } | TunnelKind::Socks { bind, port } => {
-                match listen(bind, *port).await {
-                    Ok(l) => Some(l),
-                    Err(reason) => return self.reporter.send(TunnelState::Failed(reason)),
-                }
-            }
-            TunnelKind::Remote { .. } => None,
+        let front = match self.front().await {
+            Ok(front) => front,
+            Err(reason) => return self.reporter.send(TunnelState::Failed(reason)),
+        };
+        // On the first start a refused forward fails the tunnel at once; only a lost
+        // connection is worth reconnecting.
+        let mut ready = match self.prepare(&front, connection).await {
+            Ok(ready) => ready,
+            Err(Ended::Stopped) => return,
+            Err(Ended::Failed(reason)) => return self.reporter.send(TunnelState::Failed(reason)),
+            Err(Ended::Lost(reason)) => match self.reconnect(&front, reason).await {
+                Some(ready) => ready,
+                None => return,
+            },
         };
         loop {
-            match self.serve(listener.as_ref(), connection).await {
+            match self.serve(&front, ready).await {
                 Ended::Stopped => return,
                 Ended::Failed(reason) => return self.reporter.send(TunnelState::Failed(reason)),
-                Ended::Lost(reason) => match self.reconnect(listener.as_ref(), reason).await {
-                    Some(c) => connection = c,
+                Ended::Lost(reason) => match self.reconnect(&front, reason).await {
+                    Some(next) => ready = next,
                     None => return,
                 },
             }
         }
+    }
+
+    /// Bind the listener of a local or SOCKS tunnel.
+    async fn front(&self) -> Result<Front, String> {
+        Ok(match self.def.kind.clone() {
+            TunnelKind::Local {
+                bind,
+                port,
+                host,
+                host_port,
+            } => Front::Local {
+                listener: listen(&bind, port).await?,
+                host,
+                host_port,
+            },
+            TunnelKind::Socks { bind, port } => Front::Socks {
+                listener: listen(&bind, port).await?,
+            },
+            TunnelKind::Remote {
+                bind,
+                port,
+                host,
+                host_port,
+            } => Front::Remote {
+                bind: listen_address(&bind).to_owned(),
+                port,
+                host,
+                host_port,
+            },
+        })
     }
 
     /// The profile's pooled connection. A connection the pool does not hold (a reconnect's
@@ -270,16 +357,32 @@ impl Tunnel {
             .await
     }
 
+    /// Set the tunnel up on `connection`: nothing for a local or SOCKS tunnel (its listener is
+    /// already bound), the server's forward for a remote one. A connection that has already
+    /// ended is `Lost`.
+    async fn prepare(&self, front: &Front, connection: Arc<Connection>) -> Result<Ready, Ended> {
+        if let Some(reason) = connection.closed().now_or_never() {
+            return Err(Ended::Lost(reason));
+        }
+        let forward = match front {
+            Front::Remote { bind, port, .. } => Some(self.request(&connection, bind, *port).await?),
+            Front::Local { .. } | Front::Socks { .. } => None,
+        };
+        Ok(Ready {
+            connection,
+            forward,
+        })
+    }
+
     /// Reconnect after the connection was lost for `reason`: attempts with backoff and no
-    /// prompts until one succeeds (`Some`), the attempts run out or one needs the user (both
-    /// reported as `Failed`), or the tunnel is stopped (`None` for all three). Clients that
-    /// reach `listener` meanwhile are closed at once.
-    async fn reconnect(
-        &mut self,
-        listener: Option<&TcpListener>,
-        mut reason: String,
-    ) -> Option<Arc<Connection>> {
-        let mut stop = self.stop.clone();
+    /// prompts until one gives a tunnel ready to serve (`Some`), the attempts run out or one
+    /// needs the user (both reported as `Failed`), or the tunnel is stopped (`None` for all
+    /// three). An attempt fails when the connection cannot be had, or when the remote forward
+    /// is refused on it (the old session may still hold the port for a while); its reason is
+    /// the one reported when the attempts run out. Clients that reach the listener meanwhile
+    /// are closed at once.
+    async fn reconnect(&self, front: &Front, mut reason: String) -> Option<Ready> {
+        let listener = front.listener();
         let mut attempt = 0u32;
         loop {
             attempt = attempt.saturating_add(1);
@@ -291,84 +394,100 @@ impl Tunnel {
             }
             self.reporter
                 .send(TunnelState::Reconnecting { attempt, max });
+            // The attempt answers `stop` itself, so a remote request it interrupts can take
+            // back what the server granted.
             let wait = async {
-                tokio::time::sleep(backoff(attempt)).await;
-                self.connect(Arc::new(NoPrompt)).await
-            };
-            tokio::pin!(wait);
-            let result = loop {
+                let mut stop = self.stop.clone();
                 tokio::select! {
                     biased;
-                    () = stopped(&mut stop) => return None,
-                    result = &mut wait => break result,
-                    accepted = accept(listener) => {
-                        // Not forwarding yet: the client is closed right away.
-                        drop(accepted);
-                    }
+                    () = stopped(&mut stop) => return Err(Attempt::Stopped),
+                    () = tokio::time::sleep(backoff(attempt)) => {}
                 }
+                let connection = tokio::select! {
+                    biased;
+                    () = stopped(&mut stop) => return Err(Attempt::Stopped),
+                    c = self.connect(Arc::new(NoPrompt)) => c.map_err(|e| match e {
+                        SshError::NeedsInput => Attempt::NeedsInput,
+                        e => Attempt::Failed(e.to_string()),
+                    })?,
+                };
+                self.prepare(front, connection)
+                    .await
+                    .map_err(|ended| match ended {
+                        Ended::Stopped => Attempt::Stopped,
+                        Ended::Lost(r) | Ended::Failed(r) => Attempt::Failed(r),
+                    })
+            };
+            let result = tokio::select! {
+                biased;
+                result = wait => result,
+                never = refuse_clients(|| accept(listener)) => match never {},
             };
             match result {
-                Ok(connection) => return Some(connection),
-                Err(SshError::NeedsInput) => {
+                Ok(ready) => return Some(ready),
+                Err(Attempt::Stopped) => return None,
+                Err(Attempt::NeedsInput) => {
                     self.reporter
                         .send(TunnelState::Failed(SshError::NeedsInput.to_string()));
                     return None;
                 }
-                Err(e) => {
+                Err(Attempt::Failed(e)) => {
                     tracing::debug!(error = %e, attempt, "tunnel reconnect failed");
-                    reason = e.to_string();
+                    reason = e;
                 }
             }
         }
     }
 
-    /// Run the tunnel on `connection` until it is stopped, its connection is lost or it
-    /// fails, then release the connection and what was served on it.
-    async fn serve(
-        &mut self,
-        listener: Option<&TcpListener>,
-        connection: Arc<Connection>,
-    ) -> Ended {
-        match (self.def.kind.clone(), listener) {
+    /// Run the tunnel until it is stopped or its connection is lost, then release the
+    /// connection and what was served on it.
+    async fn serve(&self, front: &Front, ready: Ready) -> Ended {
+        let Ready {
+            connection,
+            forward,
+        } = ready;
+        match (front, forward) {
             (
-                TunnelKind::Local {
-                    host, host_port, ..
-                },
-                Some(listener),
-            ) => {
-                self.serve_listener(listener, connection, move |c, tcp, peer| {
-                    forward_local(c, tcp, peer, host.clone(), host_port)
-                })
-                .await
-            }
-            (TunnelKind::Socks { .. }, Some(listener)) => {
-                self.serve_listener(listener, connection, serve_socks).await
-            }
-            (
-                TunnelKind::Remote {
-                    bind,
-                    port,
+                Front::Local {
+                    listener,
                     host,
                     host_port,
                 },
                 _,
             ) => {
+                let (host, host_port) = (host.clone(), *host_port);
+                self.serve_listener(listener, connection, move |c, tcp, peer| {
+                    forward_local(c, tcp, peer, host.clone(), host_port)
+                })
+                .await
+            }
+            (Front::Socks { listener }, _) => {
+                self.serve_listener(listener, connection, serve_socks).await
+            }
+            (
+                Front::Remote {
+                    host, host_port, ..
+                },
+                Some(forward),
+            ) => {
                 let ended = self
-                    .serve_remote(connection, &bind, port, host, host_port)
+                    .serve_forward(connection, forward, host.clone(), *host_port)
                     .await;
                 // The server's port is only known while the forward is up.
                 self.port.store(0, Ordering::Release);
                 ended
             }
-            // `run` binds a listener for every local and SOCKS tunnel before serving.
-            (_, None) => Ended::Failed("no listener".into()),
+            // `prepare` sets up the forward of every remote tunnel before it is served.
+            (Front::Remote { .. }, None) => {
+                unreachable!("a remote tunnel served without its forward")
+            }
         }
     }
 
     /// Accept clients on `listener`, handing each to `client` (with the connection), until
     /// stopped or the connection ends.
     async fn serve_listener<F, Fut>(
-        &mut self,
+        &self,
         listener: &TcpListener,
         connection: Arc<Connection>,
         client: F,
@@ -411,32 +530,30 @@ impl Tunnel {
         result
     }
 
-    /// Ask the server to listen on `bind:port` and connect each of its connections to
-    /// `host:host_port` here, until stopped or the connection ends.
-    async fn serve_remote(
-        &mut self,
-        connection: Arc<Connection>,
+    /// Ask the server to listen on `bind:port` and claim the routing of its connections.
+    /// A refusal is `Failed` with the reason in the user's words.
+    async fn request(
+        &self,
+        connection: &Connection,
         bind: &str,
         port: u16,
-        host: String,
-        host_port: u16,
-    ) -> Ended {
-        let bind = listen_address(bind).to_owned();
+    ) -> Result<Forward, Ended> {
         let requested = u32::from(port);
         // A fixed port is claimed before it is requested, so no connection arriving right
         // after the server's answer is refused. Port 0 can only be claimed once the server
         // has said which port it chose.
         let taken = |port: u32| {
-            format!(
+            Ended::Failed(format!(
                 "server refused the forward: {bind} port {port} is already used by another tunnel"
-            )
+            ))
         };
         let early = match requested {
             0 => None,
-            port => match connection.claim_forward(&bind, port) {
-                Some(claimed) => Some(claimed),
-                None => return Ended::Failed(taken(port)),
-            },
+            port => Some(
+                connection
+                    .claim_forward(bind, port)
+                    .ok_or_else(|| taken(port))?,
+            ),
         };
         let mut stop = self.stop.clone();
         let bound = tokio::select! {
@@ -447,40 +564,59 @@ impl Tunnel {
                 if requested != 0 {
                     let _ = tokio::time::timeout(
                         CANCEL_GRACE,
-                        connection.target().cancel_tcpip_forward(bind.as_str(), requested),
+                        connection.target().cancel_tcpip_forward(bind, requested),
                     )
                     .await;
                 }
-                return Ended::Stopped;
+                return Err(Ended::Stopped);
             }
-            reason = connection.closed() => return Ended::Lost(reason),
-            bound = request_forward(&connection, &bind, requested) => match bound {
-                Ok(bound) => bound,
-                Err(reason) => return Ended::Failed(reason),
-            },
+            reason = connection.closed() => return Err(Ended::Lost(reason)),
+            bound = request_forward(connection, bind, requested) => bound.map_err(Ended::Failed)?,
         };
-        let (claim, mut channels) = match early {
+        let (claim, channels) = match early {
             Some(claimed) => claimed,
-            None => match connection.claim_forward(&bind, bound) {
+            None => match connection.claim_forward(bind, bound) {
                 Some(claimed) => claimed,
                 None => {
                     // Another tunnel holds the routing for the port the server just gave us
                     // (possible only after a forward outside this app's control ended).
                     let _ = tokio::time::timeout(
                         CANCEL_GRACE,
-                        connection
-                            .target()
-                            .cancel_tcpip_forward(bind.as_str(), bound),
+                        connection.target().cancel_tcpip_forward(bind, bound),
                     )
                     .await;
-                    return Ended::Failed(taken(bound));
+                    return Err(taken(bound));
                 }
             },
         };
+        Ok(Forward {
+            bind: bind.to_owned(),
+            bound,
+            claim,
+            channels,
+        })
+    }
+
+    /// Connect each of the server's connections on `forward` to `host:host_port` here, until
+    /// stopped or the connection ends.
+    async fn serve_forward(
+        &self,
+        connection: Arc<Connection>,
+        forward: Forward,
+        host: String,
+        host_port: u16,
+    ) -> Ended {
+        let Forward {
+            bind,
+            bound,
+            claim,
+            mut channels,
+        } = forward;
         self.port.store(bound, Ordering::Release);
         let mut clients = Clients::new(&self.reporter);
         let closed = connection.closed();
         tokio::pin!(closed);
+        let mut stop = self.stop.clone();
         let result = loop {
             tokio::select! {
                 biased;
@@ -527,6 +663,25 @@ fn backoff(attempt: u32) -> Duration {
         _ => 30,
     };
     Duration::from_secs(secs)
+}
+
+/// Close every client `accept` gives at once (a tunnel that is reconnecting cannot forward
+/// them yet), pausing [`ACCEPT_PAUSE`] after a failed accept (out of file descriptors, say)
+/// so a lasting error does not spin. Never ends; it is raced against what it waits for.
+async fn refuse_clients<T, F, Fut>(mut accept: F) -> std::convert::Infallible
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = std::io::Result<T>>,
+{
+    loop {
+        match accept().await {
+            Ok(client) => drop(client),
+            Err(e) => {
+                tracing::debug!(error = %e, "tunnel accept failed while reconnecting");
+                tokio::time::sleep(ACCEPT_PAUSE).await;
+            }
+        }
+    }
 }
 
 /// The next client of `listener`, or never without one.
@@ -913,6 +1068,38 @@ mod tests {
             .expect("read timed out")
             .expect("read");
         buf
+    }
+
+    #[tokio::test]
+    async fn refusing_clients_pauses_after_accept_errors() {
+        // An accept that always fails (out of file descriptors, say) must not spin.
+        let calls = AtomicUsize::new(0);
+        let refusing = refuse_clients(|| async {
+            calls.fetch_add(1, Ordering::Relaxed);
+            tokio::task::yield_now().await;
+            Err::<(), _>(std::io::Error::other("too many open files"))
+        });
+        let _ = tokio::time::timeout(Duration::from_millis(350), refusing).await;
+        let calls = calls.load(Ordering::Relaxed);
+        assert!((1..=5).contains(&calls), "{calls} accepts in 350 ms");
+    }
+
+    #[tokio::test]
+    async fn refusing_clients_closes_each_at_once() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let refusing = tokio::spawn(async move {
+            let _ = refuse_clients(|| listener.accept()).await;
+        });
+        for _ in 0..3 {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let mut buf = [0u8; 1];
+            let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+                .await
+                .expect("client not closed");
+            assert!(matches!(read, Ok(0) | Err(_)));
+        }
+        refusing.abort();
     }
 
     #[test]
