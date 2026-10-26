@@ -174,6 +174,20 @@ fn incoming_preview(
         .map(snap)
 }
 
+/// Where a carried tab (its layout `subtree`) dropped at `p` lands in a tab whose whole
+/// layout is `full` (maximized or not: the merge shows it all), filling `area`, and the
+/// rectangle it would take. `None` where it cannot land or a pane would not fit.
+pub(crate) fn incoming_target(
+    full: &Layout,
+    area: Rectangle,
+    subtree: &Layout,
+    p: Point,
+    cell: Option<Size>,
+) -> Option<(Drop, Rectangle)> {
+    let at = drop_target(full, area, p, None)?;
+    Some((at, incoming_preview(full, area, subtree, at, cell)?))
+}
+
 /// The grab handle of a pane at `rect`: centred on its top edge, just inside it.
 fn handle_rect(rect: Rectangle) -> Rectangle {
     Rectangle {
@@ -276,6 +290,7 @@ pub fn tiles<'a>(
         t,
         window,
         layout: tab.shown_layout(),
+        full: tab.layout.clone(),
         focused: tab.focused,
         ids,
         children,
@@ -288,7 +303,11 @@ pub fn tiles<'a>(
 struct Tiles<'a> {
     t: &'static Tokens,
     window: window::Id,
+    /// The layout on screen (one pane while one is maximized).
     layout: Layout,
+    /// The tab's whole layout: a carried tab is aimed at it, since merging shows it all. The
+    /// tab itself is not changed before the drop.
+    full: Layout,
     focused: PaneId,
     ids: Vec<PaneId>,
     children: Vec<Element<'a, Message>>,
@@ -504,11 +523,8 @@ impl Tiles<'_> {
         // A target where a pane would end up below the minimum size is no target.
         let target = |p: Option<Point>| {
             p.filter(|_| incoming.mergeable)
-                .and_then(|p| drop_target(&self.layout, bounds, p, None))
-                .filter(|at| {
-                    incoming_preview(&self.layout, bounds, &incoming.layout, *at, self.cell)
-                        .is_some()
-                })
+                .and_then(|p| incoming_target(&self.full, bounds, &incoming.layout, p, self.cell))
+                .map(|(at, _)| at)
         };
         let end = |state: &mut State, shell: &mut Shell<'_, Message>| {
             state.incoming = None;
@@ -749,7 +765,7 @@ impl Tiles<'_> {
         let state = tree.state.downcast_ref::<State>();
         let Some(r) = self.incoming.as_ref().and_then(|incoming| {
             let at = state.incoming?;
-            incoming_preview(&self.layout, bounds, &incoming.layout, at, self.cell)
+            incoming_preview(&self.full, bounds, &incoming.layout, at, self.cell)
         }) else {
             return;
         };
@@ -1450,6 +1466,7 @@ mod tests {
                 t: &crate::theme::DARK,
                 window: wid,
                 layout: two(),
+                full: two(),
                 focused: PaneId(1),
                 ids,
                 children,
@@ -1548,6 +1565,7 @@ mod tests {
                 Element::new(Tiles {
                     t: &crate::theme::DARK,
                     window: wid,
+                    full: layout.clone(),
                     layout,
                     focused: PaneId(1),
                     ids,

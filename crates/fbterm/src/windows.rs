@@ -287,7 +287,7 @@ impl App {
             DragMsg::StartTab(tab) => {
                 self.carry = Some((wid, Carry::Tab(tab)));
                 self.hover = None;
-                self.show_drop_layout(wid)
+                Task::none()
             }
             DragMsg::OverTab(over) => {
                 if !matches!(self.carry_in(wid), Some(Carry::Tab(_))) {
@@ -312,8 +312,7 @@ impl App {
                         && matches!(self.carry_in(wid), Some(Carry::Tab(_))) =>
                 {
                     self.hover = None;
-                    let switched = self.with_window(wid, |w| w.select(index));
-                    Task::batch([switched, self.show_drop_layout(wid)])
+                    self.with_window(wid, |w| w.select(index))
                 }
                 _ => Task::none(),
             },
@@ -392,26 +391,6 @@ impl App {
             return None;
         }
         self.fits_in(wid, tab.focused, &moved).then_some(moved)
-    }
-
-    /// A tab is carried over `wid`: the tab shown, if it is another one, shows its whole
-    /// layout, so the preview over it is where the merge lands (a merge un-maximizes anyway).
-    fn show_drop_layout(&mut self, wid: window::Id) -> Task<Message> {
-        let Some(Carry::Tab(source)) = self.carry_in(wid) else {
-            return Task::none();
-        };
-        let Some(tab) = self
-            .windows
-            .get_mut(&wid)
-            .and_then(WindowState::active_tab_mut)
-        else {
-            return Task::none();
-        };
-        if tab.id == source || tab.maximized.take().is_none() {
-            return Task::none();
-        }
-        self.save_state();
-        self.shown(wid)
     }
 
     fn end_carry(&mut self) {
@@ -824,27 +803,115 @@ mod tests {
         );
     }
 
+    /// Tab 0 (`a1 | a2`) shown with a2 maximized, never started; the state file in use.
+    fn maximized_target(p: &Profile) -> (App, window::Id, [PaneId; 3], [TabId; 2]) {
+        let (mut app, wid, ids, tabs) = app_with_tabs(p);
+        let w = app.windows.get_mut(&wid).unwrap();
+        w.active = 0;
+        w.tabs[0].maximized = Some(ids[1]);
+        app.state_saving_enabled = true;
+        (app, wid, ids, tabs)
+    }
+
     #[test]
-    fn a_carried_tab_sees_the_whole_layout_of_a_maximized_tab() {
+    fn cancelled_tab_drag_leaves_target_maximized_and_unsaved() {
+        use crate::tabs::TabState;
         use crate::windows::DragMsg;
         let p = profile("a");
-        let (mut app, wid, [_, a2, _], [ta, tb]) = app_with_tabs(&p);
-        app.windows.get_mut(&wid).unwrap().tabs[0].maximized = Some(a2);
+        let (mut app, wid, [a1, a2, _], [_, tb]) = maximized_target(&p);
+        let state = app.paths.state();
+        let before = std::fs::read_to_string(&state).ok();
+        for m in [DragMsg::StartTab(tb), DragMsg::OverTab(None), DragMsg::End] {
+            let _ = app.update(Message::Drag(wid, m));
+        }
+        let tab = &app.windows[&wid].tabs[0];
+        assert_eq!(tab.maximized, Some(a2), "still maximized");
+        assert_eq!(
+            tab.pane(a1).unwrap().state,
+            TabState::NotConnected,
+            "the hidden pane was not started"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&state).ok(),
+            before,
+            "nothing saved"
+        );
+
+        // A hover switch onto a maximized tab shows it as it is (selected like a click on its
+        // button: that runs `shown()` as any selection does).
+        let (mut app, wid, [_, a2, _], [_, tb]) = maximized_target(&p);
+        app.windows.get_mut(&wid).unwrap().active = 1;
         let _ = app.update(Message::Drag(wid, DragMsg::StartTab(tb)));
         let _ = app.update(Message::Drag(wid, DragMsg::OverTab(Some(0))));
         let generation = app.hover_generation;
         let _ = app.update(Message::Drag(wid, DragMsg::HoverElapsed(generation)));
-        let w = &app.windows[&wid];
-        assert_eq!(w.active_tab().map(|t| t.id), Some(ta));
+        let _ = app.update(Message::Drag(wid, DragMsg::End));
+        let tab = &app.windows[&wid].tabs[0];
+        assert_eq!(app.windows[&wid].active, 0);
         assert_eq!(
-            w.tabs[0].maximized, None,
-            "the preview is drawn on the whole layout"
+            tab.maximized,
+            Some(a2),
+            "still maximized after the drag ended"
         );
-        // Picking up another tab over a maximized one shows its layout at once.
-        let (mut app, wid, [_, _, b], [ta, _]) = app_with_tabs(&p);
-        app.windows.get_mut(&wid).unwrap().tabs[1].maximized = Some(b);
-        let _ = app.update(Message::Drag(wid, DragMsg::StartTab(ta)));
-        assert_eq!(app.windows[&wid].tabs[1].maximized, None);
+    }
+
+    #[test]
+    fn tab_drag_preview_uses_full_layout_of_maximized_target() {
+        let p = profile("a");
+        let (mut app, wid, [a1, a2, b], [ta, tb]) = maximized_target(&p);
+        app.state_saving_enabled = false;
+        let area = iced::Rectangle::with_size(iced::Size::new(1000.0, 600.0));
+        let _ = app.update(Message::Tiles(
+            wid,
+            crate::tiles::TilesMsg::Area(area.size()),
+        ));
+        let (full, carried) = {
+            let w = &app.windows[&wid];
+            (w.tabs[0].layout.clone(), w.tabs[1].layout.clone())
+        };
+        // Over the left part of the window, where a1 sits in the whole layout (a2 fills it on
+        // screen): next to a1.
+        let (at, preview) = crate::tiles::incoming_target(
+            &full,
+            area,
+            &carried,
+            iced::Point::new(250.0, 500.0),
+            None,
+        )
+        .unwrap();
+        assert_eq!(at, Drop::Tile(a1, Side::Bottom));
+        let _ = app.merge_tab(wid, tb, ta, at);
+        let tab = &app.windows[&wid].tabs[0];
+        let landed = tab
+            .layout
+            .rects(area)
+            .into_iter()
+            .find(|(id, _)| *id == b)
+            .map(|(_, r)| r)
+            .unwrap();
+        assert!(
+            (landed.x - preview.x).abs() <= 1.0
+                && (landed.y - preview.y).abs() <= 1.0
+                && (landed.width - preview.width).abs() <= 1.0
+                && (landed.height - preview.height).abs() <= 1.0,
+            "preview {preview:?}, landed {landed:?}"
+        );
+        assert!(tab.layout.contains(a2));
+    }
+
+    #[test]
+    fn merge_into_maximized_tab_unmaximizes_and_starts_panes() {
+        use crate::tabs::TabState;
+        let p = profile("a");
+        let (mut app, wid, [a1, _, b], [ta, tb]) = maximized_target(&p);
+        app.state_saving_enabled = false;
+        let _ = app.merge_tab(wid, tb, ta, Drop::Edge(Side::Right));
+        let tab = &app.windows[&wid].tabs[0];
+        assert_eq!(tab.maximized, None);
+        assert_eq!(tab.visible_panes().len(), 3);
+        for pane in [a1, b] {
+            assert_ne!(tab.pane(pane).unwrap().state, TabState::NotConnected);
+        }
     }
 
     #[test]
