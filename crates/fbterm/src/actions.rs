@@ -6,7 +6,7 @@ use crate::app::{App, Message};
 use crate::editor::EditorMsg;
 use crate::keys::Action;
 use crate::layout::{Dir, Side};
-use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState};
+use crate::palette::{self, PaletteItem, PaletteMsg, PaletteState, Pick, Placing, Stage};
 use crate::pane_actions::Zoom;
 use crate::settings_window::SettingsMsg;
 use crate::tabs::WindowState;
@@ -41,9 +41,19 @@ impl App {
             Action::ZoomOut => self.on_window(wid, |app, wid| app.zoom_pane(wid, Zoom::Out)),
             Action::ZoomReset => self.on_window(wid, |app, wid| app.zoom_pane(wid, Zoom::Reset)),
             Action::MaximizePane => self.on_window(wid, App::toggle_maximize),
-            // Declared for their chords and the Settings list; later tasks give them behaviour.
             Action::FindInTab => self.on_window(wid, App::find_in_tab),
-            Action::MergeTab | Action::MoveTile | Action::TileToTab => Task::none(),
+            Action::MergeTab => self.on_window(wid, App::merge_tab_palette),
+            Action::MoveTile => self.on_window(wid, App::move_tile_palette),
+            Action::TileToTab => self.on_window(wid, |app, wid| {
+                let Some(w) = app.windows.get(&wid) else {
+                    return Task::none();
+                };
+                let (end, pane) = (w.tabs.len(), w.active_tab().map(|t| t.focused));
+                match pane {
+                    Some(pane) => app.tile_to_tab(wid, pane, end),
+                    None => Task::none(),
+                }
+            }),
             Action::NextTab => self.with_focused(WindowState::next),
             Action::PrevTab => self.with_focused(WindowState::prev),
             Action::SelectTab(n) => self.with_focused(|w| w.select_number(n)),
@@ -142,7 +152,9 @@ impl App {
             // Nothing matches: Enter does nothing, the palette stays open.
             return Task::none();
         }
-        self.palettes.remove(&wid);
+        let Some(stage) = self.palettes.remove(&wid).map(|s| s.stage) else {
+            return Task::none();
+        };
         match chosen {
             Some(PaletteItem::Profile { id, .. })
                 if msg == (PaletteMsg::Submit { split: true }) =>
@@ -151,7 +163,91 @@ impl App {
             }
             Some(PaletteItem::Profile { id, .. }) => self.open_tab(wid, id),
             Some(PaletteItem::Action { action, .. }) => self.run_palette_action(wid, action),
+            Some(PaletteItem::Choice { pick, .. }) => self.palette_choice(wid, stage, pick),
             None => Task::none(),
+        }
+    }
+
+    /// Open `wid`'s palette on a rearranging step listing `items` (nothing to list: nothing
+    /// opens).
+    fn open_stage(
+        &mut self,
+        wid: window::Id,
+        stage: Stage,
+        items: Vec<PaletteItem>,
+    ) -> Task<Message> {
+        if items.is_empty() {
+            return Task::none();
+        }
+        self.close_find_all();
+        let state = PaletteState::staged(stage, items);
+        let input = state.input.clone();
+        self.palettes.insert(wid, state);
+        iced::widget::operation::focus(input)
+    }
+
+    /// "Merge tab into…": first which of the window's other tabs the active one goes into.
+    fn merge_tab_palette(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(w) = self.windows.get(&wid) else {
+            return Task::none();
+        };
+        let Some(source) = w.active_tab().map(|t| t.id) else {
+            return Task::none();
+        };
+        let items = palette::tab_choices(w, source);
+        self.open_stage(wid, Stage::MergeInto { source }, items)
+    }
+
+    /// "Move tile…": where the focused pane goes within its tab.
+    fn move_tile_palette(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(WindowState::active_tab) else {
+            return Task::none();
+        };
+        if tab.panes.len() < 2 {
+            return Task::none();
+        }
+        let (pane, into) = (tab.focused, tab.id);
+        let items = palette::drop_choices(tab, Some(pane));
+        self.open_stage(
+            wid,
+            Stage::Place {
+                what: Placing::Tile(pane),
+                into,
+            },
+            items,
+        )
+    }
+
+    /// A rearranging choice was picked at `stage`.
+    fn palette_choice(&mut self, wid: window::Id, stage: Stage, pick: Pick) -> Task<Message> {
+        match (stage, pick) {
+            (Stage::MergeInto { source }, Pick::Tab(into)) => {
+                let Some(tab) = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|w| w.find(into).map(|i| &w.tabs[i]))
+                else {
+                    return Task::none();
+                };
+                let items = palette::drop_choices(tab, None);
+                let what = Placing::Tab(source);
+                self.open_stage(wid, Stage::Place { what, into }, items)
+            }
+            (
+                Stage::Place {
+                    what: Placing::Tab(source),
+                    into,
+                },
+                Pick::Drop(at),
+            ) => self.merge_tab(wid, source, into, at),
+            (
+                Stage::Place {
+                    what: Placing::Tile(pane),
+                    ..
+                },
+                Pick::Drop(at),
+            ) => self.move_tile(wid, pane, at),
+            _ => Task::none(),
         }
     }
 

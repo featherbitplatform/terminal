@@ -80,6 +80,8 @@ pub enum Message {
     Terminal(window::Id, PaneId, TerminalOutput),
     /// Focus, divider drags and the area of a window's panes.
     Tiles(window::Id, crate::tiles::TilesMsg),
+    /// A tab or tile carried between the tab bar and the panes.
+    Drag(window::Id, crate::windows::DragMsg),
     /// A pane's resize quiet period passed; applies if no newer resize came (its generation).
     ResizeSettled(PaneId, u64),
     /// Tab-bar and shortcut actions act on the focused window.
@@ -227,6 +229,12 @@ pub struct App {
     pub focused: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
+    /// The tab or tile being dragged, and in which window.
+    pub(crate) carry: Option<(window::Id, crate::windows::Carry)>,
+    /// The tab button a carried tab hovers: window, index and the hover's generation.
+    pub(crate) hover: Option<(window::Id, usize, u64)>,
+    /// Counts hovers, so only the latest one's timer switches tabs.
+    pub(crate) hover_generation: u64,
     /// The find-in-all-tabs box, when open (in one window at a time).
     pub find_box: Option<FindAll>,
     /// The profile editor window, when open.
@@ -451,6 +459,9 @@ impl App {
             resize_generation: 0,
             focused: None,
             palettes: Palettes::new(),
+            carry: None,
+            hover: None,
+            hover_generation: 0,
             find_box: None,
             editor: None,
             settings_win: None,
@@ -613,6 +624,7 @@ impl App {
             Message::Session(id, event) => self.session_event(id, event),
             Message::Terminal(wid, pane, output) => self.terminal_output(wid, pane, output),
             Message::Tiles(wid, msg) => self.tiles_msg(wid, msg),
+            Message::Drag(wid, msg) => self.drag_msg(wid, msg),
             Message::ResizeSettled(pane, generation) => {
                 self.resize_settled(pane, generation);
                 Task::none()
@@ -753,6 +765,10 @@ impl App {
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
+                if self.carry.is_some_and(|(w, _)| w == id) {
+                    self.carry = None;
+                    self.hover = None;
+                }
                 if self.find_box.as_ref().is_some_and(|f| f.window == id) {
                     self.close_find_all();
                 }

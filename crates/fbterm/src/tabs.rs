@@ -119,7 +119,7 @@ impl Tab {
         self.panes.iter().find(|p| p.id == id)
     }
 
-    #[allow(dead_code)] // used by tab merge and tile moves (tiling task 10)
+    #[allow(dead_code)] // read by tests; part of the tab's read surface
     pub fn pane_mut(&mut self, id: PaneId) -> Option<&mut Pane> {
         self.panes.iter_mut().find(|p| p.id == id)
     }
@@ -409,7 +409,6 @@ impl WindowState {
         self.tabs.get_mut(self.active)
     }
 
-    #[allow(dead_code)] // tab drag and merge (tiling task 10) look tabs up by id again
     pub fn find(&self, id: TabId) -> Option<usize> {
         self.tabs.iter().position(|t| t.id == id)
     }

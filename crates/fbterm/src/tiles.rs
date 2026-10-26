@@ -4,6 +4,8 @@
 //! moves: a tile is picked up by the grab handle shown at the top of the hovered pane, or
 //! anywhere in a pane with the pick modifier held (Cmd on macOS, Ctrl+Shift elsewhere), and
 //! dropped on a tile's edge or the outer edge of the content, with a preview of where it lands.
+//! A tab carried from the tab bar over the content gets the same targets and preview, and a tile
+//! carried out over the tab bar is reported to the app (`DragMsg::Tile`) so the bar can take it.
 //!
 //! A tab with one pane draws exactly its pane's view: no divider, outline, dimming or handle.
 
@@ -19,9 +21,10 @@ use iced::{
 
 use crate::app::Message;
 use crate::layout::{Axis, DIVIDER, Drop, Layout, PaneId, Path, Side};
-use crate::tabs::Tab;
+use crate::tabs::{Tab, TabId};
 use crate::theme::Tokens;
 use crate::ui::{ICON_GRIP, ICONS};
+use crate::windows::DragMsg;
 
 /// Extra grab room on each side of a divider, over the panes next to it.
 const SLOP: f32 = 2.0;
@@ -135,6 +138,19 @@ fn preview(layout: &Layout, area: Rectangle, pane: PaneId, at: Drop) -> Option<R
         .map(|(_, r)| snap(r))
 }
 
+/// The rectangle a whole tab dropped at `at` takes (its panes keep their arrangement inside).
+fn incoming_preview(layout: &Layout, area: Rectangle, at: Drop) -> Option<Rectangle> {
+    // Stands in for the tab's layout: a subtree takes the same room as a single pane.
+    const PLACEHOLDER: PaneId = PaneId(u64::MAX);
+    let mut merged = layout.clone();
+    merged.insert(Layout::Pane(PLACEHOLDER), at);
+    merged
+        .rects(area)
+        .into_iter()
+        .find(|(id, _)| *id == PLACEHOLDER)
+        .map(|(_, r)| snap(r))
+}
+
 /// The grab handle of a pane at `rect`: centred on its top edge, just inside it.
 fn handle_rect(rect: Rectangle) -> Rectangle {
     Rectangle {
@@ -209,15 +225,25 @@ fn snap(r: Rectangle) -> Rectangle {
     }
 }
 
+/// A tab carried from the tab bar while these tiles are shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Incoming {
+    pub tab: TabId,
+    /// It is another tab than the one shown, so it can be dropped here.
+    pub mergeable: bool,
+}
+
 /// Lays `panes` (the views of `tab.visible_panes()`, in any order) out at their rectangles
 /// of the tab's layout. `focused_outline`: nothing modal covers the tiles, so (when the tab
 /// shows more than one pane) the focus outline is drawn and tiles can be picked up.
+/// `incoming`: a tab carried over the window, which may be dropped on these tiles.
 pub fn tiles<'a>(
     t: &'static Tokens,
     window: window::Id,
     tab: &'a Tab,
     panes: Vec<(PaneId, Element<'a, Message>)>,
     focused_outline: bool,
+    incoming: Option<Incoming>,
 ) -> Element<'a, Message> {
     let (ids, children) = panes.into_iter().unzip();
     Element::new(Tiles {
@@ -228,6 +254,7 @@ pub fn tiles<'a>(
         ids,
         children,
         outline: focused_outline,
+        incoming,
     })
 }
 
@@ -239,6 +266,7 @@ struct Tiles<'a> {
     ids: Vec<PaneId>,
     children: Vec<Element<'a, Message>>,
     outline: bool,
+    incoming: Option<Incoming>,
 }
 
 struct Drag {
@@ -284,6 +312,10 @@ struct State {
     swallow_escape: bool,
     /// The last press on a divider, for double-click.
     last_press: Option<(Path, Instant)>,
+    /// Where a carried tab would land, while it is over these tiles.
+    incoming: Option<Drop>,
+    /// The carried tile last reported to the app (`DragMsg::Tile`).
+    reported: Option<PaneId>,
     /// The area last reported to the app.
     area: Option<Size>,
 }
@@ -345,13 +377,6 @@ impl Tiles<'_> {
                 }
                 state.swallow_escape = true;
                 shell.request_redraw();
-                shell.capture_event();
-                Flow::Consumed
-            }
-            Event::Keyboard(keyboard::Event::KeyReleased { key, .. })
-                if is_escape(key) && state.swallow_escape =>
-            {
-                state.swallow_escape = false;
                 shell.capture_event();
                 Flow::Consumed
             }
@@ -427,145 +452,72 @@ impl Tiles<'_> {
         }
     }
 
-    /// Passes `event` on to the panes' views (the arguments of `Widget::update`).
-    #[allow(clippy::too_many_arguments)]
-    fn update_children(
-        &mut self,
-        tree: &mut Tree,
+    /// A tab carried from the tab bar: the preview follows the pointer over the tiles, a
+    /// release drops it, Escape (or losing the pointer or focus) ends it. The panes see none
+    /// of it. Returns whether the event was consumed.
+    fn incoming_event(
+        &self,
+        state: &mut State,
         event: &Event,
-        layout: Placed<'_>,
+        bounds: Rectangle,
         cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) {
-        for ((child, state), layout) in self
-            .children
-            .iter_mut()
-            .zip(&mut tree.children)
-            .zip(layout.children())
-        {
-            child.as_widget_mut().update(
-                state, event, layout, cursor, renderer, clipboard, shell, viewport,
-            );
-        }
-    }
-}
-
-impl Tiles<'_> {
-    fn draw_handle(&self, renderer: &mut iced::Renderer, r: Rectangle, hot: bool) {
-        use iced::advanced::Renderer as _;
-        use iced::advanced::text::{self, Renderer as _};
-        renderer.fill_quad(
-            renderer::Quad {
-                bounds: r,
-                border: Border {
-                    color: self.t.border,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                snap: true,
-                ..renderer::Quad::default()
-            },
-            self.t.raised,
-        );
-        renderer.fill_text(
-            text::Text {
-                content: ICON_GRIP.to_string(),
-                bounds: Size::new(GRIP, GRIP),
-                size: Pixels(GRIP),
-                line_height: text::LineHeight::Absolute(Pixels(GRIP)),
-                font: ICONS,
-                align_x: text::Alignment::Center,
-                align_y: iced::alignment::Vertical::Center,
-                shaping: text::Shaping::Basic,
-                wrapping: text::Wrapping::None,
-            },
-            r.center(),
-            if hot {
-                self.t.text
-            } else {
-                self.t.text_secondary
-            },
-            r,
-        );
-    }
-}
-
-impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
-    fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<State>()
-    }
-
-    fn state(&self) -> tree::State {
-        tree::State::new(State::default())
-    }
-
-    fn children(&self) -> Vec<Tree> {
-        self.children.iter().map(Tree::new).collect()
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(&self.children);
-    }
-
-    fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        let size = limits.max();
-        let rects = self.layout.rects(Rectangle::with_size(size));
-        let several = self.several();
-        let nodes = self
-            .ids
-            .iter()
-            .zip(&mut self.children)
-            .zip(&mut tree.children)
-            .map(|((id, child), tree)| {
-                let r = rects
-                    .iter()
-                    .find(|(p, _)| p == id)
-                    .map_or(Rectangle::default(), |(_, r)| *r);
-                let r = if several { snap(r) } else { r };
-                child
-                    .as_widget_mut()
-                    .layout(tree, renderer, &layout::Limits::new(Size::ZERO, r.size()))
-                    .move_to(r.position())
-            })
-            .collect();
-        layout::Node::with_children(size, nodes)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Placed<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        operation.container(None, layout.bounds());
-        operation.traverse(&mut |operation| {
-            for ((child, state), layout) in self
-                .children
-                .iter_mut()
-                .zip(&mut tree.children)
-                .zip(layout.children())
-            {
-                child
-                    .as_widget_mut()
-                    .operate(state, layout, renderer, operation);
+    ) -> bool {
+        let Some(incoming) = self.incoming else {
+            if state.incoming.take().is_some() {
+                shell.request_redraw();
             }
-        });
+            return false;
+        };
+        state.tile = None;
+        let target = |p: Option<Point>| {
+            p.filter(|_| incoming.mergeable)
+                .and_then(|p| drop_target(&self.layout, bounds, p, None))
+        };
+        let end = |state: &mut State, shell: &mut Shell<'_, Message>| {
+            state.incoming = None;
+            shell.publish(Message::Drag(self.window, DragMsg::End));
+            shell.request_redraw();
+        };
+        match event {
+            Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                let at = target(cursor.position());
+                if at != state.incoming {
+                    state.incoming = at;
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                // Where the pointer is now: a hover may have switched the tab shown.
+                state.incoming = None;
+                if let Some(at) = target(cursor.position()) {
+                    shell.publish(Message::Drag(
+                        self.window,
+                        DragMsg::DropTab {
+                            tab: incoming.tab,
+                            at,
+                        },
+                    ));
+                }
+                shell.request_redraw();
+            }
+            Event::Keyboard(keyboard::Event::KeyPressed { key, .. }) if is_escape(key) => {
+                state.swallow_escape = true;
+                end(state, shell);
+            }
+            e if cancels_drag(e) => {
+                end(state, shell);
+                return false;
+            }
+            _ => return false,
+        }
+        shell.capture_event();
+        true
     }
 
-    fn update(
+    /// Everything `Widget::update` does but reporting a carried tile.
+    #[allow(clippy::too_many_arguments)]
+    fn update_inner(
         &mut self,
         tree: &mut Tree,
         event: &Event,
@@ -584,6 +536,18 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
         }
         if let Event::Keyboard(keyboard::Event::ModifiersChanged(m)) = event {
             state.modifiers = *m;
+        }
+        // The Escape that cancelled a drag: its release is not passed on either.
+        if let Event::Keyboard(keyboard::Event::KeyReleased { key, .. }) = event
+            && is_escape(key)
+            && state.swallow_escape
+        {
+            state.swallow_escape = false;
+            shell.capture_event();
+            return;
+        }
+        if self.incoming_event(state, event, bounds, cursor, shell) {
+            return;
         }
         match self.tile_event(state, event, bounds, cursor, shell) {
             Flow::Consumed => return,
@@ -716,6 +680,205 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
             tree, event, layout, cursor, renderer, clipboard, shell, viewport,
         );
     }
+    /// Passes `event` on to the panes' views (the arguments of `Widget::update`).
+    #[allow(clippy::too_many_arguments)]
+    fn update_children(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Placed<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        for ((child, state), layout) in self
+            .children
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            child.as_widget_mut().update(
+                state, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+        }
+    }
+}
+
+impl Tiles<'_> {
+    /// Where a tab carried over the tiles would land.
+    fn draw_incoming(&self, tree: &Tree, renderer: &mut iced::Renderer, bounds: Rectangle) {
+        use iced::advanced::Renderer as _;
+        let state = tree.state.downcast_ref::<State>();
+        let Some(r) = self
+            .incoming
+            .and(state.incoming)
+            .and_then(|at| incoming_preview(&self.layout, bounds, at))
+        else {
+            return;
+        };
+        renderer.with_layer(bounds.expand(1.0), |renderer| {
+            self.draw_preview(renderer, r);
+        });
+    }
+
+    /// The violet preview of where a dropped tile or tab lands.
+    fn draw_preview(&self, renderer: &mut iced::Renderer, r: Rectangle) {
+        use iced::advanced::Renderer as _;
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: r,
+                border: Border {
+                    color: self.t.accent,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                snap: true,
+                ..renderer::Quad::default()
+            },
+            self.t.accent_soft,
+        );
+    }
+
+    fn draw_handle(&self, renderer: &mut iced::Renderer, r: Rectangle, hot: bool) {
+        use iced::advanced::Renderer as _;
+        use iced::advanced::text::{self, Renderer as _};
+        renderer.fill_quad(
+            renderer::Quad {
+                bounds: r,
+                border: Border {
+                    color: self.t.border,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                snap: true,
+                ..renderer::Quad::default()
+            },
+            self.t.raised,
+        );
+        renderer.fill_text(
+            text::Text {
+                content: ICON_GRIP.to_string(),
+                bounds: Size::new(GRIP, GRIP),
+                size: Pixels(GRIP),
+                line_height: text::LineHeight::Absolute(Pixels(GRIP)),
+                font: ICONS,
+                align_x: text::Alignment::Center,
+                align_y: iced::alignment::Vertical::Center,
+                shaping: text::Shaping::Basic,
+                wrapping: text::Wrapping::None,
+            },
+            r.center(),
+            if hot {
+                self.t.text
+            } else {
+                self.t.text_secondary
+            },
+            r,
+        );
+    }
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<State>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(State::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&self.children);
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let size = limits.max();
+        let rects = self.layout.rects(Rectangle::with_size(size));
+        let several = self.several();
+        let nodes = self
+            .ids
+            .iter()
+            .zip(&mut self.children)
+            .zip(&mut tree.children)
+            .map(|((id, child), tree)| {
+                let r = rects
+                    .iter()
+                    .find(|(p, _)| p == id)
+                    .map_or(Rectangle::default(), |(_, r)| *r);
+                let r = if several { snap(r) } else { r };
+                child
+                    .as_widget_mut()
+                    .layout(tree, renderer, &layout::Limits::new(Size::ZERO, r.size()))
+                    .move_to(r.position())
+            })
+            .collect();
+        layout::Node::with_children(size, nodes)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Placed<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            for ((child, state), layout) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                child
+                    .as_widget_mut()
+                    .operate(state, layout, renderer, operation);
+            }
+        });
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Placed<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.update_inner(
+            tree, event, layout, cursor, renderer, clipboard, shell, viewport,
+        );
+        // Tell the app when a tile starts or stops being carried: the tab bar takes a tile
+        // dropped on it.
+        let state = tree.state.downcast_mut::<State>();
+        let carried = state
+            .tile
+            .as_ref()
+            .filter(|t| t.carrying && !t.cancelled)
+            .map(|t| t.pane);
+        if carried != state.reported {
+            state.reported = carried;
+            shell.publish(Message::Drag(self.window, DragMsg::Tile(carried)));
+        }
+    }
 
     fn mouse_interaction(
         &self,
@@ -787,10 +950,11 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                 .as_widget()
                 .draw(state, renderer, theme, style, layout, cursor, viewport);
         }
+        let bounds = layout.bounds();
         if !self.several() {
+            self.draw_incoming(tree, renderer, bounds);
             return;
         }
-        let bounds = layout.bounds();
         let fill = |renderer: &mut iced::Renderer, bounds: Rectangle, color: Color| {
             renderer.fill_quad(
                 renderer::Quad {
@@ -865,19 +1029,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                     ..
                 }) => {
                     if let Some(r) = preview(&self.layout, bounds, *pane, *at) {
-                        renderer.fill_quad(
-                            renderer::Quad {
-                                bounds: r,
-                                border: Border {
-                                    color: self.t.accent,
-                                    width: 1.0,
-                                    radius: 0.0.into(),
-                                },
-                                snap: true,
-                                ..renderer::Quad::default()
-                            },
-                            self.t.accent_soft,
-                        );
+                        self.draw_preview(renderer, r);
                     }
                 }
                 None if state.drag.is_none() && self.movable() => {
@@ -894,6 +1046,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                 _ => {}
             }
         });
+        self.draw_incoming(tree, renderer, bounds);
     }
 
     fn overlay<'b>(
@@ -1188,6 +1341,16 @@ mod tests {
             setup: impl FnOnce(),
             steps: &[(Event, Point)],
         ) -> Vec<Step> {
+            drive_with(terms, None, setup, steps)
+        }
+
+        /// `drive`, with a tab carried over the tiles.
+        fn drive_with(
+            terms: &[SharedTerminal; 2],
+            incoming: Option<Incoming>,
+            setup: impl FnOnce(),
+            steps: &[(Event, Point)],
+        ) -> Vec<Step> {
             let style: TerminalStyle =
                 crate::settings_window::terminal_style(&fbterm_config::Settings::default());
             let wid = window::Id::unique();
@@ -1208,6 +1371,7 @@ mod tests {
                 ids,
                 children,
                 outline: true,
+                incoming,
             });
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
                 iced::Font::DEFAULT,
@@ -1305,6 +1469,7 @@ mod tests {
                     ids,
                     children,
                     outline: true,
+                    incoming: None,
                 })
             };
             let viewport = Rectangle::with_size(SIZE);
@@ -1382,6 +1547,84 @@ mod tests {
                 terms[0].lock().selection().is_none(),
                 "no text was selected"
             );
+        }
+
+        #[test]
+        fn a_carried_tab_drops_on_the_tiles() {
+            let terms = [term(), term()];
+            let tab = TabId::next();
+            let carried = |mergeable| Some(Incoming { tab, mergeable });
+            let steps = [
+                (moved(700.0, 300.0), Point::new(700.0, 300.0)),
+                (moved(560.0, 300.0), Point::new(560.0, 300.0)),
+                (release(), Point::new(560.0, 300.0)),
+            ];
+            let out = drive_with(&terms, carried(true), || {}, &steps);
+            assert!(out.iter().all(|s| s.captured), "the panes see none of it");
+            let dropped: Vec<_> = out
+                .iter()
+                .flat_map(|s| &s.messages)
+                .filter_map(|m| match m {
+                    Message::Drag(_, DragMsg::DropTab { tab: t, at }) => Some((*t, *at)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(dropped, [(tab, Drop::Tile(PaneId(2), Side::Left))]);
+
+            // Over the tab's own content: nothing to drop on.
+            let out = drive_with(&terms, carried(false), || {}, &steps);
+            assert!(
+                out.iter()
+                    .flat_map(|s| &s.messages)
+                    .all(|m| !matches!(m, Message::Drag(_, DragMsg::DropTab { .. })))
+            );
+
+            // Escape ends it, and neither the press nor the release reaches the terminal.
+            let out = drive_with(
+                &terms,
+                carried(true),
+                || {},
+                &[
+                    (escape(true), Point::new(700.0, 300.0)),
+                    (escape(false), Point::new(700.0, 300.0)),
+                ],
+            );
+            assert!(out.iter().all(|s| s.captured));
+            assert!(
+                out[0]
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, Message::Drag(_, DragMsg::End)))
+            );
+        }
+
+        #[test]
+        fn a_carried_tile_is_reported_until_dropped() {
+            let terms = [term(), term()];
+            let carried = |steps: &[Step]| -> Vec<Option<PaneId>> {
+                steps
+                    .iter()
+                    .flat_map(|s| &s.messages)
+                    .filter_map(|m| match m {
+                        Message::Drag(_, DragMsg::Tile(p)) => Some(*p),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // Carried out over the tab bar (above the tiles) and released there: no drop here.
+            let out = drive(
+                &terms,
+                || {},
+                &[
+                    (mods(pick_mods()), Point::new(200.0, 300.0)),
+                    (press(), Point::new(200.0, 300.0)),
+                    (moved(200.0, 100.0), Point::new(200.0, 100.0)),
+                    (moved(200.0, -10.0), Point::new(200.0, -10.0)),
+                    (release(), Point::new(200.0, -10.0)),
+                ],
+            );
+            assert_eq!(carried(&out), [Some(PaneId(1)), None]);
+            assert!(drops(&out).is_empty());
         }
 
         #[test]

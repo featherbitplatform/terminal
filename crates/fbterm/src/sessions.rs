@@ -1188,6 +1188,65 @@ mod pane_tests {
         }
 
         #[test]
+        fn merge_keeps_sessions() {
+            use crate::layout::{Drop, Side};
+            use feathercritty::grid::Dimensions;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let first = connected("one", shell("seq 1 200; echo ready; sleep 30", tx.clone()));
+            let second = connected("two", shell("echo also; sleep 30", tx.clone()));
+            let third = connected("three", shell("echo third; sleep 30", tx));
+            let (a, b, c) = (first.id, second.id, third.id);
+            let sessions: Vec<_> = [&first, &second, &third]
+                .iter()
+                .map(|p| p.session.as_ref().unwrap().id)
+                .collect();
+            let term = first.terminal().unwrap().clone();
+            // Tab 0: one | two; tab 1: three (active).
+            let (mut app, wid) = app_with(first, second);
+            let w = app.windows.get_mut(&wid).unwrap();
+            w.push(Tab::single(third));
+            let (target, source) = (w.tabs[0].id, w.tabs[1].id);
+            wait_for(&term, "ready");
+            let history = term.lock().term().grid().history_size();
+            assert!(history > 0, "the first pane has scrollback");
+            let requests = crate::memory::requests();
+
+            let _ = app.merge_tab(wid, source, target, Drop::Tile(a, Side::Left));
+            let _ = app.merge_tab(wid, target, source, Drop::Edge(Side::Top));
+
+            let w = &app.windows[&wid];
+            assert_eq!(w.tabs.len(), 1);
+            let tab = &w.tabs[0];
+            assert_eq!(tab.layout.panes(), vec![c, a, b]);
+            let ids: Vec<_> = [a, b, c]
+                .iter()
+                .map(|p| tab.pane(*p).unwrap().session.as_ref().unwrap().id)
+                .collect();
+            assert_eq!(ids, sessions, "the same sessions, not new ones");
+            assert!(
+                [a, b, c]
+                    .iter()
+                    .all(|p| tab.pane(*p).unwrap().state == TabState::Connected)
+            );
+            let moved = tab.pane(a).unwrap().terminal().unwrap();
+            assert!(std::sync::Arc::ptr_eq(moved, &term), "the same terminal");
+            assert_eq!(moved.lock().term().grid().history_size(), history);
+            assert!(screen(moved).contains("ready"));
+            // Panes moved, nothing was freed: no close-tab release.
+            assert_eq!(crate::memory::requests(), requests);
+            assert!(app.pending_release.is_empty());
+
+            // And back out to a tab of its own: still the same session.
+            let _ = app.tile_to_tab(wid, a, 1);
+            let w = &app.windows[&wid];
+            let moved = w.tabs[1].pane(a).unwrap();
+            assert_eq!(moved.session.as_ref().unwrap().id, sessions[0]);
+            assert!(std::sync::Arc::ptr_eq(moved.terminal().unwrap(), &term));
+            assert_eq!(crate::memory::requests(), requests);
+            assert!(app.pending_release.is_empty());
+        }
+
+        #[test]
         fn unmaximizing_takes_the_redraws_left_pending() {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
             let first = connected("one", shell("echo hi; sleep 30", tx.clone()));

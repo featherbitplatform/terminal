@@ -1,4 +1,5 @@
-//! Opening, restoring and closing windows and tabs, quitting, and saving the layout.
+//! Opening, restoring and closing windows and tabs, quitting, and saving the layout; merging a
+//! tab into another and turning a tile into a tab (by drag or from the palette).
 
 use std::time::Duration;
 
@@ -7,8 +8,38 @@ use iced::{Task, window};
 
 use crate::app::{App, Message, unix_now};
 use crate::chrome::Chrome;
+use crate::layout::{Drop, PaneId};
 use crate::restore;
-use crate::tabs::{self, Pane, Tab, TabState, WindowState};
+use crate::tabs::{self, Pane, Tab, TabId, TabState, WindowState};
+
+/// How long a carried tab hovers over another tab's button before that tab is shown.
+pub(crate) const HOVER_SWITCH: Duration = Duration::from_millis(500);
+
+/// What is being carried across a window: a tab picked up from the tab bar, or a tile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Carry {
+    Tab(TabId),
+    Tile(PaneId),
+}
+
+/// What the tab bar and the tiles report about a drag that crosses between them.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DragMsg {
+    /// A tab button was pressed and moved past the drag threshold: it is carried.
+    StartTab(TabId),
+    /// The carried tab is over this tab button (`None`: over none).
+    OverTab(Option<usize>),
+    /// A hover over a tab button (its generation) lasted `HOVER_SWITCH`.
+    HoverElapsed(u64),
+    /// The carried tab was dropped on the content of the shown tab.
+    DropTab { tab: TabId, at: Drop },
+    /// A tile is being carried (`None`: no longer).
+    Tile(Option<PaneId>),
+    /// A carried tile was dropped on the tab bar: a tab of its own at `index`.
+    TileToTab { pane: PaneId, index: usize },
+    /// The drag ended (released, Escape, the pointer or focus left).
+    End,
+}
 
 impl App {
     /// A new terminal window of `size` (logical pixels), with no tabs yet.
@@ -246,6 +277,165 @@ impl App {
         self.save_state_soon()
     }
 
+    /// What is carried in `wid`, if anything.
+    pub(crate) fn carry_in(&self, wid: window::Id) -> Option<Carry> {
+        self.carry.filter(|(w, _)| *w == wid).map(|(_, c)| c)
+    }
+
+    pub(crate) fn drag_msg(&mut self, wid: window::Id, msg: DragMsg) -> Task<Message> {
+        match msg {
+            DragMsg::StartTab(tab) => {
+                self.carry = Some((wid, Carry::Tab(tab)));
+                self.hover = None;
+                Task::none()
+            }
+            DragMsg::OverTab(over) => {
+                if !matches!(self.carry_in(wid), Some(Carry::Tab(_))) {
+                    return Task::none();
+                }
+                let Some(index) = over else {
+                    self.hover = None;
+                    return Task::none();
+                };
+                self.hover_generation += 1;
+                let generation = self.hover_generation;
+                self.hover = Some((wid, index, generation));
+                Task::perform(
+                    async { tokio::time::sleep(HOVER_SWITCH).await },
+                    move |()| Message::Drag(wid, DragMsg::HoverElapsed(generation)),
+                )
+            }
+            DragMsg::HoverElapsed(generation) => match self.hover {
+                Some((w, index, g))
+                    if w == wid
+                        && g == generation
+                        && matches!(self.carry_in(wid), Some(Carry::Tab(_))) =>
+                {
+                    self.hover = None;
+                    self.with_window(wid, |w| w.select(index))
+                }
+                _ => Task::none(),
+            },
+            DragMsg::DropTab { tab, at } => {
+                self.end_carry();
+                let target = self
+                    .windows
+                    .get(&wid)
+                    .and_then(WindowState::active_tab)
+                    .map(|t| t.id);
+                match target {
+                    Some(target) => self.merge_tab(wid, tab, target, at),
+                    None => Task::none(),
+                }
+            }
+            DragMsg::Tile(pane) => {
+                match pane {
+                    Some(pane) => self.carry = Some((wid, Carry::Tile(pane))),
+                    None if matches!(self.carry_in(wid), Some(Carry::Tile(_))) => {
+                        self.end_carry();
+                    }
+                    None => {}
+                }
+                Task::none()
+            }
+            DragMsg::TileToTab { pane, index } => {
+                self.end_carry();
+                self.tile_to_tab(wid, pane, index)
+            }
+            DragMsg::End => {
+                self.end_carry();
+                Task::none()
+            }
+        }
+    }
+
+    fn end_carry(&mut self) {
+        self.carry = None;
+        self.hover = None;
+    }
+
+    /// Merge tab `source` into tab `target` of `wid`: the source's whole layout (its
+    /// arrangement kept) lands at `at`, its panes move over with their sessions, the source
+    /// leaves the bar and focus goes to its focused pane. Nothing closes, so nothing is
+    /// released. Merging a tab into itself (or a missing one) does nothing.
+    pub(crate) fn merge_tab(
+        &mut self,
+        wid: window::Id,
+        source: TabId,
+        target: TabId,
+        at: Drop,
+    ) -> Task<Message> {
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return Task::none();
+        };
+        if source == target || window.find(target).is_none() {
+            return Task::none();
+        }
+        // Taken out of the bar, not closed: its panes live on in the target.
+        let Some(moved) = window.find(source).and_then(|i| window.close(i)) else {
+            return Task::none();
+        };
+        let moved = moved.tab;
+        let Some(index) = window.find(target) else {
+            return Task::none();
+        };
+        let tab = &mut window.tabs[index];
+        tab.maximized = None;
+        tab.layout.insert(moved.layout, at);
+        tab.panes.extend(moved.panes);
+        tab.recent.extend(moved.recent);
+        tab.focus(moved.focused);
+        window.active = index;
+        self.save_state();
+        // The panes now on screen take their pending redraws; one never started starts.
+        self.shown(wid)
+    }
+
+    /// Move the tile `pane` out of its tab into a tab of its own at `index` of `wid`'s bar,
+    /// shown. The pane keeps its session. A tab's only pane stays where it is.
+    pub(crate) fn tile_to_tab(
+        &mut self,
+        wid: window::Id,
+        pane: PaneId,
+        index: usize,
+    ) -> Task<Message> {
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return Task::none();
+        };
+        let Some((t, _)) = window.locate(pane) else {
+            return Task::none();
+        };
+        // Not a pane close: nothing is released, the pane goes on in its new tab.
+        let Some(moved) = window.tabs[t].close_pane(pane) else {
+            return Task::none();
+        };
+        let index = index.min(window.tabs.len());
+        window.tabs.insert(index, Tab::single(moved));
+        window.active = index;
+        self.save_state();
+        self.shown(wid)
+    }
+
+    /// Move the tile `pane` to `at` within its tab (the palette's "Move tile…"), showing the
+    /// whole layout.
+    pub(crate) fn move_tile(&mut self, wid: window::Id, pane: PaneId, at: Drop) -> Task<Message> {
+        let Some(window) = self.windows.get_mut(&wid) else {
+            return Task::none();
+        };
+        let Some((t, _)) = window.locate(pane) else {
+            return Task::none();
+        };
+        let tab = &mut window.tabs[t];
+        let before = tab.layout.clone();
+        if !tab.layout.move_pane(pane, at) || tab.layout == before {
+            return Task::none();
+        }
+        tab.maximized = None;
+        tab.focus(pane);
+        self.save_state();
+        self.shown(wid)
+    }
+
     /// Save after 500 ms without another request (window edge and divider drags).
     pub(crate) fn save_state_soon(&mut self) -> Task<Message> {
         self.resize_count += 1;
@@ -254,5 +444,268 @@ impl App {
             async { tokio::time::sleep(Duration::from_millis(500)).await },
             move |()| Message::SaveState(n),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fbterm_config::Profile;
+    use iced::window;
+
+    use crate::app::{App, Message};
+    use crate::keys::Action;
+    use crate::layout::{Axis, Drop, Layout, PaneId, Side};
+    use crate::palette::{PaletteItem, PaletteMsg};
+    use crate::restore_tests::{paths_with, profile};
+    use crate::tabs::{Pane, Tab, TabId, WindowState};
+
+    fn two_panes(first: Pane, second: Pane) -> Tab {
+        let (a, b) = (first.id, second.id);
+        let mut tab = Tab::single(first);
+        tab.layout.split(a, Side::Right, b);
+        tab.panes.push(second);
+        tab
+    }
+
+    fn named(p: &Profile, title: &str) -> Pane {
+        let mut pane = Pane::for_profile(p);
+        pane.title = title.into();
+        pane
+    }
+
+    /// One window: tab 0 holds `a1 | a2` (a2 focused), tab 1 holds `b`; tab 1 is active.
+    fn app_with_tabs(p: &Profile) -> (App, window::Id, [PaneId; 3], [TabId; 2]) {
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(p)), true);
+        app.state_saving_enabled = false;
+        let wid = window::Id::unique();
+        let (a1, a2, b) = (named(p, "build"), named(p, "logs"), named(p, "shell"));
+        let ids = [a1.id, a2.id, b.id];
+        let mut first = two_panes(a1, a2);
+        first.focus(ids[1]);
+        let second = Tab::single(b);
+        let tabs = [first.id, second.id];
+        let mut w = WindowState::new();
+        w.push(first);
+        w.push(second);
+        app.windows.clear();
+        app.windows.insert(wid, w);
+        (app, wid, ids, tabs)
+    }
+
+    fn labels(app: &App, wid: window::Id) -> Vec<String> {
+        let state = &app.palettes[&wid];
+        (0..)
+            .map_while(|i| state.at(i))
+            .map(|item| match item {
+                PaletteItem::Choice { label, .. } | PaletteItem::Action { label, .. } => {
+                    label.clone()
+                }
+                PaletteItem::Profile { name, .. } => name.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn merge_tab_inserts_whole_layout() {
+        let p = profile("a");
+        let (mut app, wid, [a1, a2, b], [ta, tb]) = app_with_tabs(&p);
+        let _ = app.merge_tab(wid, ta, tb, Drop::Edge(Side::Right));
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 1, "the merged tab is gone");
+        let tab = &w.tabs[0];
+        assert_eq!(tab.id, tb);
+        assert_eq!(w.active, 0);
+        // b on the left, the whole a1 | a2 split (its arrangement kept) on the right.
+        let Layout::Split {
+            axis: Axis::Row,
+            first,
+            second,
+            ..
+        } = &tab.layout
+        else {
+            panic!("a row: {:?}", tab.layout);
+        };
+        assert_eq!(**first, Layout::Pane(b));
+        assert!(matches!(
+            &**second,
+            Layout::Split { axis: Axis::Row, first, second, .. }
+                if **first == Layout::Pane(a1) && **second == Layout::Pane(a2)
+        ));
+        assert_eq!(tab.panes.len(), 3);
+        assert_eq!(
+            tab.focused, a2,
+            "focus goes to the merged tab's focused pane"
+        );
+
+        // Into a tile's edge: that tile is split.
+        let (mut app, wid, [a1, a2, b], [ta, tb]) = app_with_tabs(&p);
+        let _ = app.merge_tab(wid, tb, ta, Drop::Tile(a1, Side::Bottom));
+        let tab = &app.windows[&wid].tabs[0];
+        assert_eq!(tab.id, ta);
+        assert_eq!(tab.layout.panes(), vec![a1, b, a2]);
+        assert_eq!(tab.focused, b);
+    }
+
+    #[test]
+    fn tile_to_tab_creates_tab_at_index() {
+        let p = profile("a");
+        let (mut app, wid, [a1, a2, b], [ta, tb]) = app_with_tabs(&p);
+        let _ = app.tile_to_tab(wid, a2, 0);
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 3);
+        assert_eq!(w.tabs[0].layout, Layout::Pane(a2));
+        assert_eq!(w.tabs[0].panes.len(), 1);
+        assert_eq!(w.tabs[0].panes[0].id, a2, "the same pane, moved");
+        assert_eq!(w.active, 0, "the new tab is shown");
+        assert_eq!(w.tabs[1].id, ta);
+        assert_eq!(w.tabs[1].layout, Layout::Pane(a1));
+        assert_eq!(w.tabs[1].focused, a1);
+        assert_eq!(w.tabs[2].id, tb);
+        assert_eq!(w.tabs[2].layout, Layout::Pane(b));
+
+        // At the end of the bar (the palette's "Move tile to new tab").
+        let (mut app, wid, [_, a2, _], _) = app_with_tabs(&p);
+        let _ = app.update(Message::Shortcut(wid, Action::SelectTab(1)));
+        let _ = app.update(Message::Shortcut(wid, Action::TileToTab));
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 3);
+        assert_eq!(w.tabs[2].layout, Layout::Pane(a2));
+        assert_eq!(w.active, 2);
+    }
+
+    #[test]
+    fn merge_into_self_is_noop() {
+        let p = profile("a");
+        let (mut app, wid, [_, _, b], [ta, tb]) = app_with_tabs(&p);
+        let before: Vec<Layout> = app.windows[&wid]
+            .tabs
+            .iter()
+            .map(|t| t.layout.clone())
+            .collect();
+        let _ = app.merge_tab(wid, ta, ta, Drop::Edge(Side::Left));
+        let _ = app.merge_tab(wid, tb, tb, Drop::Edge(Side::Left));
+        // A single-pane tab's tile cannot leave it: the tab would just be recreated.
+        let _ = app.tile_to_tab(wid, b, 0);
+        let _ = app.tile_to_tab(wid, b, 2);
+        let w = &app.windows[&wid];
+        let after: Vec<Layout> = w.tabs.iter().map(|t| t.layout.clone()).collect();
+        assert_eq!(after, before);
+        assert_eq!(w.tabs[0].id, ta);
+        assert_eq!(w.tabs[1].id, tb);
+        // The drag path refuses the same.
+        let _ = app.update(Message::Drag(
+            wid,
+            crate::windows::DragMsg::DropTab {
+                tab: tb,
+                at: Drop::Edge(Side::Left),
+            },
+        ));
+        assert_eq!(app.windows[&wid].tabs.len(), 2);
+    }
+
+    #[test]
+    fn a_carried_tab_hovering_a_tab_shows_it_after_a_while() {
+        use crate::windows::DragMsg;
+        let p = profile("a");
+        let (mut app, wid, [_, a2, b], [ta, tb]) = app_with_tabs(&p);
+        let drag = |app: &mut App, m| {
+            let _ = app.update(Message::Drag(wid, m));
+        };
+        drag(&mut app, DragMsg::StartTab(tb));
+        drag(&mut app, DragMsg::OverTab(Some(0)));
+        let first = app.hover_generation;
+        // Moved on before the time was up: that hover's timer does nothing.
+        drag(&mut app, DragMsg::OverTab(None));
+        drag(&mut app, DragMsg::HoverElapsed(first));
+        assert_eq!(app.windows[&wid].active, 1);
+        drag(&mut app, DragMsg::OverTab(Some(0)));
+        let second = app.hover_generation;
+        drag(&mut app, DragMsg::HoverElapsed(second));
+        assert_eq!(app.windows[&wid].active, 0, "tab 0 is shown");
+        // Dropped on its content: merged there.
+        drag(
+            &mut app,
+            DragMsg::DropTab {
+                tab: tb,
+                at: Drop::Tile(a2, Side::Bottom),
+            },
+        );
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.tabs[0].id, ta);
+        assert!(w.tabs[0].layout.contains(b));
+        assert_eq!(app.carry, None);
+
+        // A tile dropped on the bar becomes a tab there.
+        drag(&mut app, DragMsg::Tile(Some(b)));
+        assert!(app.carry.is_some());
+        drag(&mut app, DragMsg::TileToTab { pane: b, index: 0 });
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 2);
+        assert_eq!(w.tabs[0].layout, Layout::Pane(b));
+        drag(&mut app, DragMsg::Tile(None));
+        assert_eq!(app.carry, None);
+    }
+
+    #[test]
+    fn palette_merge_lists_drop_choices() {
+        let p = profile("a");
+        let (mut app, wid, [a1, a2, b], [ta, _]) = app_with_tabs(&p);
+        // From tab "shell": merge it into the other tab.
+        let _ = app.update(Message::Shortcut(wid, Action::MergeTab));
+        assert_eq!(labels(&app, wid), ["logs"], "the other tab, by its title");
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Pick(0)));
+        assert_eq!(
+            labels(&app, wid),
+            [
+                "Next to build: left",
+                "Next to build: right",
+                "Next to build: above",
+                "Next to build: below",
+                "Next to logs: left",
+                "Next to logs: right",
+                "Next to logs: above",
+                "Next to logs: below",
+                "Whole column on the left",
+                "Whole column on the right",
+                "Whole row on top",
+                "Whole row on bottom",
+            ]
+        );
+        // Typing filters the choices.
+        let _ = app.update(Message::Palette(
+            wid,
+            PaletteMsg::Query("logs below".into()),
+        ));
+        assert_eq!(labels(&app, wid), ["Next to logs: below"]);
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Submit { split: false }));
+        assert!(app.palettes.is_empty());
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 1);
+        assert_eq!(w.tabs[0].id, ta);
+        assert_eq!(w.tabs[0].layout.panes(), vec![a1, a2, b]);
+        assert_eq!(w.tabs[0].focused, b);
+
+        // "Move tile…": the focused pane's choices in its own tab, without no-op moves.
+        let _ = app.update(Message::Shortcut(wid, Action::MoveTile));
+        let listed = labels(&app, wid);
+        assert!(!listed.iter().any(|l| l.contains("shell")), "{listed:?}");
+        assert!(
+            !listed.contains(&"Next to logs: below".to_owned()),
+            "already there: {listed:?}"
+        );
+        assert!(listed.contains(&"Whole column on the left".to_owned()));
+        let at = listed
+            .iter()
+            .position(|l| l == "Whole column on the left")
+            .unwrap();
+        let _ = app.update(Message::Palette(wid, PaletteMsg::Pick(at)));
+        let tab = &app.windows[&wid].tabs[0];
+        assert_eq!(tab.layout.panes(), vec![b, a1, a2]);
+        assert!(app.palettes.is_empty());
+
+        // The launcher still lists profiles and actions afterwards.
+        let _ = app.update(Message::Shortcut(wid, Action::Palette));
+        assert!(labels(&app, wid).contains(&"Merge tab into\u{2026}".to_owned()));
     }
 }

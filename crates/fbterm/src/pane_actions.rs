@@ -488,16 +488,16 @@ mod tests {
     }
 
     #[test]
-    fn declared_actions_do_nothing_yet() {
+    fn rearranging_needs_something_to_rearrange() {
         let p = profile("a");
         let (mut app, wid, _) = app_with(&p, big());
-        act(&mut app, wid, Action::SplitRight);
+        // One tab of one pane: no other tab to merge into, no tile to move.
         let before = tab(&app, wid).layout.clone();
         for a in [Action::MergeTab, Action::MoveTile, Action::TileToTab] {
             act(&mut app, wid, a);
         }
         assert_eq!(tab(&app, wid).layout, before);
-        assert_eq!(tab(&app, wid).panes.len(), 2);
+        assert_eq!(app.windows[&wid].tabs.len(), 1);
         assert!(app.palettes.is_empty());
         assert!(app.find_box.is_none());
     }
