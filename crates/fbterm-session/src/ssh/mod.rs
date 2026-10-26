@@ -26,6 +26,7 @@
 mod auth;
 mod known_hosts;
 pub(crate) mod pool;
+pub mod tunnel;
 
 use std::collections::HashMap;
 use std::future::Future;

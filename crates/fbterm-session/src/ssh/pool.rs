@@ -176,6 +176,13 @@ impl SshPool {
     pub fn connected_profiles(&self) -> Vec<ProfileId> {
         self.slots.live(Connection::is_alive)
     }
+
+    /// Whether `connection` is the one the pool hands out for `profile`. Not so for the
+    /// result of a no-prompt dial that an interactive caller replaced while it ran: that one
+    /// works, but nothing else shares it, so a tunnel should acquire again instead.
+    pub(crate) fn holds(&self, profile: &ProfileId, connection: &Arc<Connection>) -> bool {
+        self.slots.holds(*profile, connection)
+    }
 }
 
 /// One profile's SSH connection: the target plus every hop in front of it, shared by the
@@ -279,6 +286,45 @@ impl Connection {
     /// Stop accepting forwarded channels for `address:port`.
     pub fn unregister_forward(&self, address: &str, port: u32) {
         self.forwards.lock().remove(&(address.to_owned(), port));
+    }
+
+    /// Like [`Connection::register_forward`], but the claim ends when the returned guard is
+    /// dropped, and only if it is still the registered one: a later claim on the same forward
+    /// (a restarted tunnel) is never removed by an earlier one ending. The guard does not keep
+    /// the connection open.
+    pub(crate) fn claim_forward(
+        &self,
+        address: &str,
+        port: u32,
+    ) -> (ForwardClaim, mpsc::UnboundedReceiver<Channel<Msg>>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let key = (address.to_owned(), port);
+        self.forwards.lock().insert(key.clone(), tx.clone());
+        let claim = ForwardClaim {
+            forwards: self.forwards.clone(),
+            key,
+            tx,
+        };
+        (claim, rx)
+    }
+}
+
+/// A registered remote forward (see [`Connection::claim_forward`]); unregisters it on drop.
+pub(crate) struct ForwardClaim {
+    forwards: Forwards,
+    key: (String, u32),
+    tx: mpsc::UnboundedSender<Channel<Msg>>,
+}
+
+impl Drop for ForwardClaim {
+    fn drop(&mut self) {
+        let mut map = self.forwards.lock();
+        if map
+            .get(&self.key)
+            .is_some_and(|tx| tx.same_channel(&self.tx))
+        {
+            map.remove(&self.key);
+        }
     }
 }
 
@@ -810,6 +856,11 @@ impl<C: Send + Sync + 'static> Slots<C> {
         }
     }
 
+    /// Whether `c` is the live connection recorded for `id`.
+    fn holds(&self, id: ProfileId, c: &Arc<C>) -> bool {
+        matches!(self.map.lock().get(&id), Some(Slot::Live(weak)) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(c)))
+    }
+
     /// Profiles whose connection is still referenced and alive; forgets the others.
     fn live(&self, alive: fn(&C) -> bool) -> Vec<ProfileId> {
         let mut map = self.map.lock();
@@ -972,6 +1023,71 @@ mod tests {
         })
         .await;
         assert_eq!(slots.live(fake_alive), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn replaced_no_prompt_dial_that_succeeds_is_not_held() {
+        let slots = Slots::<Fake>::default();
+        let id = ProfileId::new();
+        let dials = Dials::default();
+        // Both dials get through; the slot keeps the interactive one, so the reconnect's own
+        // connection is not the pool's and a tunnel must not keep riding it.
+        let (automatic, by_hand) = tokio::join!(
+            slots.get_or_dial(
+                id,
+                NO_ASK,
+                fake_alive,
+                dials.dialer(Duration::from_millis(100), false)
+            ),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                slots
+                    .get_or_dial(
+                        id,
+                        ASK,
+                        fake_alive,
+                        dials.dialer(Duration::from_millis(150), false),
+                    )
+                    .await
+            },
+        );
+        let ((stray, _), (kept, _)) = (automatic.unwrap(), by_hand.unwrap());
+        assert_eq!((stray.serial, kept.serial), (1, 2));
+        assert!(!slots.holds(id, &stray));
+        assert!(slots.holds(id, &kept));
+        assert!(!slots.holds(ProfileId::new(), &kept));
+        // Acquiring again hands out the held one.
+        let (again, reused) = slots
+            .get_or_dial(id, NO_ASK, fake_alive, dials.dialer(QUICK, false))
+            .await
+            .unwrap();
+        assert!(reused && Arc::ptr_eq(&again, &kept));
+    }
+
+    #[test]
+    fn forward_claim_never_removes_a_newer_claim() {
+        let forwards: Forwards = Arc::default();
+        let claim = |port| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let key = ("127.0.0.1".to_owned(), port);
+            forwards.lock().insert(key.clone(), tx.clone());
+            (
+                ForwardClaim {
+                    forwards: forwards.clone(),
+                    key,
+                    tx,
+                },
+                rx,
+            )
+        };
+        let (old, _old_rx) = claim(4022);
+        // A restart of the same tunnel claims the forward again before the old one ended.
+        let (new, _new_rx) = claim(4022);
+        drop(old);
+        assert!(super::super::forward_route(Some(&forwards), "127.0.0.1", 4022).is_some());
+        drop(new);
+        assert!(super::super::forward_route(Some(&forwards), "127.0.0.1", 4022).is_none());
+        assert!(forwards.lock().is_empty());
     }
 
     #[tokio::test]

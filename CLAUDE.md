@@ -53,6 +53,7 @@ cargo deny --all-features check
 # Live SSH tests (CI job "ssh live tests"; needs Docker)
 docker compose -f dev/ssh-test/compose.yaml up -d && dev/ssh-test/wait-ready.sh
 FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
+FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_tunnels
 docker compose -f dev/ssh-test/compose.yaml down
 
 bash dev/perf/sessions.sh                # 20-tab memory/CPU measurement, about 25 min; see dev/perf/README.md
