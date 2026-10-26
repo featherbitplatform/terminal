@@ -23,6 +23,7 @@ use crate::editor::{EditorMsg, EditorState};
 use crate::find::FindMsg;
 use crate::find::all::{FindAll, FindAllMsg};
 use crate::keys::{Action, Bindings};
+use crate::layout::PaneId;
 use crate::palette::{PaletteMsg, Palettes, Recency};
 use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
@@ -30,7 +31,7 @@ use crate::prompts::{
 use crate::restore;
 use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::settings_window::{SettingsMsg, SettingsState};
-use crate::tabs::{Tab, TabId, TabState, WindowState};
+use crate::tabs::{Pane, TabState, WindowState};
 use crate::theme;
 use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
@@ -90,11 +91,11 @@ pub enum Message {
         window: window::Id,
     },
     /// A dial finished; carries the pty size it was opened with.
-    Connected(TabId, Delivered<SessionHandle>, GridSize),
-    ConnectFailed(TabId, String),
-    /// A dial was refused because the host key changed: fail the tab and explain.
+    Connected(PaneId, Delivered<SessionHandle>, GridSize),
+    ConnectFailed(PaneId, String),
+    /// A dial was refused because the host key changed: fail the pane and explain.
     HostKeyChanged {
-        tab: TabId,
+        pane: PaneId,
         host: String,
         port: u16,
         reason: String,
@@ -118,20 +119,20 @@ pub enum Message {
     Palette(window::Id, PaletteMsg),
     /// The find bar of a window's active tab.
     Find(window::Id, FindMsg),
-    /// A tab's find-bar search finished.
+    /// A pane's find-bar search finished.
     Found {
-        tab: TabId,
+        pane: PaneId,
         seq: u64,
         outcome: SearchOutcome,
     },
-    /// Search a tab's find bar again for the output that arrived (one timer per burst).
-    FindRefresh(TabId),
+    /// Search a pane's find bar again for the output that arrived (one timer per burst).
+    FindRefresh(PaneId),
     /// The find-in-all-tabs box, open in a window.
     FindAll(window::Id, FindAllMsg),
-    /// One tab's part of a find-in-all-tabs search finished.
+    /// One pane's part of a find-in-all-tabs search finished.
     FoundAll {
         seq: u64,
-        tab: TabId,
+        pane: PaneId,
         outcome: SearchOutcome,
     },
     /// Debug aid: open the find bar or the box with a query once output has arrived.
@@ -531,7 +532,7 @@ impl App {
             return "Settings · fbterm".into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
-            Some(tab) => format!("{} · fbterm", tab.title),
+            Some(tab) => format!("{} · fbterm", tab.title()),
             None => "fbterm".into(),
         }
     }
@@ -593,7 +594,7 @@ impl App {
             .values()
             .next()
             .and_then(WindowState::active_tab)
-            .is_some_and(|t| t.state != TabState::NotConnected)
+            .is_some_and(|t| t.state() != &TabState::NotConnected)
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -610,24 +611,24 @@ impl App {
             Message::NextTab => self.with_focused(WindowState::next),
             Message::PrevTab => self.with_focused(WindowState::prev),
             Message::OpenProfile { profile, window } => self.open_tab(window, profile),
-            Message::Connected(tab, delivered, requested) => {
+            Message::Connected(pane, delivered, requested) => {
                 if let Some(handle) = delivered.take() {
-                    self.connected(tab, handle, requested);
+                    self.connected(pane, handle, requested);
                 }
                 Task::none()
             }
-            Message::ConnectFailed(tab, reason) => {
-                self.connect_failed(tab, reason);
+            Message::ConnectFailed(pane, reason) => {
+                self.connect_failed(pane, reason);
                 Task::none()
             }
             Message::HostKeyChanged {
-                tab,
+                pane,
                 host,
                 port,
                 reason,
             } => {
-                let task = self.host_key_changed(tab, host, port);
-                self.connect_failed(tab, reason);
+                let task = self.host_key_changed(pane, host, port);
+                self.connect_failed(pane, reason);
                 task
             }
             Message::NewWindow => self.action(None, Action::NewWindow),
@@ -717,7 +718,7 @@ impl App {
                 let freed = self
                     .windows
                     .get(&id)
-                    .map(|w| crate::memory::weak_terminals(w.tabs.iter()))
+                    .map(|w| crate::memory::weak_terminals(w.tabs.iter().flat_map(|t| &t.panes)))
                     .unwrap_or_default();
                 let was_terminal = self.windows.remove(&id).is_some();
                 visibility::unwatch(id);
@@ -766,11 +767,11 @@ impl App {
             }
             Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::Find(wid, msg) => self.find(wid, msg),
-            Message::Found { tab, seq, outcome } => self.found(tab, seq, outcome),
-            Message::FindRefresh(tab) => self.find_refresh(tab),
+            Message::Found { pane, seq, outcome } => self.found(pane, seq, outcome),
+            Message::FindRefresh(pane) => self.find_refresh(pane),
             Message::FindAll(wid, msg) => self.find_all(wid, msg),
-            Message::FoundAll { seq, tab, outcome } => {
-                self.found_all(seq, tab, outcome);
+            Message::FoundAll { seq, pane, outcome } => {
+                self.found_all(seq, pane, outcome);
                 Task::none()
             }
             Message::DebugFind { all, query } => self.debug_find(all, query),
@@ -824,8 +825,8 @@ impl App {
         }
     }
 
-    fn connect_failed(&mut self, tab: TabId, reason: String) {
-        if let Some(t) = self.tab_mut(tab) {
+    fn connect_failed(&mut self, pane: PaneId, reason: String) {
+        if let Some((_, t)) = self.pane_mut(pane) {
             t.connecting = None;
             let text = if reason.starts_with("could not connect") {
                 format!("{reason}, press Enter to retry")
@@ -873,10 +874,12 @@ impl App {
         }
     }
 
-    pub(crate) fn tab_mut(&mut self, id: TabId) -> Option<&mut Tab> {
-        self.windows
-            .values_mut()
-            .find_map(|w| w.find(id).map(|i| &mut w.tabs[i]))
+    /// The pane `id`, wherever it is, with its window.
+    pub(crate) fn pane_mut(&mut self, id: PaneId) -> Option<(window::Id, &mut Pane)> {
+        self.windows.iter_mut().find_map(|(wid, w)| {
+            let (t, p) = w.locate(id)?;
+            Some((*wid, &mut w.tabs[t].panes[p]))
+        })
     }
 
     fn shoot(&mut self) -> Task<Message> {

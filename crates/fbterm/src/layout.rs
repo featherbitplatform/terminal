@@ -2,23 +2,29 @@
 //!
 //! A tab's panes form a binary tree. `Row` places children side by side, `Column` stacks them.
 //! Between the two children of every split sits a divider of `DIVIDER` logical pixels.
-
-// Not wired into the app yet; the first consumer lands with the next tiling task.
-#![allow(dead_code)]
+//!
+//! Items marked `allow(dead_code)` are wired in by the split, focus and drag actions of the
+//! later tiling tasks; each attribute goes when its item gets a caller.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use iced::{Rectangle, Size};
 
 /// Fewest columns a pane may be squeezed to.
+#[allow(dead_code)]
 pub const MIN_COLS: u16 = 20;
 /// Fewest rows a pane may be squeezed to.
+#[allow(dead_code)]
 pub const MIN_ROWS: u16 = 5;
 /// Logical pixels between two panes: the visible line is 1 px centred, the rest is hit area.
+#[allow(dead_code)]
 pub const DIVIDER: f32 = 4.0;
 
+#[allow(dead_code)]
 const MIN_RATIO: f32 = 0.05;
+#[allow(dead_code)]
 const MAX_RATIO: f32 = 0.95;
+#[allow(dead_code)]
 const EPS: f32 = 0.5;
 
 /// Identifies one pane for the lifetime of the process.
@@ -33,12 +39,14 @@ impl PaneId {
 }
 
 /// `Row`: children side by side. `Column`: children stacked.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Axis {
     Row,
     Column,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     Left,
@@ -47,6 +55,7 @@ pub enum Side {
     Bottom,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dir {
     Left,
@@ -56,6 +65,7 @@ pub enum Dir {
 }
 
 /// Where an inserted subtree lands.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Drop {
     /// Beside this pane, on the given side of it.
@@ -65,8 +75,10 @@ pub enum Drop {
 }
 
 /// From the root: `false` = first child, `true` = second. Names a split.
+#[allow(dead_code)]
 pub type Path = Vec<bool>;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Divider {
     pub path: Path,
@@ -74,6 +86,7 @@ pub struct Divider {
     pub rect: Rectangle,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Layout {
     Pane(PaneId),
@@ -86,6 +99,7 @@ pub enum Layout {
     },
 }
 
+#[allow(dead_code)]
 impl Side {
     fn axis(self) -> Axis {
         match self {
@@ -100,6 +114,7 @@ impl Side {
     }
 }
 
+#[allow(dead_code)]
 fn join(axis: Axis, ratio: f32, first: Layout, second: Layout) -> Layout {
     Layout::Split {
         axis,
@@ -110,6 +125,7 @@ fn join(axis: Axis, ratio: f32, first: Layout, second: Layout) -> Layout {
 }
 
 /// Places `subtree` beside `existing` on `side`, with `subtree` taking `share` of the axis.
+#[allow(dead_code)]
 fn beside(existing: Layout, subtree: Layout, side: Side, share: f32) -> Layout {
     if side.leads() {
         join(side.axis(), share, subtree, existing)
@@ -118,6 +134,7 @@ fn beside(existing: Layout, subtree: Layout, side: Side, share: f32) -> Layout {
     }
 }
 
+#[allow(dead_code)]
 impl Layout {
     /// Panes in reading order (first child before second, depth first).
     pub fn panes(&self) -> Vec<PaneId> {
@@ -358,17 +375,20 @@ impl Layout {
     }
 }
 
+#[allow(dead_code)]
 enum Node {
     Pane(PaneId, Rectangle),
     Divider(Path, Axis, Rectangle),
 }
 
 /// Overlap length of two 1-D spans.
+#[allow(dead_code)]
 fn span(a: f32, alen: f32, b: f32, blen: f32) -> f32 {
     (a + alen).min(b + blen) - a.max(b)
 }
 
 /// Cuts `area` into first, divider and second.
+#[allow(dead_code)]
 fn cut(area: Rectangle, axis: Axis, ratio: f32) -> (Rectangle, Rectangle, Rectangle) {
     let total = match axis {
         Axis::Row => area.width,

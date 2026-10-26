@@ -168,7 +168,7 @@ impl App {
         }
     }
 
-    /// The profile store changed: open palettes list the new names, tabs take new names and
+    /// The profile store changed: open palettes list the new names, panes take new names and
     /// accents (they keep their sessions; they refer to profiles by id).
     fn profiles_changed(&mut self) {
         let items = palette::items(&self.profiles);
@@ -176,14 +176,14 @@ impl App {
             state.set_items(items.clone(), &self.recency);
         }
         for w in self.windows.values_mut() {
-            for tab in &mut w.tabs {
-                if let Some(p) = self.profiles.get(tab.profile) {
-                    if tab.title == tab.name {
-                        tab.title = p.name.clone();
+            for pane in w.tabs.iter_mut().flat_map(|t| &mut t.panes) {
+                if let Some(p) = self.profiles.get(pane.profile) {
+                    if pane.title == pane.name {
+                        pane.title = p.name.clone();
                     }
-                    tab.name = p.name.clone();
-                    tab.accent = p.accent;
-                    tab.accent_style = p.accent_style;
+                    pane.name = p.name.clone();
+                    pane.accent = p.accent;
+                    pane.accent_style = p.accent_style;
                 }
             }
         }
@@ -249,21 +249,21 @@ impl App {
         }
     }
 
-    /// Explain a refused, changed host key over the window of the tab that dialled.
+    /// Explain a refused, changed host key over the window of the pane that dialled.
     pub(crate) fn host_key_changed(
         &mut self,
-        tab: crate::tabs::TabId,
+        pane: crate::layout::PaneId,
         host: String,
         port: u16,
     ) -> Task<Message> {
         let Some(w) = self
             .windows
             .iter()
-            .find_map(|(id, w)| w.find(tab).map(|_| *id))
+            .find_map(|(id, w)| w.locate(pane).map(|_| *id))
         else {
             return Task::none();
         };
-        // Tabs sharing one refused dial explain it once.
+        // Panes sharing one refused dial explain it once.
         if !self.prompts.has_changed(w, &host, port) {
             self.prompts.push(w, None, Dialog::Changed { host, port });
         }

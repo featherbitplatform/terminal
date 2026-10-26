@@ -195,7 +195,7 @@ impl App {
             return Task::none();
         };
         let alt = terminal.lock().mode().contains(TermMode::ALT_SCREEN);
-        let name = default_file_name(&tab.title, chrono::Local::now().naive_local());
+        let name = default_file_name(tab.title(), chrono::Local::now().naive_local());
         self.exporting = Some(wid);
         let terminal = Delivered::new(terminal);
         let title = dialog_title(alt);

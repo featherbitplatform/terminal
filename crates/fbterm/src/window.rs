@@ -69,7 +69,9 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         return container(text("")).into();
     };
     // With the find bar open, keys go to the bar: the terminal is drawn (and acts) unfocused.
-    let find = win.active_tab().and_then(|t| t.find.as_ref());
+    let find = win
+        .active_tab()
+        .and_then(|t| t.focused_pane().find.as_ref());
     let style = if app.app_active && app.focused == Some(id) && find.is_none() {
         &app.style
     } else {
@@ -330,7 +332,10 @@ fn tab_bar<'a>(
         hole: (active < tabs.len()).then_some(active),
         tokens: t,
         around: tabs_bar.around,
-        tabs: tabs.iter().map(|t| (t.accent, t.accent_style)).collect(),
+        tabs: tabs
+            .iter()
+            .map(|t| (t.accent(), t.accent_style()))
+            .collect(),
         scale: tabs_bar.scale,
     });
     chrome::title_bar(bar, modal, move |a| Message::TitleBar(window, a))
@@ -776,7 +781,7 @@ fn tab_button<'a>(
 ) -> Element<'a, Message> {
     let window = bar.window;
     let demo_tip = index == 0 && bar.demo_tip == Some(DemoTip::Close);
-    let (accent, accent_style, around) = (tab.accent, tab.accent_style, bar.around);
+    let (accent, accent_style, around) = (tab.accent(), tab.accent_style(), bar.around);
     let radius = tab_radius(bar.scale);
     let idle = look(t, accent, accent_style, active, false, around);
     let stripe = container(text(""))
@@ -790,7 +795,7 @@ fn tab_button<'a>(
             },
             ..container::Style::default()
         });
-    let label = text(tab.title.as_str())
+    let label = text(tab.title())
         .font(UI_FONT)
         .size(12.5)
         .wrapping(text::Wrapping::None)
@@ -812,7 +817,7 @@ fn tab_button<'a>(
     );
     let inner = row![
         stripe,
-        dot(state_color(t, &tab.state)),
+        dot(state_color(t, tab.state())),
         container(label).width(Length::Fill).clip(true),
         close
     ]

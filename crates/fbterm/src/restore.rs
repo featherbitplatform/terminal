@@ -58,7 +58,7 @@ pub fn snapshot(
             .iter()
             .filter(|(_, w)| !w.tabs.is_empty())
             .map(|(id, w)| SavedWindow {
-                tabs: w.tabs.iter().map(|t| t.profile).collect(),
+                tabs: w.tabs.iter().map(|t| t.focused_pane().profile).collect(),
                 active: w.active.min(w.tabs.len() - 1),
                 size: sizes.get(id).copied().unwrap_or(DEFAULT_SIZE),
             })
@@ -72,7 +72,7 @@ mod tests {
     use fbterm_config::{LocalProfile, Profile, ProfileId, ProfileKind};
 
     use super::*;
-    use crate::tabs::Tab;
+    use crate::tabs::{Pane, Tab};
 
     fn store(ids: &[ProfileId]) -> ProfileStore {
         ProfileStore {
@@ -170,11 +170,11 @@ mod tests {
             window::Id::unique(),
         );
         let mut one = WindowState::new();
-        one.push(Tab::new(a, "a", None));
-        one.push(Tab::new(b, "b", None));
+        one.push(Tab::single(Pane::new(a, "a", None)));
+        one.push(Tab::single(Pane::new(b, "b", None)));
         one.active = 0;
         let mut two = WindowState::new();
-        two.push(Tab::new(b, "b", None));
+        two.push(Tab::single(Pane::new(b, "b", None)));
         let windows = BTreeMap::from([(w1, one), (w2, two), (w3, WindowState::new())]);
         let sizes = HashMap::from([(w1, (1200.0, 700.0))]);
         let mut recency = Recency::new();

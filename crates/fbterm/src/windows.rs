@@ -8,7 +8,7 @@ use iced::{Task, window};
 use crate::app::{App, Message, unix_now};
 use crate::chrome::Chrome;
 use crate::restore;
-use crate::tabs::{self, Tab, TabState, WindowState};
+use crate::tabs::{self, Pane, Tab, TabState, WindowState};
 
 impl App {
     /// A new terminal window of `size` (logical pixels), with no tabs yet.
@@ -44,7 +44,7 @@ impl App {
             let window = self.windows.get_mut(&wid).expect("just inserted");
             for &profile in &saved.tabs {
                 if let Some(p) = self.profiles.get(profile) {
-                    window.tabs.push(Tab::for_profile(p));
+                    window.tabs.push(Tab::single(Pane::for_profile(p)));
                 }
             }
             window.active = saved.active.min(window.tabs.len().saturating_sub(1));
@@ -72,9 +72,9 @@ impl App {
         let Some(p) = self.profiles.get(profile) else {
             return Task::none();
         };
-        let tab = Tab::for_profile(p);
+        let tab = Tab::single(Pane::for_profile(p));
         self.recency.bump(profile, unix_now());
-        let id = tab.id;
+        let id = tab.focused;
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();
         };
@@ -90,7 +90,7 @@ impl App {
         let Some(closed) = window.close(index) else {
             return Task::none();
         };
-        let freed = crate::memory::weak_terminals(std::iter::once(&closed.tab));
+        let freed = crate::memory::weak_terminals(closed.tab.panes.iter());
         drop(closed.tab);
         self.save_state();
         self.release_closed(freed);
@@ -129,20 +129,29 @@ impl App {
     }
 
     /// The active tab of `wid` was just shown (selected, created, or its window focused): take
-    /// the redraw its session left pending while hidden (the redraw follows this update), and
-    /// start it if it never was (restored tabs connect on first focus).
+    /// the redraws its sessions left pending while hidden (the redraw follows this update), and
+    /// start every pane that never was (restored tabs connect on first focus).
     pub(crate) fn shown(&mut self, wid: window::Id) -> Task<Message> {
         let Some(window) = self.windows.get(&wid) else {
             return Task::none();
         };
         tabs::on_shown(window);
-        match window.active_tab() {
-            Some(t) if t.state == TabState::NotConnected => {
-                let id = t.id;
-                self.start(wid, id)
-            }
-            _ => Task::none(),
-        }
+        let waiting: Vec<_> = window
+            .active_tab()
+            .map(|t| {
+                t.panes
+                    .iter()
+                    .filter(|p| p.state == TabState::NotConnected)
+                    .map(|p| p.id)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Task::batch(
+            waiting
+                .into_iter()
+                .map(|id| self.start(wid, id))
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Write `state.toml`: windows, tabs, selection, sizes and recency. Does nothing for debug

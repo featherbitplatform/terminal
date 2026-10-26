@@ -419,9 +419,13 @@ fn a_lower_value_nothing_exceeds_applies_when_the_quiet_period_passes() {
 
 /// Run the search the open find bar of `wid`'s first tab is waiting for and deliver it.
 fn finish_search(app: &mut App, wid: iced::window::Id, term: &fbterm_term::SharedTerminal) {
-    let bar = app.windows[&wid].tabs[0].find.as_ref().unwrap();
+    let bar = app.windows[&wid].tabs[0]
+        .focused_pane()
+        .find
+        .as_ref()
+        .unwrap();
     let seq = bar.pending_seq().expect("a search is running");
-    let id = app.windows[&wid].tabs[0].id;
+    let id = app.windows[&wid].tabs[0].focused;
     let outcome = fbterm_term::search(
         term,
         &fbterm_term::SearchRequest {
@@ -436,7 +440,12 @@ fn finish_search(app: &mut App, wid: iced::window::Id, term: &fbterm_term::Share
 }
 
 fn matches_in(app: &App, wid: iced::window::Id) -> usize {
-    let counter = app.windows[&wid].tabs[0].find.as_ref().unwrap().counter();
+    let counter = app.windows[&wid].tabs[0]
+        .focused_pane()
+        .find
+        .as_ref()
+        .unwrap()
+        .counter();
     counter.rsplit(' ').next().unwrap().parse().unwrap()
 }
 
@@ -454,8 +463,9 @@ fn lowering_scrollback_refreshes_an_open_find_bar() {
     send(&mut app, SettingsMsg::ScrollbackApply);
     assert!(term.lock().history_len() <= 100);
     // The bar searches again, now or when its timer fires.
-    let id = app.windows[&wid].tabs[0].id;
+    let id = app.windows[&wid].tabs[0].focused;
     if app.windows[&wid].tabs[0]
+        .focused_pane()
         .find
         .as_ref()
         .unwrap()

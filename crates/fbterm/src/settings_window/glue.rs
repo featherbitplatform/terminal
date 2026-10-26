@@ -102,12 +102,13 @@ impl App {
         }
     }
 
-    /// The most history lines any open tab holds: what a lowered scrollback would cut.
+    /// The most history lines any open pane holds: what a lowered scrollback would cut.
     fn max_open_history(&self) -> usize {
         self.windows
             .values()
             .flat_map(|w| w.tabs.iter())
-            .filter_map(|tab| tab.terminal())
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|pane| pane.terminal())
             .map(|term| term.lock().history_len())
             .max()
             .unwrap_or(0)
@@ -279,8 +280,13 @@ impl App {
             self.tokens = theme::tokens(new.theme);
         }
         if new.kitty_keyboard != self.settings.kitty_keyboard {
-            for tab in self.windows.values().flat_map(|w| w.tabs.iter()) {
-                if let Some(term) = tab.terminal() {
+            let panes = self
+                .windows
+                .values()
+                .flat_map(|w| &w.tabs)
+                .flat_map(|t| &t.panes);
+            for pane in panes {
+                if let Some(term) = pane.terminal() {
                     term.lock().set_kitty_keyboard(new.kitty_keyboard);
                 }
             }
@@ -316,21 +322,25 @@ impl App {
     }
 
     /// Set every open terminal's scrollback limit. If any lost lines, release the freed memory
-    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines. A tab
+    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines. A pane
     /// that lost lines and has a find bar open searches again, so the bar does not keep
     /// counting or stepping to matches that are gone.
     fn apply_scrollback(&mut self, lines: usize, source: SettingsSource) -> Task<Message> {
-        let mut trimmed_tabs = Vec::new();
-        for (wid, window) in &self.windows {
-            for (index, tab) in window.tabs.iter().enumerate() {
-                if let Some(term) = tab.terminal()
+        let mut trimmed_panes = Vec::new();
+        let mut trimmed = 0;
+        for tab in self.windows.values().flat_map(|w| &w.tabs) {
+            let before = trimmed_panes.len();
+            for pane in &tab.panes {
+                if let Some(term) = pane.terminal()
                     && term.lock().set_scrollback(lines) > 0
                 {
-                    trimmed_tabs.push((*wid, index));
+                    trimmed_panes.push(pane.id);
                 }
             }
+            if trimmed_panes.len() > before {
+                trimmed += 1;
+            }
         }
-        let trimmed = trimmed_tabs.len();
         if trimmed == 0 {
             return Task::none();
         }
@@ -352,11 +362,7 @@ impl App {
             };
             self.show_settings_notice(line);
         }
-        Task::batch(
-            trimmed_tabs
-                .into_iter()
-                .map(|(wid, index)| self.find_output(wid, index)),
-        )
+        Task::batch(trimmed_panes.into_iter().map(|pane| self.find_output(pane)))
     }
 
     /// The refresh rate `max_fps = "display"` follows: the fastest display a terminal window is

@@ -100,7 +100,7 @@ impl App {
             .windows
             .get(&wid)
             .and_then(|w| w.active_tab())
-            .and_then(|t| t.find.as_ref())
+            .and_then(|t| t.focused_pane().find.as_ref())
             .map(|bar| bar.input.clone());
         let focus = input.map_or(Task::none(), |id| {
             iced::widget::operation::focus(id.clone())

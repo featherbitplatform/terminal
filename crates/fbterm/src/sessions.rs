@@ -16,9 +16,10 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::app::{App, DEFAULT_GRID, Delivered, Message};
+use crate::layout::PaneId;
 use crate::pacing::{OUTPUT_FPS, OutputRate, Pacer};
 use crate::prompts::UiPrompter;
-use crate::tabs::{self, InputRoute, Tab, TabId, TabState, WindowState};
+use crate::tabs::{self, InputRoute, Pane, Tab, TabState, WindowState};
 
 type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
 
@@ -124,33 +125,33 @@ impl App {
         Arc::new(Mutex::new(term))
     }
 
-    /// (Re)start a tab's session: spawn a local program, or dial an SSH profile.
-    pub(crate) fn start(&mut self, wid: window::Id, id: TabId) -> Task<Message> {
+    /// (Re)start a pane's session: spawn a local program, or dial an SSH profile.
+    pub(crate) fn start(&mut self, wid: window::Id, id: PaneId) -> Task<Message> {
         let grid = self.grids.get(&wid).copied().unwrap_or(DEFAULT_GRID);
-        tracing::info!(tab = id.0, "starting tab");
+        tracing::info!(pane = id.0, "starting pane");
         let fresh_terminal = self.new_terminal(grid);
         let events = self.events.clone();
         let profile: Option<Profile> = self
             .windows
             .get(&wid)
-            .and_then(|w| w.find(id).map(|i| w.tabs[i].profile))
+            .and_then(|w| w.locate(id).map(|(t, p)| w.tabs[t].panes[p].profile))
             .and_then(|p| self.profiles.get(p).cloned());
         let scheme = self.style.scheme;
-        let Some(tab) = self.windows.get_mut(&wid).and_then(|w| {
-            let i = w.find(id)?;
-            w.tabs.get_mut(i)
+        let Some(pane) = self.windows.get_mut(&wid).and_then(|w| {
+            let (t, p) = w.locate(id)?;
+            w.tabs[t].panes.get_mut(p)
         }) else {
             return Task::none();
         };
-        // A restart continues in the tab's terminal, so its output and scrollback stay; the
+        // A restart continues in the pane's terminal, so its output and scrollback stay; the
         // first start gets a new one.
-        let previous = tab.terminal().cloned();
+        let previous = pane.terminal().cloned();
         // Close the previous session (and drop any dial in flight) before anything touches
         // the terminal again: once closed, its lingering output is discarded, never fed.
-        if let Some(old) = tab.session.take() {
+        if let Some(old) = pane.session.take() {
             old.close();
         }
-        tab.connecting = None;
+        pane.connecting = None;
         let (terminal, fresh) = match previous {
             Some(t) => {
                 t.lock().feed(tabs::RESTART_RESET);
@@ -158,11 +159,11 @@ impl App {
             }
             None => (fresh_terminal, true),
         };
-        tab.title = tab.name.clone();
-        tab.placeholder = Some(terminal.clone());
+        pane.title = pane.name.clone();
+        pane.placeholder = Some(terminal.clone());
         let Some(profile) = profile else {
-            tab.state = TabState::Disconnected("profile not found".into());
-            write_notice(tab, "this profile no longer exists", fresh);
+            pane.state = TabState::Disconnected("profile not found".into());
+            write_notice(pane, "this profile no longer exists", fresh);
             return Task::none();
         };
         match &profile.kind {
@@ -172,25 +173,25 @@ impl App {
                         if fresh {
                             scheme.apply_to(&mut handle.terminal.lock());
                         }
-                        tab.session = Some(handle);
-                        tab.placeholder = None;
-                        tab.state = TabState::Connected;
+                        pane.session = Some(handle);
+                        pane.placeholder = None;
+                        pane.state = TabState::Connected;
                     }
                     Err(e) => {
                         let text = format!(
                             "could not start {}: {e}, press Enter to retry",
                             profile.name
                         );
-                        tab.state = TabState::Disconnected(e.to_string());
-                        write_notice(tab, &text, fresh);
+                        pane.state = TabState::Disconnected(e.to_string());
+                        write_notice(pane, &text, fresh);
                     }
                 }
                 Task::none()
             }
             ProfileKind::Ssh(ssh) => {
-                tab.state = TabState::Connecting;
+                pane.state = TabState::Connecting;
                 write_notice(
-                    tab,
+                    pane,
                     &format!("connecting to {}@{}:{}", ssh.user, ssh.host, ssh.port),
                     fresh,
                 );
@@ -199,7 +200,7 @@ impl App {
                 let pid = profile.id;
                 let requested = terminal.lock().size();
                 let terminal = terminal.clone();
-                // Questions of this dial open over this tab's window.
+                // Questions of this dial open over this pane's window.
                 let prompter = Arc::new(UiPrompter::new(Some(wid), self.prompt_tx.clone()));
                 let dial = async move {
                     pool.open_shell_prompting(&store, &pid, terminal, events, prompter)
@@ -214,7 +215,7 @@ impl App {
                         }
                         .to_string();
                         Message::HostKeyChanged {
-                            tab: id,
+                            pane: id,
                             host,
                             port,
                             reason,
@@ -223,7 +224,7 @@ impl App {
                     Err(e) => Message::ConnectFailed(id, e.to_string()),
                 })
                 .abortable();
-                tab.connecting = Some(handle.abort_on_drop());
+                pane.connecting = Some(handle.abort_on_drop());
                 task
             }
         }
@@ -231,12 +232,12 @@ impl App {
 
     /// `requested`: the size the remote pty was opened with. The window may have resized the
     /// terminal while the dial was in flight; the remote side then gets the current size.
-    pub(crate) fn connected(&mut self, id: TabId, handle: SessionHandle, requested: GridSize) {
-        // A tab closed meanwhile drops the handle here, closing the shell. The session writes
-        // into the tab's own terminal, which already carries the color scheme.
-        let Some((wid, window, index)) = self.windows.iter_mut().find_map(|(wid, w)| {
-            let i = w.find(id)?;
-            Some((*wid, w, i))
+    pub(crate) fn connected(&mut self, id: PaneId, handle: SessionHandle, requested: GridSize) {
+        // A pane closed meanwhile drops the handle here, closing the shell. The session writes
+        // into the pane's own terminal, which already carries the color scheme.
+        let Some((wid, window, (t, p))) = self.windows.iter_mut().find_map(|(wid, w)| {
+            let at = w.locate(id)?;
+            Some((*wid, w, at))
         }) else {
             return;
         };
@@ -244,62 +245,62 @@ impl App {
         if current != requested {
             handle.resize(current);
         }
-        let tab = &mut window.tabs[index];
+        let pane = &mut window.tabs[t].panes[p];
         let warnings = handle.auth_warnings().to_vec();
-        if let Some(text) = tabs::install_session(tab, handle) {
-            write_notice(tab, &text, false);
+        if let Some(text) = tabs::install_session(pane, handle) {
+            write_notice(pane, &text, false);
         }
-        // Once per tab: each tab's own handle carries its connection's warnings.
+        // Once per pane: each pane's own handle carries its connection's warnings.
         for warning in warnings {
             match warning {
-                AuthWarning::RsaUserKey => write_notice(tab, crate::editor::RSA_ADVICE, false),
+                AuthWarning::RsaUserKey => write_notice(pane, crate::editor::RSA_ADVICE, false),
             }
         }
         // The shell's reader started before the handle got here, so a `Dirty` it raised went
-        // nowhere and is still pending: take it as a visible tab does (the redraw after this
-        // update shows the output); a hidden tab, or a tab in a window that cannot be seen,
+        // nowhere and is still pending: take it as a visible pane does (the redraw after this
+        // update shows the output); a hidden pane, or a pane in a window that cannot be seen,
         // keeps it pending until it is shown.
         if !self.occluded.contains(&wid) {
-            tabs::on_dirty(window, index);
+            tabs::on_dirty(window, id);
         }
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {
         if event == SessionEvent::Released {
-            // The session of a tab the user closed: no tab is left to show it.
+            // The session of a pane the user closed: no pane is left to show it.
             self.release_swept();
             return Task::none();
         }
-        let Some((wid, window, index)) = self.windows.iter_mut().find_map(|(wid, w)| {
-            let i = w
+        let Some((wid, window, pane)) = self.windows.iter_mut().find_map(|(wid, w)| {
+            let id = w
                 .tabs
                 .iter()
-                .position(|t| t.session.as_ref().is_some_and(|s| s.id == sid))?;
-            Some((*wid, w, i))
+                .flat_map(|t| &t.panes)
+                .find(|p| p.session.as_ref().is_some_and(|s| s.id == sid))?
+                .id;
+            Some((*wid, w, id))
         }) else {
             return Task::none();
         };
         if event == SessionEvent::Dirty {
-            // A visible tab re-arms here, before the redraw that follows this update locks
-            // the terminal. A hidden tab, or any tab of a window that cannot be seen (see
+            // A visible pane re-arms here, before the redraw that follows this update locks
+            // the terminal. A hidden pane, or any pane of a window that cannot be seen (see
             // `crate::visibility`), leaves the flag pending, so its session raises no further
             // Dirty until it is shown (see `App::shown`).
-            if !self.occluded.contains(&wid) && tabs::on_dirty(window, index) {
-                // A find bar on the shown tab follows its output.
-                return self.find_output(wid, index);
+            if !self.occluded.contains(&wid) && tabs::on_dirty(window, pane) {
+                // A find bar on the shown pane follows its output.
+                return self.find_output(pane);
             }
             return Task::none();
         }
-        let tab = &mut window.tabs[index];
-        match &event {
-            SessionEvent::Dirty => Task::none(),
-            _ => {
-                if let Some(text) = tabs::apply_event(tab, &event) {
-                    write_notice(tab, &text, false);
-                }
-                Task::none()
-            }
+        let Some((t, p)) = window.locate(pane) else {
+            return Task::none();
+        };
+        let pane = &mut window.tabs[t].panes[p];
+        if let Some(text) = tabs::apply_event(pane, &event) {
+            write_notice(pane, &text, false);
         }
+        Task::none()
     }
 
     pub(crate) fn terminal_output(
@@ -309,23 +310,24 @@ impl App {
     ) -> Task<Message> {
         match output {
             TerminalOutput::Input(bytes) => {
-                let Some(tab) = self
+                let Some(pane) = self
                     .windows
                     .get_mut(&wid)
                     .and_then(WindowState::active_tab_mut)
+                    .map(Tab::focused_pane_mut)
                 else {
                     return Task::none();
                 };
-                match tabs::route_input(&tab.state, &bytes) {
+                match tabs::route_input(&pane.state, &bytes) {
                     InputRoute::Send => {
-                        if let Some(s) = &tab.session {
+                        if let Some(s) = &pane.session {
                             self.receiver.typed(s.id);
                             s.send(bytes);
                         }
                         Task::none()
                     }
                     InputRoute::Reconnect | InputRoute::Respawn => {
-                        let id = tab.id;
+                        let id = pane.id;
                         self.start(wid, id)
                     }
                     InputRoute::Ignore => Task::none(),
@@ -337,7 +339,7 @@ impl App {
                     .windows
                     .get(&wid)
                     .and_then(WindowState::active_tab)
-                    .and_then(|t| t.session.as_ref())
+                    .and_then(|t| t.focused_pane().session.as_ref())
                 {
                     s.resize(grid);
                 }
@@ -353,10 +355,10 @@ impl App {
     }
 }
 
-/// Write a dim notice into the tab's visible terminal, keeping its scrollback.
+/// Write a dim notice into the pane's terminal, keeping its scrollback.
 /// `fresh`: the terminal was just created and is still empty.
-pub(crate) fn write_notice(tab: &Tab, text: &str, fresh: bool) {
-    if let Some(term) = tab.terminal() {
+pub(crate) fn write_notice(pane: &Pane, text: &str, fresh: bool) {
+    if let Some(term) = pane.terminal() {
         term.lock().feed(&tabs::notice_bytes(text, fresh));
     }
 }
@@ -537,6 +539,160 @@ mod tests {
             "file:///a%00b",
         ] {
             assert_eq!(link_action(url), LinkAction::Refuse, "{url}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod pane_tests {
+    use iced::window;
+
+    use crate::app::App;
+    use crate::layout::Side;
+    use crate::restore_tests::{paths_with, profile};
+    use crate::tabs::{Pane, Tab, TabState, WindowState};
+
+    /// Two panes side by side in one tab, as a split would make them.
+    fn two_panes(first: Pane, second: Pane) -> Tab {
+        let (a, b) = (first.id, second.id);
+        let mut tab = Tab::single(first);
+        tab.layout.split(a, Side::Right, b);
+        tab.panes.push(second);
+        tab
+    }
+
+    #[test]
+    fn shown_starts_every_pane_of_the_active_tab() {
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(two_panes(Pane::for_profile(&p), Pane::for_profile(&p)));
+        w.push(Tab::single(Pane::for_profile(&p)));
+        w.active = 0;
+        app.windows.clear();
+        app.windows.insert(wid, w);
+        let _ = app.shown(wid);
+        let w = &app.windows[&wid];
+        assert!(
+            w.tabs[0]
+                .panes
+                .iter()
+                .all(|p| p.state != TabState::NotConnected),
+            "both panes of the shown tab started"
+        );
+        assert_eq!(w.tabs[1].panes[0].state, TabState::NotConnected);
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use std::time::{Duration, Instant};
+
+        use fbterm_config::{LocalProfile, Paths, ProfileId};
+        use fbterm_session::{SessionEvent, SessionHandle};
+        use fbterm_term::SharedTerminal;
+        use feathercritty::index::{Column, Line};
+        use iced::window;
+
+        use super::two_panes;
+        use crate::app::{App, Message};
+        use crate::tabs::{self, Pane, Tab, TabState, WindowState};
+
+        type Sink = tokio::sync::mpsc::UnboundedSender<(
+            fbterm_session::SessionId,
+            fbterm_session::SessionEvent,
+        )>;
+
+        fn shell(script: &str, tx: Sink) -> SessionHandle {
+            let local = LocalProfile {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), script.into()],
+                cwd: None,
+                env: Default::default(),
+            };
+            fbterm_session::spawn_local(&local, crate::app::DEFAULT_GRID, 100, tx).expect("spawn")
+        }
+
+        fn connected(name: &str, session: SessionHandle) -> Pane {
+            let mut pane = Pane::new(ProfileId::new(), name, None);
+            pane.session = Some(session);
+            pane.state = TabState::Connected;
+            pane
+        }
+
+        fn screen(term: &SharedTerminal) -> String {
+            let t = term.lock();
+            let size = t.size();
+            let grid = t.term().grid();
+            (0..i32::from(size.rows))
+                .map(|r| {
+                    (0..usize::from(size.cols))
+                        .map(|c| grid.screen()[Line(r)][Column(c)].c)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[test]
+        fn events_reach_their_pane() {
+            let dir = std::env::temp_dir().join(format!("fbterm-pane-test-{}", ProfileId::new()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (mut app, _) = App::build(Paths { config_dir: dir }, true);
+            app.state_saving_enabled = false;
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let first = connected("one", shell("sleep 30", tx.clone()));
+            let second = connected("two", shell("sleep 30", tx));
+            let sid = second.session.as_ref().unwrap().id;
+            let (a, b) = (first.id, second.id);
+            let wid = window::Id::unique();
+            let mut w = WindowState::new();
+            w.push(two_panes(first, second));
+            app.windows.clear();
+            app.windows.insert(wid, w);
+
+            let _ = app.update(Message::Session(sid, SessionEvent::Exited(Some(1))));
+
+            let tab = &app.windows[&wid].tabs[0];
+            let (one, two) = (tab.pane(a).unwrap(), tab.pane(b).unwrap());
+            assert_eq!(
+                one.state,
+                TabState::Connected,
+                "the other pane is untouched"
+            );
+            assert_eq!(two.state, TabState::Exited(Some(1)));
+            let notice = "process exited with code 1";
+            assert!(screen(two.terminal().unwrap()).contains(notice));
+            assert!(!screen(one.terminal().unwrap()).contains(notice));
+        }
+
+        #[test]
+        fn dirty_takes_only_visible_panes() {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let hidden = connected("busy", shell("echo hi; sleep 30", tx));
+            let c = hidden.id;
+            let first = Pane::new(ProfileId::new(), "a", None);
+            let second = Pane::new(ProfileId::new(), "b", None);
+            let (a, b) = (first.id, second.id);
+            let mut w = WindowState::new();
+            w.push(two_panes(first, second));
+            w.push(Tab::single(hidden));
+            w.active = 0;
+            // Wait for the background pane's Dirty.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                match rx.try_recv() {
+                    Ok((_, SessionEvent::Dirty)) => break,
+                    _ if Instant::now() > deadline => panic!("no Dirty"),
+                    _ => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            assert!(tabs::on_dirty(&w, a));
+            assert!(tabs::on_dirty(&w, b));
+            assert!(!tabs::on_dirty(&w, c), "a pane of a background tab");
+            let session = w.tabs[1].panes[0].session.as_ref().unwrap();
+            assert!(session.take_dirty(), "its flag is left set");
         }
     }
 }

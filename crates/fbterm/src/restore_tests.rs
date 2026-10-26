@@ -59,7 +59,7 @@ fn states(app: &App) -> Vec<Vec<bool>> {
         .map(|w| {
             w.tabs
                 .iter()
-                .map(|t| t.state != TabState::NotConnected)
+                .map(|t| t.state() != &TabState::NotConnected)
                 .collect()
         })
         .collect()
@@ -84,7 +84,7 @@ fn relaunch_restores_windows_and_connects_only_the_active_tabs() {
     );
     let first = app.windows.values().next().unwrap();
     assert_eq!(first.active, 1);
-    assert_eq!(first.tabs[0].profile, a.id);
+    assert_eq!(first.tabs[0].focused_pane().profile, a.id);
     assert_eq!(app.sizes.values().next(), Some(&(900.0, 500.0)));
 }
 
@@ -216,7 +216,7 @@ fn a_hand_edit_of_profiles_replaces_them_and_keeps_open_tabs() {
     assert!(app.profiles.get(b.id).is_some());
     assert!(app.profiles_error.is_none());
     let tab = &app.windows.values().next().unwrap().tabs[0];
-    assert_eq!((tab.profile, tab.name.as_str()), (a.id, "a2"));
+    assert_eq!((tab.focused_pane().profile, tab.name()), (a.id, "a2"));
 }
 
 #[test]
