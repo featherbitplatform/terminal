@@ -941,11 +941,17 @@ impl App {
                 self.open_windows.insert(id);
                 // The chrome switched after this window was asked for: give it the current
                 // decorations, as the switch gave every window already open.
-                match chrome::take_created(id) {
+                let decorations = match chrome::take_created(id) {
                     Some(made) if chrome::needs_toggle(made, self.chrome.get()) => {
                         window::toggle_decorations(id)
                     }
                     _ => Task::none(),
+                };
+                // Only fbterm moves a unified window, so a press on a tab never moves it.
+                if self.chrome.get().system_drags_bar() {
+                    decorations
+                } else {
+                    Task::batch([decorations, chrome::keep_system_drag_off(id)])
                 }
             }
             Message::WindowVisible(id, visible) => {

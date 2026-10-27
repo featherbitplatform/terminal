@@ -3,7 +3,9 @@
 //! macOS uses a unified title bar: the OS title strip is transparent and hidden, the content
 //! runs under it, and the tab bar (or the editor's header) takes its place with the native
 //! window buttons drawn over its leading end. Empty space in that bar moves the window and a
-//! double click zooms it.
+//! double click zooms it. AppKit never moves a unified window by itself
+//! ([`Chrome::system_drags_bar`], [`keep_system_drag_off`]): only fbterm's own move from empty
+//! bar space does, so dragging a tab drags only the tab.
 //!
 //! Windows and Linux draw their own: the window has no OS decorations, the tab bar (or the
 //! editor's header) is the title bar and holds drawn minimize, maximize and close controls
@@ -746,6 +748,15 @@ impl Chrome {
         self == Self::Drawn
     }
 
+    /// Whether the system itself may move the window from a press in its bar. Not the unified
+    /// bar: the tab strip lies in AppKit's title-bar drag region (the content runs under the
+    /// transparent title strip and the content view never declines `mouseDownCanMoveWindow`),
+    /// so the Window Server would move the window from a press on a tab while the app drags
+    /// the tab. fbterm moves it itself from empty bar space ([`BarAction::Drag`]).
+    pub fn system_drags_bar(self) -> bool {
+        self != Self::Unified
+    }
+
     /// What a left press in the bar means. `captured` is whether a widget in the bar (a tab, a
     /// button) took it; only presses on empty space act on the window. `modal` is whether the
     /// palette or a dialog covers the window: then the bar does nothing.
@@ -1001,11 +1012,89 @@ fn set_acrylic_backdrop(window: &dyn window::Window) {
     }
 }
 
+/// Stop the system moving window `id` from a press in its bar, for a chrome whose
+/// [`Chrome::system_drags_bar`] is false. On macOS the window is made not movable, which turns
+/// off the Window Server's title-bar drag; [`BarAction::Drag`] still moves it (see [`drag`]).
+/// Nothing elsewhere.
+pub fn keep_system_drag_off<T: Send + 'static>(id: window::Id) -> iced::Task<T> {
+    #[cfg(target_os = "macos")]
+    {
+        window::run(id, |w| {
+            if let Some(ns_window) = ns_window(w) {
+                ns_window.setMovable(false);
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = id;
+        iced::Task::none()
+    }
+}
+
+/// Move window `id` with the pointer from the press being handled. On macOS the window may
+/// have been made not movable ([`keep_system_drag_off`]), and AppKit documents that this turns
+/// off the Window Server's dragging, so it is movable for the moment the drag is handed to the
+/// Window Server (`performWindowDragWithEvent:` returns at once and the server carries on),
+/// then as it was. Elsewhere iced's own drag.
+fn drag<T: Send + 'static>(id: window::Id) -> iced::Task<T> {
+    #[cfg(target_os = "macos")]
+    {
+        window::run(id, drag_with_current_event).discard()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        window::drag(id)
+    }
+}
+
+/// [`drag`] on macOS: what winit's `drag_window` does (the app's current event, the press,
+/// handed to `performWindowDragWithEvent:`), with the window movable for the call.
+#[cfg(target_os = "macos")]
+fn drag_with_current_event(w: &dyn window::Window) {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    let Some(ns_window) = ns_window(w) else {
+        return;
+    };
+    let Some(event) = NSApplication::sharedApplication(mtm).currentEvent() else {
+        return;
+    };
+    let movable = ns_window.isMovable();
+    ns_window.setMovable(true);
+    ns_window.performWindowDragWithEvent(&event);
+    ns_window.setMovable(movable);
+}
+
+/// The AppKit window behind `w`; `None` off the main thread or for a non-AppKit handle.
+#[cfg(target_os = "macos")]
+pub(crate) fn ns_window(
+    w: &dyn window::Window,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    use iced::window::raw_window_handle::RawWindowHandle;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSView;
+    // Window callbacks run on the main thread, as AppKit requires.
+    MainThreadMarker::new()?;
+    let handle = w.window_handle().ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: the handle points at the window's live content view for the duration of
+    // this callback, and we are on the main thread.
+    let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
+    view.window()
+}
+
 /// The task for a bar action on window `id`. [`BarAction::Close`] is the app's to handle (it
 /// may ask before closing), so it does nothing here.
-pub fn perform<T>(id: window::Id, action: BarAction) -> iced::Task<T> {
+pub fn perform<T: Send + 'static>(id: window::Id, action: BarAction) -> iced::Task<T> {
     match action {
-        BarAction::Drag => window::drag(id),
+        BarAction::Drag => drag(id),
         BarAction::ToggleMaximize => window::toggle_maximize(id),
         BarAction::Minimize => window::minimize(id, true),
         BarAction::ResizeFrom(direction) => window::drag_resize(id, direction),
@@ -1384,6 +1473,16 @@ mod tests {
         ] {
             assert_eq!(Chrome::Unified.bar_press(true, false, kind), None);
         }
+    }
+
+    #[test]
+    fn only_fbterm_moves_a_unified_window() {
+        // The tab strip lies in AppKit's title-bar drag region: left to the system, a press
+        // on a tab would move the window while the tab is dragged.
+        assert!(!Chrome::Unified.system_drags_bar());
+        // Drawn bars are not a title bar to the system; OS title bars are the system's own.
+        assert!(Chrome::Drawn.system_drags_bar());
+        assert!(Chrome::Native.system_drags_bar());
     }
 
     #[test]

@@ -564,6 +564,25 @@ mod tests {
     }
 
     #[test]
+    fn a_unified_window_is_kept_from_moving_itself_when_it_opens() {
+        let (mut app, _dir) = app();
+        let w = window::Id::unique();
+        app.chrome = Box::leak(Box::new(ChromeCell::starting(Chrome::Unified)));
+        // On macOS one task turns off AppKit's own title-bar drag for this window.
+        assert_eq!(
+            app.update(Message::AnyWindowOpened(w)).units(),
+            usize::from(cfg!(target_os = "macos"))
+        );
+        // Drawn chrome leaves the system alone.
+        app.chrome = Box::leak(Box::new(ChromeCell::starting(Chrome::Drawn)));
+        assert_eq!(
+            app.update(Message::AnyWindowOpened(window::Id::unique()))
+                .units(),
+            0
+        );
+    }
+
+    #[test]
     fn a_window_opened_across_a_switch_gets_the_current_decorations() {
         let (mut app, _dir) = app();
         let (late, fine) = (window::Id::unique(), window::Id::unique());
