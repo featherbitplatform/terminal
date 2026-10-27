@@ -31,18 +31,39 @@ impl OsBlob {
 }
 
 /// A keyring error as ours. Only "there is no secret service at all" is
-/// [`SecretError::Unavailable`] (Auto may then move to the vault): no keyring store at all, or
-/// on Linux a Secret Service error that says no provider is there (see [`no_service`]).
-/// Everything else (denied, locked or cancelled access, timeouts, a prompt cut short, a
-/// keyring daemon slow to start) is [`SecretError::Backend`]: the storage is there. macOS
-/// always has a keychain, and reports a user's "Deny" as a platform failure: never
-/// unavailable there.
+/// [`SecretError::Unavailable`] (Auto may then move to the vault): on Linux a Secret Service
+/// error that says no provider or no session is there (see [`no_service`]), or no keyring
+/// store for this platform. Everything else (denied, locked or cancelled access, timeouts, a
+/// prompt cut short, a keyring daemon slow to start) is [`SecretError::Backend`]: the storage
+/// is there. macOS always has a keychain, and reports a user's "Deny" as a platform failure:
+/// never unavailable there.
 pub(crate) fn keychain_error(e: keyring::Error) -> SecretError {
-    let text = e.to_string();
+    let setup = match &e {
+        keyring::Error::NoDefaultStore => keyring::Entry::store_status().as_ref().err(),
+        _ => None,
+    };
+    classify(e, setup)
+}
+
+/// [`keychain_error`] with the result of keyring's store setup at hand. keyring sets its
+/// store up once per process and caches a failure: every later entry is `NoDefaultStore`,
+/// and only the setup error (`setup`) says whether the service is missing or just failed
+/// (for example a D-Bus timeout while the keyring daemon starts at login), so a
+/// `NoDefaultStore` is classified by it.
+fn classify(e: keyring::Error, setup: Option<&keyring::Error>) -> SecretError {
     let missing = match &e {
-        keyring::Error::NoDefaultStore => true,
+        keyring::Error::NoDefaultStore => match setup {
+            Some(keyring::Error::PlatformFailure(source)) => no_service(&fault_of(source.as_ref())),
+            // keyring's own "this platform has no store".
+            Some(keyring::Error::Invalid(param, _)) => param == "platform",
+            _ => false,
+        },
         keyring::Error::PlatformFailure(source) => no_service(&fault_of(source.as_ref())),
         _ => false,
+    };
+    let text = match setup {
+        Some(cause) => format!("{e}: {cause}"),
+        None => e.to_string(),
     };
     if missing {
         SecretError::Unavailable(text)
@@ -302,14 +323,27 @@ mod tests {
         // Denied, locked or cancelled access: the storage is there.
         let denied = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
         assert!(matches!(keychain_error(denied), SecretError::Backend(_)));
-        assert!(matches!(
-            keychain_error(keyring::Error::NoDefaultStore),
-            SecretError::Unavailable(_)
-        ));
         // A platform failure that is not a Secret Service error (and every one on macOS,
         // where a user's "Deny" arrives as one): the storage is there.
         let failure = keychain_error(platform("something failed"));
         assert!(matches!(failure, SecretError::Backend(_)), "{failure:?}");
+    }
+
+    #[test]
+    fn a_failed_store_setup_is_unavailable_only_when_nothing_is_there() {
+        // keyring caches its one store setup: every later entry is `NoDefaultStore`, and
+        // the setup error says why. A setup failure that is not "no service" (here a plain
+        // platform failure, on Linux a D-Bus timeout) keeps the storage.
+        let flaky = platform("timed out");
+        let e = classify(keyring::Error::NoDefaultStore, Some(&flaky));
+        assert!(matches!(e, SecretError::Backend(_)), "{e:?}");
+        // An unsupported platform has no storage at all.
+        let unsupported = keyring::Error::Invalid("platform".into(), "unsupported".into());
+        let e = classify(keyring::Error::NoDefaultStore, Some(&unsupported));
+        assert!(matches!(e, SecretError::Unavailable(_)), "{e:?}");
+        // No setup error to look at: the storage may be there.
+        let e = classify(keyring::Error::NoDefaultStore, None);
+        assert!(matches!(e, SecretError::Backend(_)), "{e:?}");
     }
 
     #[test]
@@ -410,6 +444,31 @@ mod tests {
         assert!(unavailable(secret_service::Error::Zbus(zbus::Error::FDO(
             Box::new(zbus::fdo::Error::ServiceUnknown("no keyring".into()))
         ))));
+        // The same errors from keyring's cached store setup (`NoDefaultStore` on every
+        // later entry): only a missing service moves Auto.
+        let setup =
+            |e: secret_service::Error| classify(keyring::Error::NoDefaultStore, Some(&wrap(e)));
+        assert!(matches!(
+            setup(secret_service::Error::Unavailable),
+            SecretError::Unavailable(_)
+        ));
+        assert!(matches!(
+            setup(secret_service::Error::ZbusFdo(
+                zbus::fdo::Error::ServiceUnknown("no keyring".into())
+            )),
+            SecretError::Unavailable(_)
+        ));
+        for e in [
+            secret_service::Error::ZbusFdo(zbus::fdo::Error::NoReply("slow".into())),
+            secret_service::Error::ZbusFdo(zbus::fdo::Error::Timeout("slow".into())),
+            secret_service::Error::Zbus(zbus::Error::InputOutput(std::sync::Arc::new(
+                std::io::Error::other("hiccup"),
+            ))),
+        ] {
+            let shown = e.to_string();
+            let got = setup(e);
+            assert!(matches!(got, SecretError::Backend(_)), "{shown}: {got:?}");
+        }
         for e in [
             secret_service::Error::Locked,
             secret_service::Error::Prompt,

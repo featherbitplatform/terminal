@@ -479,6 +479,24 @@ impl SecretBackend {
             .store(VaultStore::exists(&self.vault_path), Ordering::Release);
     }
 
+    /// Settle Auto's pending check without making it: an explicit storage choice in Settings
+    /// is never switched over. Lock-free.
+    pub fn settle_auto(&self) {
+        self.unprobed.store(false, Ordering::Release);
+    }
+
+    /// Whether Auto's check is still to be made (lock-free).
+    pub fn probe_pending(&self) -> bool {
+        self.unprobed.load(Ordering::Acquire)
+    }
+
+    /// Run Auto's pending check now (a no-op once made, or for an explicit choice). A caller
+    /// that decides on [`Self::needs_main_password`] before its data calls runs this first,
+    /// off the UI thread (it reads the system storage, and may wait [`PROBE_RETRY`]).
+    pub fn probe(&self) {
+        self.probe_once();
+    }
+
     /// Auto's one check, on the first data call: when the system storage is not there at
     /// all, use the vault from now on. A denied, locked or failing storage stays: moving
     /// away from it would hide its secrets.
@@ -491,8 +509,12 @@ impl SecretBackend {
             return;
         }
         // One read of an id nothing has: every store reads its item or file for it. A storage
-        // that seems missing gets one more look a moment later (a keyring daemon started on
-        // demand at login can miss the first call).
+        // that seems missing gets one more look a moment later, which helps only with errors
+        // after the store's setup (a provider that answers on the second call). A failed
+        // setup is cached by keyring for the whole process, so the keychain classifies it by
+        // its cause: only a missing service reads as unavailable, and a setup that merely
+        // failed (a keyring daemon slow to start at login) is a backend error that never
+        // switches.
         let look = || self.system.get(&ProfileId::new(), SecretKind::Password);
         let mut result = look();
         if matches!(result, Err(SecretError::Unavailable(_))) {
@@ -1048,6 +1070,43 @@ mod tests {
             let b = backend(SecretStorage::Keychain, Arc::new(Unavailable), other.path());
             assert!(b.get(&id, SecretKind::Password).is_err());
             assert_eq!(b.active(), Storage::System);
+        }
+
+        #[test]
+        fn an_explicit_choice_settles_auto() {
+            // The user picked the system storage while Auto had not looked yet: a missing
+            // storage then fails the call instead of switching over the choice.
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(SecretStorage::Auto, Arc::new(Unavailable), dir.path());
+            let fired = hooked(&b);
+            b.settle_auto();
+            assert!(b.get(&pid(), SecretKind::Password).is_err());
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
+            assert!(!b.take_auto_switched());
+        }
+
+        #[test]
+        fn probe_runs_autos_check_before_the_first_data_call() {
+            // A caller that decides on `needs_main_password` first (an import) checks now,
+            // so the answer is the one its data calls will meet.
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(SecretStorage::Auto, Arc::new(Unavailable), dir.path());
+            let fired = hooked(&b);
+            assert_eq!(b.needs_main_password(), None, "not probed yet");
+            b.probe();
+            assert_eq!(b.active(), Storage::Vault);
+            assert_eq!(b.needs_main_password(), Some(MainPassword::Set));
+            assert_eq!(fired.load(Ordering::SeqCst), 1);
+            b.probe();
+            assert_eq!(fired.load(Ordering::SeqCst), 1, "once");
+            // A working system storage stays.
+            let other = tempfile::tempdir().unwrap();
+            let counting = Arc::new(Counting::default());
+            let b = backend(SecretStorage::Auto, counting.clone(), other.path());
+            b.probe();
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(counting.calls.load(Ordering::SeqCst), 1);
         }
 
         /// A system storage missing for its first `n` reads, then there.
