@@ -14,7 +14,7 @@ featherbit terminal keeps its configuration in one directory per user.
 | Linux | `~/.config/fbterm` (respects `XDG_CONFIG_HOME`) |
 | Windows | `%APPDATA%\featherbit\fbterm\config` |
 
-The directory is created the first time the app writes a file. All files are TOML and are written atomically (a temporary file in the same directory, then a rename), so a crash never leaves a half-written file.
+Uninstalling the app never removes this directory (see [Install on Linux](install-linux#uninstall) and [Install on Windows](install-windows#upgrade-and-uninstall)). The directory is created the first time the app writes a file. All files are TOML and are written atomically (a temporary file in the same directory, then a rename), so a crash never leaves a half-written file.
 
 | File | Written by | Purpose |
 | --- | --- | --- |
@@ -44,6 +44,7 @@ color_scheme = "graphite"
 kitty_keyboard = false
 background_opacity = 1.0
 background_blur = false
+window_decorations = "fbterm"
 max_fps = 60
 tunnel_max_retries = 10
 secret_storage = "auto"
@@ -58,7 +59,8 @@ secret_storage = "auto"
 | `color_scheme` | string (scheme id) | `"graphite"` | Color scheme for every session; a profile can override it. An id that matches no scheme uses Graphite and is reported in the banner. See [Color schemes](color-schemes). |
 | `kitty_keyboard` | `true` or `false` | `false` | Let programs turn on the kitty keyboard protocol, which reports keys such as Esc, Ctrl and Alt chords, and optionally every key and key releases, as unambiguous escape codes. When `false`, programs' requests for it are ignored and keys use the classic encoding. A change applies to open tabs at once: turning it off returns every tab to the classic encoding, turning it on lets programs enable the protocol from then on (restart a program that asked for it earlier). |
 | `background_opacity` | number, `0.05` to `1.0` | `1.0` | Opacity of the terminal's background and of the tab bar, from `0.05` (nearly see-through) to `1.0` (opaque). Text, the cursor, the selection and cells a program gives their own background color stay opaque. On macOS a change applies to open windows at once; on Linux and Windows a window can only become see-through if it was opened while the value was below `1.0`, so open a new window after lowering it. |
-| `background_blur` | `true` or `false` | `false` | Blur what shows through a see-through background. Takes effect only for windows opened while `background_opacity` is below `1.0`, so open a new window after changing it. macOS only for now. |
+| `background_blur` | `true` or `false` | `false` | Blur what shows through a see-through background. Takes effect only for windows opened while `background_opacity` is below `1.0`, so open a new window after changing it. Works on macOS, on Windows 11 22H2 and newer, and on KDE Plasma under Wayland; elsewhere the Settings switch is disabled and reads `Not supported on this system`. |
+| `window_decorations` | `"fbterm"` or `"system"` | `"fbterm"` | Linux only; other systems ignore it. Who draws the window's title bar: `"fbterm"` draws it in the tab bar, `"system"` uses the desktop's. In the file it is written as `# Window title bar on Linux: "fbterm" draws it in the tab bar, "system" uses the desktop's.` In Settings this is **Title bar**. If the desktop refuses to let fbterm move its window, the session uses the system title bar anyway and says so once; the setting stays as you wrote it. See [Install on Linux](install-linux#title-bar). |
 | `max_fps` | integer, `30` to `240`, or `"display"` | `60` | Most redraws per second caused by program output. Typing, scrolling, selecting and resizing always redraw at once. `"display"` follows the refresh rate of the screen your windows are on (the fastest one, if they are on several screens); where the rate cannot be detected (Linux and Windows for now) it means `60`. Higher values use more CPU while output streams. Applies at once. |
 | `tunnel_max_retries` | integer, `0` to `100` | `10` | How many times a [tunnel](tunnels#reconnecting) tries to reconnect on its own after its connection drops. `0` turns automatic reconnecting off. In the Settings window this is **Reconnect attempts** under Tunnels. Applies at once. |
 | `secret_storage` | `"auto"`, `"keychain"` or `"vault"` | `"auto"` | Where [saved secrets](saved-secrets) are kept: the system storage where there is one (else the encrypted vault), the system storage, or the vault. In the Settings window this is **Saved secrets**, which also moves the secrets when you change it. A change made by hand while the app runs takes effect at the next launch and moves nothing, so prefer Settings. |

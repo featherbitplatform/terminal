@@ -1,6 +1,6 @@
 # featherbit terminal
 
-A native, SSH-first terminal emulator for macOS, written in Rust. It stays fast and light with many sessions open: twenty tabs with full scrollback take about 123 MB of memory.
+A native, SSH-first terminal emulator for macOS, Linux and Windows, written in Rust. It stays fast and light with many sessions open: twenty tabs with full scrollback take about 123 MB of memory.
 
 ![CI](https://github.com/featherbitplatform/terminal/actions/workflows/ci.yml/badge.svg) ![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
@@ -12,7 +12,11 @@ Full documentation: [featherbitplatform.github.io/terminal](https://featherbitpl
 
 ## Install
 
-Download the `.dmg` from the [latest release](https://github.com/featherbitplatform/terminal/releases/latest). It is a universal build for Apple Silicon and Intel Macs. Builds are not signed yet, so macOS asks you to confirm the first launch: see [Install on macOS](https://featherbitplatform.github.io/terminal/install-macos) for the steps and for checking the download's SHA-256.
+Download from the [latest release](https://github.com/featherbitplatform/terminal/releases/latest); each file comes with a `.sha256` checksum. Builds are not signed yet, so each system asks you to confirm the first launch.
+
+- **macOS:** the universal `.dmg` for Apple Silicon and Intel Macs. See [Install on macOS](https://featherbitplatform.github.io/terminal/install-macos).
+- **Linux:** `.deb` (Debian 12 and Ubuntu 22.04 and newer), `.rpm` (Fedora 39 and RHEL 9 and newer) or `.tar.gz`, for x86_64 and aarch64. See [Install on Linux](https://featherbitplatform.github.io/terminal/install-linux).
+- **Windows:** the `.msi` for Windows 11 (x64). See [Install on Windows](https://featherbitplatform.github.io/terminal/install-windows).
 
 ## Features
 
@@ -35,9 +39,11 @@ Requires a recent stable Rust toolchain (edition 2024).
 cargo run -p fbterm            # build and run
 cargo test --workspace         # tests
 bash dev/package-macos.sh 0.1.0  # universal .app and .dmg into target/dist/ (macOS only)
+bash dev/package-linux.sh 0.1.0 x86_64  # .deb, .rpm, .tar.gz (Linux; see the script)
+pwsh dev/package-windows.ps1 0.1.0      # .msi (Windows)
 ```
 
-The code builds and tests on macOS, Linux and Windows; release builds are macOS only for now. Terminal emulation comes from [feathercritty](https://github.com/featherbitplatform/feathercritty), our fork of the `alacritty_terminal` crate.
+The code builds and tests on macOS, Linux and Windows, and releases ship for all three. Terminal emulation comes from [feathercritty](https://github.com/featherbitplatform/feathercritty), our fork of the `alacritty_terminal` crate.
 
 ## Contributing
 
