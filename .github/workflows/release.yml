@@ -232,15 +232,60 @@ jobs:
           name: windows-smoke-msi-logs
           path: ${{ runner.temp }}/fbterm-msi-logs
 
+  # CycloneDX SBOMs, attached to the release beside the packages: the app's crates
+  # (Cargo.lock) and the docs site's npm packages (website/package-lock.json, the JavaScript
+  # the published docs site serves). Same generator and names as `bash dev/sast.sh sbom`.
+  # Runs on pull requests too, so a change here is tried before a tag depends on it.
+  sbom:
+    name: sbom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve version
+        id: version
+        run: bash dev/release-version.sh
+      # Pinned, so a release SBOM never changes format with an unreviewed syft release; dev/sast.sh
+      # uses the same version.
+      - name: Install syft
+        id: syft
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: v1.54.1
+      - name: Generate SBOMs
+        env:
+          SYFT: ${{ steps.syft.outputs.cmd }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/dist
+          "$SYFT" scan file:Cargo.lock \
+            --source-name fbterm --source-version "$VERSION" \
+            -o "cyclonedx-json=target/dist/fbterm-$VERSION.cdx.json"
+          "$SYFT" scan file:website/package-lock.json \
+            --source-name fbterm-docs --source-version "$VERSION" \
+            -o "cyclonedx-json=target/dist/fbterm-docs-$VERSION.cdx.json"
+          # An SBOM without components means syft read nothing from the lockfile.
+          for f in target/dist/*.cdx.json; do
+            jq -e '.components | length > 0' "$f" > /dev/null || { echo "::error::no components in $f"; exit 1; }
+            echo "$f: $(jq '.components | length' "$f") components"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fbterm-sbom
+          if-no-files-found: error
+          path: |
+            target/dist/fbterm-${{ steps.version.outputs.version }}.cdx.json
+            target/dist/fbterm-docs-${{ steps.version.outputs.version }}.cdx.json
+
   # One release with every system's files, published only when every build and every smoke
   # test passed: any failing job skips this one, so nothing is published. Only a tag push
   # publishes; a manual run on a tag builds and tests, never re-publishes. The release is
-  # made as a draft, gets all 16 files, and only then is published, so a failed upload never
+  # made as a draft, gets all 18 files, and only then is published, so a failed upload never
   # leaves a half-published release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [deny, release-version-check, package, linux, linux-smoke, windows, windows-smoke]
+    needs: [deny, release-version-check, package, linux, linux-smoke, windows, windows-smoke, sbom]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -252,7 +297,9 @@ jobs:
       # Put above the generated notes.
       NOTES: >-
         Downloads for macOS (universal `.dmg`), Linux (`.deb`, `.rpm` and `.tar.gz` for x86_64
-        and aarch64) and Windows (x86_64 `.msi`), each with its `.sha256` checksum. Install
+        and aarch64) and Windows (x86_64 `.msi`), each with its `.sha256` checksum, plus
+        CycloneDX SBOMs of the app (`fbterm-${{ needs.package.outputs.version }}.cdx.json`)
+        and the docs site (`fbterm-docs-${{ needs.package.outputs.version }}.cdx.json`). Install
         steps: [macOS](https://featherbitplatform.github.io/terminal/install-macos),
         [Linux](https://featherbitplatform.github.io/terminal/install-linux),
         [Windows](https://featherbitplatform.github.io/terminal/install-windows).
@@ -283,6 +330,8 @@ jobs:
           dist/fbterm-$VERSION-linux-aarch64.tar.gz.sha256
           dist/fbterm-$VERSION-windows-x86_64.msi
           dist/fbterm-$VERSION-windows-x86_64.msi.sha256
+          dist/fbterm-$VERSION.cdx.json
+          dist/fbterm-docs-$VERSION.cdx.json
           EOF
           missing=0
           while read -r file; do
@@ -291,7 +340,7 @@ jobs:
               missing=1
             fi
           done < "$RUNNER_TEMP/release-files"
-          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 16 ]
+          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 18 ]
           exit "$missing"
       - name: Remove a draft a failed run left
         run: |
