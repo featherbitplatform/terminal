@@ -178,6 +178,8 @@ pub enum Message {
     ConfigChanged(Changed),
     /// A tunnel's state changed (see [`crate::tunnels`]).
     Tunnel(TunnelKey, TunnelState),
+    /// The file panel (see [`crate::file_panel`]).
+    FilePanel(crate::file_panel::FilePanelMsg),
 }
 
 /// Where a settings change came from. The scrollback notice is for edits made in
@@ -227,6 +229,10 @@ pub struct App {
     pub(crate) tunnels: Tunnels,
     /// `tunnel_max_retries`, shared with running tunnels so a change applies to them at once.
     pub(crate) tunnel_retries: Arc<AtomicU32>,
+    /// The file panel of every window (see [`crate::file_panel`]).
+    pub(crate) file_panels: crate::file_panel::FilePanels,
+    /// The file panel's background work: opening SFTP sessions and reading folders.
+    pub(crate) file_panel_work: crate::file_panel::Work,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
     pub(crate) visibility: visibility::Changes,
@@ -470,6 +476,8 @@ impl App {
         let tunnel_retries = Arc::new(AtomicU32::new(settings.tunnel_max_retries));
         let mut app = Self {
             tunnels: Tunnels::new(pool.clone()),
+            file_panels: crate::file_panel::FilePanels::new(saved.file_panel_width),
+            file_panel_work: crate::file_panel::Work::new(pool.clone()),
             tunnel_retries,
             bindings: Bindings::current(&settings.keys.map),
             theme: theme::graphite_theme(settings.theme),
@@ -561,6 +569,7 @@ impl App {
         task = task.chain(app.open_debug_tunnels());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
+        task = task.chain(app.open_debug_files());
         (app, task)
     }
 
@@ -642,6 +651,15 @@ impl App {
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
             Subscription::run_with(self.tunnels.receiver.clone(), tunnel_stream)
                 .map(|(key, state)| Message::Tunnel(key, state)),
+            Subscription::run_with(
+                self.file_panel_work.receiver.clone(),
+                crate::file_panel::panel_stream,
+            )
+            .map(|event| {
+                Message::FilePanel(crate::file_panel::FilePanelMsg::Event(Delivered::new(
+                    event,
+                )))
+            }),
             Subscription::run_with(self.visibility.clone(), visibility::stream)
                 .map(|(id, visible)| Message::WindowVisible(id, visible)),
             Subscription::run_with(self.display.clone(), display_rate::stream)
@@ -678,6 +696,14 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch(message);
+        // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
+        // shows its focused pane's profile.
+        self.sync_file_panels();
+        task
+    }
+
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Session(id, event) => self.session_event(id, event),
             Message::Terminal(wid, pane, output) => self.terminal_output(wid, pane, output),
@@ -836,6 +862,7 @@ impl App {
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
+                self.file_panels.open.remove(&id);
                 if self.carry.is_some_and(|(w, _)| w == id) {
                     self.carry = None;
                     self.hover = None;
@@ -932,6 +959,7 @@ impl App {
                 Task::batch(tasks)
             }
             Message::Tunnel(key, state) => self.tunnel_event(key, state),
+            Message::FilePanel(msg) => self.file_panel_msg(msg),
             Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {

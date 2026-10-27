@@ -69,6 +69,9 @@ pub struct SavedState {
     pub windows: Vec<SavedWindow>,
     /// When each profile was last opened (unix seconds).
     pub recency: BTreeMap<ProfileId, i64>,
+    /// The file panel's width, when the user changed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_panel_width: Option<f32>,
 }
 
 impl SavedState {

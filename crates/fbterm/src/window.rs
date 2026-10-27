@@ -16,6 +16,7 @@ use iced::{
 
 use crate::app::{App, Message, TabBarMsg};
 use crate::chrome::{self, Chrome};
+use crate::file_panel::FilePanelMsg;
 use crate::keys::{Action, Bindings};
 use crate::palette;
 use crate::shortcuts::{Mode, Shortcuts};
@@ -219,16 +220,21 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         .into(),
         None => text("").into(),
     };
-    body = body.push(
-        container(content)
-            .padding(Padding::from([4.0, 8.0]))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(term_bg.into()),
-                ..container::Style::default()
-            }),
-    );
+    let terminal_area: Element<'_, Message> = container(content)
+        .padding(Padding::from([4.0, 8.0]))
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(term_bg.into()),
+            ..container::Style::default()
+        })
+        .into();
+    // The file panel docks at the active tab's right edge, outside the tiles: they lay out in
+    // what is left, as they would in a narrower window.
+    let panel = win
+        .active_tab()
+        .and_then(|_| crate::file_panel::view(app, id));
+    body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
     // toggles still work, and not while a dialog waits for an answer.
     let covered = Mode::Blocked {
@@ -294,6 +300,250 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         }));
     }
     layers.into()
+}
+
+/// The narrowest the terminal area gets beside the file panel.
+pub(crate) const MIN_TERMINAL_WIDTH: f32 = 200.0;
+
+/// How far either side of the file panel's left edge a press grabs it.
+const DOCK_GRAB: f32 = 3.0;
+
+/// `content` with the file panel (and its width) docked at its right edge. Without a panel
+/// it is `content` itself, laid out exactly as before.
+pub(crate) fn dock<'a>(
+    content: Element<'a, Message>,
+    panel: Option<(Element<'a, Message>, f32)>,
+) -> Element<'a, Message> {
+    match panel {
+        None => content,
+        Some((panel, width)) => Element::new(Dock {
+            content,
+            panel,
+            width,
+        }),
+    }
+}
+
+/// The active tab's content and the file panel beside it, whose left edge drags to resize
+/// it (reported as [`FilePanelMsg::Resize`], then [`FilePanelMsg::ResizeEnd`]).
+struct Dock<'a> {
+    content: Element<'a, Message>,
+    panel: Element<'a, Message>,
+    width: f32,
+}
+
+#[derive(Default)]
+struct DockState {
+    dragging: bool,
+}
+
+impl Dock<'_> {
+    /// Where a press grabs the panel's edge.
+    fn edge(layout: Layout<'_>) -> Rectangle {
+        let bounds = layout.bounds();
+        let x = layout.children().nth(1).map_or(bounds.x, |l| l.bounds().x);
+        Rectangle {
+            x: x - DOCK_GRAB,
+            width: 2.0 * DOCK_GRAB,
+            ..bounds
+        }
+    }
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for Dock<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<DockState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(DockState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content), Tree::new(&self.panel)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&[&self.content, &self.panel]);
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let max = limits.max();
+        // The panel never squeezes the terminal below its minimum width.
+        let width = self
+            .width
+            .min(max.width - MIN_TERMINAL_WIDTH)
+            .max(0.0)
+            .round();
+        let content_width = max.width - width;
+        let content = self.content.as_widget_mut().layout(
+            &mut tree.children[0],
+            renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(content_width, max.height)),
+        );
+        let panel = self
+            .panel
+            .as_widget_mut()
+            .layout(
+                &mut tree.children[1],
+                renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(width, max.height)),
+            )
+            .move_to(Point::new(content_width, 0.0));
+        layout::Node::with_children(max, vec![content, panel])
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            for ((child, state), layout) in [&mut self.content, &mut self.panel]
+                .into_iter()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                child
+                    .as_widget_mut()
+                    .operate(state, layout, renderer, operation);
+            }
+        });
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        let state = tree.state.downcast_mut::<DockState>();
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cursor.is_over(Self::edge(layout)) =>
+            {
+                state.dragging = true;
+                shell.capture_event();
+                return;
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
+                let width = bounds.x + bounds.width - position.x;
+                shell.publish(Message::FilePanel(FilePanelMsg::Resize(width)));
+                shell.capture_event();
+                return;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
+                state.dragging = false;
+                shell.publish(Message::FilePanel(FilePanelMsg::ResizeEnd));
+                shell.capture_event();
+                return;
+            }
+            _ => {}
+        }
+        for ((child, state), layout) in [&mut self.content, &mut self.panel]
+            .into_iter()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            child.as_widget_mut().update(
+                state, event, layout, cursor, renderer, clipboard, shell, viewport,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        if tree.state.downcast_ref::<DockState>().dragging || cursor.is_over(Self::edge(layout)) {
+            return mouse::Interaction::ResizingHorizontally;
+        }
+        [&self.content, &self.panel]
+            .into_iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .map(|((child, state), layout)| {
+                child
+                    .as_widget()
+                    .mouse_interaction(state, layout, cursor, viewport, renderer)
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        for ((child, state), layout) in [&self.content, &self.panel]
+            .into_iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+        {
+            child
+                .as_widget()
+                .draw(state, renderer, theme, style, layout, cursor, viewport);
+        }
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        let (first, second) = tree.children.split_at_mut(1);
+        let mut layouts = layout.children();
+        let (content_layout, panel_layout) = (layouts.next()?, layouts.next()?);
+        let content = self.content.as_widget_mut().overlay(
+            &mut first[0],
+            content_layout,
+            renderer,
+            viewport,
+            translation,
+        );
+        let panel = self.panel.as_widget_mut().overlay(
+            &mut second[0],
+            panel_layout,
+            renderer,
+            viewport,
+            translation,
+        );
+        match (content, panel) {
+            (Some(a), Some(b)) => Some(overlay::Group::with_children(vec![a, b]).overlay()),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 /// One pane's terminal, with its find bar over its top right while open.

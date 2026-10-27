@@ -215,7 +215,8 @@ impl App {
         if !self.state_saving_enabled || self.quitting || self.profiles_error.is_some() {
             return;
         }
-        let state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
+        let mut state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
+        state.file_panel_width = self.file_panels.saved_width();
         if let Err(e) = state.save(&self.paths.state()) {
             tracing::warn!(error = %e, "could not save the session state");
         }

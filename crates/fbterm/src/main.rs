@@ -43,6 +43,7 @@ mod dialogs;
 mod display_rate;
 mod editor;
 mod export;
+mod file_panel;
 mod find;
 mod keys;
 mod layout;

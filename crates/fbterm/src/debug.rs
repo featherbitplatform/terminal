@@ -172,6 +172,23 @@ impl App {
         self.open_tunnels()
     }
 
+    /// `FBTERM_DEMO_FILES=<folder>:<name>,<name>/,...` (debug aid): the first window's file
+    /// panel open, serving this sample listing for every SSH pane (connected or not) without
+    /// touching the network; names ending in `/` are folders.
+    pub(crate) fn open_debug_files(&mut self) -> Task<Message> {
+        let Some(spec) = debug_env("FBTERM_DEMO_FILES") else {
+            return Task::none();
+        };
+        let demo = crate::file_panel::Demo::parse(&spec.to_string_lossy());
+        self.file_panel_work.backend = std::sync::Arc::new(demo);
+        self.file_panels.demo = true;
+        if let Some(&wid) = self.windows.keys().next() {
+            self.file_panels.open.insert(wid);
+        }
+        self.sync_file_panels();
+        Task::none()
+    }
+
     /// `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (debug aids): the find bar of the first
     /// window's active tab, or the find-in-all-tabs box, open with that query once the tabs
     /// have had a second to print something.
