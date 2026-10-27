@@ -739,6 +739,7 @@ fn error_profile(error: &ValidationError) -> &str {
         ValidationError::MissingJump { profile, .. }
         | ValidationError::JumpNotSsh { profile }
         | ValidationError::JumpCycle { profile }
+        | ValidationError::JumpChainTooLong { profile }
         | ValidationError::EmptyTunnelName { profile }
         | ValidationError::DuplicateTunnel { profile, .. }
         | ValidationError::TunnelPort { profile, .. }
@@ -759,6 +760,10 @@ fn message(error: &ValidationError) -> String {
             "It jumps through a profile that is not an SSH profile.".into()
         }
         ValidationError::JumpCycle { .. } => "Its jump chain loops back to itself.".into(),
+        ValidationError::JumpChainTooLong { .. } => format!(
+            "It goes through more than {} jump hosts.",
+            fbterm_config::MAX_JUMP_CHAIN
+        ),
         ValidationError::EmptyHost(_) => "Its host is empty.".into(),
         ValidationError::EmptyTunnelName { .. } => "One of its tunnels has no name.".into(),
         ValidationError::DuplicateTunnel { name, .. } => {

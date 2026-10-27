@@ -19,4 +19,4 @@ pub use settings::{MaxFps, SETTINGS_TEMPLATE, Settings, ThemeMode};
 pub use settings_edit::SettingChange;
 pub use shells::discover_shells;
 pub use state::{SavedAxis, SavedLayout, SavedSplitTab, SavedState, SavedTab, SavedWindow};
-pub use store::{ConfigError, ProfileStore, ValidationError};
+pub use store::{ConfigError, MAX_JUMP_CHAIN, ProfileStore, ValidationError};

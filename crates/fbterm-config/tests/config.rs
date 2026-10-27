@@ -1037,3 +1037,92 @@ fn validate_is_linear_for_diamonds_and_long_chains() {
         assert_eq!(found, cycles);
     }
 }
+
+/// Forty levels of two profiles, each jumping through both profiles of the level below: the
+/// expanded chain doubles per level.
+fn two_wide_diamond(levels: usize) -> Vec<Profile> {
+    let mut out: Vec<Profile> = vec![ssh("a0", vec![]), ssh("b0", vec![])];
+    for i in 1..levels {
+        let below = vec![out[2 * i - 2].id, out[2 * i - 1].id];
+        out.push(ssh(&format!("a{i}"), below.clone()));
+        out.push(ssh(&format!("b{i}"), below));
+    }
+    out
+}
+
+#[test]
+fn chains_longer_than_32_hops_are_refused() {
+    use std::time::{Duration, Instant};
+    // 32 hops are fine, 33 are not.
+    let mut chain = vec![ssh("c0", vec![])];
+    for i in 1..=33 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), vec![prev]));
+    }
+    let store = ProfileStore {
+        profiles: chain.clone(),
+    };
+    assert_eq!(store.jump_chain(chain[32].id).unwrap().len(), 32);
+    assert_eq!(
+        store.validate(),
+        vec![ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        }]
+    );
+    assert_eq!(
+        store.jump_chain(chain[33].id),
+        Err(ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        })
+    );
+    assert_eq!(
+        ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        }
+        .to_string(),
+        "profile \"c33\" goes through more than 32 jump hosts"
+    );
+
+    // A diamond: few profiles, but an exponentially long expanded chain.
+    let diamond = two_wide_diamond(40);
+    let top = diamond[79].id;
+    let store = ProfileStore { profiles: diamond };
+    let start = Instant::now();
+    let errors = store.validate();
+    // Levels 0 to 4 expand to 0, 2, 6, 14 and 30 hops; every level above is too long.
+    assert_eq!(errors.len(), 70, "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(e, ValidationError::JumpChainTooLong { .. }))
+    );
+    assert!(matches!(
+        store.jump_chain(top),
+        Err(ValidationError::JumpChainTooLong { .. })
+    ));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A chain far deeper than recursion allows never overflows.
+    let mut deep = vec![ssh("d0", vec![])];
+    for i in 1..50_000 {
+        let prev = deep[i - 1].id;
+        deep.push(ssh(&format!("d{i}"), vec![prev]));
+    }
+    let last = deep[49_999].id;
+    let store = ProfileStore { profiles: deep };
+    let start = Instant::now();
+    assert!(matches!(
+        store.jump_chain(last),
+        Err(ValidationError::JumpChainTooLong { .. })
+    ));
+    assert_eq!(store.validate().len(), 49_999 - 32);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}

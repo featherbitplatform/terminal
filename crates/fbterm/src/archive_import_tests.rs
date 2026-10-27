@@ -871,7 +871,9 @@ fn crafted_jump_shapes_plan_quickly() {
     let mut long = archive(ArchiveKind::Full, &[]);
     long.profiles = chain;
 
-    for (a, blocked) in [(diamond, 0), (long, 1000)] {
+    // Diamond levels 0 to 4 expand to 0, 2, 6, 14 and 30 hops; the 70 profiles above
+    // would go through more than 32 jump hosts.
+    for (a, blocked) in [(diamond, 70), (long, 1000)] {
         let start = Instant::now();
         let mut p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
         // Re-validating on a choice is as quick.
@@ -884,6 +886,23 @@ fn crafted_jump_shapes_plan_quickly() {
         let found = p.entries.iter().filter(|e| e.error.is_some()).count();
         assert_eq!(found, blocked);
     }
+}
+
+#[test]
+fn chains_over_32_hops_are_blocked() {
+    let mut chain = vec![ssh("c0", AuthMethod::Agent, Vec::new())];
+    for i in 1..=33 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), AuthMethod::Agent, vec![prev]));
+    }
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.profiles = chain;
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    assert!(p.entries[..33].iter().all(|e| e.error.is_none()));
+    assert_eq!(
+        p.entries[33].error.as_deref(),
+        Some("It goes through more than 32 jump hosts.")
+    );
 }
 
 #[test]
