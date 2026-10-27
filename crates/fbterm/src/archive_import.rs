@@ -37,6 +37,15 @@ const READ_ONLY: &str =
 const STALE: &str = "The profiles changed since the archive was opened. Open it again to import.";
 const TWICE: &str = "It appears more than once in the archive.";
 const NO_NAME: &str = "Its name is empty.";
+const MISSING: &str = "It jumps through a profile that is not in the archive or on this computer.";
+const TOO_LARGE: &str = "This archive is too large or malformed to import.";
+
+/// The most an archive may carry: far beyond any real setup, small enough that planning stays
+/// quick whatever shape a crafted archive has.
+const MAX_PROFILES: usize = 1000;
+const MAX_JUMPS: usize = 16;
+const MAX_SCHEMES: usize = 200;
+const MAX_KEYS: usize = 200;
 
 /// The name a key file gets when the archived name is not a plain, harmless file name.
 const FALLBACK_KEY_NAME: &str = "id_imported";
@@ -118,13 +127,15 @@ pub(crate) struct ImportPlan {
     pub schemes: Vec<SchemeEntry>,
     /// A full archive with saved passwords or passphrases.
     pub has_secrets: bool,
-    /// A full archive with key files that can be written.
+    /// A full archive with key files that imported key profiles use.
     pub has_keys: bool,
     /// Things left out of the archive (invalid schemes, oversized key files), for the preview.
     pub warnings: Vec<String>,
     kind: ArchiveKind,
     /// The local profiles the plan was made against.
     local: ProfileStore,
+    /// The archived profiles of each key file that can be written (full archives only).
+    key_users: Vec<Vec<ProfileId>>,
 }
 
 /// A saved secret to store for an imported profile.
@@ -176,14 +187,23 @@ pub(crate) struct Applied {
     pub scheme_writes: Vec<Scheme>,
 }
 
-/// The import preview of `archive` against the local profiles and schemes.
-pub(crate) fn plan(local: &ProfileStore, archive: &Archive, schemes: &SchemeSet) -> ImportPlan {
+/// The import preview of `archive` against the local profiles and schemes. An archive beyond
+/// the limits (more than 1000 profiles, 200 schemes or 200 key files, a profile with more
+/// than 16 jumps or the same jump twice) is refused as a whole.
+pub(crate) fn plan(
+    local: &ProfileStore,
+    archive: &Archive,
+    schemes: &SchemeSet,
+) -> Result<ImportPlan, String> {
+    if !within_limits(archive) {
+        return Err(TOO_LARGE.into());
+    }
     let kind = archive.kind;
     let full = kind == ArchiveKind::Full;
     let mut warnings = Vec::new();
     let (scheme_entries, dropped) = plan_schemes(archive, schemes, &mut warnings);
 
-    let mut has_keys = false;
+    let mut key_users = Vec::new();
     if full {
         for key in &archive.keys {
             if key.bytes.len() as u64 > MAX_KEY_BYTES {
@@ -192,7 +212,7 @@ pub(crate) fn plan(local: &ProfileStore, archive: &Archive, schemes: &SchemeSet)
                     shown(&plain_key_name(&key.file_name))
                 ));
             } else {
-                has_keys = true;
+                key_users.push(key.profiles.clone());
             }
         }
     }
@@ -239,13 +259,28 @@ pub(crate) fn plan(local: &ProfileStore, archive: &Archive, schemes: &SchemeSet)
         entries,
         schemes: scheme_entries,
         has_secrets: full && !archive.secrets.is_empty(),
-        has_keys,
+        has_keys: false,
         warnings,
         kind,
         local: local.clone(),
+        key_users,
     };
     revalidate(&mut plan);
-    plan
+    Ok(plan)
+}
+
+/// Whether the archive stays within what an import handles (see [`plan`]).
+fn within_limits(archive: &Archive) -> bool {
+    archive.profiles.len() <= MAX_PROFILES
+        && archive.schemes.len() <= MAX_SCHEMES
+        && archive.keys.len() <= MAX_KEYS
+        && archive.profiles.iter().all(|p| match &p.kind {
+            ProfileKind::Ssh(ssh) => {
+                let distinct: HashSet<&ProfileId> = ssh.jump.iter().collect();
+                ssh.jump.len() <= MAX_JUMPS && distinct.len() == ssh.jump.len()
+            }
+            ProfileKind::Local(_) => true,
+        })
 }
 
 /// Change one entry's choice and check every entry again (references follow the choice).
@@ -374,9 +409,22 @@ fn first_entries(entries: &[ImportEntry]) -> HashMap<ProfileId, usize> {
 
 fn revalidate(plan: &mut ImportPlan) {
     let resolved = resolve(&plan.local, &plan.entries, plan.kind);
+    let index = first_entries(&plan.entries);
+    plan.has_keys = plan.key_users.iter().flatten().any(|id| {
+        index
+            .get(id)
+            .and_then(|&i| resolved.finals[i])
+            .and_then(|id| resolved.store.get(id))
+            .is_some_and(uses_key)
+    });
     for (entry, error) in plan.entries.iter_mut().zip(resolved.errors) {
         entry.error = error;
     }
+}
+
+/// Whether a profile signs in with a key.
+fn uses_key(p: &Profile) -> bool {
+    matches!(&p.kind, ProfileKind::Ssh(ssh) if matches!(ssh.auth, AuthMethod::Key { .. }))
 }
 
 /// The local profiles with the entries applied, plus what happened to each entry.
@@ -390,10 +438,23 @@ struct Resolved {
 
 /// Apply the entries' choices, then validate the result; entries that make it invalid are
 /// blocked and the rest applied again, until nothing new is blocked (each round blocks at
-/// least one more entry, so this ends).
+/// least one more entry, so this ends). Every round is linear in profiles plus jumps, and an
+/// entry jumping through a blocked new profile is blocked in the same round, so a long chain
+/// of archived profiles does not take a round per link.
 fn resolve(local: &ProfileStore, entries: &[ImportEntry], kind: ArchiveKind) -> Resolved {
     let index = first_entries(entries);
     let baseline = local.validate();
+    // Entries jumping through each entry, by the archived jump.
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    for (i, e) in entries.iter().enumerate() {
+        if let ProfileKind::Ssh(ssh) = &e.incoming.kind {
+            for j in &ssh.jump {
+                if let Some(&k) = index.get(j) {
+                    dependents[k].push(i);
+                }
+            }
+        }
+    }
     let mut blocked: Vec<Option<String>> = entries.iter().map(|e| e.flaw.clone()).collect();
     loop {
         // Two entries replacing the same local profile: the first one wins.
@@ -407,22 +468,24 @@ fn resolve(local: &ProfileStore, entries: &[ImportEntry], kind: ArchiveKind) -> 
             {
                 let name = local.get(m).map(|p| p.name.as_str()).unwrap_or_default();
                 blocked[i] = Some(format!(
-                    "Another profile in the archive already replaces {name}."
+                    "Another profile in the archive already replaces {}.",
+                    shown(name)
                 ));
             }
         }
 
         let (store, finals) = build(local, entries, &blocked, &index, kind);
-        let mut changed = false;
+        let round = Round::new(entries, &store, &finals);
+        let mut newly = Vec::new();
         for error in store.validate() {
-            for (i, why) in culprits(&error, entries, &store, &finals, &baseline) {
+            for (i, why) in round.culprits(&error, &baseline) {
                 if blocked[i].is_none() {
                     blocked[i] = Some(why);
-                    changed = true;
+                    newly.push(i);
                 }
             }
         }
-        if !changed {
+        if newly.is_empty() {
             for (i, e) in entries.iter().enumerate() {
                 // A skipped entry is not imported, so nothing is wrong with it.
                 if e.choice == Choice::Skip && e.flaw.is_none() {
@@ -434,6 +497,18 @@ fn resolve(local: &ProfileStore, entries: &[ImportEntry], kind: ArchiveKind) -> 
                 finals,
                 errors: blocked,
             };
+        }
+        // A blocked profile without a local match is not there to jump through.
+        while let Some(k) = newly.pop() {
+            if entries[k].matched.is_some() {
+                continue;
+            }
+            for &i in &dependents[k] {
+                if blocked[i].is_none() && entries[i].choice != Choice::Skip {
+                    blocked[i] = Some(MISSING.to_string());
+                    newly.push(i);
+                }
+            }
         }
     }
 }
@@ -473,6 +548,13 @@ fn build(
     };
 
     let mut store = local.clone();
+    let position: HashMap<ProfileId, usize> = store
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.id, i))
+        .collect();
+    let mut names: HashSet<String> = store.profiles.iter().map(|p| p.name.clone()).collect();
     for (e, final_id) in entries.iter().zip(&finals) {
         let Some(final_id) = *final_id else {
             continue;
@@ -485,116 +567,169 @@ fn build(
         }
         match (e.matched, e.choice) {
             (Some(m), Choice::Overwrite) => {
-                if let Some(slot) = store.profiles.iter_mut().find(|q| q.id == m) {
+                if let Some(&at) = position.get(&m) {
+                    let slot = &mut store.profiles[at];
+                    names.insert(p.name.clone());
                     *slot = replaced(slot, p, kind);
                 }
             }
             (Some(_), _) => {
                 p.id = final_id;
-                p.name = copy_name(&store, &p.name);
+                p.name = copy_name(&names, &p.name);
+                names.insert(p.name.clone());
                 store.profiles.push(p);
             }
-            (None, _) => store.profiles.push(p),
+            (None, _) => {
+                names.insert(p.name.clone());
+                store.profiles.push(p);
+            }
         }
     }
     (store, finals)
 }
 
-/// `incoming` replacing `old`, keeping `old`'s id. A shared archive carries no key path or
-/// passphrase flag, so a key profile keeps the local ones (and its saved secrets, which a
-/// shared import never touches).
+/// `incoming` replacing `old`, keeping `old`'s id. Overwrite replaces only what the archive
+/// carries:
+/// - A shared archive carries no key path or passphrase flag, so a key profile keeps the local
+///   ones (and its saved secrets, which a shared import never touches).
+/// - A full archive's key path points into another machine, so a key profile with a local
+///   path keeps it and takes the passphrase flag (which travels with the archived secret);
+///   a key file the archive carries replaces the path later (`place_keys`). Archive paths are
+///   never looked at on disk.
 fn replaced(old: &Profile, mut incoming: Profile, kind: ArchiveKind) -> Profile {
     incoming.id = old.id;
-    if kind == ArchiveKind::Shared
-        && let ProfileKind::Ssh(new) = &mut incoming.kind
+    if let ProfileKind::Ssh(new) = &mut incoming.kind
         && let ProfileKind::Ssh(old) = &old.kind
-        && matches!(new.auth, AuthMethod::Key { .. })
-        && matches!(old.auth, AuthMethod::Key { .. })
+        && let AuthMethod::Key {
+            path: new_path,
+            passphrase: new_passphrase,
+        } = &mut new.auth
+        && let AuthMethod::Key {
+            path: old_path,
+            passphrase: old_passphrase,
+        } = &old.auth
     {
-        new.auth = old.auth.clone();
+        match kind {
+            ArchiveKind::Shared => {
+                *new_path = old_path.clone();
+                *new_passphrase = *old_passphrase;
+            }
+            ArchiveKind::Full => {
+                if old_path.is_some() {
+                    *new_path = old_path.clone();
+                }
+            }
+        }
     }
     incoming
 }
 
 /// `{name} (imported)`, or `{name} (imported 2)`, ... when that is taken too.
-fn copy_name(store: &ProfileStore, name: &str) -> String {
-    let taken = |n: &str| store.profiles.iter().any(|p| p.name == n);
+fn copy_name(names: &HashSet<String>, name: &str) -> String {
     let first = format!("{name} (imported)");
-    if !taken(&first) {
+    if !names.contains(&first) {
         return first;
     }
     (2..)
         .map(|k| format!("{name} (imported {k})"))
-        .find(|n| !taken(n))
+        .find(|n| !names.contains(n))
         .expect("a free name")
 }
 
-/// The entries to block for a validation error of the result, with the reason shown on each.
-fn culprits(
-    error: &ValidationError,
-    entries: &[ImportEntry],
-    store: &ProfileStore,
-    finals: &[Option<ProfileId>],
-    baseline: &[ValidationError],
-) -> Vec<(usize, String)> {
-    let name = error_profile(error);
-    let named: Vec<usize> = (0..entries.len())
-        .filter(|&i| {
-            finals[i]
-                .and_then(|id| store.get(id))
-                .is_some_and(|p| p.name == name)
-        })
-        .collect();
-    let why = message(error);
+/// Lookups for assigning one round's validation errors to entries.
+struct Round<'a> {
+    /// Importing entries by the name they have in the result, in entry order.
+    by_name: HashMap<&'a str, Vec<usize>>,
+    /// The jumps of profiles the import neither adds nor replaces, by name (the first one).
+    untouched: HashMap<&'a str, &'a [ProfileId]>,
+    /// Importing entries that replace a local profile, by its id.
+    replacements: Vec<(ProfileId, usize)>,
+}
 
-    if let ValidationError::DuplicateName(_) = error {
-        let imported: HashSet<ProfileId> = finals.iter().flatten().copied().collect();
-        let local_has_it = store
-            .profiles
+impl<'a> Round<'a> {
+    fn new(entries: &[ImportEntry], store: &'a ProfileStore, finals: &[Option<ProfileId>]) -> Self {
+        let entry_of: HashMap<ProfileId, usize> = finals
             .iter()
-            .any(|p| p.name == name && !imported.contains(&p.id));
-        // Against a local profile every importing one is wrong; among imported ones the
-        // first keeps the name.
-        let skip = usize::from(!local_has_it);
-        return named
-            .into_iter()
-            .skip(skip)
-            .map(|i| (i, why.clone()))
+            .enumerate()
+            .filter_map(|(i, id)| id.map(|id| (id, i)))
             .collect();
-    }
-    if !named.is_empty() {
-        return named.into_iter().map(|i| (i, why.clone())).collect();
-    }
-    if baseline.contains(error) {
-        return Vec::new();
+        let mut by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+        let mut untouched: HashMap<&str, &[ProfileId]> = HashMap::new();
+        for p in &store.profiles {
+            match entry_of.get(&p.id) {
+                Some(&i) => by_name.entry(p.name.as_str()).or_default().push(i),
+                None => {
+                    let jumps: &[ProfileId] = match &p.kind {
+                        ProfileKind::Ssh(ssh) => &ssh.jump,
+                        ProfileKind::Local(_) => &[],
+                    };
+                    untouched.entry(p.name.as_str()).or_insert(jumps);
+                }
+            }
+        }
+        for list in by_name.values_mut() {
+            list.sort_unstable();
+        }
+        let replacements = (0..entries.len())
+            .filter_map(|i| {
+                finals[i]
+                    .filter(|id| Some(*id) == entries[i].matched)
+                    .map(|id| (id, i))
+            })
+            .collect();
+        Self {
+            by_name,
+            untouched,
+            replacements,
+        }
     }
 
-    // A local profile the import made invalid (only a replacement can): block the
-    // replacements it jumps through, or every replacement when none of them is a direct hop.
-    let replacements: Vec<usize> = (0..entries.len())
-        .filter(|&i| finals[i].is_some() && finals[i] == entries[i].matched)
-        .collect();
-    let hops: Vec<ProfileId> = store
-        .profiles
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| match &p.kind {
-            ProfileKind::Ssh(ssh) => ssh.jump.clone(),
-            ProfileKind::Local(_) => Vec::new(),
-        })
-        .unwrap_or_default();
-    let direct: Vec<usize> = replacements
-        .iter()
-        .copied()
-        .filter(|&i| finals[i].is_some_and(|id| hops.contains(&id)))
-        .collect();
-    let chosen = if direct.is_empty() {
-        replacements
-    } else {
-        direct
-    };
-    let why = format!("It would make the jump chain of {} invalid.", shown(name));
-    chosen.into_iter().map(|i| (i, why.clone())).collect()
+    /// The entries to block for a validation error of the result, with the reason shown on
+    /// each.
+    fn culprits(
+        &self,
+        error: &ValidationError,
+        baseline: &[ValidationError],
+    ) -> Vec<(usize, String)> {
+        let name = error_profile(error);
+        let named = self
+            .by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let why = message(error);
+
+        if let ValidationError::DuplicateName(_) = error {
+            // Against a local profile every importing one is wrong; among imported ones the
+            // first keeps the name.
+            let skip = usize::from(!self.untouched.contains_key(name));
+            return named.iter().skip(skip).map(|&i| (i, why.clone())).collect();
+        }
+        if !named.is_empty() {
+            return named.iter().map(|&i| (i, why.clone())).collect();
+        }
+        if baseline.contains(error) {
+            return Vec::new();
+        }
+
+        // A local profile the import made invalid (only a replacement can): block the
+        // replacements it jumps through, or every replacement when none of them is a direct
+        // hop.
+        let hops = self.untouched.get(name).copied().unwrap_or_default();
+        let direct: Vec<usize> = self
+            .replacements
+            .iter()
+            .filter(|(id, _)| hops.contains(id))
+            .map(|&(_, i)| i)
+            .collect();
+        let chosen = if direct.is_empty() {
+            self.replacements.iter().map(|&(_, i)| i).collect()
+        } else {
+            direct
+        };
+        let why = format!("It would make the jump chain of {} invalid.", shown(name));
+        chosen.into_iter().map(|i| (i, why.clone())).collect()
+    }
 }
 
 /// The profile a validation error is about.
@@ -619,9 +754,7 @@ fn message(error: &ValidationError) -> String {
         ValidationError::DuplicateName(name) => {
             format!("A profile named {} already exists.", shown(name))
         }
-        ValidationError::MissingJump { .. } => {
-            "It jumps through a profile that is not in the archive or on this computer.".into()
-        }
+        ValidationError::MissingJump { .. } => MISSING.into(),
         ValidationError::JumpNotSsh { .. } => {
             "It jumps through a profile that is not an SSH profile.".into()
         }
@@ -666,50 +799,51 @@ fn plan_schemes(
 ) -> (Vec<SchemeEntry>, HashSet<String>) {
     let mut entries: Vec<SchemeEntry> = Vec::new();
     let mut dropped = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for s in &archive.schemes {
         // A built-in id is the built-in, whatever the archive's copy says.
         if BUILTIN_IDS.contains(&s.id.as_str()) {
             continue;
         }
-        let repeated = entries.iter().any(|e| e.archived_id == s.id);
-        let entry = if repeated {
-            None
+        let name = if s.name.trim().is_empty() {
+            &s.id
         } else {
-            match local.get(&s.id) {
-                Some(mine) if same_scheme(mine, s) => Some(SchemeEntry {
-                    archived_id: s.id.clone(),
-                    scheme: mine.clone(),
-                    outcome: SchemeOutcome::Reused,
-                }),
-                Some(_) => valid_scheme(Scheme {
-                    id: schemes::new_user_id(),
-                    name: format!("{} (imported)", s.name),
-                    builtin: false,
-                    ..s.clone()
-                })
-                .map(|scheme| SchemeEntry {
-                    archived_id: s.id.clone(),
-                    scheme,
-                    outcome: SchemeOutcome::Renamed,
-                }),
-                None => valid_scheme(s.clone()).map(|scheme| SchemeEntry {
-                    archived_id: s.id.clone(),
-                    scheme,
-                    outcome: SchemeOutcome::Imported,
-                }),
-            }
+            &s.name
+        };
+        if !seen.insert(s.id.as_str()) {
+            warnings.push(format!(
+                "The archive lists the color scheme {} twice; only the first is used.",
+                shown(name)
+            ));
+            continue;
+        }
+        let entry = match local.get(&s.id) {
+            Some(mine) if same_scheme(mine, s) => Some(SchemeEntry {
+                archived_id: s.id.clone(),
+                scheme: mine.clone(),
+                outcome: SchemeOutcome::Reused,
+            }),
+            Some(_) => valid_scheme(Scheme {
+                id: schemes::new_user_id(),
+                name: format!("{} (imported)", s.name),
+                builtin: false,
+                ..s.clone()
+            })
+            .map(|scheme| SchemeEntry {
+                archived_id: s.id.clone(),
+                scheme,
+                outcome: SchemeOutcome::Renamed,
+            }),
+            None => valid_scheme(s.clone()).map(|scheme| SchemeEntry {
+                archived_id: s.id.clone(),
+                scheme,
+                outcome: SchemeOutcome::Imported,
+            }),
         };
         match entry {
             Some(entry) => entries.push(entry),
             None => {
-                if !repeated {
-                    dropped.insert(s.id.clone());
-                }
-                let name = if s.name.trim().is_empty() {
-                    &s.id
-                } else {
-                    &s.name
-                };
+                dropped.insert(s.id.clone());
                 warnings.push(format!(
                     "{} is not a valid color scheme, so it was left out.",
                     shown(name)
@@ -780,6 +914,8 @@ fn harmless(name: &str) -> bool {
         && !name.ends_with(' ')
         && !name.chars().any(reserved_char)
         && !SSH_FILES.iter().any(|f| f.eq_ignore_ascii_case(name))
+        // Never a private key where a public key is looked for.
+        && !name.to_ascii_lowercase().ends_with(".pub")
         && !windows_device(name)
 }
 
@@ -822,14 +958,7 @@ fn place_keys(
             .iter()
             .filter_map(|id| index.get(id).and_then(|&i| finals[i]))
             .filter(|id| !placed.contains(id))
-            .filter(|&id| {
-                store.get(id).is_some_and(|p| {
-                    matches!(
-                        &p.kind,
-                        ProfileKind::Ssh(ssh) if matches!(ssh.auth, AuthMethod::Key { .. })
-                    )
-                })
-            })
+            .filter(|&id| store.get(id).is_some_and(uses_key))
             .collect();
         if users.is_empty() {
             continue;

@@ -164,7 +164,7 @@ fn matches_by_id_then_name() {
     let fresh = ssh("fresh", AuthMethod::Agent, Vec::new());
 
     let a = archive(ArchiveKind::Full, &[&renamed, &web, &both, &fresh]);
-    let p = plan(&local_store, &a, &no_schemes());
+    let p = plan(&local_store, &a, &no_schemes()).unwrap();
     let matched: Vec<_> = p.entries.iter().map(|e| e.matched).collect();
     assert_eq!(
         matched,
@@ -187,7 +187,7 @@ fn default_choice_is_skip() {
     }
     let fresh = ssh("fresh", AuthMethod::Agent, Vec::new());
     let a = archive(ArchiveKind::Full, &[&changed, &fresh]);
-    let p = plan(&local_store, &a, &no_schemes());
+    let p = plan(&local_store, &a, &no_schemes()).unwrap();
     assert_eq!(p.entries[0].choice, Choice::Skip);
     assert!(p.entries.iter().all(|e| e.error.is_none()));
 
@@ -213,7 +213,7 @@ fn keep_both_renames_and_rewires() {
     let mut a = archive(ArchiveKind::Full, &[&archived_bastion, &db]);
     a.secrets = vec![secret(db.id, SecretKind::Password, PASSWORD)];
 
-    let mut p = plan(&local_store, &a, &no_schemes());
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
     set_choice(&mut p, 0, Choice::KeepBoth);
     assert!(p.entries.iter().all(|e| e.error.is_none()));
     let dir = key_dir();
@@ -235,7 +235,7 @@ fn keep_both_renames_and_rewires() {
     assert_eq!(applied.secret_ops[0].value.as_str(), PASSWORD);
 
     // A second Keep both of the same profile picks the next free name.
-    let again = plan(&applied.store, &a, &no_schemes());
+    let again = plan(&applied.store, &a, &no_schemes()).unwrap();
     let mut again = again;
     set_choice(&mut again, 0, Choice::KeepBoth);
     let twice = apply(&again, &a, &applied.store, dir.path(), false).unwrap();
@@ -257,7 +257,7 @@ fn skip_points_references_at_local() {
     let db = ssh("db", AuthMethod::Agent, vec![archived_bastion.id]);
     let a = archive(ArchiveKind::Full, &[&archived_bastion, &db]);
 
-    let p = plan(&local_store, &a, &no_schemes());
+    let p = plan(&local_store, &a, &no_schemes()).unwrap();
     assert_eq!(p.entries[0].matched, Some(bastion.id));
     assert_eq!(p.entries[0].choice, Choice::Skip);
     assert!(p.entries.iter().all(|e| e.error.is_none()));
@@ -287,7 +287,7 @@ fn invalid_reference_blocks_entry() {
     let a = archive(ArchiveKind::Full, &[&hop, &db, &web]);
 
     // Skip points db at the local shell: invalid, and web through db with it.
-    let mut p = plan(&local_store, &a, &no_schemes());
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
     assert_eq!(p.entries[0].matched, Some(local_hop.id));
     assert!(p.entries[0].error.is_none());
     assert_eq!(
@@ -313,7 +313,7 @@ fn invalid_reference_blocks_entry() {
         s.jump = vec![y.id];
     }
     let a = archive(ArchiveKind::Full, &[&x, &y]);
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     assert_eq!(
         p.entries[0].error.as_deref(),
         Some("Its jump chain loops back to itself.")
@@ -360,7 +360,7 @@ fn imported_profiles_get_the_stores_validation() {
         ArchiveKind::Full,
         &[&empty_host, &bad_tunnel, &renamed, &nameless, &missing],
     );
-    let mut p = plan(&local_store, &a, &no_schemes());
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
     set_choice(&mut p, 2, Choice::Overwrite);
     let errors: Vec<_> = p.entries.iter().map(|e| e.error.as_deref()).collect();
     assert_eq!(
@@ -392,7 +392,7 @@ fn full_overwrite_replaces_carried_secrets() {
         // Not the method the profile uses: never stored.
         secret(db.id, SecretKind::KeyPassphrase, PASSPHRASE),
     ];
-    let mut p = plan(&local_store, &a, &no_schemes());
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
     assert!(p.has_secrets);
     set_choice(&mut p, 0, Choice::Overwrite);
     let dir = key_dir();
@@ -416,7 +416,7 @@ fn shared_overwrite_keeps_local_secrets_and_key_path() {
         s.host = "db2.example.com".into();
     }
     let a = archive(ArchiveKind::Shared, &[&shared]);
-    let mut p = plan(&local_store, &a, &no_schemes());
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
     assert!(!p.has_secrets);
     set_choice(&mut p, 0, Choice::Overwrite);
     let dir = key_dir();
@@ -443,7 +443,7 @@ fn shared_archive_claims_are_ignored() {
     ];
     a.keys = vec![archived_key("id_db", KEY_BYTES, &[db.id])];
 
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     assert!(!p.has_secrets);
     assert!(!p.has_keys);
     assert_eq!(p.entries.len(), 2);
@@ -473,7 +473,7 @@ fn existing_key_file_is_never_replaced() {
     let db = ssh("db", key(Some("/elsewhere/id_ed25519"), false), Vec::new());
     let mut a = archive(ArchiveKind::Full, &[&db]);
     a.keys = vec![archived_key("id_ed25519", KEY_BYTES, &[db.id])];
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     assert!(p.has_keys);
     let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
 
@@ -488,6 +488,9 @@ fn existing_key_file_is_never_replaced() {
             passphrase: false
         }
     );
+    // Key bytes never show in debug output.
+    let shown = format!("{:?}", applied.key_writes);
+    assert!(!shown.contains("imported-4d1f"), "{shown}");
     // Nothing on disk changed.
     assert_eq!(std::fs::read(&existing).unwrap(), OTHER_KEY);
     assert!(!dir.path().join("id_ed25519-2").exists());
@@ -503,7 +506,7 @@ fn identical_key_file_is_reused() {
     let web = ssh("web", key(Some("/elsewhere/id_ed25519"), false), Vec::new());
     let mut a = archive(ArchiveKind::Full, &[&db, &web]);
     a.keys = vec![archived_key("id_ed25519", KEY_BYTES, &[db.id, web.id])];
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
     assert!(applied.key_writes.is_empty());
     for p in &applied.store.profiles {
@@ -532,12 +535,23 @@ fn key_file_names_are_reduced_to_plain_names() {
         ("authorized_keys", "id_imported"),
         ("Config", "id_imported"),
         ("NUL", "id_imported"),
+        ("con.txt", "id_imported"),
+        ("\\\\server\\x", "x"),
+        ("a/b", "b"),
+        ("id\0nul", "id_imported"),
+        ("id_ed25519.pub", "id_imported"),
+        ("ID_RSA.PUB", "id_imported"),
     ];
+    let long = "k".repeat(129);
+    let cases: Vec<(&str, &str)> = cases
+        .into_iter()
+        .chain([(long.as_str(), "id_imported"), (&long[..128], &long[..128])])
+        .collect();
     for (archived, expected) in cases {
         let db = ssh("db", key(None, false), Vec::new());
         let mut a = archive(ArchiveKind::Full, &[&db]);
         a.keys = vec![archived_key(archived, KEY_BYTES, &[db.id])];
-        let p = plan(&ProfileStore::default(), &a, &no_schemes());
+        let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
         let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
         assert_eq!(applied.key_writes.len(), 1, "{archived:?}");
         let path = &applied.key_writes[0].path;
@@ -553,7 +567,7 @@ fn key_file_names_are_reduced_to_plain_names() {
         archived_key("a/id_x", KEY_BYTES, &[db.id]),
         archived_key("b/ID_X", OTHER_KEY, &[web.id]),
     ];
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
     let paths: Vec<_> = applied.key_writes.iter().map(|w| w.path.clone()).collect();
     assert_eq!(
@@ -569,7 +583,7 @@ fn oversized_archived_key_is_never_written() {
     let mut a = archive(ArchiveKind::Full, &[&db]);
     let big = vec![b'k'; MAX_KEY_BYTES as usize + 1];
     a.keys = vec![archived_key("id_big", &big, &[db.id])];
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     assert!(!p.has_keys);
     assert_eq!(
         p.warnings,
@@ -591,7 +605,7 @@ fn existing_key_that_is_not_a_regular_file_is_never_read_as_identical() {
     let db = ssh("db", key(None, false), Vec::new());
     let mut a = archive(ArchiveKind::Full, &[&db]);
     a.keys = vec![archived_key("id_dir", KEY_BYTES, &[db.id])];
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
     assert_eq!(applied.key_writes[0].path, dir.path().join("id_dir-2"));
 }
@@ -614,7 +628,7 @@ fn scheme_clash_imports_copy() {
     let mut a = archive(ArchiveKind::Full, &[&a1, &a2, &a3]);
     a.schemes = vec![theirs.clone(), same.clone(), fresh.clone()];
 
-    let p = plan(&ProfileStore::default(), &a, &local_schemes);
+    let p = plan(&ProfileStore::default(), &a, &local_schemes).unwrap();
     assert!(p.warnings.is_empty(), "{:?}", p.warnings);
     let outcomes: Vec<_> = p.schemes.iter().map(|s| s.outcome).collect();
     assert_eq!(
@@ -685,7 +699,7 @@ fn archived_schemes_get_the_scheme_file_rules() {
     let mut a = archive(ArchiveKind::Full, &[&p1, &p2, &p3, &p4, &p5, &p6]);
     a.schemes = vec![fake_builtin, bad_id, upper, huge, ok];
 
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     let ids: Vec<_> = p.schemes.iter().map(|s| s.scheme.id.as_str()).collect();
     assert_eq!(ids, vec!["user-ok"]);
     assert_eq!(p.warnings.len(), 3, "{:?}", p.warnings);
@@ -718,7 +732,7 @@ fn archived_schemes_get_the_scheme_file_rules() {
 fn read_only_profiles_refuse_the_import() {
     let db = ssh("db", AuthMethod::Agent, Vec::new());
     let a = archive(ArchiveKind::Full, &[&db]);
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     let dir = key_dir();
     let err = apply(&p, &a, &ProfileStore::default(), dir.path(), true).unwrap_err();
     assert_eq!(
@@ -731,7 +745,7 @@ fn read_only_profiles_refuse_the_import() {
 fn a_stale_plan_is_refused() {
     let db = ssh("db", AuthMethod::Agent, Vec::new());
     let a = archive(ArchiveKind::Full, &[&db]);
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     let meanwhile = store(&[&ssh("new", AuthMethod::Agent, Vec::new())]);
     let dir = key_dir();
     let err = apply(&p, &a, &meanwhile, dir.path(), false).unwrap_err();
@@ -747,7 +761,7 @@ fn duplicate_ids_in_the_archive_import_once() {
     let mut twin = db.clone();
     twin.name = "twin".into();
     let a = archive(ArchiveKind::Full, &[&db, &twin]);
-    let p = plan(&ProfileStore::default(), &a, &no_schemes());
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
     assert!(p.entries[0].error.is_none());
     assert_eq!(
         p.entries[1].error.as_deref(),
@@ -767,7 +781,7 @@ fn overwrite_that_breaks_a_local_jump_is_blocked() {
     let mut shell = local("hop");
     shell.id = hop.id;
     let a = archive(ArchiveKind::Full, &[&shell]);
-    let mut p = plan(&local_store, &a, &no_schemes());
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
     assert_eq!(p.entries[0].matched, Some(hop.id));
     set_choice(&mut p, 0, Choice::Overwrite);
     assert_eq!(
@@ -781,4 +795,171 @@ fn overwrite_that_breaks_a_local_jump_is_blocked() {
     // Back to Skip, the entry has nothing wrong with it.
     set_choice(&mut p, 0, Choice::Skip);
     assert!(p.entries[0].error.is_none());
+}
+
+#[test]
+fn over_limit_archives_are_refused() {
+    const REFUSED: &str = "This archive is too large or malformed to import.";
+    let refused = |a: &Archive| {
+        assert_eq!(
+            plan(&ProfileStore::default(), a, &no_schemes()).unwrap_err(),
+            REFUSED
+        );
+    };
+
+    let many: Vec<Profile> = (0..1001)
+        .map(|i| ssh(&format!("p{i}"), AuthMethod::Agent, Vec::new()))
+        .collect();
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.profiles = many.clone();
+    refused(&a);
+    a.profiles.pop();
+    assert!(plan(&ProfileStore::default(), &a, &no_schemes()).is_ok());
+
+    let hops: Vec<ProfileId> = many[..17].iter().map(|p| p.id).collect();
+    let wide = ssh("wide", AuthMethod::Agent, hops.clone());
+    refused(&archive(ArchiveKind::Full, &[&wide]));
+    let ok = ssh("ok", AuthMethod::Agent, hops[..16].to_vec());
+    assert!(
+        plan(
+            &ProfileStore::default(),
+            &archive(ArchiveKind::Full, &[&ok]),
+            &no_schemes()
+        )
+        .is_ok()
+    );
+    let twice = ssh("twice", AuthMethod::Agent, vec![hops[0], hops[0]]);
+    refused(&archive(ArchiveKind::Full, &[&twice]));
+
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.schemes = (0..201)
+        .map(|i| user_scheme(&format!("user-{i}"), "S"))
+        .collect();
+    refused(&a);
+
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.keys = (0..201)
+        .map(|i| archived_key(&format!("id_{i}"), KEY_BYTES, &[]))
+        .collect();
+    refused(&a);
+}
+
+#[test]
+fn crafted_jump_shapes_plan_quickly() {
+    use std::time::{Duration, Instant};
+    // Forty levels, each profile jumping through both profiles of the level below.
+    let mut levels = vec![[
+        ssh("a0", AuthMethod::Agent, Vec::new()),
+        ssh("b0", AuthMethod::Agent, Vec::new()),
+    ]];
+    for i in 1..40 {
+        let below = vec![levels[i - 1][0].id, levels[i - 1][1].id];
+        levels.push([
+            ssh(&format!("a{i}"), AuthMethod::Agent, below.clone()),
+            ssh(&format!("b{i}"), AuthMethod::Agent, below),
+        ]);
+    }
+    let mut diamond = archive(ArchiveKind::Full, &[]);
+    diamond.profiles = levels.into_iter().flatten().collect();
+
+    // A thousand-link chain whose root is missing: every link is blocked in turn.
+    let mut chain = vec![ssh("c0", AuthMethod::Agent, vec![ProfileId::new()])];
+    for i in 1..1000 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), AuthMethod::Agent, vec![prev]));
+    }
+    let mut long = archive(ArchiveKind::Full, &[]);
+    long.profiles = chain;
+
+    for (a, blocked) in [(diamond, 0), (long, 1000)] {
+        let start = Instant::now();
+        let mut p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+        // Re-validating on a choice is as quick.
+        set_choice(&mut p, 0, Choice::KeepBoth);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let found = p.entries.iter().filter(|e| e.error.is_some()).count();
+        assert_eq!(found, blocked);
+    }
+}
+
+#[test]
+fn full_overwrite_without_key_file_keeps_local_key_path() {
+    let db = ssh("db", key(Some("/home/me/.ssh/id_db"), false), Vec::new());
+    let keyless = ssh("keyless", key(None, false), Vec::new());
+    let local_store = store(&[&db, &keyless]);
+    let mut theirs = db.clone();
+    if let ProfileKind::Ssh(s) = &mut theirs.kind {
+        s.auth = key(Some("/other/machine/id_db"), true);
+    }
+    let mut their_keyless = keyless.clone();
+    if let ProfileKind::Ssh(s) = &mut their_keyless.kind {
+        s.auth = key(Some("/other/machine/id_k"), false);
+    }
+    let a = archive(ArchiveKind::Full, &[&theirs, &their_keyless]);
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
+    set_choice(&mut p, 0, Choice::Overwrite);
+    set_choice(&mut p, 1, Choice::Overwrite);
+    let dir = key_dir();
+    let applied = apply(&p, &a, &local_store, dir.path(), false).unwrap();
+    // The local path stays; the passphrase flag travels with the archive's secrets.
+    assert_eq!(
+        auth(by_name(&applied.store, "db")),
+        &key(Some("/home/me/.ssh/id_db"), true)
+    );
+    // Without a local path, the archive's profile is taken as it is.
+    assert_eq!(
+        auth(by_name(&applied.store, "keyless")),
+        &key(Some("/other/machine/id_k"), false)
+    );
+
+    // With the key file in the archive, the profile points at the placed file.
+    let mut a = a;
+    a.keys = vec![archived_key("id_db", KEY_BYTES, &[db.id])];
+    let applied = apply(&p, &a, &local_store, dir.path(), false).unwrap();
+    assert_eq!(
+        auth(by_name(&applied.store, "db")),
+        &AuthMethod::Key {
+            path: Some(dir.path().join("id_db")),
+            passphrase: true
+        }
+    );
+}
+
+#[test]
+fn repeated_schemes_are_reported_once_each() {
+    let first = user_scheme("user-1", "Ocean");
+    let mut second = user_scheme("user-1", "Ocean again");
+    second.colors.background.r ^= 0x01;
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.schemes = vec![first, second];
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    assert_eq!(p.schemes.len(), 1);
+    assert_eq!(p.schemes[0].scheme.name, "Ocean");
+    assert_eq!(
+        p.warnings,
+        vec!["The archive lists the color scheme Ocean again twice; only the first is used."]
+    );
+}
+
+#[test]
+fn has_keys_counts_only_keys_imported_profiles_use() {
+    let db = ssh("db", key(None, false), Vec::new());
+    let agent = ssh("agent", AuthMethod::Agent, Vec::new());
+    let mut a = archive(ArchiveKind::Full, &[&db, &agent]);
+    a.keys = vec![
+        archived_key("unused", KEY_BYTES, &[ProfileId::new()]),
+        archived_key("agents", KEY_BYTES, &[agent.id]),
+    ];
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    assert!(!p.has_keys);
+    a.keys.push(archived_key("id_db", KEY_BYTES, &[db.id]));
+    let mut p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    assert!(p.has_keys);
+    // Leaving the key's only profile out leaves the key out too.
+    set_choice(&mut p, 0, Choice::Skip);
+    assert!(!p.has_keys);
 }
