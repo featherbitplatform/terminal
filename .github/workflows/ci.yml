@@ -35,11 +35,7 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  deny:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
+  # cargo-deny runs in security.yml (job cargo-deny), which also re-scans weekly.
 
   ssh-live:
     name: ssh live tests
