@@ -60,6 +60,10 @@ jobs:
         run: FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
       - name: Live tunnel tests
         run: FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_tunnels
+      - name: Live SFTP tests
+        run: FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_sftp
+      - name: Live file panel tests
+        run: FBTERM_TEST_SSH=1 cargo test -p fbterm file_panel::live_tests
       - name: Container logs
         if: failure()
         run: docker compose -f dev/ssh-test/compose.yaml logs

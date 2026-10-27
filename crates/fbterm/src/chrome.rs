@@ -15,6 +15,60 @@ use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector, window};
 
+/// Whether the macOS app menu's Quit keeps `Cmd+Q` with `running` transfers: only while none
+/// runs. While some do, the key is taken from the menu so it reaches the app's own Quit, which
+/// asks first; the menu would end the app at once (and works with every window minimised).
+pub(crate) fn quit_key_wanted(running: usize) -> bool {
+    running == 0
+}
+
+/// Whether a menu item with `action` is the app menu's Quit.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn is_quit_item(action: Option<&str>) -> bool {
+    action == Some("terminate:")
+}
+
+/// Give the macOS app menu's Quit its `Cmd+Q` (`menu_has_it`) or take it away, so the key
+/// goes through the app's own Quit. The item stays; choosing it with the mouse still ends the
+/// app at once. Returns whether the item was found and set (the menu exists once the app has
+/// launched). Elsewhere, and in tests, there is no menu: it only reports success.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn set_quit_key(menu_has_it: bool) -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSString;
+    // AppKit's menus belong to the main thread, where iced runs `update`.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(menu) = NSApplication::sharedApplication(mtm).mainMenu() else {
+        return false;
+    };
+    let key = NSString::from_str(if menu_has_it { "q" } else { "" });
+    let mut set = false;
+    for top in menu.itemArray().iter() {
+        let Some(submenu) = top.submenu() else {
+            continue;
+        };
+        for item in submenu.itemArray().iter() {
+            let action = item
+                .action()
+                .map(|sel| sel.name().to_string_lossy().into_owned());
+            if is_quit_item(action.as_deref()) {
+                // The modifier mask (Cmd) stays as the menu built it.
+                item.setKeyEquivalent(&key);
+                set = true;
+            }
+        }
+    }
+    set
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
+pub(crate) fn set_quit_key(_menu_has_it: bool) -> bool {
+    true
+}
+
 /// Height of the macOS title bar area in logical pixels (measured on macOS 27: the window
 /// buttons are 14 px tall, centered 16 px from the top).
 pub const MACOS_TITLEBAR_HEIGHT: f32 = 32.0;
@@ -415,6 +469,18 @@ mod tests {
                 blur: false
             }
         );
+    }
+
+    #[test]
+    fn the_menus_quit_keeps_cmd_q_unless_transfers_run() {
+        assert!(is_quit_item(Some("terminate:")));
+        assert!(!is_quit_item(Some("hide:")));
+        assert!(!is_quit_item(Some("performClose:")));
+        assert!(!is_quit_item(None));
+        // The menu keeps Cmd+Q unless a transfer runs.
+        assert!(quit_key_wanted(0));
+        assert!(!quit_key_wanted(1));
+        assert!(!quit_key_wanted(3));
     }
 
     #[cfg(target_os = "macos")]

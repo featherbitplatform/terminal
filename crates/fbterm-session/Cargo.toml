@@ -11,13 +11,14 @@ workspace = true
 fbterm-config = { path = "../fbterm-config" }
 fbterm-term = { path = "../fbterm-term" }
 portable-pty = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 directories = { workspace = true }
 tracing = { workspace = true }
 fbterm-secrets = { path = "../fbterm-secrets" }
 russh = { workspace = true }
+russh-sftp = { workspace = true }
 async-trait = { workspace = true }
 # known_hosts: hashed host names are HMAC-SHA1 with base64 salts (same versions as russh).
 hmac = "0.13"

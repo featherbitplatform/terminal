@@ -222,6 +222,8 @@ listing with size/mtime, navigate, download, upload, drag in from and out to Fin
 mkdir/rename/delete *(builder's call)*. Transfers run in a queue with progress at the bottom of the
 panel and do not block the terminal. Starting directory: the remote home *(builder's call; following
 the shell's cwd can come later)*.
+Done 2026-10-27 (milestone 4): SFTP browsing, downloads and uploads with a transfer queue; mkdir,
+rename, delete and drag out to Finder were left out; see `2026-10-27-file-panel-design.md`.
 
 ### 5.9 Export / import
 
@@ -455,7 +457,7 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    2026-10-24, with a search over all tabs; see 5.12; tiling done 2026-10-26, see 5.6 and
    `2026-10-26-tiling-design.md`; measurements in `dev/perf/README.md`, scenario H).
 3. Tunnels (done 2026-10-27; see 5.7 and `2026-10-27-tunnels-design.md`).
-4. File panel.
+4. File panel (done 2026-10-27; see 5.8 and `2026-10-27-file-panel-design.md`).
 5. Export/import, optional main-password vault.
 6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
    (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).

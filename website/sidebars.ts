@@ -8,6 +8,7 @@ const sidebars: SidebarsConfig = {
     'tiling',
     'color-schemes',
     'tunnels',
+    'file-panel',
     'keyboard-shortcuts',
     'files',
   ],

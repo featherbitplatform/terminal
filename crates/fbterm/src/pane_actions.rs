@@ -119,18 +119,34 @@ impl App {
     /// goes through the release path of a closed tab: the memory goes back to the OS once the
     /// last reference to it drops.
     pub(crate) fn close_focused_pane(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(focused) = self
+            .windows
+            .get(&wid)
+            .and_then(WindowState::active_tab)
+            .map(|t| t.focused)
+        else {
+            return Task::none();
+        };
+        // Running transfers it would end are asked about first.
+        if self.ask_before_closing(wid, &[focused], crate::prompts::Closing::Pane(focused)) {
+            return Task::none();
+        }
+        self.close_pane(wid, focused)
+    }
+
+    /// Close `pane` of `wid`; the last pane of a tab closes the tab.
+    pub(crate) fn close_pane(&mut self, wid: window::Id, pane: PaneId) -> Task<Message> {
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();
         };
-        let active = window.active;
-        let Some(tab) = window.active_tab_mut() else {
+        let Some((index, _)) = window.locate(pane) else {
             return Task::none();
         };
+        let tab = &mut window.tabs[index];
         if tab.panes.len() < 2 {
-            return self.close_tab(wid, active);
+            return self.close_tab(wid, index);
         }
-        let focused = tab.focused;
-        let Some(pane) = tab.close_pane(focused) else {
+        let Some(pane) = tab.close_pane(pane) else {
             return Task::none();
         };
         let freed = crate::memory::weak_terminals(std::iter::once(&pane));

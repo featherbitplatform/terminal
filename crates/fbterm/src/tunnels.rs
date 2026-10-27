@@ -496,7 +496,7 @@ impl App {
     }
 
     /// Connected shell panes of `profile`, in every window.
-    fn shell_count(&self, profile: ProfileId) -> usize {
+    pub(crate) fn shell_count(&self, profile: ProfileId) -> usize {
         self.windows
             .values()
             .flat_map(|w| &w.tabs)

@@ -69,7 +69,8 @@ impl App {
             focused: self.app_active
                 && self.focused == Some(wid)
                 && tab.focused == pane.id
-                && pane.find.is_none(),
+                && pane.find.is_none()
+                && !self.file_panels.has_focus(wid),
             accent: None,
             ..self.style.clone()
         }

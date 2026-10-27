@@ -258,6 +258,7 @@ fn actions() -> Vec<PaletteItem> {
         (Action::Settings, "Settings"),
         (Action::EditSchemes, "Color schemes"),
         (Action::Tunnels, "Tunnels"),
+        (Action::FilePanel, "File panel"),
         (Action::OpenSettingsFile, "Open settings file"),
         (Action::RevealConfigFolder, "Reveal config folder"),
         (Action::Quit, "Quit"),
@@ -761,6 +762,7 @@ mod tests {
                 "Settings",
                 "Color schemes",
                 "Tunnels",
+                "File panel",
                 "Open settings file",
                 "Reveal config folder",
                 "Quit"
@@ -908,7 +910,7 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 20);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 21);
     }
 
     #[test]

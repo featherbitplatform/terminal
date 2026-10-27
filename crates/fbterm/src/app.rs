@@ -178,6 +178,8 @@ pub enum Message {
     ConfigChanged(Changed),
     /// A tunnel's state changed (see [`crate::tunnels`]).
     Tunnel(TunnelKey, TunnelState),
+    /// The file panel (see [`crate::file_panel`]).
+    FilePanel(crate::file_panel::FilePanelMsg),
 }
 
 /// Where a settings change came from. The scrollback notice is for edits made in
@@ -227,6 +229,10 @@ pub struct App {
     pub(crate) tunnels: Tunnels,
     /// `tunnel_max_retries`, shared with running tunnels so a change applies to them at once.
     pub(crate) tunnel_retries: Arc<AtomicU32>,
+    /// The file panel of every window (see [`crate::file_panel`]).
+    pub(crate) file_panels: crate::file_panel::FilePanels,
+    /// The file panel's background work: opening SFTP sessions and reading folders.
+    pub(crate) file_panel_work: crate::file_panel::Work,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
     pub(crate) visibility: visibility::Changes,
@@ -279,6 +285,9 @@ pub struct App {
     /// The app is quitting: windows closing from now on are not the user dropping them, so
     /// the layout saved at quit must stay as it is.
     pub(crate) quitting: bool,
+    /// macOS: `Cmd+Q` is taken from the app menu's Quit (while transfers run, so the key
+    /// reaches the app's Quit, which asks first); see [`App::sync_quit_key`].
+    pub(crate) quit_key_free: bool,
     /// Windows we asked to close. A window that closes without being asked is the OS tearing
     /// the app down (macOS Cmd+Q from the menu): that is a quit too.
     pub(crate) closing: std::collections::HashSet<window::Id>,
@@ -470,6 +479,11 @@ impl App {
         let tunnel_retries = Arc::new(AtomicU32::new(settings.tunnel_max_retries));
         let mut app = Self {
             tunnels: Tunnels::new(pool.clone()),
+            file_panels: crate::file_panel::FilePanels::new(
+                saved.file_panel_width,
+                saved.file_panel_show_hidden.unwrap_or(true),
+            ),
+            file_panel_work: crate::file_panel::Work::new(pool.clone()),
             tunnel_retries,
             bindings: Bindings::current(&settings.keys.map),
             theme: theme::graphite_theme(settings.theme),
@@ -514,6 +528,7 @@ impl App {
                 && debug_env("FBTERM_SCREENSHOT").is_none()
                 && crate::perf::opts().is_none(),
             quitting: false,
+            quit_key_free: false,
             closing: Default::default(),
             sizes: HashMap::new(),
             fullscreen: Default::default(),
@@ -561,6 +576,7 @@ impl App {
         task = task.chain(app.open_debug_tunnels());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
+        task = task.chain(app.open_debug_files());
         (app, task)
     }
 
@@ -635,6 +651,10 @@ impl App {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
+                // Files dropped from the OS on a window: only these start an upload by drag.
+                Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
+                    crate::file_panel::FilePanelMsg::Dropped(id, path),
+                )),
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
@@ -642,6 +662,22 @@ impl App {
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
             Subscription::run_with(self.tunnels.receiver.clone(), tunnel_stream)
                 .map(|(key, state)| Message::Tunnel(key, state)),
+            Subscription::run_with(
+                self.file_panel_work.receiver.clone(),
+                crate::file_panel::panel_stream,
+            )
+            .map(|event| {
+                Message::FilePanel(crate::file_panel::FilePanelMsg::Event(Delivered::new(
+                    event,
+                )))
+            }),
+            Subscription::run_with(
+                self.file_panel_work.transfers.clone(),
+                crate::file_panel::transfer_stream,
+            )
+            .map(|(id, event)| {
+                Message::FilePanel(crate::file_panel::FilePanelMsg::Transfer(id, event))
+            }),
             Subscription::run_with(self.visibility.clone(), visibility::stream)
                 .map(|(id, visible)| Message::WindowVisible(id, visible)),
             Subscription::run_with(self.display.clone(), display_rate::stream)
@@ -678,6 +714,18 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch(message);
+        // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
+        // shows its focused pane's profile.
+        self.sync_file_panels();
+        self.sync_quit_key();
+        match self.sync_panel_focus() {
+            Some(unfocus) => Task::batch([task, unfocus]),
+            None => task,
+        }
+    }
+
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Session(id, event) => self.session_event(id, event),
             Message::Terminal(wid, pane, output) => self.terminal_output(wid, pane, output),
@@ -836,6 +884,14 @@ impl App {
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
+                self.file_panels.open.remove(&id);
+                self.file_panels.ui.remove(&id);
+                // A save dialog it had open answers nothing now.
+                self.file_panels.saving.remove(&id);
+                // Nor does its picker; its drops and undecided uploads are forgotten.
+                self.file_panels.picking.remove(&id);
+                self.file_panels.dropped.remove(&id);
+                self.file_panels.batches.remove(&id);
                 if self.carry.is_some_and(|(w, _)| w == id) {
                     self.carry = None;
                     self.hover = None;
@@ -932,6 +988,7 @@ impl App {
                 Task::batch(tasks)
             }
             Message::Tunnel(key, state) => self.tunnel_event(key, state),
+            Message::FilePanel(msg) => self.file_panel_msg(msg),
             Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {

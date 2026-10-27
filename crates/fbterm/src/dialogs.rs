@@ -5,7 +5,8 @@ use iced::{Task, window};
 use crate::app::{App, Message, load_profiles};
 use crate::chrome::Chrome;
 use crate::editor::{EditorMsg, EditorState, SaveError};
-use crate::prompts::{Dialog, PromptEvent, PromptMsg};
+use crate::file_panel::ClashAnswer;
+use crate::prompts::{Clash, Dialog, PromptEvent, PromptMsg, Rename};
 use crate::tunnels::NO_WINDOW;
 
 impl App {
@@ -250,18 +251,97 @@ impl App {
                 self.focus_prompt(w)
             }
             PromptMsg::Cancel(w) => {
+                // In the name field, `Back` (or Escape) returns to the choice.
+                if let Some(Dialog::Clash(clash)) = self.prompts.front_mut(w)
+                    && clash.rename.is_some()
+                {
+                    clash.rename = None;
+                    return Task::none();
+                }
+                // The clash dialog's `Cancel` (or Escape) skips that file and goes on.
+                if let Some(Dialog::Clash(clash)) = self.prompts.front(w) {
+                    let all = clash.apply_all && clash.offer_all;
+                    self.prompts.pop(w);
+                    let task = self.clash_answer(w, ClashAnswer::Cancel { all });
+                    return Task::batch([task, self.focus_prompt(w)]);
+                }
                 self.prompts.cancel(w);
                 self.focus_prompt(w)
             }
             PromptMsg::Submit(w) => {
+                if let Some(Dialog::Clash(clash)) = self.prompts.front(w) {
+                    if clash.rename.is_some() {
+                        return self.clash_rename_submit(w);
+                    }
+                    return Task::none();
+                }
                 self.prompts.submit(w);
                 self.focus_prompt(w)
+            }
+            PromptMsg::ClashReplace(w) => {
+                let Some(Dialog::Clash(clash)) = self.prompts.front(w) else {
+                    return Task::none();
+                };
+                let all = clash.apply_all && clash.offer_all;
+                self.prompts.pop(w);
+                let task = self.clash_answer(w, ClashAnswer::Replace { all });
+                Task::batch([task, self.focus_prompt(w)])
+            }
+            PromptMsg::ClashRename(w) => {
+                let Some(Dialog::Clash(clash)) = self.prompts.front(w) else {
+                    return Task::none();
+                };
+                // One new name is for one file: not with `Apply to all`.
+                if clash.rename.is_some() || (clash.offer_all && clash.apply_all) {
+                    return Task::none();
+                }
+                let value = self.clash_free_name(w, &clash.name.clone());
+                if let Some(Dialog::Clash(clash)) = self.prompts.front_mut(w) {
+                    clash.rename = Some(Rename {
+                        value,
+                        problem: None,
+                        input: iced::widget::Id::unique(),
+                    });
+                }
+                match self.prompts.front(w).and_then(Dialog::input) {
+                    Some(id) => Task::batch([
+                        iced::widget::operation::focus(id.clone()),
+                        iced::widget::operation::select_all(id),
+                    ]),
+                    None => Task::none(),
+                }
+            }
+            PromptMsg::ClashApplyAll(w, on) => {
+                if let Some(Dialog::Clash(clash)) = self.prompts.front_mut(w) {
+                    clash.apply_all = on;
+                }
+                Task::none()
+            }
+            PromptMsg::ClashName(w, typed) => {
+                if let Some(Dialog::Clash(Clash {
+                    rename: Some(r), ..
+                })) = self.prompts.front_mut(w)
+                {
+                    r.value = typed;
+                    r.problem = None;
+                }
+                Task::none()
+            }
+            PromptMsg::StopTransfers(w) => {
+                let Some(Dialog::Transfers { then, .. }) = self.prompts.front(w) else {
+                    return Task::none();
+                };
+                let then = *then;
+                self.prompts.pop(w);
+                let task = self.stop_transfers_and_close(Some(w), then);
+                Task::batch([task, self.focus_prompt(w)])
             }
             PromptMsg::CloseTab(w) => {
                 let tab = self.prompts.confirm_close(w);
                 let index = tab.and_then(|id| self.windows.get(&w)?.find(id));
+                // Transfers that closing would end are asked about too.
                 let close = match index {
-                    Some(i) => self.close_tab(w, i),
+                    Some(i) => self.close_tab_if_no_transfers(w, i),
                     None => Task::none(),
                 };
                 Task::batch([close, self.focus_prompt(w)])

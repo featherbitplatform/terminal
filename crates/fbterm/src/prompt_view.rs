@@ -1,5 +1,6 @@
 //! The dialog drawn over a terminal window: trust a host key, a changed host key, a password /
-//! key passphrase, or confirm closing a split tab.
+//! key passphrase, confirm closing a split tab, an upload's name clash, or closing while
+//! transfers run.
 
 use fbterm_secrets::SecretKind;
 use iced::widget::{Space, button, checkbox, column, container, opaque, row, text, text_input};
@@ -7,7 +8,7 @@ use iced::window;
 use iced::{Alignment, Color, Element, Length, Padding};
 
 use crate::app::Message;
-use crate::prompts::{Dialog, PromptMsg, host_port, keygen_command};
+use crate::prompts::{Clash, Dialog, PromptMsg, host_port, keygen_command};
 use crate::redact::Redacted;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
@@ -134,6 +135,38 @@ pub fn view<'a>(
         ]
         .spacing(14)
         .into(),
+        Dialog::Clash(clash) => clash_view(t, window, clash),
+        Dialog::Transfers {
+            count, in_place, ..
+        } => column![
+            header(
+                t,
+                ui::ICON_WARNING,
+                t.warning,
+                crate::file_panel::running_message(*count)
+            ),
+        ]
+        // Cancelling may leave a file being written in place incomplete: said only then.
+        .extend(in_place.then(|| {
+            text(crate::file_panel::IN_PLACE_WARNING)
+                .font(UI_FONT)
+                .size(13)
+                .color(t.text_secondary)
+                .into()
+        }))
+        .push(buttons(vec![
+                ui::text_button(t, "Keep open", Some(msg(PromptMsg::Cancel(window))), ui::secondary)
+                    .into(),
+                ui::text_button(
+                    t,
+                    "Cancel transfers and close",
+                    Some(msg(PromptMsg::StopTransfers(window))),
+                    ui::primary,
+                )
+                .into(),
+            ]))
+        .spacing(14)
+        .into(),
         Dialog::Secret {
             profile,
             kind,
@@ -197,6 +230,106 @@ pub fn view<'a>(
         }
     };
     modal(t, body)
+}
+
+/// The clash dialog: `"{name}" already exists in {folder}.` with `Replace`, `Rename` and
+/// `Cancel` (and `Apply to all` while other files wait); after `Rename`, the name field.
+fn clash_view<'a>(
+    t: &'static Tokens,
+    window: window::Id,
+    clash: &'a Clash,
+) -> Element<'a, Message> {
+    let msg = Message::Prompt;
+    let line = crate::file_panel::clash_message(
+        &crate::file_panel::plain_name(&clash.name),
+        &crate::file_panel::plain_name(&clash.folder),
+    );
+    let message = row![
+        ui::icon(ui::ICON_WARNING, 18.0, t.warning),
+        text(line)
+            .font(UI_FONT)
+            .size(14)
+            .color(t.text)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .width(Length::Fill),
+    ]
+    .spacing(10);
+    let mut body = column![message].spacing(14);
+    match &clash.rename {
+        Some(rename) => {
+            let field = text_input("", &rename.value)
+                .id(rename.input.clone())
+                .on_input(move |v| msg(PromptMsg::ClashName(window, v)))
+                .on_submit(msg(PromptMsg::Submit(window)))
+                .font(MONO)
+                .size(13)
+                .padding(Padding::from([8.0, 10.0]))
+                .style(move |_, s| ui::input_style(t, s));
+            let mut field_col = column![field].spacing(6);
+            if let Some(problem) = &rename.problem {
+                field_col = field_col.push(
+                    text(problem.as_str())
+                        .font(UI_FONT)
+                        .size(12)
+                        .color(t.danger),
+                );
+            }
+            body = body.push(field_col).push(buttons(vec![
+                ui::text_button(
+                    t,
+                    "Back",
+                    Some(msg(PromptMsg::Cancel(window))),
+                    ui::secondary,
+                )
+                .into(),
+                ui::text_button(
+                    t,
+                    "Rename",
+                    Some(msg(PromptMsg::Submit(window))),
+                    ui::primary,
+                )
+                .into(),
+            ]));
+        }
+        None => {
+            if clash.offer_all {
+                body = body.push(
+                    checkbox(clash.apply_all)
+                        .label("Apply to all")
+                        .on_toggle(move |b| msg(PromptMsg::ClashApplyAll(window, b)))
+                        .font(UI_FONT)
+                        .text_size(13)
+                        .size(15),
+                );
+            }
+            // `Apply to all` is for Replace and Cancel: one new name is for one file.
+            let all = clash.offer_all && clash.apply_all;
+            body = body.push(buttons(vec![
+                ui::text_button(
+                    t,
+                    "Cancel",
+                    Some(msg(PromptMsg::Cancel(window))),
+                    ui::secondary,
+                )
+                .into(),
+                ui::text_button(
+                    t,
+                    "Rename",
+                    (!all).then(|| msg(PromptMsg::ClashRename(window))),
+                    ui::secondary,
+                )
+                .into(),
+                ui::text_button(
+                    t,
+                    "Replace",
+                    Some(msg(PromptMsg::ClashReplace(window))),
+                    ui::primary,
+                )
+                .into(),
+            ]));
+        }
+    }
+    body.into()
 }
 
 /// `body` on a card over a dimmed window, taking every click.

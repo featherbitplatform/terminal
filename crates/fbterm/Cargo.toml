@@ -30,15 +30,17 @@ png = { workspace = true }
 feathercritty = { workspace = true }
 toml = { workspace = true }
 read-fonts = "=0.41.0"
+# Temporary folders that remove themselves (already in the lockfile through fbterm-session).
+tempfile = "3"
 # A headless renderer for driving widgets through `Widget::update` in tests (the version iced uses).
 iced_tiny_skia = "=0.14.1"
 
-# Window occlusion (see `visibility.rs`) and display refresh rate (`display_rate.rs`): the same versions iced's windowing already uses.
+# Window occlusion (see `visibility.rs`), display refresh rate (`display_rate.rs`) and the app menu's Quit key (`chrome.rs`): the same versions iced's windowing already uses.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSNotification", "NSOperation", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
 
 # `malloc_trim` for `memory::release_freed` (glibc only; macOS declares its own call, other targets do nothing).
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]

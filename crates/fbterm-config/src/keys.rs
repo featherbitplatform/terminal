@@ -33,6 +33,9 @@ pub enum Action {
     EditSchemes,
     /// The Tunnels window (no chord by default).
     Tunnels,
+    /// Show or hide the file panel of the active tab: Cmd+Shift+E on macOS, Ctrl+Shift+E
+    /// elsewhere.
+    FilePanel,
     /// Create `settings.toml` if missing and open it with the system's default app (no chord
     /// by default).
     OpenSettingsFile,
@@ -111,7 +114,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 41] = [
+    pub const ALL: [Action; 42] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -144,6 +147,7 @@ impl Action {
         Action::Settings,
         Action::EditSchemes,
         Action::Tunnels,
+        Action::FilePanel,
         Action::Find,
         Action::FindAll,
         Action::FindNext,
@@ -178,6 +182,7 @@ impl Action {
             Self::Settings => "settings",
             Self::EditSchemes => "edit_schemes",
             Self::Tunnels => "tunnels",
+            Self::FilePanel => "file_panel",
             Self::OpenSettingsFile => "open_settings_file",
             Self::RevealConfigFolder => "reveal_config_folder",
             Self::ExportTab => "export_tab",
@@ -222,6 +227,7 @@ impl Action {
             Self::Settings => "Settings".into(),
             Self::EditSchemes => "Color schemes".into(),
             Self::Tunnels => "Tunnels".into(),
+            Self::FilePanel => "File panel".into(),
             Self::OpenSettingsFile => "Open settings file".into(),
             Self::RevealConfigFolder => "Reveal config folder".into(),
             Self::ExportTab => "Export tab to file".into(),
@@ -271,7 +277,8 @@ impl Action {
             | Self::EditProfiles
             | Self::Settings
             | Self::EditSchemes
-            | Self::Tunnels => ActionGroup::Windows,
+            | Self::Tunnels
+            | Self::FilePanel => ActionGroup::Windows,
             Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious | Self::FindInTab => {
                 ActionGroup::Search
             }
@@ -282,7 +289,8 @@ impl Action {
     }
 
     /// Whether the action's chord cannot be changed on this platform: on macOS Quit stays Cmd+Q,
-    /// which the app menu owns (it acts before any window sees the key).
+    /// the key every Mac app quits with (the app menu's Quit handles it, except while file
+    /// transfers run: then the app takes it from the menu so this binding can ask first).
     pub fn is_fixed(self, mac: bool) -> bool {
         mac && self == Self::Quit
     }
@@ -620,8 +628,8 @@ fn arrow_chord(mac: bool, key: ChordKey) -> Chord {
 }
 
 /// What already owns `chord` outside the binding table, so it cannot be bound: the terminal's
-/// copy, paste and scroll keys, Save in the profile editor, and on macOS the app menu's Quit,
-/// Hide and Hide Others (which act before any window sees the key).
+/// copy, paste and scroll keys, Save in the profile editor, and on macOS Quit (fixed on Cmd+Q)
+/// and the app menu's Hide and Hide Others (which act before any window sees the key).
 pub fn reserved(mac: bool, chord: Chord) -> Option<&'static str> {
     let Chord {
         key,
@@ -690,6 +698,7 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
         Action::NextTab => (']', true),
         Action::PrevTab => ('[', true),
         Action::Palette => ('p', true),
+        Action::FilePanel => ('e', true),
         Action::SelectTab(n @ 1..=9) => (char::from(b'0' + n), false),
         Action::EditProfiles => (',', true),
         Action::Settings if !mac => return Some(ctrl_chord(',', false, false)),
@@ -1401,6 +1410,22 @@ mod tests {
         assert_eq!(a.group(), ActionGroup::Windows);
         assert_eq!(default_chord(true, a), None);
         assert_eq!(default_chord(false, a), None);
+    }
+
+    #[test]
+    fn file_panel_is_listed_with_its_chord() {
+        let a = Action::FilePanel;
+        assert!(Action::ALL.contains(&a));
+        assert_eq!(a.name(), "file_panel");
+        assert_eq!(Action::from_name("file_panel"), Some(a));
+        assert_eq!(a.title(), "File panel");
+        let d = |mac| default_chord(mac, a).map(|c| c.to_config(mac));
+        assert_eq!(d(true).as_deref(), Some("shift+cmd+e"));
+        assert_eq!(d(false).as_deref(), Some("ctrl+shift+e"));
+        for mac in [true, false] {
+            let chord = default_chord(mac, a).unwrap();
+            assert_eq!(reserved(mac, chord), None);
+        }
     }
 
     #[test]

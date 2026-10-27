@@ -72,6 +72,7 @@ impl App {
             Action::Settings => self.settings_msg(SettingsMsg::Open),
             Action::EditSchemes => self.open_schemes(None),
             Action::Tunnels => self.open_tunnels(),
+            Action::FilePanel => self.on_window(wid, App::toggle_file_panel),
             Action::OpenSettingsFile => {
                 crate::config_files::open_settings_file(&self.paths);
                 Task::none()
@@ -81,7 +82,7 @@ impl App {
                 Task::none()
             }
             Action::ExportTab => self.export_tab(wid),
-            Action::Quit => self.quit(),
+            Action::Quit => self.quit_asking(),
             Action::Find => match wid {
                 Some(wid) => self.find(wid, crate::find::FindMsg::Open),
                 None => Task::none(),

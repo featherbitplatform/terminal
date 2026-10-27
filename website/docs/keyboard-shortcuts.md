@@ -23,6 +23,7 @@ On macOS the shortcuts use `Cmd`, and `Option` only for moving between panes; ne
 | Select tab 1 to 9 | `Cmd+1` to `Cmd+9` | `Ctrl+Shift+1` to `Ctrl+Shift+9` |
 | New window | `Cmd+N` | `Ctrl+Shift+N` |
 | Quit (saves the layout first) | `Cmd+Q` | `Ctrl+Shift+Q` |
+| Show or hide the [file panel](file-panel) | `Cmd+Shift+E` | `Ctrl+Shift+E` |
 
 ## Panes
 
@@ -108,6 +109,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Edit profiles | Open the profile editor. |
 | Settings | Open the Settings window. |
 | Tunnels | Open the [Tunnels](tunnels) window. It has no shortcut by default. |
+| File panel | Show or hide the [file panel](file-panel) beside the focused pane's terminal. |
 | Tunnel: _profile_ / _name_ | One row per tunnel, with its state on the right. Choosing a row switches that tunnel on or off. |
 | Color schemes | Open the Color schemes window to duplicate, rename, edit and delete color schemes. It also opens from **Edit schemes…** in Settings and in the profile editor. |
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
@@ -136,8 +138,8 @@ Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear butt
 - **Change one:** click its shortcut, then press the new one. While you record, keys go to the recorder only: they never reach a terminal and never run a shortcut. `Escape` cancels and keeps the old shortcut.
 - **Already in use:** if another action has that shortcut, the row names it and offers **Take over** (the other action is then left without a shortcut) or **Cancel**. Two actions never share a shortcut.
 - **Not allowed:** a shortcut needs `Cmd`, `Ctrl` or `Alt` (`Option`), except `F1` to `F12`, which work alone. Plain letters, `Enter`, `Tab` and `Escape` cannot be shortcuts on their own, and `Escape` never can.
-- **Reserved:** keys that already do something outside this list cannot be taken: copy and paste in the terminal (`Cmd+C` and `Cmd+V` on macOS, `Ctrl+Shift+C` and `Ctrl+Shift+V` elsewhere), the scrollback keys (`Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, `Shift+End`, and `Cmd+Home`, `Cmd+End` on macOS), Save in the profile editor (exactly `Cmd+S`, `Ctrl+S` elsewhere; with `Shift` or `Alt` added it is free to use) and, on macOS, the app menu's `Cmd+Q` (Quit), `Cmd+H` (Hide) and `Cmd+Option+H` (Hide Others). The row says what uses the key.
-- **Quit on macOS** is always `Cmd+Q`: the app menu handles it before any window sees the key, so its row is fixed.
+- **Reserved:** keys that already do something outside this list cannot be taken: copy and paste in the terminal (`Cmd+C` and `Cmd+V` on macOS, `Ctrl+Shift+C` and `Ctrl+Shift+V` elsewhere), the scrollback keys (`Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, `Shift+End`, and `Cmd+Home`, `Cmd+End` on macOS), Save in the profile editor (exactly `Cmd+S`, `Ctrl+S` elsewhere; with `Shift` or `Alt` added it is free to use) and, on macOS, `Cmd+Q` (Quit) and the app menu's `Cmd+H` (Hide) and `Cmd+Option+H` (Hide Others). The row says what uses the key.
+- **Quit on macOS** is always `Cmd+Q`, so its row is fixed. While file transfers are running, the key goes through the app's own Quit, which first asks whether to cancel them; this needs a window in front, so with every window minimised `Cmd+Q` does nothing until one is shown again. With no transfers running, `Cmd+Q` quits at once from the app menu, as in any app. Choosing **Quit** in the app menu with the mouse always quits at once.
 - **Taken from programs:** a shortcut that programs in the terminal would normally receive works, but its row shows a warning saying what is lost when that is known (for example ``Ctrl+R is reverse search in bash and zsh``). On macOS that is any shortcut without `Cmd`. On Linux and Windows it is `Ctrl` with a letter (without `Shift`), `Ctrl` with a few symbols, arrows and editing keys, any `Alt` shortcut (Meta in bash, zsh and emacs) and `F` keys on their own.
 - **Remove one:** the `x` that appears when you point at a row leaves the action without a shortcut (it stays in the palette).
 - **Go back:** a changed row has a reset button that restores its default, and **Restore defaults** restores them all.
@@ -167,7 +169,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |
 | `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Find in this tab (all panes of the tab), merge this tab into another, move the focused tile, move it to a tab of its own (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
-| `new_window`, `edit_profiles`, `settings`, `edit_schemes`, `tunnels` | New window, the profile editor, Settings, the Color schemes window, the Tunnels window (no default shortcut) |
+| `new_window`, `edit_profiles`, `settings`, `edit_schemes`, `tunnels`, `file_panel` | New window, the profile editor, Settings, the Color schemes window, the Tunnels window (no default shortcut), the file panel (`Cmd+Shift+E`, `Ctrl+Shift+E`) |
 | `find`, `find_all`, `find_next`, `find_previous` | Find in pane, find in all tabs, older and newer match in the find bar |
 | `palette`, `open_settings_file`, `reveal_config_folder`, `quit` | The palette, the palette actions of the same names, quit |
 

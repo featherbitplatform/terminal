@@ -229,6 +229,8 @@ pub fn snapshot(
             })
             .collect(),
         recency: recency.clone().into(),
+        file_panel_width: None,
+        file_panel_show_hidden: None,
     }
 }
 
