@@ -1470,6 +1470,7 @@ dependencies = [
  "objc2-foundation 0.3.2",
  "parking_lot",
  "png",
+ "raw-window-handle",
  "read-fonts 0.41.0",
  "rfd",
  "tempfile",
@@ -1477,6 +1478,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "tracing-subscriber",
+ "windows-sys 0.61.2",
  "zeroize",
 ]
 

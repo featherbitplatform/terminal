@@ -69,6 +69,7 @@ mod find;
 mod keys;
 mod layout;
 mod memory;
+mod move_watch;
 mod pacing;
 mod palette;
 mod pane_actions;

@@ -48,3 +48,9 @@ objc2-app-kit = { version = "0.3", default-features = false, features = ["std", 
 # `malloc_trim` for `memory::release_freed` (glibc only; macOS declares its own call, other targets do nothing).
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"
+
+# Background blur on Windows 11 (`chrome::system_backdrop`): the acrylic system backdrop set on
+# the window's handle; the versions the rest of the workspace and iced's windowing use.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Graphics_Dwm"] }
+raw-window-handle = "0.6"

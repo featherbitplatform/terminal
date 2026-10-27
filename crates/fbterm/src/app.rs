@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::archive_window::{ArchiveMsg, ArchiveState};
-use crate::chrome::{self, BarAction};
+use crate::chrome::{self, BarAction, Chrome};
 use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
 use crate::find::FindMsg;
@@ -116,6 +116,8 @@ pub enum Message {
     },
     NewWindow,
     WindowOpened(window::Id),
+    /// Any window (terminal, editor, Settings, ...) opened.
+    AnyWindowOpened(window::Id),
     WindowFocused(window::Id),
     WindowUnfocused(window::Id),
     /// A terminal window became visible (`true`) or stopped being visible.
@@ -128,6 +130,10 @@ pub enum Message {
     /// A press on empty title-bar space, a drawn window control or a drawn window's edge:
     /// move, zoom, minimize, close or resize that window.
     TitleBar(window::Id, BarAction),
+    /// Seen on a window while a move or resize request is watched (see [`crate::move_watch`]).
+    MoveSeen(window::Id, crate::move_watch::Seen),
+    /// The answer time of the watched move or resize request (its token) passed.
+    MoveCheck(u64),
     Shortcut(window::Id, Action),
     DismissNotices,
     /// Palette input for one window.
@@ -324,6 +330,21 @@ pub struct App {
     /// Maximized windows, where the chrome is drawn (their edges do not resize, and the
     /// maximize control restores).
     pub maximized: std::collections::HashSet<window::Id>,
+    /// Every open window, of any kind (their decorations switch with the chrome).
+    pub(crate) open_windows: std::collections::HashSet<window::Id>,
+    /// The chrome in use: [`chrome::CHROME`], or in tests a cell of the app's own.
+    pub(crate) chrome: &'static chrome::ChromeCell,
+    /// Whose window conventions this run follows and the chrome it started with (see
+    /// [`chrome::chrome_for_setting`]).
+    pub(crate) chrome_base: (chrome::Platform, Chrome),
+    /// Whether move and resize requests are watched for a desktop refusing them (Linux).
+    pub(crate) watch_moves: bool,
+    pub(crate) move_watch: crate::move_watch::MoveWatch,
+    /// The desktop refused a move or resize: the system title bar for the rest of the session
+    /// (until `window_decorations` is set to `"fbterm"` again from the Settings window).
+    pub(crate) chrome_fell_back: bool,
+    /// The fallback notice was shown (once per session).
+    pub(crate) chrome_notice_shown: bool,
     /// Counts resizes, so only the last one of a burst saves.
     pub(crate) resize_count: u64,
     /// The text of `profiles.toml` / `settings.toml` as last loaded or written by us: a change
@@ -464,6 +485,16 @@ fn query_mode(id: window::Id) -> Task<Message> {
     // Maximizing and restoring resize the window too.
     let maximized = window::is_maximized(id).map(move |m| Message::WindowMaximized(id, m));
     Task::batch([now, settled, maximized])
+}
+
+/// The chrome cell the app switches: the one every window reads, or in tests one of its own,
+/// so a test that switches cannot change the chrome other tests see.
+fn app_chrome_cell() -> &'static chrome::ChromeCell {
+    if cfg!(test) {
+        Box::leak(Box::new(chrome::ChromeCell::new()))
+    } else {
+        &chrome::CHROME
+    }
 }
 
 /// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`, ...); release
@@ -614,6 +645,13 @@ impl App {
             sizes: HashMap::new(),
             fullscreen: Default::default(),
             maximized: Default::default(),
+            open_windows: Default::default(),
+            chrome: app_chrome_cell(),
+            chrome_base: (chrome::setup().look, chrome::setup().chrome),
+            watch_moves: chrome::Platform::current() == chrome::Platform::Linux,
+            move_watch: Default::default(),
+            chrome_fell_back: false,
+            chrome_notice_shown: false,
             resize_count: 0,
             profiles_seen,
             settings_seen,
@@ -646,6 +684,8 @@ impl App {
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
+        // Before any window opens: the Linux `window_decorations` setting picks the chrome.
+        let _ = app.reapply_chrome();
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -733,6 +773,7 @@ impl App {
             Subscription::run_with(self.receiver.clone(), session_stream)
                 .map(|(id, ev)| Message::Session(id, ev)),
             iced::event::listen_with(|event, _, id| match event {
+                Event::Window(window::Event::Opened { .. }) => Some(Message::AnyWindowOpened(id)),
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
@@ -773,6 +814,10 @@ impl App {
             subs.push(iced::time::every(Duration::from_millis(1500)).map(|_| Message::Shoot));
         }
         subs.push(window::resize_events().map(|(id, size)| Message::WindowResized(id, size)));
+        if self.move_watch.watching() {
+            // Only while a move or resize request is watched (at most `ANSWER_TIME`).
+            subs.push(iced::event::listen_with(crate::move_watch::watch_event));
+        }
         subs.push(
             Subscription::run_with(
                 ConfigDir(self.paths.config_dir.clone()),
@@ -855,14 +900,28 @@ impl App {
             Message::WindowOpened(id) => {
                 self.focused.get_or_insert(id);
                 if self.windows.contains_key(&id) {
+                    let backdrop = Chrome::current().backdrop(
+                        self.settings.background_opacity,
+                        self.settings.background_blur,
+                    );
+                    let blur = if backdrop.blur && chrome::setup().blur {
+                        chrome::system_backdrop(id)
+                    } else {
+                        Task::none()
+                    };
                     Task::batch([
                         visibility::watch(id, &self.visibility),
                         display_rate::watch(id, &self.display),
                         window::scale_factor(id).map(move |s| Message::WindowScale(id, s)),
+                        blur,
                     ])
                 } else {
                     Task::none()
                 }
+            }
+            Message::AnyWindowOpened(id) => {
+                self.open_windows.insert(id);
+                Task::none()
             }
             Message::WindowVisible(id, visible) => {
                 if visible {
@@ -923,7 +982,14 @@ impl App {
             }
             // A drawn close control is the OS close button.
             Message::TitleBar(wid, BarAction::Close) => self.close_requested(wid),
-            Message::TitleBar(wid, action) => chrome::perform(wid, action),
+            Message::TitleBar(wid, action) => {
+                Task::batch([chrome::perform(wid, action), self.watch_move(wid, action)])
+            }
+            Message::MoveSeen(wid, seen) => {
+                self.move_watch.seen(wid, seen);
+                Task::none()
+            }
+            Message::MoveCheck(token) => self.check_move(token),
             Message::WindowClosed(id) => {
                 if self.editor_window() == Some(id) {
                     self.editor = None;
@@ -977,6 +1043,7 @@ impl App {
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.maximized.remove(&id);
+                self.open_windows.remove(&id);
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
                 self.file_panels.ui.remove(&id);

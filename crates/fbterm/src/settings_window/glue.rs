@@ -299,6 +299,7 @@ impl App {
     /// `background_opacity` is read each frame too; a window can only show through if it was
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
+    /// `window_decorations` (Linux) switches every open window's title bar at once.
     ///
     /// Returns the find refreshes a scrollback lowering asks for.
     pub(crate) fn apply_settings(
@@ -358,6 +359,7 @@ impl App {
         self.tunnel_retries
             .store(new.tunnel_max_retries, std::sync::atomic::Ordering::Relaxed);
         let rate_changed = new.max_fps != self.settings.max_fps;
+        let decorations_changed = new.window_decorations != self.settings.window_decorations;
         let scheme_changed = new.color_scheme != self.settings.color_scheme;
         let before = scheme_changed.then(|| self.pane_colors());
         self.settings = new;
@@ -366,6 +368,10 @@ impl App {
         }
         if let Some(before) = before {
             self.schemes_moved(&before);
+        }
+        if decorations_changed {
+            let chrome = self.window_decorations_changed(self.settings.window_decorations);
+            return Task::batch([task, chrome]);
         }
         task
     }

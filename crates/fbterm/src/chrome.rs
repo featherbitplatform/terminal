@@ -16,6 +16,7 @@
 //! The chrome can change while fbterm runs ([`ChromeCell`]); open windows then switch their
 //! OS decorations.
 
+use fbterm_config::WindowDecorations;
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse::{self, click};
 use iced::advanced::widget::{Operation, Tree, Widget, tree};
@@ -282,12 +283,10 @@ fn kde_layout(kwinrc: &str) -> Option<String> {
 
 /// The desktop's button layout, read once before the first window opens: KDE's `kwinrc`
 /// under KDE, else GNOME's `button-layout` through `gsettings` (a subprocess given at most
-/// `GSETTINGS_TIMEOUT`, killed after that). `None` when neither can be read.
+/// `PROBE_TIMEOUT`, killed after that). `None` when neither can be read.
 #[cfg(target_os = "linux")]
 fn desktop_layout() -> Option<String> {
-    let kde = std::env::var("XDG_CURRENT_DESKTOP")
-        .is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("kde")));
-    if kde {
+    if is_kde() {
         let dir = std::env::var_os("XDG_CONFIG_HOME")
             .map(std::path::PathBuf::from)
             .or_else(|| {
@@ -299,38 +298,11 @@ fn desktop_layout() -> Option<String> {
     gsettings_button_layout()
 }
 
-/// How long the `gsettings` read may take before the standard layout is used.
-#[cfg(target_os = "linux")]
-const GSETTINGS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
-
 #[cfg(target_os = "linux")]
 fn gsettings_button_layout() -> Option<String> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
-    let mut child = Command::new("gsettings")
-        .args(["get", "org.gnome.desktop.wm.preferences", "button-layout"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + GSETTINGS_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::info!("gsettings did not answer; standard window controls");
-                return None;
-            }
-        }
-    };
-    let mut out = String::new();
-    child.stdout.take()?.read_to_string(&mut out).ok()?;
-    status.success().then_some(out)
+    let mut command = std::process::Command::new("gsettings");
+    command.args(["get", "org.gnome.desktop.wm.preferences", "button-layout"]);
+    probe_output(command, "gsettings")
 }
 
 /// What this run draws, chosen once by [`init`] before the first window opens.
@@ -341,6 +313,8 @@ pub struct Setup {
     /// Whose conventions the drawn controls follow (look and default placement).
     pub look: Platform,
     pub controls: ControlsLayout,
+    /// Whether this system can blur what shows through a window ([`blur_supported`]).
+    pub blur: bool,
 }
 
 static SETUP: OnceLock<Setup> = OnceLock::new();
@@ -354,6 +328,7 @@ pub fn setup() -> &'static Setup {
             chrome: Chrome::for_platform(platform),
             look: platform,
             controls: controls_layout(platform, None),
+            blur: blur_supported(platform, &BlurProbe::default()),
         }
     })
 }
@@ -367,6 +342,8 @@ pub fn setup() -> &'static Setup {
 /// controls on any system (e.g. `linux:close,minimize,maximize:`), for screenshots.
 pub fn init() {
     let platform = Platform::current();
+    // Blur is the real system's, also with the debug aid.
+    let blur = blur_supported(platform, &BlurProbe::read());
     let demo =
         crate::app::debug_env("FBTERM_DEMO_CHROME").and_then(|v| v.to_str().and_then(demo_chrome));
     let setup = match demo {
@@ -374,6 +351,7 @@ pub fn init() {
             chrome: Chrome::Drawn,
             look,
             controls: controls_layout(look, desktop.as_deref()),
+            blur,
         },
         None => {
             let chrome = Chrome::for_platform(platform);
@@ -385,11 +363,155 @@ pub fn init() {
                 chrome,
                 look: platform,
                 controls: controls_layout(platform, desktop.as_deref()),
+                blur,
             }
         }
     };
-    tracing::info!(chrome = ?setup.chrome, controls = ?setup.controls, "window chrome");
+    tracing::info!(
+        chrome = ?setup.chrome,
+        controls = ?setup.controls,
+        blur = setup.blur,
+        "window chrome"
+    );
     let _ = SETUP.set(setup);
+}
+
+/// The chrome for the `window_decorations` setting where the run started with `initial`
+/// (see [`init`]) on a system with `look`'s conventions. Only Linux has the choice: the
+/// system's title bar for `System`, or for the rest of the session once the desktop refused
+/// drawn chrome (`fell_back`). Elsewhere the setting is ignored.
+pub fn chrome_for_setting(
+    look: Platform,
+    initial: Chrome,
+    setting: WindowDecorations,
+    fell_back: bool,
+) -> Chrome {
+    if look != Platform::Linux || initial != Chrome::Drawn {
+        return initial;
+    }
+    if setting == WindowDecorations::System || fell_back {
+        Chrome::Native
+    } else {
+        Chrome::Drawn
+    }
+}
+
+/// What decides whether this system can blur behind a window (read once by [`init`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlurProbe {
+    /// Windows' build number, if known.
+    pub windows_build: Option<u32>,
+    /// The session is a Wayland one (Linux).
+    pub wayland: bool,
+    /// The desktop is KDE (Linux).
+    pub kde: bool,
+}
+
+/// The first Windows build with system backdrops (`DWMWA_SYSTEMBACKDROP_TYPE`): Windows 11
+/// 22H2.
+pub const WINDOWS_BACKDROP_BUILD: u32 = 22621;
+
+/// Whether `platform` can blur what shows through a window, given `probe`. macOS always can;
+/// Windows 11 from [`WINDOWS_BACKDROP_BUILD`] through its acrylic backdrop; Linux on Wayland
+/// under KDE, whose compositor offers the KDE blur protocol (the one the windowing layer
+/// speaks; X11 has none it uses).
+pub fn blur_supported(platform: Platform, probe: &BlurProbe) -> bool {
+    match platform {
+        Platform::MacOs => true,
+        Platform::Windows => probe
+            .windows_build
+            .is_some_and(|b| b >= WINDOWS_BACKDROP_BUILD),
+        Platform::Linux => probe.wayland && probe.kde,
+    }
+}
+
+/// The build number in the output of Windows' `ver` (`Microsoft Windows [Version
+/// 10.0.22631.4317]`).
+#[cfg(any(test, target_os = "windows"))]
+pub fn windows_build(ver: &str) -> Option<u32> {
+    let (_, rest) = ver.split_once("Version ")?;
+    let version = rest.split(']').next()?.trim();
+    version.split('.').nth(2)?.parse().ok()
+}
+
+impl BlurProbe {
+    /// This system's (on Windows `ver` runs once, given at most `PROBE_TIMEOUT`).
+    fn read() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+            Self {
+                windows_build: None,
+                wayland: set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET"),
+                kde: is_kde(),
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Self {
+                windows_build: read_windows_build(),
+                ..Self::default()
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Self::default()
+        }
+    }
+}
+
+/// Whether the desktop is KDE.
+#[cfg(target_os = "linux")]
+fn is_kde() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("kde")))
+}
+
+/// How long a desktop or system query at startup may take.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The output of `command`, or `None` if it fails or takes longer than `PROBE_TIMEOUT`
+/// (then it is killed).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn probe_output(mut command: std::process::Command, what: &str) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::info!("{what} did not answer");
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status.success().then_some(out)
+}
+
+/// Windows' build number, from `cmd /c ver` (no console window).
+#[cfg(target_os = "windows")]
+fn read_windows_build() -> Option<u32> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut command = std::process::Command::new("cmd");
+    command.args(["/c", "ver"]).creation_flags(CREATE_NO_WINDOW);
+    probe_output(command, "ver")
+        .as_deref()
+        .and_then(windows_build)
 }
 
 /// `FBTERM_DEMO_CHROME`: the system to imitate and its button layout.
@@ -664,7 +786,6 @@ impl Default for ChromeCell {
 /// one, so each has its OS decorations toggled; new windows get `to`'s through
 /// [`Chrome::window_settings`]. `None` when nothing changes. The caller forgets what it
 /// tracks only for drawn chrome (which windows are maximized).
-#[allow(dead_code)] // Wired to the app with the Linux title bar fallback.
 pub fn use_chrome<T: Send + 'static>(
     cell: &ChromeCell,
     to: Chrome,
@@ -678,7 +799,6 @@ pub fn use_chrome<T: Send + 'static>(
 
 /// Give up drawn chrome for this run: the desktop's title bar on every open window and every
 /// new one (see [`use_chrome`]).
-#[allow(dead_code)] // Wired to the app with the Linux title bar fallback.
 pub fn fall_back_to_system<T: Send + 'static>(
     cell: &ChromeCell,
     open: impl IntoIterator<Item = window::Id>,
@@ -706,6 +826,54 @@ impl Chrome {
             transparent: translucent || self == Self::Unified,
             blur: blur && translucent,
         }
+    }
+}
+
+/// What blurs what shows through terminal window `id`, beyond what its window settings ask
+/// for (`blur` there covers macOS and the KDE blur protocol on Linux): on Windows, the acrylic
+/// system backdrop. Nothing elsewhere.
+pub fn system_backdrop<T: Send + 'static>(id: window::Id) -> iced::Task<T> {
+    #[cfg(target_os = "windows")]
+    {
+        window::run(id, set_acrylic_backdrop).discard()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = id;
+        iced::Task::none()
+    }
+}
+
+/// Ask DWM for the acrylic backdrop behind `window` (Windows 11 22H2 and later; older builds
+/// refuse the attribute, which only logs).
+#[cfg(target_os = "windows")]
+fn set_acrylic_backdrop(window: &dyn window::Window) {
+    use raw_window_handle::RawWindowHandle;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::{
+        DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DwmSetWindowAttribute,
+    };
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = win32.hwnd.get() as HWND;
+    let backdrop = DWMSBT_TRANSIENTWINDOW;
+    // SAFETY: `hwnd` is the handle of a live window: iced runs this callback on the thread
+    // that owns the window, while it exists. The value pointer is to a local i32 that outlives
+    // the call, and its size is passed with it; DWM only reads it.
+    let result = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE as u32,
+            (&raw const backdrop).cast(),
+            std::mem::size_of_val(&backdrop) as u32,
+        )
+    };
+    if result != 0 {
+        tracing::info!(result, "the system refused the blurred backdrop");
     }
 }
 
@@ -1379,6 +1547,32 @@ mod tests {
         // Nothing is ever switched to the unified bar.
         assert!(use_chrome::<()>(&cell, Chrome::Unified, [a]).is_none());
         assert_eq!(cell.get(), Chrome::Drawn);
+    }
+
+    #[test]
+    fn system_setting_uses_native_chrome() {
+        use fbterm_config::WindowDecorations::{Fbterm, System};
+        let linux = |setting, fell_back| {
+            chrome_for_setting(Platform::Linux, Chrome::Drawn, setting, fell_back)
+        };
+        assert_eq!(linux(System, false), Chrome::Native);
+        assert_eq!(linux(Fbterm, false), Chrome::Drawn);
+        // A desktop that refused drawn chrome keeps the system's for the session.
+        assert_eq!(linux(Fbterm, true), Chrome::Native);
+        assert!(
+            linux(System, false)
+                .window_settings(window::Settings::default())
+                .decorations
+        );
+        // Other systems ignore the setting.
+        assert_eq!(
+            chrome_for_setting(Platform::Windows, Chrome::Drawn, System, true),
+            Chrome::Drawn
+        );
+        assert_eq!(
+            chrome_for_setting(Platform::MacOs, Chrome::Unified, System, true),
+            Chrome::Unified
+        );
     }
 
     #[test]

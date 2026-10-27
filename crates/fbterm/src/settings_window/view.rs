@@ -3,7 +3,7 @@
 
 use fbterm_config::keys::{Action, ActionGroup, Bindings, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
-use fbterm_config::{SecretStorage, ThemeMode};
+use fbterm_config::{SecretStorage, ThemeMode, WindowDecorations};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, text, text_input, toggler,
 };
@@ -11,6 +11,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
+use crate::chrome::{self, Platform};
 use crate::saved_secrets::{SectionInfo, choice_label, storage_note};
 use crate::schemes::SchemeChoice;
 use crate::theme::{Tokens, UI_FONT};
@@ -301,8 +302,8 @@ fn appearance<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let (blur_hint, blur_inert) = blur_hint(cfg!(target_os = "macos"), v.background_opacity);
-    vec![
+    let blur = blur_row(chrome::setup().blur, v.background_opacity);
+    let mut rows = vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
         setting(t, "Color scheme", None, false, scheme),
@@ -317,17 +318,43 @@ fn appearance<'a>(
         setting(
             t,
             "Background blur",
-            Some(blur_hint),
-            blur_inert,
+            Some(blur.hint),
+            blur.inert,
             switch(
                 t,
                 v.background_blur,
-                editable,
-                blur_inert,
+                editable && blur.enabled,
+                blur.inert,
                 SettingsMsg::Blur,
             ),
         ),
-    ]
+    ];
+    if shows_title_bar_row(chrome::setup().look) {
+        let title_bar = row![
+            segment(
+                t,
+                "fbterm",
+                v.window_decorations == WindowDecorations::Fbterm,
+                editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::Fbterm))),
+            ),
+            segment(
+                t,
+                "System",
+                v.window_decorations == WindowDecorations::System,
+                editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::System))),
+            ),
+        ]
+        .spacing(2);
+        let title_bar = container(title_bar).padding(2).style(move |_| well(t));
+        rows.push(setting(t, "Title bar", None, false, title_bar));
+    }
+    rows
+}
+
+/// Whether the Settings window offers the `Title bar` choice: only where windows follow
+/// Linux's conventions (the `window_decorations` setting is ignored elsewhere).
+pub fn shows_title_bar_row(look: Platform) -> bool {
+    look == Platform::Linux
 }
 
 fn terminal<'a>(
@@ -901,15 +928,31 @@ fn number<'a>(
         .into()
 }
 
-/// The blur row's hint, and whether blur has no effect now (it is still saved): only macOS
-/// blurs for now, and only below full opacity.
-pub fn blur_hint(mac: bool, opacity: f32) -> (&'static str, bool) {
-    if !mac {
-        ("macOS only for now", true)
+/// How the blur row shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlurRow {
+    pub hint: &'static str,
+    /// Drawn muted: blur has no effect now (a switch that can be used is still saved).
+    pub inert: bool,
+    /// The switch can be used.
+    pub enabled: bool,
+}
+
+/// The blur row where the system can blur (`supported`, see [`chrome::blur_supported`]) at
+/// `opacity`: blur only shows below full opacity; where it is not supported the switch cannot
+/// be used at all.
+pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
+    let (hint, inert, enabled) = if !supported {
+        ("Not supported on this system", true, false)
     } else if opacity >= 1.0 {
-        ("Needs opacity below 100%", true)
+        ("Needs opacity below 100%", true, true)
     } else {
-        ("Applies to new windows", false)
+        ("Applies to new windows", false, true)
+    };
+    BlurRow {
+        hint,
+        inert,
+        enabled,
     }
 }
 

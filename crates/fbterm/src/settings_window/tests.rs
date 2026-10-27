@@ -194,15 +194,72 @@ fn unwritten_changes_go_back_in_line_unless_newer_ones_wait() {
 
 #[test]
 fn blur_says_when_it_has_no_effect() {
+    let row = view::blur_row(true, 0.8);
     assert_eq!(
-        view::blur_hint(true, 0.8),
-        ("Applies to new windows", false)
+        (row.hint, row.inert, row.enabled),
+        ("Applies to new windows", false, true)
     );
+    let row = view::blur_row(true, 1.0);
     assert_eq!(
-        view::blur_hint(true, 1.0),
-        ("Needs opacity below 100%", true)
+        (row.hint, row.inert, row.enabled),
+        ("Needs opacity below 100%", true, true)
     );
-    assert_eq!(view::blur_hint(false, 0.8), ("macOS only for now", true));
+}
+
+#[test]
+fn blur_switch_disabled_when_unsupported() {
+    use crate::chrome::{BlurProbe, Platform, blur_supported};
+    let probe = |windows_build: Option<u32>, wayland: bool, kde: bool| BlurProbe {
+        windows_build,
+        wayland,
+        kde,
+    };
+    // macOS always blurs; Windows 11 (build 22621 and later) through its backdrop; Linux
+    // where the compositor offers the KDE blur protocol (Wayland under KDE).
+    assert!(blur_supported(Platform::MacOs, &probe(None, false, false)));
+    assert!(blur_supported(
+        Platform::Windows,
+        &probe(Some(22631), false, false)
+    ));
+    assert!(!blur_supported(
+        Platform::Windows,
+        &probe(Some(19045), false, false)
+    ));
+    assert!(!blur_supported(
+        Platform::Windows,
+        &probe(None, false, false)
+    ));
+    assert!(blur_supported(Platform::Linux, &probe(None, true, true)));
+    assert!(!blur_supported(Platform::Linux, &probe(None, false, true)));
+    assert!(!blur_supported(Platform::Linux, &probe(None, true, false)));
+    // Unsupported: the switch cannot be used and says why, whatever the opacity.
+    for opacity in [0.8, 1.0] {
+        let row = view::blur_row(false, opacity);
+        assert_eq!(row.hint, "Not supported on this system");
+        assert!(!row.enabled);
+        assert!(row.inert);
+    }
+    assert_eq!(
+        crate::chrome::windows_build("\r\nMicrosoft Windows [Version 10.0.22631.4317]\r\n"),
+        Some(22631)
+    );
+    assert_eq!(crate::chrome::windows_build("garbage"), None);
+}
+
+#[test]
+fn the_title_bar_row_is_linux_only_and_writes_the_setting() {
+    use crate::chrome::Platform;
+    use fbterm_config::WindowDecorations;
+    assert!(view::shows_title_bar_row(Platform::Linux));
+    assert!(!view::shows_title_bar_row(Platform::Windows));
+    assert!(!view::shows_title_bar_row(Platform::MacOs));
+    let mut s = state();
+    s.update(SettingsMsg::TitleBar(WindowDecorations::System));
+    assert_eq!(s.values.window_decorations, WindowDecorations::System);
+    assert_eq!(
+        s.take_pending(),
+        [SettingChange::WindowDecorations(WindowDecorations::System)]
+    );
 }
 
 fn labels(s: &SettingsState) -> Vec<String> {

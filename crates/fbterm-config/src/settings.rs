@@ -39,6 +39,27 @@ impl SecretStorage {
     }
 }
 
+/// Who draws a window's title bar on Linux (`window_decorations`). Other systems ignore it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowDecorations {
+    /// fbterm: the tab bar is the title bar, with drawn window controls.
+    #[default]
+    Fbterm,
+    /// The desktop's own title bar, with the tab bar below it.
+    System,
+}
+
+impl WindowDecorations {
+    /// The value as written in `settings.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fbterm => "fbterm",
+            Self::System => "system",
+        }
+    }
+}
+
 /// The most redraws per second caused by program output (`max_fps`). Typing, scrolling and
 /// resizing always redraw at once; this only caps how often streaming output is drawn.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -135,6 +156,8 @@ pub struct Settings {
     pub background_opacity: f32,
     /// Blur what shows through a translucent background, where the platform supports it.
     pub background_blur: bool,
+    /// Who draws the window title bar on Linux; ignored elsewhere.
+    pub window_decorations: WindowDecorations,
     /// Most redraws per second caused by program output.
     pub max_fps: MaxFps,
     /// Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
@@ -157,6 +180,7 @@ impl Default for Settings {
             kitty_keyboard: false,
             background_opacity: 1.0,
             background_blur: false,
+            window_decorations: WindowDecorations::Fbterm,
             max_fps: MaxFps::default(),
             tunnel_max_retries: 10,
             secret_storage: SecretStorage::Auto,
@@ -372,8 +396,12 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Opacity of the terminal background and tab bar, from 0.05 (nearly clear) to 1.0 (opaque).
 #background_opacity = 1.0
 
-# Blur what shows through a see-through background (true or false; macOS only for now).
+# Blur what shows through a see-through background (true or false), where the system
+# supports it: macOS, Windows 11 and Linux desktops that offer blur.
 #background_blur = false
+
+# Window title bar on Linux: "fbterm" draws it in the tab bar, "system" uses the desktop's.
+#window_decorations = "fbterm"
 
 # Most redraws per second caused by program output: a whole number from 30 to 240, or
 # "display" to follow the refresh rate of the screen (60 when it cannot be detected).
