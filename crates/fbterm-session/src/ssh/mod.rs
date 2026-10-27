@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use fbterm_config::{Profile, ProfileId, ProfileKind, SshProfile, ValidationError};
-use fbterm_secrets::{SecretKind, SecretStore};
+use fbterm_secrets::{SecretKind, SecretStore, Zeroizing};
 use parking_lot::Mutex;
 use russh::client::{self, DisconnectReason, Handle, Msg, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
@@ -105,6 +105,13 @@ pub trait Prompter: Send + Sync {
     /// key logged in, nor for a key file the profile already names.
     fn key_file_accepted(&self, _profile: ProfileId, _path: &Path) {}
 
+    /// Saved secrets are in the encrypted vault and it is locked: ask for its main password
+    /// (`Unlock saved secrets`). The connect unlocks the vault with the answer. `None` means
+    /// cancelled, or nobody can be asked: the connect then asks for its secret as if none
+    /// were saved. The app asks once per session; after a cancel it answers `None` at once
+    /// until the user unlocks from Settings or an export.
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>>;
+
     /// Whether this prompter can reach a person at all. `false` for [`NoPrompt`]: a connect
     /// that would have needed a question then fails with [`SshError::NeedsInput`].
     fn can_ask(&self) -> bool {
@@ -134,6 +141,10 @@ impl Prompter for NoPrompt {
     }
 
     async fn ask_key_file(&self, _profile_name: &str) -> Option<PathBuf> {
+        None
+    }
+
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
         None
     }
 
@@ -668,6 +679,11 @@ impl Prompter for ClockedPrompter {
         self.inner.key_file_accepted(profile, path);
     }
 
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        let _paused = self.clock.pause();
+        self.inner.unlock_vault().await
+    }
+
     fn can_ask(&self) -> bool {
         self.inner.can_ask()
     }
@@ -932,6 +948,10 @@ mod tests {
             true
         }
         async fn ask_secret(&self, _: &str, _: SecretKind, _: bool) -> Option<SecretAnswer> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+        async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
             tokio::time::sleep(self.0).await;
             None
         }

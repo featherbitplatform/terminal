@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbterm_config::ProfileId;
-use fbterm_secrets::SecretKind;
+use fbterm_secrets::{SecretKind, Zeroizing};
 use fbterm_session::ssh::tunnel::TunnelKey;
 use fbterm_session::ssh::{Prompter, SecretAnswer};
 use iced::futures::Stream;
@@ -55,6 +55,11 @@ pub enum Ask {
     KeyFile {
         profile: String,
         reply: oneshot::Sender<Option<PathBuf>>,
+    },
+    /// Saved secrets are in the locked vault: `Unlock saved secrets`. Never queued here: the
+    /// app shows one dialog for every connect asking (see `crate::saved_secrets`).
+    UnlockVault {
+        reply: oneshot::Sender<Option<Zeroizing<String>>>,
     },
 }
 
@@ -187,6 +192,10 @@ impl Prompter for UiPrompter {
             path: path.to_path_buf(),
         });
     }
+
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        self.ask(|reply| Ask::UnlockVault { reply }).await.flatten()
+    }
 }
 
 /// Prompt events, delivered to the update loop by one subscription.
@@ -311,8 +320,10 @@ pub enum Dialog {
 }
 
 impl Dialog {
-    fn from_ask(ask: Ask) -> Self {
-        match ask {
+    /// The dialog for `ask`; `None` (answered "no") for the unlock question, which has its
+    /// own dialog.
+    fn from_ask(ask: Ask) -> Option<Self> {
+        Some(match ask {
             Ask::HostKey {
                 host,
                 port,
@@ -343,7 +354,11 @@ impl Dialog {
                 choosing: false,
                 reply: Some(reply),
             },
-        }
+            Ask::UnlockVault { reply } => {
+                let _ = reply.send(None);
+                return None;
+            }
+        })
     }
 
     /// Whether Enter / Connect answers: a secret prompt needs something typed.
@@ -401,7 +416,10 @@ pub struct PromptQueues(HashMap<window::Id, VecDeque<Pending>>);
 impl PromptQueues {
     /// Queue a dialog from an asker; returns whether it is now the one shown.
     pub fn ask(&mut self, window: window::Id, id: PromptId, ask: Ask) -> bool {
-        self.push(window, Some(id), Dialog::from_ask(ask))
+        match Dialog::from_ask(ask) {
+            Some(dialog) => self.push(window, Some(id), dialog),
+            None => false,
+        }
     }
 
     /// Queue an app dialog (changed key); returns whether it is now the one shown.

@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fbterm_config::SecretStorage;
 use fbterm_config::{AuthMethod, Profile, ProfileId, ProfileKind, SshProfile};
-use fbterm_secrets::{MemoryStore, SecretKind, SecretStore};
+use fbterm_secrets::{MemoryStore, SecretBackend, SecretKind, SecretStore, Zeroizing};
 use fbterm_session::ssh::HostKeyStatus;
 use fbterm_session::ssh::{
     ClientHandler, Prompter, SecretAnswer, SshContext, SshError, check_host_key, connect_direct,
@@ -70,6 +71,9 @@ struct Script {
     key_file_calls: parking_lot::Mutex<Vec<String>>,
     /// Chosen key files reported as accepted.
     accepted_keys: parking_lot::Mutex<Vec<(ProfileId, PathBuf)>>,
+    /// The answer to `Unlock saved secrets` (`None`: cancel), and how often it was asked.
+    unlock: parking_lot::Mutex<Option<String>>,
+    unlock_calls: AtomicUsize,
 }
 
 impl Script {
@@ -89,6 +93,8 @@ impl Script {
             key_files: parking_lot::Mutex::new(key_files),
             key_file_calls: parking_lot::Mutex::new(vec![]),
             accepted_keys: parking_lot::Mutex::new(vec![]),
+            unlock: parking_lot::Mutex::new(None),
+            unlock_calls: AtomicUsize::new(0),
         })
     }
     fn host_key_calls(&self) -> usize {
@@ -137,6 +143,11 @@ impl Prompter for Script {
         self.accepted_keys
             .lock()
             .push((profile, path.to_path_buf()));
+    }
+
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        self.unlock_calls.fetch_add(1, Ordering::SeqCst);
+        self.unlock.lock().clone().map(Zeroizing::new)
     }
 }
 
@@ -531,6 +542,77 @@ async fn cancelled_prompt_gives_cancelled() {
     assert_eq!(fx.store.get(&p.id, SecretKind::Password).unwrap(), None);
 }
 
+/// The main password of the sample vaults.
+const MAIN: &str = "main-pw-for-live-tests";
+
+/// A secret backend using a locked vault (in `dir`) that holds `p`'s password.
+fn locked_vault_with_password(dir: &Path, p: &Profile) -> Arc<SecretBackend> {
+    let vault = dir.join("secrets.fbvault");
+    let setup = SecretBackend::with_system(
+        SecretStorage::Vault,
+        Box::new(MemoryStore::new()),
+        vault.clone(),
+    );
+    setup.create_vault(MAIN).unwrap();
+    setup.set(&p.id, SecretKind::Password, PASSWORD).unwrap();
+    // A new session: the vault starts locked.
+    Arc::new(SecretBackend::with_system(
+        SecretStorage::Vault,
+        Box::new(MemoryStore::new()),
+        vault,
+    ))
+}
+
+#[tokio::test]
+async fn cancel_unlock_asks_for_password_instead() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = locked_vault_with_password(dir.path(), &p);
+    let script = Script::new(true, vec![answer(PASSWORD, false)]);
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.unlock_calls.load(Ordering::SeqCst), 1);
+    // As if nothing were saved: asked once, not as a retry.
+    assert_eq!(
+        *script.secret_calls.lock(),
+        vec![(SecretKind::Password, false)]
+    );
+    assert!(!secrets.vault_unlocked());
+}
+
+#[tokio::test]
+async fn locked_vault_unlocks_through_the_prompter() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = locked_vault_with_password(dir.path(), &p);
+    let script = Script::new(true, vec![]);
+    *script.unlock.lock() = Some(MAIN.into());
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.unlock_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        script.secret_calls.lock().is_empty(),
+        "the saved password was used"
+    );
+    assert!(secrets.vault_unlocked());
+}
+
 #[tokio::test]
 async fn learned_key_is_known_to_check_host_key() {
     if !enabled() {
@@ -673,6 +755,10 @@ mod pool {
 
     #[async_trait]
     impl Prompter for TrustAll {
+        async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
         async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
             None
         }
@@ -1178,6 +1264,10 @@ mod pool {
 
     #[async_trait]
     impl Prompter for Gate {
+        async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
         async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
             None
         }
@@ -1387,6 +1477,10 @@ mod access {
 
     #[async_trait]
     impl Prompter for TrustAny {
+        async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
         async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
             None
         }

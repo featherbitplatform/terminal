@@ -68,7 +68,7 @@ pub(super) fn auth<'a>(
     t: &'static Tokens,
     s: &'a SshDraft,
     editable: bool,
-    degraded: bool,
+    storage: fbterm_secrets::Storage,
     rsa_key: bool,
 ) -> Element<'a, Message> {
     let segment = |caption: &'a str, choice: AuthChoice| {
@@ -172,16 +172,11 @@ pub(super) fn auth<'a>(
     let stores_secret =
         matches!(s.auth, AuthChoice::Password) || (s.auth == AuthChoice::Key && s.key_passphrase);
     if stores_secret {
-        let note = if degraded {
-            "Keychain unavailable: passwords are kept for this session only"
-        } else {
-            "Saved in the system keychain, never in profiles.toml."
-        };
-        col = col.push(text(note).font(UI_FONT).size(12).color(if degraded {
-            t.warning
-        } else {
-            t.text_muted
-        }));
+        let note = format!(
+            "{}, never in profiles.toml.",
+            crate::saved_secrets::storage_note(storage)
+        );
+        col = col.push(text(note).font(UI_FONT).size(12).color(t.text_muted));
     }
     col.into()
 }

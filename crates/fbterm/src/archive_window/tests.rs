@@ -677,3 +677,258 @@ fn copy() {
     };
     assert_eq!(exported_text(&e), "Exported 1 profile to a.fbprofiles.");
 }
+
+/// Opens `sample_archive` (in `dir`) in the import window, its key folder in `dir/keys`, and
+/// chooses Overwrite for the local db-host.
+fn ready_import(app: &mut App, dir: &Path, archive: &Archive) -> PathBuf {
+    let file = archive_file(dir, archive);
+    open(app, Action::ImportProfiles);
+    open_archive(app, &file, PASSWORD);
+    let keys = dir.join("keys");
+    key_folder(app, &keys);
+    send(app, ArchiveMsg::Choice(0, RowChoice::Overwrite));
+    keys
+}
+
+#[test]
+fn import_refused_while_the_editor_has_unsaved_changes() {
+    let db = ssh("db-host", AuthMethod::Password, Vec::new());
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let dir = temp();
+    let keys = ready_import(&mut app, dir.path(), &sample_archive());
+    let _ = app.update(Message::Editor(crate::editor::EditorMsg::Open));
+    let _ = app.update(Message::Editor(crate::editor::EditorMsg::Select(db.id)));
+    let _ = app.update(Message::Editor(crate::editor::EditorMsg::Name(
+        "db-edited".into(),
+    )));
+    assert!(app.editor.as_ref().unwrap().1.dirty);
+    let before = std::fs::read_to_string(paths.profiles()).unwrap();
+
+    send(&mut app, ArchiveMsg::Import);
+    assert_eq!(
+        state(&app).import.problem.as_deref(),
+        Some(super::EDITOR_DIRTY)
+    );
+    assert!(state(&app).import.opened.is_some(), "kept to import later");
+    assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    assert!(!keys.exists());
+    assert_eq!(app.secrets.get(&db.id, SecretKind::Password).unwrap(), None);
+    assert_eq!(
+        app.editor
+            .as_ref()
+            .unwrap()
+            .1
+            .selected_draft()
+            .unwrap()
+            .name,
+        "db-edited",
+        "the edits are untouched"
+    );
+}
+
+#[test]
+fn import_refused_when_color_schemes_changed_since_opening() {
+    let db = ssh("db-host", AuthMethod::Password, Vec::new());
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let dir = temp();
+    let mut scheme = fbterm_config::schemes::builtins().remove(2);
+    scheme.id = format!("user-{}", ProfileId::new());
+    scheme.name = "Dusk".into();
+    scheme.builtin = false;
+    let mut archive = sample_archive();
+    archive.profiles[0].color_scheme = Some(scheme.id.clone());
+    archive.schemes = vec![scheme.clone()];
+    let keys = ready_import(&mut app, dir.path(), &archive);
+    let before = std::fs::read_to_string(paths.profiles()).unwrap();
+
+    // A scheme file with that id is saved after the preview was made.
+    let mut mine = scheme.clone();
+    mine.name = "Mine".into();
+    fbterm_config::schemes::save_user(&paths.schemes(), &mine).unwrap();
+    send(&mut app, ArchiveMsg::Import);
+    assert_eq!(
+        state(&app).import.problem.as_deref(),
+        Some(super::SCHEMES_STALE)
+    );
+    assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    assert!(!keys.exists());
+    let on_disk =
+        std::fs::read_to_string(paths.schemes().join(format!("{}.toml", scheme.id))).unwrap();
+    assert!(on_disk.contains("Mine"), "the local scheme is untouched");
+    assert_eq!(app.secrets.get(&db.id, SecretKind::Password).unwrap(), None);
+}
+
+/// A system store that counts single and batch saves.
+#[derive(Default)]
+struct Counting {
+    inner: fbterm_secrets::MemoryStore,
+    sets: std::sync::atomic::AtomicUsize,
+    batches: std::sync::atomic::AtomicUsize,
+}
+
+impl fbterm_secrets::SecretStore for Counting {
+    fn get(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<Option<String>, fbterm_secrets::SecretError> {
+        self.inner.get(id, kind)
+    }
+    fn set(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+        value: &str,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.sets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.set(id, kind, value)
+    }
+    fn remove(&self, id: &ProfileId) -> Result<(), fbterm_secrets::SecretError> {
+        self.inner.remove(id)
+    }
+    fn remove_kind(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.inner.remove_kind(id, kind)
+    }
+    fn set_many(
+        &self,
+        items: &[fbterm_secrets::SecretEntry],
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.batches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.set_many(items)
+    }
+}
+
+/// Lets a test keep looking at a store it handed to a backend.
+struct Shared(std::sync::Arc<Counting>);
+
+impl fbterm_secrets::SecretStore for Shared {
+    fn get(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<Option<String>, fbterm_secrets::SecretError> {
+        self.0.get(id, kind)
+    }
+    fn set(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+        value: &str,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.set(id, kind, value)
+    }
+    fn remove(&self, id: &ProfileId) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.remove(id)
+    }
+    fn remove_kind(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.remove_kind(id, kind)
+    }
+    fn set_many(
+        &self,
+        items: &[fbterm_secrets::SecretEntry],
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.set_many(items)
+    }
+}
+
+#[test]
+fn imported_secrets_are_stored_in_one_batch() {
+    use fbterm_secrets::SecretStore;
+    let db = ssh("db-host", AuthMethod::Password, Vec::new());
+    let web = ssh("web", AuthMethod::Password, Vec::new());
+    let mut app = app_with(std::slice::from_ref(&db));
+    let dir = temp();
+    let counting = std::sync::Arc::new(Counting::default());
+    app.use_secret_backend(std::sync::Arc::new(
+        fbterm_secrets::SecretBackend::with_system(
+            fbterm_config::SecretStorage::Keychain,
+            Box::new(Shared(counting.clone())),
+            dir.path().join("secrets.fbvault"),
+        ),
+    ));
+    let mut archive = sample_archive();
+    archive.secrets.push(ArchivedSecret {
+        profile: web.id,
+        kind: SecretKind::Password,
+        value: Zeroizing::new("web-pw".into()),
+    });
+    archive.profiles.push(web.clone());
+    ready_import(&mut app, dir.path(), &archive);
+    send(&mut app, ArchiveMsg::Import);
+    assert_eq!(
+        state(&app).import.notice.as_ref().map(|n| n.text.as_str()),
+        Some("Imported 4 profiles (1 replaced), 1 key file and 2 saved secrets.")
+    );
+    assert_eq!(state(&app).busy, None);
+    use std::sync::atomic::Ordering::SeqCst;
+    assert_eq!(counting.batches.load(SeqCst), 1, "one batch");
+    assert_eq!(counting.sets.load(SeqCst), 0, "no single saves");
+    assert_eq!(
+        counting
+            .get(&web.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("web-pw")
+    );
+}
+
+#[test]
+fn import_into_a_locked_vault_unlocks_first() {
+    use fbterm_secrets::SecretStore;
+    let db = ssh("db-host", AuthMethod::Password, Vec::new());
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let dir = temp();
+    let vault = dir.path().join("secrets.fbvault");
+    let make = fbterm_secrets::SecretBackend::with_system(
+        fbterm_config::SecretStorage::Vault,
+        Box::new(fbterm_secrets::MemoryStore::new()),
+        vault.clone(),
+    );
+    make.create_vault("main-pw-import").unwrap();
+    drop(make);
+    let backend = std::sync::Arc::new(fbterm_secrets::SecretBackend::with_system(
+        fbterm_config::SecretStorage::Vault,
+        Box::new(fbterm_secrets::MemoryStore::new()),
+        vault.clone(),
+    ));
+    app.use_secret_backend(backend.clone());
+    let keys = ready_import(&mut app, dir.path(), &sample_archive());
+    let before = std::fs::read_to_string(paths.profiles()).unwrap();
+
+    send(&mut app, ArchiveMsg::Import);
+    let d = app.vault.dialog.as_ref().expect("unlock first");
+    assert_eq!(d.kind, crate::saved_secrets::Kind::Unlock);
+    assert_eq!(Some(d.window), app.archive_window());
+    assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    assert!(!keys.exists(), "nothing written before the vault opens");
+    assert!(state(&app).import.opened.is_some());
+
+    let _ = app.update(Message::Vault(crate::saved_secrets::VaultMsg::Password(
+        Redacted("main-pw-import".into()),
+    )));
+    let _ = app.update(Message::Vault(crate::saved_secrets::VaultMsg::Submit));
+    assert!(app.vault.dialog.is_none());
+    assert_eq!(
+        state(&app).import.notice.as_ref().map(|n| n.text.as_str()),
+        Some("Imported 3 profiles (1 replaced), 1 key file and 1 saved secret.")
+    );
+    // In the vault file: a fresh store opened with the main password reads it.
+    let fresh = fbterm_secrets::VaultStore::new();
+    fresh.unlock(&vault, "main-pw-import").unwrap();
+    assert_eq!(
+        fresh.get(&db.id, SecretKind::Password).unwrap().as_deref(),
+        Some(SAVED)
+    );
+}

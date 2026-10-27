@@ -37,6 +37,10 @@ struct TrustAny;
 
 #[async_trait::async_trait]
 impl Prompter for TrustAny {
+    async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+        None
+    }
+
     async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
         None
     }

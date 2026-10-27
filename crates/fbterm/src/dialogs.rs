@@ -5,11 +5,13 @@ use std::path::{Path, PathBuf};
 use fbterm_config::{AuthMethod, ProfileId, ProfileKind};
 use iced::{Task, window};
 
-use crate::app::{App, Message, load_profiles};
+use crate::app::{App, Delivered, Message, load_profiles};
 use crate::chrome::Chrome;
-use crate::editor::{EditorMsg, EditorState, SaveError};
+use crate::editor::{EditorMsg, EditorState, SaveError, SecretResults, run_secret_ops};
 use crate::file_panel::ClashAnswer;
-use crate::prompts::{Clash, Dialog, PromptEvent, PromptId, PromptMsg, Rename, key_file_title};
+use crate::prompts::{
+    Ask, Clash, Dialog, PromptEvent, PromptId, PromptMsg, Rename, key_file_title,
+};
 use crate::tunnels::NO_WINDOW;
 
 impl App {
@@ -24,10 +26,8 @@ impl App {
                 Some(id) => self.close_window(id),
                 None => Task::none(),
             },
-            EditorMsg::Save => {
-                self.save_profiles();
-                Task::none()
-            }
+            EditorMsg::Save => self.save_profiles(true),
+            EditorMsg::SaveNoAsk => self.save_profiles(false),
             EditorMsg::EditSchemes => {
                 let current = self
                     .editor
@@ -84,44 +84,103 @@ impl App {
         open.discard()
     }
 
-    /// Validate, write `profiles.toml` atomically, then change the keychain and use the new
-    /// profiles everywhere.
-    fn save_profiles(&mut self) {
+    /// Validate, write `profiles.toml` atomically and use the new profiles everywhere, then
+    /// make the secret changes on the blocking pool (Save waits meanwhile). With `ask`, a
+    /// vault that must be unlocked or made first is asked for before anything is written.
+    fn save_profiles(&mut self, ask: bool) -> Task<Message> {
         let path = self.paths.profiles();
         let refused = self.profiles_error.is_some();
-        let Some((_, ed)) = &mut self.editor else {
-            return;
+        let need = self.backend.needs_main_password();
+        let Some((wid, ed)) = &mut self.editor else {
+            return Task::none();
         };
+        let wid = *wid;
+        if ed.saving.is_some() {
+            return Task::none();
+        }
         if refused {
             ed.notice =
                 Some("profiles.toml failed to load: fix it and reload before saving".into());
-            return;
+            return Task::none();
         }
-        let saved = match ed.save(&mut self.profiles, &path) {
-            Ok(()) => {
-                ed.notice = Some("Saved".into());
-                true
-            }
+        if ask
+            && let Some(need) = need
+            && ed.needs_vault(&self.profiles, need)
+        {
+            return self.ask_main_password(
+                wid,
+                need,
+                Message::Editor(EditorMsg::SaveNoAsk),
+                Some(Message::Editor(EditorMsg::SaveNoAsk)),
+            );
+        }
+        let ops = match ed.write(&mut self.profiles, &path) {
+            Ok(ops) => ops,
             Err(SaveError::Invalid(errors)) => {
                 tracing::info!(problems = errors.len(), "profiles not saved: invalid");
                 ed.notice = None;
-                false
+                return Task::none();
             }
             Err(SaveError::Write(e)) => {
                 ed.notice = Some(format!("Could not save: {e}"));
-                false
+                return Task::none();
             }
-            // The file was written; only some keychain changes failed.
-            Err(SaveError::Secrets(failures)) => {
-                ed.notice = Some(format!("Profiles saved, but {}", failures.join("; ")));
-                true
-            }
+            Err(SaveError::Secrets(_)) => unreachable!("write makes no secret changes"),
         };
-        if saved {
-            // Our own write is not an edit to pick up again.
-            self.profiles_seen = std::fs::read_to_string(&path).ok();
-            self.profiles_changed();
+        let nothing_else = ops.is_empty();
+        if nothing_else {
+            let _ = ed.finish(Vec::new());
+            ed.notice = Some("Saved".into());
         }
+        // Our own write is not an edit to pick up again.
+        self.profiles_seen = std::fs::read_to_string(&path).ok();
+        self.profiles_changed();
+        if nothing_else {
+            return Task::none();
+        }
+        self.editor_seq += 1;
+        let seq = self.editor_seq;
+        let Some((_, ed)) = &mut self.editor else {
+            return Task::none();
+        };
+        ed.saving = Some(seq);
+        ed.notice = Some("Saving\u{2026}".into());
+        let secrets = ed.secret_store();
+        self.run_blocking(
+            move || Delivered::new(Ok(run_secret_ops(secrets.as_ref(), ops))),
+            |e| Delivered::new(Err(e)),
+            move |results| Message::EditorSecrets(seq, results),
+        )
+    }
+
+    /// The secret changes of editor save `seq` ran.
+    pub(crate) fn editor_secrets_done(
+        &mut self,
+        seq: u64,
+        results: Delivered<Result<SecretResults, String>>,
+    ) {
+        let Some((_, ed)) = self
+            .editor
+            .as_mut()
+            .filter(|(_, ed)| ed.saving == Some(seq))
+        else {
+            return;
+        };
+        ed.saving = None;
+        ed.notice = Some(match results.take() {
+            Some(Ok(results)) => match ed.finish(results) {
+                Ok(()) => "Saved".into(),
+                Err(SaveError::Secrets(failures)) => {
+                    format!("Profiles saved, but {}", failures.join("; "))
+                }
+                Err(_) => "Saved".into(),
+            },
+            Some(Err(e)) => {
+                ed.dirty = true;
+                format!("Profiles saved, but the saved secrets could not be changed: {e}")
+            }
+            None => return,
+        });
     }
 
     /// `profiles.toml` changed on disk (hand edit, or a tool). Changes that are only our own
@@ -210,6 +269,11 @@ impl App {
         match msg {
             PromptMsg::Event(delivered) => match delivered.take() {
                 Some(PromptEvent::Ask {
+                    window,
+                    ask: Ask::UnlockVault { reply },
+                    ..
+                }) => self.connect_unlock(window, reply),
+                Some(PromptEvent::Ask {
                     id,
                     window,
                     tunnel,
@@ -246,10 +310,13 @@ impl App {
                         (None, None) => Task::none(),
                     }
                 }
-                Some(PromptEvent::Withdraw(id)) => match self.prompts.withdraw(id) {
-                    Some(w) => self.focus_prompt(w),
-                    None => Task::none(),
-                },
+                Some(PromptEvent::Withdraw(id)) => {
+                    self.connect_unlock_withdrawn();
+                    match self.prompts.withdraw(id) {
+                        Some(w) => self.focus_prompt(w),
+                        None => Task::none(),
+                    }
+                }
                 Some(PromptEvent::KeyFileAccepted { profile, path }) => {
                     self.remember_key_file(profile, path);
                     Task::none()

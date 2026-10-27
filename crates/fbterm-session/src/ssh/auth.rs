@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::{AuthMethod, Profile, SshProfile};
-use fbterm_secrets::SecretKind;
+use fbterm_secrets::{SecretError, SecretKind, SecretStore, Zeroizing};
 use russh::client::Handle;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
 
@@ -85,9 +85,34 @@ fn failed(profile: &Profile) -> SshError {
     }
 }
 
-/// The saved secret, if any. A store error is logged (without the value) and treated as none.
-fn saved(ctx: &SshContext, profile: &Profile, kind: SecretKind) -> Option<String> {
-    match ctx.secrets.get(&profile.id, kind) {
+/// Run a secret-store call on the blocking pool: vault calls wait on a write or run scrypt,
+/// which must not hold up the connection's task.
+async fn off_task<T: Send + 'static>(
+    ctx: &SshContext,
+    call: impl FnOnce(&dyn SecretStore) -> Result<T, SecretError> + Send + 'static,
+) -> Result<T, SecretError> {
+    let secrets = ctx.secrets.clone();
+    tokio::task::spawn_blocking(move || call(secrets.as_ref()))
+        .await
+        .unwrap_or_else(|e| Err(SecretError::Backend(e.to_string())))
+}
+
+/// The saved secret, if any. A locked vault is first unlocked with the main password the
+/// prompter gives; a cancel (or a prompter that cannot ask) means none is saved. A store
+/// error is logged (without the value) and treated as none.
+async fn saved(ctx: &SshContext, profile: &Profile, kind: SecretKind) -> Option<String> {
+    let id = profile.id;
+    let result = match off_task(ctx, move |s| s.get(&id, kind)).await {
+        Err(SecretError::Locked) => {
+            let password = ctx.prompter.unlock_vault().await?;
+            match off_task(ctx, move |s| s.unlock_vault(&password)).await {
+                Ok(()) => off_task(ctx, move |s| s.get(&id, kind)).await,
+                Err(e) => Err(e),
+            }
+        }
+        other => other,
+    };
+    match result {
         Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, ?kind, "cannot read saved secret");
@@ -97,11 +122,12 @@ fn saved(ctx: &SshContext, profile: &Profile, kind: SecretKind) -> Option<String
 }
 
 /// Save an accepted secret if the user asked to.
-fn remember(ctx: &SshContext, profile: &Profile, kind: SecretKind, answer: &SecretAnswer) {
+async fn remember(ctx: &SshContext, profile: &Profile, kind: SecretKind, answer: &SecretAnswer) {
     if !answer.remember {
         return;
     }
-    if let Err(e) = ctx.secrets.set(&profile.id, kind, &answer.value) {
+    let (id, value) = (profile.id, Zeroizing::new(answer.value.clone()));
+    if let Err(e) = off_task(ctx, move |s| s.set(&id, kind, &value)).await {
         tracing::warn!(error = %e, ?kind, "cannot save secret");
     }
 }
@@ -113,7 +139,7 @@ async fn password(
     ctx: &SshContext,
 ) -> Result<(), SshError> {
     let mut retry = false;
-    if let Some(pw) = saved(ctx, profile, SecretKind::Password) {
+    if let Some(pw) = saved(ctx, profile, SecretKind::Password).await {
         if handle.authenticate_password(&ssh.user, pw).await?.success() {
             return Ok(());
         }
@@ -131,7 +157,7 @@ async fn password(
             .await?
             .success()
         {
-            remember(ctx, profile, SecretKind::Password, &answer);
+            remember(ctx, profile, SecretKind::Password, &answer).await;
             return Ok(());
         }
         retry = true;
@@ -174,7 +200,7 @@ async fn unlock(
         return Ok((k, None));
     }
     let mut retry = false;
-    if let Some(pass) = saved(ctx, profile, SecretKind::KeyPassphrase) {
+    if let Some(pass) = saved(ctx, profile, SecretKind::KeyPassphrase).await {
         if let Some(k) = load(path, Some(&pass))? {
             return Ok((k, None));
         }
@@ -234,7 +260,7 @@ async fn key(
         return Err(failed(profile));
     }
     if let Some(answer) = answer {
-        remember(ctx, profile, SecretKind::KeyPassphrase, &answer);
+        remember(ctx, profile, SecretKind::KeyPassphrase, &answer).await;
     }
     Ok(warning)
 }
@@ -312,6 +338,163 @@ mod tests {
             Some(AuthWarning::RsaUserKey)
         );
         assert_eq!(rsa_warning(&Algorithm::Ed25519), None);
+    }
+
+    mod vault {
+        use super::*;
+        use crate::ssh::{NoPrompt, Prompter};
+        use fbterm_config::{ProfileId, ProfileKind, SecretStorage};
+        use fbterm_secrets::{MemoryStore, SecretBackend, SecretStore, Zeroizing};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        const MAIN: &str = "main-pw-auth-tests";
+
+        /// Answers `Unlock saved secrets` with `answer` and counts the questions.
+        struct Unlocker {
+            answer: Option<&'static str>,
+            asked: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Prompter for Unlocker {
+            async fn confirm_host_key(&self, _: &str, _: u16, _: &str) -> bool {
+                false
+            }
+            async fn ask_secret(
+                &self,
+                _: &str,
+                _: SecretKind,
+                _: bool,
+            ) -> Option<crate::ssh::SecretAnswer> {
+                None
+            }
+            async fn ask_key_file(&self, _: &str) -> Option<PathBuf> {
+                None
+            }
+            async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                self.answer.map(|a| Zeroizing::new(a.to_owned()))
+            }
+        }
+
+        fn profile() -> Profile {
+            Profile {
+                id: ProfileId::new(),
+                name: "db".into(),
+                group: None,
+                accent: None,
+                accent_style: Default::default(),
+                color_scheme: None,
+                kind: ProfileKind::Ssh(SshProfile {
+                    host: "db.example.com".into(),
+                    port: 22,
+                    user: "ops".into(),
+                    auth: AuthMethod::Password,
+                    jump: vec![],
+                    tunnels: Vec::new(),
+                }),
+            }
+        }
+
+        /// A locked vault (in `dir`) holding `p`'s password.
+        fn locked(dir: &Path, p: &Profile) -> Arc<SecretBackend> {
+            let path = dir.join("secrets.fbvault");
+            let setup = SecretBackend::with_system(
+                SecretStorage::Vault,
+                Box::new(MemoryStore::new()),
+                path.clone(),
+            );
+            setup.create_vault(MAIN).unwrap();
+            setup.set(&p.id, SecretKind::Password, "saved-pw").unwrap();
+            Arc::new(SecretBackend::with_system(
+                SecretStorage::Vault,
+                Box::new(MemoryStore::new()),
+                path,
+            ))
+        }
+
+        fn context(secrets: Arc<SecretBackend>, prompter: Arc<dyn Prompter>) -> SshContext {
+            SshContext {
+                known_hosts: PathBuf::from("known_hosts"),
+                secrets,
+                prompter,
+            }
+        }
+
+        #[tokio::test]
+        async fn cancel_unlock_treats_the_secret_as_not_saved() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = locked(dir.path(), &p);
+            let asker = Arc::new(Unlocker {
+                answer: None,
+                asked: AtomicUsize::new(0),
+            });
+            let ctx = context(secrets.clone(), asker.clone());
+            assert_eq!(saved(&ctx, &p, SecretKind::Password).await, None);
+            assert_eq!(asker.asked.load(Ordering::SeqCst), 1);
+            assert!(!secrets.vault_unlocked());
+            // Nobody to ask (automatic reconnects): not saved, and nothing is asked.
+            let ctx = SshContext {
+                prompter: Arc::new(NoPrompt),
+                ..ctx
+            };
+            assert_eq!(saved(&ctx, &p, SecretKind::Password).await, None);
+        }
+
+        #[tokio::test]
+        async fn unlock_answer_opens_the_vault_for_the_saved_secret() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = locked(dir.path(), &p);
+            let asker = Arc::new(Unlocker {
+                answer: Some(MAIN),
+                asked: AtomicUsize::new(0),
+            });
+            let ctx = context(secrets.clone(), asker.clone());
+            assert_eq!(
+                saved(&ctx, &p, SecretKind::Password).await.as_deref(),
+                Some("saved-pw")
+            );
+            assert!(secrets.vault_unlocked());
+            // Open now: no second question.
+            assert_eq!(
+                saved(&ctx, &p, SecretKind::Password).await.as_deref(),
+                Some("saved-pw")
+            );
+            assert_eq!(asker.asked.load(Ordering::SeqCst), 1);
+
+            // A wrong main password is not a saved secret either.
+            let other = profile();
+            let other_dir = tempfile::tempdir().unwrap();
+            let secrets = locked(other_dir.path(), &other);
+            let wrong = Arc::new(Unlocker {
+                answer: Some("wrong"),
+                asked: AtomicUsize::new(0),
+            });
+            let ctx = context(secrets, wrong);
+            assert_eq!(saved(&ctx, &other, SecretKind::Password).await, None);
+        }
+
+        #[tokio::test]
+        async fn remember_saves_off_the_calling_task() {
+            let p = profile();
+            let store = Arc::new(MemoryStore::new());
+            let ctx = SshContext {
+                known_hosts: PathBuf::from("known_hosts"),
+                secrets: store.clone(),
+                prompter: Arc::new(NoPrompt),
+            };
+            let answer = crate::ssh::SecretAnswer {
+                value: "typed".into(),
+                remember: true,
+            };
+            remember(&ctx, &p, SecretKind::Password, &answer).await;
+            assert_eq!(
+                store.get(&p.id, SecretKind::Password).unwrap().as_deref(),
+                Some("typed")
+            );
+        }
     }
 
     #[test]

@@ -33,17 +33,42 @@ const TAB_TOP_GAP: f32 = 4.0;
 const TAB_DRAG_THRESHOLD: f32 = 6.0;
 
 pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
+    let content = window_view(app, id);
+    // The main password dialog over a window other than a terminal window (those draw it
+    // with their other dialogs).
+    match app.vault.dialog.as_ref().filter(|d| d.window == id) {
+        Some(d) if !app.windows.contains_key(&id) => {
+            stack![content, vault_layer(app, id, d)].into()
+        }
+        _ => content,
+    }
+}
+
+/// The main password dialog, taking the keys.
+fn vault_layer<'a>(
+    app: &'a App,
+    id: window::Id,
+    d: &'a crate::saved_secrets::VaultDialog,
+) -> Element<'a, Message> {
+    Element::new(Shortcuts {
+        content: crate::saved_secrets::view::view(app.tokens, d),
+        window: id,
+        mode: Mode::Vault,
+        bindings: &app.bindings,
+    })
+}
+
+fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     let t = app.tokens;
     if let Some((eid, state)) = &app.editor
         && *eid == id
     {
-        let degraded = app.fallback.as_ref().is_some_and(|f| f.degraded());
         let schemes = app.scheme_choices(true);
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id));
         }
-        let content = content.push(crate::editor::view::view(t, state, schemes, degraded));
+        let content = content.push(crate::editor::view::view(t, state, schemes, app.storage()));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -61,7 +86,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         let notice = app.settings_notice.as_deref();
         let schemes = app.scheme_choices(false);
         let content = content.push(crate::settings_window::view::view(
-            t, state, schemes, notice,
+            t,
+            state,
+            schemes,
+            notice,
+            app.secrets_section(),
         ));
         return Element::new(Shortcuts {
             content: content.into(),
@@ -159,7 +188,9 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let palette = app.palettes.get(&id);
     let find_box = app.find_box.as_ref().filter(|f| f.window == id);
     let dialog = app.prompts.front(id);
-    let modal = palette.is_some() || find_box.is_some() || dialog.is_some();
+    let vault = app.vault.dialog.as_ref().filter(|d| d.window == id);
+    let asking = dialog.is_some() || vault.is_some();
+    let modal = palette.is_some() || find_box.is_some() || asking;
     let carry = app.carry_in(id);
     let bar = TabBar {
         window: id,
@@ -264,9 +295,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
     // toggles still work, and not while a dialog waits for an answer.
-    let covered = Mode::Blocked {
-        toggles: dialog.is_none(),
-    };
+    let covered = Mode::Blocked { toggles: !asking };
     // A carried tab follows the pointer over the whole window.
     let ghost = match carry {
         Some(Carry::Tab(source)) => win
@@ -300,11 +329,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         layers = layers.push(Element::new(Shortcuts {
             content: palette::view(t, id, state, &app.bindings),
             window: id,
-            mode: if dialog.is_some() {
-                covered
-            } else {
-                Mode::Palette
-            },
+            mode: if asking { covered } else { Mode::Palette },
             bindings: &app.bindings,
         }));
     }
@@ -312,21 +337,24 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         layers = layers.push(Element::new(Shortcuts {
             content: crate::find::all_view::view(t, id, state),
             window: id,
-            mode: if dialog.is_some() {
-                covered
-            } else {
-                Mode::FindAll
-            },
+            mode: if asking { covered } else { Mode::FindAll },
             bindings: &app.bindings,
         }));
     }
     if let Some(d) = dialog {
         layers = layers.push(Element::new(Shortcuts {
-            content: crate::prompt_view::view(t, id, d),
+            content: crate::prompt_view::view(t, id, d, app.storage()),
             window: id,
-            mode: Mode::Prompt,
+            mode: if vault.is_some() {
+                covered
+            } else {
+                Mode::Prompt
+            },
             bindings: &app.bindings,
         }));
+    }
+    if let Some(d) = vault {
+        layers = layers.push(vault_layer(app, id, d));
     }
     layers.into()
 }

@@ -4,8 +4,8 @@
 use std::path::{Path, PathBuf};
 
 use fbterm_config::schemes;
-use fbterm_secrets::MemoryStore;
 use fbterm_secrets::archive::ArchiveKind;
+use fbterm_secrets::{MainPassword, MemoryStore, SecretEntry};
 use iced::{Task, window};
 use zeroize::Zeroizing;
 
@@ -148,6 +148,18 @@ impl App {
                 if let Some(problem) = state.export_problem(&self.profiles) {
                     state.export.problem = Some(problem);
                     return Task::none();
+                }
+                // A full archive reads saved secrets: open a locked vault first (this asks
+                // even after a connect's unlock was cancelled: the user asked for it).
+                if state.export.kind == ArchiveKind::Full
+                    && self.backend.needs_main_password() == Some(MainPassword::Unlock)
+                {
+                    return self.ask_main_password(
+                        wid,
+                        MainPassword::Unlock,
+                        Message::Archive(ArchiveMsg::Export),
+                        None,
+                    );
                 }
                 let seq = self.next_job();
                 if let Some((_, state)) = &mut self.archive_win {
@@ -309,17 +321,39 @@ impl App {
                 }
             }
             ArchiveMsg::Import => return self.import_opened(),
+            ArchiveMsg::SecretsStored(seq, result) => {
+                if state.busy.map(|(s, _)| s) != Some(seq) {
+                    return Task::none();
+                }
+                state.busy = None;
+                let Some((mut summary, schemes_written)) = state.import.storing.take() else {
+                    return Task::none();
+                };
+                match result {
+                    Ok(n) => summary.secrets = n,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "imported secrets were not stored");
+                        summary
+                            .secret_failures
+                            .push(format!("The saved secrets could not be stored ({e})."));
+                    }
+                }
+                return self.import_done(&summary, schemes_written);
+            }
         }
         Task::none()
     }
 
-    /// `Import`: apply the preview, then write key files, color schemes, `profiles.toml` and
-    /// saved secrets, in that order.
+    /// `Import`: apply the preview, then write key files, color schemes and `profiles.toml`,
+    /// in that order, then store the saved secrets in one batch on the blocking pool. A vault
+    /// that must be unlocked or made first is asked for before anything is written.
     fn import_opened(&mut self) -> Task<Message> {
         let editor_dirty = self.editor.as_ref().is_some_and(|(_, ed)| ed.dirty);
-        let Some((_, state)) = &mut self.archive_win else {
+        let need = self.backend.needs_main_password();
+        let Some((wid, state)) = &mut self.archive_win else {
             return Task::none();
         };
+        let wid = *wid;
         if state.busy.is_some() {
             return Task::none();
         }
@@ -327,43 +361,81 @@ impl App {
             return Task::none();
         };
         let key_dir = state.import.key_dir.clone().or_else(default_key_dir);
-        let result = self.write_import(&opened, key_dir.as_deref(), editor_dirty);
+        let result = self.write_import(&opened, key_dir.as_deref(), editor_dirty, need);
         let Some((_, state)) = &mut self.archive_win else {
             return Task::none();
         };
         match result {
-            Ok((summary, schemes_written)) => {
-                tracing::info!(
-                    added = summary.added,
-                    replaced = summary.replaced,
-                    "imported profiles"
-                );
-                state.import.notice = Some(Notice {
-                    error: !summary.secret_failures.is_empty(),
-                    text: imported_text(&summary),
-                });
+            Ok(Written::Ask(need)) => {
+                state.import.opened = Some(opened);
+                self.ask_main_password(wid, need, Message::Archive(ArchiveMsg::Import), None)
+            }
+            Ok(Written::Files {
+                summary,
+                schemes_written,
+                secrets,
+            }) => {
                 state.import.problem = None;
                 // `opened` (the decrypted archive) is dropped here, wiping its secrets.
                 drop(opened);
-                if schemes_written {
-                    return self.reload_schemes();
+                if secrets.is_empty() {
+                    return self.import_done(&summary, schemes_written);
                 }
+                let seq = self.next_job();
+                let Some((_, state)) = &mut self.archive_win else {
+                    return Task::none();
+                };
+                state.busy = Some((seq, Busy::Storing));
+                state.import.storing = Some((summary, schemes_written));
+                let store = self.secrets.clone();
+                self.blocking(
+                    move || {
+                        let n = secrets.len();
+                        store
+                            .set_many(&secrets)
+                            .map(|()| n)
+                            .map_err(|e| e.to_string())
+                    },
+                    Err,
+                    move |r| ArchiveMsg::SecretsStored(seq, r),
+                )
             }
             Err(e) => {
                 state.import.problem = Some(e);
                 state.import.opened = Some(opened);
+                Task::none()
             }
+        }
+    }
+
+    /// An import is complete: say what it wrote.
+    fn import_done(&mut self, summary: &ImportSummary, schemes_written: bool) -> Task<Message> {
+        tracing::info!(
+            added = summary.added,
+            replaced = summary.replaced,
+            "imported profiles"
+        );
+        if let Some((_, state)) = &mut self.archive_win {
+            state.import.notice = Some(Notice {
+                error: !summary.secret_failures.is_empty(),
+                text: imported_text(summary),
+            });
+        }
+        if schemes_written {
+            return self.reload_schemes();
         }
         Task::none()
     }
 
-    /// The writes of an import; the summary and whether color schemes were written.
+    /// The writes of an import but its saved secrets, which it returns to store. Nothing is
+    /// written when the vault must be unlocked or made first (`need`).
     fn write_import(
         &mut self,
         opened: &Opened,
         key_dir: Option<&Path>,
         editor_dirty: bool,
-    ) -> Result<(ImportSummary, bool), String> {
+        need: Option<MainPassword>,
+    ) -> Result<Written, String> {
         let plan = &opened.plan;
         if plan.has_keys && key_dir.is_none() {
             return Err(NO_KEY_DIR.into());
@@ -389,6 +461,11 @@ impl App {
             self.schemes.get(&s.id).is_some() || scheme_dir.join(format!("{}.toml", s.id)).exists()
         }) {
             return Err(SCHEMES_STALE.into());
+        }
+        if !applied.secret_ops.is_empty()
+            && let Some(need) = need
+        {
+            return Ok(Written::Ask(need));
         }
 
         let mut summary = ImportSummary::default();
@@ -448,32 +525,37 @@ impl App {
         // Our own write is not an edit to pick up again.
         self.profiles_seen = std::fs::read_to_string(&file).ok();
         self.profiles = applied.store;
-
-        // 4. Saved secrets (only ever set).
-        for op in &applied.secret_ops {
-            match self.secrets.set(&op.profile, op.kind, &op.value) {
-                Ok(()) => summary.secrets += 1,
-                Err(e) => {
-                    let name = self
-                        .profiles
-                        .get(op.profile)
-                        .map_or_else(|| op.profile.to_string(), |p| p.name.clone());
-                    tracing::warn!(error = %e, "an imported secret was not stored");
-                    summary
-                        .secret_failures
-                        .push(format!("The saved secret of {name} could not be stored."));
-                }
-            }
-        }
-
         if let Some((_, ed)) = &mut self.editor {
             *ed = EditorState::new(&self.profiles, self.secrets.clone(), None);
             ed.notice = Some("Imported".into());
         }
         self.profiles_changed();
+
+        // 4. Saved secrets (only ever set): the caller stores them in one batch.
+        let secrets: Vec<SecretEntry> = applied
+            .secret_ops
+            .into_iter()
+            .map(|op| (op.profile, op.kind, op.value))
+            .collect();
         let schemes_written = summary.schemes > 0;
-        Ok((summary, schemes_written))
+        Ok(Written::Files {
+            summary,
+            schemes_written,
+            secrets,
+        })
     }
+}
+
+/// What [`App::write_import`] did.
+enum Written {
+    /// Nothing yet: the vault needs its main password (or a new one) first.
+    Ask(MainPassword),
+    /// Key files, schemes and profiles are written; `secrets` are still to store.
+    Files {
+        summary: ImportSummary,
+        schemes_written: bool,
+        secrets: Vec<SecretEntry>,
+    },
 }
 
 /// The system's save dialog over the archive window, offering `name`.

@@ -11,7 +11,7 @@ use fbterm_config::settings::{
     DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE, SCROLLBACK_WARN_ABOVE,
     TUNNEL_RETRIES_RANGE,
 };
-use fbterm_config::{ConfigError, MaxFps, SettingChange, Settings, ThemeMode};
+use fbterm_config::{ConfigError, MaxFps, SecretStorage, SettingChange, Settings, ThemeMode};
 
 mod fonts;
 mod glue;
@@ -76,6 +76,11 @@ pub enum SettingsMsg {
     ClearKey(Action),
     /// Put every default chord back.
     ResetKeys,
+    /// A `Saved secrets` choice: the app moves the secrets (asking for the main password
+    /// when the vault needs it) and then writes it.
+    SecretStorage(SecretStorage),
+    /// `Reset vault`: the app asks first.
+    ResetVault,
 }
 
 /// A chord being recorded in the Keyboard section.
@@ -189,6 +194,8 @@ pub struct SettingsState {
     pending: Vec<SettingChange>,
     /// Counts debounced changes, so only the last of a burst writes.
     generation: u64,
+    /// The scrolling page, for the `FBTERM_OPEN_SETTINGS=secrets` debug aid.
+    pub page: iced::widget::Id,
 }
 
 pub(crate) fn size_text(v: f32) -> String {
@@ -223,6 +230,7 @@ impl SettingsState {
             recording: None,
             pending: Vec::new(),
             generation: 0,
+            page: iced::widget::Id::unique(),
         };
         state.sync(values);
         state
@@ -399,7 +407,9 @@ impl SettingsState {
             | SettingsMsg::Close
             | SettingsMsg::OpenFile
             | SettingsMsg::RevealFolder
-            | SettingsMsg::EditSchemes => Effect::NONE,
+            | SettingsMsg::EditSchemes
+            | SettingsMsg::SecretStorage(_)
+            | SettingsMsg::ResetVault => Effect::NONE,
             SettingsMsg::Flush(n) => match self.held_lower {
                 Some((v, at)) if at == n => {
                     self.held_lower = None;

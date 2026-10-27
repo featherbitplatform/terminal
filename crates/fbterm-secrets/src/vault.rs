@@ -208,6 +208,16 @@ impl SecretStore for VaultStore {
             !items.is_empty()
         })
     }
+
+    /// Every secret of `ids` in one re-encryption and one file write (none if they hold
+    /// nothing).
+    fn remove_many(&self, ids: &[ProfileId]) -> Result<(), SecretError> {
+        self.update(|c| {
+            let before = c.len();
+            c.retain(|(id, _), _| !ids.contains(id));
+            c.len() != before
+        })
+    }
 }
 
 fn vault_err(message: &str) -> SecretError {

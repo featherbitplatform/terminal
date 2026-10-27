@@ -201,6 +201,14 @@ mod sys {
     /// DPAPI for the current Windows user, never showing any UI.
     pub struct Dpapi;
 
+    /// Log why the DPAPI call `call` failed (its `GetLastError` code, which says nothing about
+    /// the data) and report the failure.
+    fn failed(call: &'static str) -> CodecFailed {
+        let code = std::io::Error::last_os_error().raw_os_error();
+        tracing::warn!(call, code, "DPAPI call failed");
+        CodecFailed
+    }
+
     /// A borrowed input blob; DPAPI only reads it.
     fn input(bytes: &[u8]) -> Result<CRYPT_INTEGER_BLOB, CodecFailed> {
         Ok(CRYPT_INTEGER_BLOB {
@@ -262,7 +270,7 @@ mod sys {
                 )
             };
             if ok == 0 {
-                return Err(CodecFailed);
+                return Err(failed("CryptProtectData"));
             }
             Ok(out.bytes().to_vec())
         }
@@ -284,7 +292,7 @@ mod sys {
                 )
             };
             if ok == 0 {
-                return Err(CodecFailed);
+                return Err(failed("CryptUnprotectData"));
             }
             // The plaintext goes straight into a wiped buffer; `out` wipes DPAPI's copy.
             Ok(Zeroizing::new(out.bytes().to_vec()))
@@ -292,23 +300,24 @@ mod sys {
     }
 }
 
+/// A stand-in for DPAPI on every platform, for this crate's tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::Path;
+pub(crate) mod test_codec {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
     use zeroize::Zeroizing;
 
-    const SECRET: &str = "dpapi-secret-value-3a9c";
+    use super::{Codec, CodecFailed};
+
     const MARK: &[u8] = b"FAKE";
 
     /// Stand-in for DPAPI on every platform: a marker, then the bytes inverted. Counts
     /// writes, and refuses to protect while `fail` is set.
     #[derive(Clone, Default)]
-    struct Fake {
-        writes: Arc<AtomicUsize>,
-        fail: Arc<AtomicBool>,
+    pub(crate) struct Fake {
+        pub(crate) writes: Arc<AtomicUsize>,
+        pub(crate) fail: Arc<AtomicBool>,
     }
 
     impl Codec for Fake {
@@ -328,6 +337,17 @@ mod tests {
             Ok(Zeroizing::new(rest.iter().map(|b| !b).collect()))
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_codec::Fake;
+    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+    use zeroize::Zeroizing;
+
+    const SECRET: &str = "dpapi-secret-value-3a9c";
 
     fn store(dir: &Path) -> (CodecStore<Fake>, Fake, PathBuf) {
         let path = fbterm_config::Paths {

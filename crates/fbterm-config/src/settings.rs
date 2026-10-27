@@ -13,6 +13,32 @@ pub enum ThemeMode {
     Light,
 }
 
+/// Where saved passwords and key passphrases live (`secret_storage`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStorage {
+    /// The system's secure storage where it works, else the encrypted vault (fbterm then
+    /// writes `"vault"` and says why once).
+    #[default]
+    Auto,
+    /// The system's secure storage: the macOS Keychain, the Linux Secret Service, or on
+    /// Windows a DPAPI-protected file in the config directory.
+    Keychain,
+    /// The encrypted vault in the config directory, opened with a main password.
+    Vault,
+}
+
+impl SecretStorage {
+    /// The value as written in `settings.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Keychain => "keychain",
+            Self::Vault => "vault",
+        }
+    }
+}
+
 /// The most redraws per second caused by program output (`max_fps`). Typing, scrolling and
 /// resizing always redraw at once; this only caps how often streaming output is drawn.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -113,6 +139,9 @@ pub struct Settings {
     pub max_fps: MaxFps,
     /// Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
     pub tunnel_max_retries: u32,
+    /// Where saved secrets live. Changed through the Settings window, which moves them; a
+    /// hand edit applies on the next launch and moves nothing.
+    pub secret_storage: SecretStorage,
     /// Keyboard shortcuts changed from their defaults (the `[keys]` table).
     pub keys: KeyOverrides,
 }
@@ -130,6 +159,7 @@ impl Default for Settings {
             background_blur: false,
             max_fps: MaxFps::default(),
             tunnel_max_retries: 10,
+            secret_storage: SecretStorage::Auto,
             keys: KeyOverrides::default(),
         }
     }
@@ -353,6 +383,11 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 
 # Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
 #tunnel_max_retries = 10
+
+# Where saved passwords and key passphrases live: "auto" (the system keychain where it
+# works, else the encrypted vault), "keychain" or "vault" (an encrypted file opened with a
+# main password). Change it in the Settings window, which moves the saved secrets across.
+#secret_storage = "auto"
 
 # Keyboard shortcuts changed from their defaults, by action. The Keyboard section of the
 # Settings window lists every action with its chord and changes them for you.

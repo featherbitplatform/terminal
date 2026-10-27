@@ -15,10 +15,12 @@ use crate::ui::{self, MONO};
 
 const CARD_WIDTH: f32 = 460.0;
 
+/// `storage`: where a remembered secret goes, for the `Remember` checkbox.
 pub fn view<'a>(
     t: &'static Tokens,
     window: window::Id,
     dialog: &'a Dialog,
+    storage: fbterm_secrets::Storage,
 ) -> Element<'a, Message> {
     let msg = move |m| Message::Prompt(m);
     let body: Element<'a, Message> = match dialog {
@@ -235,7 +237,7 @@ pub fn view<'a>(
                 .align_y(Alignment::Center),
                 field_col,
                 checkbox(*remember)
-                    .label("Remember in keychain")
+                    .label(crate::saved_secrets::remember_label(storage))
                     .on_toggle(move |b| msg(PromptMsg::Remember(window, b)))
                     .font(UI_FONT)
                     .text_size(13)

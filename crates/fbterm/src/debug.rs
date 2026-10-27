@@ -142,10 +142,47 @@ impl App {
 
     /// `FBTERM_OPEN_SETTINGS=1` (debug aid): open the Settings window at startup.
     pub(crate) fn open_debug_settings(&mut self) -> Task<Message> {
-        if debug_env("FBTERM_OPEN_SETTINGS").is_none() {
+        let Some(value) = debug_env("FBTERM_OPEN_SETTINGS") else {
+            return Task::none();
+        };
+        let open = self.open_settings();
+        let page = self.settings_win.as_ref().map(|(_, s)| s.page.clone());
+        match page {
+            // `secrets`: scrolled down to the Saved secrets section once it is laid out.
+            Some(page) if value == "secrets" => open.chain(
+                Task::perform(
+                    async { tokio::time::sleep(std::time::Duration::from_millis(400)).await },
+                    |()| (),
+                )
+                .then(move |()| {
+                    iced::widget::operation::scroll_to(
+                        page.clone(),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: 470.0 },
+                    )
+                }),
+            ),
+            _ => open,
+        }
+    }
+
+    /// `FBTERM_DEMO_VAULT=1` (debug aid, with `FBTERM_SECRETS=memory` only): make the
+    /// in-memory backend's vault in its temporary folder (main password `demo`) at startup,
+    /// on the blocking pool, so Settings shows `Reset vault`. A screenshot waits for it.
+    pub(crate) fn open_debug_vault(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_DEMO_VAULT").is_none() || !self.backend.is_in_memory() {
             return Task::none();
         }
-        self.open_settings()
+        self.vault.demo_pending = true;
+        let backend = self.backend.clone();
+        self.run_blocking(
+            move || {
+                if let Err(e) = backend.create_vault("demo") {
+                    tracing::warn!(error = %e, "demo vault not made");
+                }
+            },
+            |_| (),
+            |()| Message::Vault(crate::saved_secrets::VaultMsg::DemoReady),
+        )
     }
 
     /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
@@ -311,7 +348,7 @@ impl App {
         Task::batch([search, focus])
     }
 
-    /// `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed` (debug aid): show a sample dialog in the
+    /// `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword` (debug aid): show a sample dialog in the
     /// first window. Nothing waits for its answer.
     pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {
         let Some(kind) = debug_env("FBTERM_DEMO_PROMPT") else {
@@ -337,6 +374,21 @@ impl App {
                 profile: "bastion".into(),
                 reply: tokio::sync::oneshot::channel().0,
             },
+            // The main password dialogs, as a connect and Settings show them.
+            "unlock" | "setpassword" => {
+                let (kind, purpose) = if kind == "unlock" {
+                    (
+                        crate::saved_secrets::Kind::Unlock,
+                        crate::saved_secrets::Purpose::Connect,
+                    )
+                } else {
+                    (
+                        crate::saved_secrets::Kind::Set,
+                        crate::saved_secrets::Purpose::Switch(fbterm_config::SecretStorage::Vault),
+                    )
+                };
+                return self.open_vault_dialog(w, kind, purpose);
+            }
             "changed" => {
                 self.prompts.push(
                     w,

@@ -17,14 +17,14 @@ pub use dpapi::DpapiStore;
 #[cfg(not(windows))]
 pub use keychain::KeychainStore;
 pub use vault::VaultStore;
+pub use zeroize::Zeroizing;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::path::{Path, PathBuf};
 
-use fbterm_config::{Paths, ProfileId};
-use parking_lot::Mutex;
+use fbterm_config::{Paths, ProfileId, SecretStorage};
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -63,6 +63,13 @@ pub enum SecretError {
     /// sentence for the user, never secret material or raw parser output.
     #[error("{0}")]
     Storage(String),
+    /// Saved secrets use the encrypted vault, and it has no main password yet.
+    #[error("Saved secrets need a main password.")]
+    NoMainPassword,
+    /// A storage switch copied the secrets but did not read the same ones back: nothing was
+    /// removed from the old storage.
+    #[error("The copied secrets did not read back the same.")]
+    NotVerified,
 }
 
 pub trait SecretStore: Send + Sync {
@@ -87,12 +94,29 @@ pub trait SecretStore: Send + Sync {
         Ok(out)
     }
 
-    /// Save several secrets. The default sets them one by one; stores whose every write is
-    /// expensive (the vault re-encrypts its whole file) save them in one write.
+    /// Save several secrets. The default sets them one by one and is NOT atomic: an error
+    /// part way leaves the earlier ones saved. Stores whose every write is expensive (the
+    /// vault re-encrypts its whole file) override it with one write, which is all or nothing.
     fn set_many(&self, items: &[SecretEntry]) -> Result<(), SecretError> {
         for (id, kind, value) in items {
             self.set(id, *kind, value)?;
         }
+        Ok(())
+    }
+
+    /// Forget every secret of these profiles. Like [`Self::set_many`], the default removes
+    /// them one by one and is not atomic; the vault overrides it with one write.
+    fn remove_many(&self, ids: &[ProfileId]) -> Result<(), SecretError> {
+        for id in ids {
+            self.remove(id)?;
+        }
+        Ok(())
+    }
+
+    /// Open a store that needs the user's main password (the encrypted vault). Stores
+    /// without one have nothing to open and accept anything. Runs scrypt for the vault:
+    /// never call it on the UI thread.
+    fn unlock_vault(&self, _main_password: &str) -> Result<(), SecretError> {
         Ok(())
     }
 }
@@ -131,7 +155,7 @@ impl ProfileSecrets {
     }
 }
 
-/// In-memory store: used by tests and as the session fallback.
+/// In-memory store: used by tests and by `FBTERM_SECRETS=memory`.
 #[derive(Default)]
 pub struct MemoryStore {
     map: Mutex<HashMap<ProfileId, ProfileSecrets>>,
@@ -181,81 +205,316 @@ pub fn system_store(paths: &Paths) -> Box<dyn SecretStore> {
     }
 }
 
-/// System storage first; after its first error everything goes to a session-only
-/// in-memory store (the system storage is not retried).
-pub struct FallbackStore {
-    primary: Box<dyn SecretStore>,
-    session: MemoryStore,
-    degraded: AtomicBool,
+/// Which storage holds saved secrets now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Storage {
+    /// The system's secure storage ([`system_store`]).
+    System,
+    /// The encrypted vault (`<config>/secrets.fbvault`).
+    Vault,
 }
 
-impl FallbackStore {
-    /// Over [`system_store`] for the config directory of `paths`.
-    pub fn new(paths: &Paths) -> Self {
-        Self::with_primary(system_store(paths))
+impl Storage {
+    /// The storage a `secret_storage` setting starts with (Auto starts with the system's and
+    /// may move to the vault once, see [`SecretBackend::detect_auto`]).
+    pub fn for_setting(setting: SecretStorage) -> Self {
+        match setting {
+            SecretStorage::Auto | SecretStorage::Keychain => Self::System,
+            SecretStorage::Vault => Self::Vault,
+        }
+    }
+}
+
+/// What the vault in use needs before secrets can be saved or read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MainPassword {
+    /// The vault exists and is locked: `Unlock saved secrets`.
+    Unlock,
+    /// No vault yet: `Set a main password`.
+    Set,
+}
+
+/// The app's secret store: the system's storage or the encrypted vault, whichever the
+/// `secret_storage` setting chose, behind one [`SecretStore`].
+///
+/// Every call runs against the storage in use under a read lock, and a switch holds the write
+/// lock for the whole move, so a call in flight finishes before a switch starts and a call
+/// made during one waits for it. Vault calls run scrypt or wait on a write that does: callers
+/// keep every call off the UI thread.
+///
+/// With the vault in use but locked, calls fail with [`SecretError::Locked`]; with no vault
+/// file yet, reads find nothing and saves fail with [`SecretError::NoMainPassword`].
+pub struct SecretBackend {
+    active: RwLock<Storage>,
+    system: Box<dyn SecretStore>,
+    vault: VaultStore,
+    vault_path: PathBuf,
+    /// The setting at startup was `"auto"`: [`Self::detect_auto`] may move to the vault.
+    auto: bool,
+    /// The memory backend's temporary folder (holding its vault), removed on drop.
+    temp_dir: Option<PathBuf>,
+}
+
+impl SecretBackend {
+    /// The backend for `setting` over the system storage and vault of `paths`. Nothing is
+    /// read until the first call.
+    pub fn new(setting: SecretStorage, paths: &Paths) -> Self {
+        Self::with_system(setting, system_store(paths), paths.vault())
     }
 
-    pub(crate) fn with_primary(primary: Box<dyn SecretStore>) -> Self {
+    /// The backend of `FBTERM_SECRETS=memory` and tests: an in-memory system storage and a
+    /// vault in a fresh temporary folder (removed when the backend drops), so switching works
+    /// without touching the real keychain, DPAPI file or config folder. `setting` only picks
+    /// the storage to start with (Auto never moves: the memory store always works).
+    pub fn in_memory(setting: SecretStorage) -> Self {
+        let dir = std::env::temp_dir().join(format!(
+            "fbterm-memory-secrets-{}-{}",
+            std::process::id(),
+            next_temp()
+        ));
+        let setting = match setting {
+            SecretStorage::Auto => SecretStorage::Keychain,
+            other => other,
+        };
+        let mut backend = Self::with_system(
+            setting,
+            Box::new(MemoryStore::new()),
+            dir.join("secrets.fbvault"),
+        );
+        backend.temp_dir = Some(dir);
+        backend
+    }
+
+    /// The backend over any system store, with its vault at `vault_path`.
+    pub fn with_system(
+        setting: SecretStorage,
+        system: Box<dyn SecretStore>,
+        vault_path: PathBuf,
+    ) -> Self {
         Self {
-            primary,
-            session: MemoryStore::new(),
-            degraded: AtomicBool::new(false),
+            active: RwLock::new(Storage::for_setting(setting)),
+            system,
+            vault: VaultStore::new(),
+            vault_path,
+            auto: setting == SecretStorage::Auto,
+            temp_dir: None,
         }
     }
 
-    /// True once the system storage failed and secrets are session-only.
-    pub fn degraded(&self) -> bool {
-        self.degraded.load(Ordering::SeqCst)
+    pub fn active(&self) -> Storage {
+        *self.active.read()
     }
 
-    fn degrade(&self, err: &SecretError) {
-        if !self.degraded.swap(true, Ordering::SeqCst) {
-            tracing::warn!(error = %err, "system secret storage unavailable; keeping secrets for this session only");
+    pub fn vault_path(&self) -> &Path {
+        &self.vault_path
+    }
+
+    pub fn vault_exists(&self) -> bool {
+        VaultStore::exists(&self.vault_path)
+    }
+
+    pub fn vault_unlocked(&self) -> bool {
+        self.vault.is_unlocked()
+    }
+
+    /// Whether this is the [`Self::in_memory`] backend (its vault in a temporary folder).
+    pub fn is_in_memory(&self) -> bool {
+        self.temp_dir.is_some()
+    }
+
+    /// What the storage in use needs before it can save: `None` for the system storage or an
+    /// unlocked vault.
+    pub fn needs_main_password(&self) -> Option<MainPassword> {
+        if self.active() == Storage::System || self.vault.is_unlocked() {
+            None
+        } else if self.vault_exists() {
+            Some(MainPassword::Unlock)
+        } else {
+            Some(MainPassword::Set)
         }
     }
 
-    /// Run `op` on the primary unless degraded; on error degrade and return None.
-    fn try_primary<T>(
-        &self,
-        op: impl FnOnce(&dyn SecretStore) -> Result<T, SecretError>,
-    ) -> Option<T> {
-        if self.degraded() {
-            return None;
+    /// Auto at startup: when the system storage does not work at all (no secret service on
+    /// Linux, say), use the vault from now on. Probes once with one read; returns whether it
+    /// switched (the app then writes `"vault"` and says why once). Not for the UI thread.
+    pub fn detect_auto(&self) -> bool {
+        let mut active = self.active.write();
+        if !self.auto || *active != Storage::System {
+            return false;
         }
-        match op(self.primary.as_ref()) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                self.degrade(&e);
-                None
+        // Only "not there at all" counts: a damaged or unreadable item is still the user's
+        // storage, and moving away from it would hide those secrets.
+        // One read of an id nothing has: every store reads its item or file for it.
+        match self.system.get(&ProfileId::new(), SecretKind::Password) {
+            Err(SecretError::Backend(e)) => {
+                tracing::warn!(error = %e, "system secret storage unavailable; using the encrypted vault");
+                *active = Storage::Vault;
+                true
             }
+            _ => false,
+        }
+    }
+
+    /// Make the vault with `main_password` and leave it unlocked (no vault may exist yet).
+    pub fn create_vault(&self, main_password: &str) -> Result<(), SecretError> {
+        self.vault.create(&self.vault_path, main_password)
+    }
+
+    /// `Reset vault`: delete the vault file and forget its contents and main password. The
+    /// storage in use stays as it is: with the vault in use, the next save asks for a new
+    /// main password.
+    pub fn reset_vault(&self) -> Result<(), SecretError> {
+        // No call is in flight on the vault while it goes.
+        let _active = self.active.write();
+        self.vault.reset(&self.vault_path)
+    }
+
+    /// The store behind `storage`.
+    fn store(&self, storage: Storage) -> &dyn SecretStore {
+        match storage {
+            Storage::System => self.system.as_ref(),
+            Storage::Vault => &self.vault,
+        }
+    }
+
+    /// Make the vault usable for a switch: unlocked, created with `main_password` when there
+    /// is none and `create` allows it.
+    fn open_vault(&self, main_password: Option<&str>, create: bool) -> Result<(), SecretError> {
+        if self.vault.is_unlocked() {
+            return Ok(());
+        }
+        let exists = self.vault_exists();
+        match main_password {
+            None if exists => Err(SecretError::Locked),
+            None => Err(SecretError::NoMainPassword),
+            Some(pw) if exists => self.vault.unlock(&self.vault_path, pw),
+            Some(pw) if create => self.vault.create(&self.vault_path, pw),
+            // Moving away from a vault that does not exist: nothing to read.
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Run `op` on the storage in use (see the type's notes on a vault with no file).
+    fn with_active<T>(
+        &self,
+        missing: impl FnOnce() -> Result<T, SecretError>,
+        op: impl FnOnce(&dyn SecretStore) -> Result<T, SecretError>,
+    ) -> Result<T, SecretError> {
+        let active = self.active.read();
+        if *active == Storage::Vault && !self.vault.is_unlocked() && !self.vault_exists() {
+            return missing();
+        }
+        op(self.store(*active))
+    }
+
+    /// Move every saved secret of `ids` to `target` and use it from now on.
+    ///
+    /// The secrets are read from the storage in use, written to `target`, read back and
+    /// compared, and only then removed from the old storage. A failed read of the old
+    /// storage, a failed write or a different read-back cancels the switch: the old storage
+    /// keeps everything and stays in use. Moving to the vault creates it with
+    /// `main_password` when there is none, else unlocks it; moving away from a locked vault
+    /// unlocks it first. A failure to clear the old storage after the move is logged (the
+    /// secrets are safe in the new one).
+    pub fn switch_to(
+        &self,
+        target: Storage,
+        main_password: Option<&str>,
+        ids: &[ProfileId],
+    ) -> Result<(), SecretError> {
+        let mut active = self.active.write();
+        let from = *active;
+        if from == target {
+            return Ok(());
+        }
+        // The vault's side first: reading from a locked vault needs it unlocked, and writing
+        // to the vault needs it made or unlocked. A vault being left that was never made
+        // holds nothing.
+        let old_vault_missing = from == Storage::Vault && !self.vault_exists();
+        if from == Storage::Vault && !old_vault_missing {
+            self.open_vault(main_password, false)?;
+        }
+        let old = self.store(from);
+        let moving = if old_vault_missing {
+            Vec::new()
+        } else {
+            old.entries(ids)?
+        };
+        if target == Storage::Vault {
+            self.open_vault(main_password, true)?;
+        }
+        let new = self.store(target);
+        new.set_many(&moving)?;
+        let found: HashMap<(ProfileId, SecretKind), Zeroizing<String>> = new
+            .entries(ids)?
+            .into_iter()
+            .map(|(id, kind, value)| ((id, kind), value))
+            .collect();
+        let verified = moving
+            .iter()
+            .all(|(id, kind, value)| found.get(&(*id, *kind)).is_some_and(|v| v == value));
+        if !verified {
+            return Err(SecretError::NotVerified);
+        }
+        *active = target;
+        tracing::info!(?target, moved = moving.len(), "saved secrets moved");
+        let mut holders: Vec<ProfileId> = moving.iter().map(|(id, _, _)| *id).collect();
+        holders.sort();
+        holders.dedup();
+        if let Err(e) = old.remove_many(&holders) {
+            tracing::warn!(error = %e, "moved secrets could not be removed from the old storage");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for SecretBackend {
+    fn drop(&mut self) {
+        if let Some(dir) = &self.temp_dir {
+            self.vault.lock();
+            let _ = std::fs::remove_dir_all(dir);
         }
     }
 }
 
-impl SecretStore for FallbackStore {
+/// Numbers the memory backends' temporary folders within this process.
+fn next_temp() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+impl SecretStore for SecretBackend {
     fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError> {
-        match self.try_primary(|p| p.get(id, kind)) {
-            Some(v) => Ok(v),
-            None => self.session.get(id, kind),
-        }
+        self.with_active(|| Ok(None), |s| s.get(id, kind))
     }
     fn set(&self, id: &ProfileId, kind: SecretKind, value: &str) -> Result<(), SecretError> {
-        match self.try_primary(|p| p.set(id, kind, value)) {
-            Some(()) => Ok(()),
-            None => self.session.set(id, kind, value),
-        }
+        self.with_active(
+            || Err(SecretError::NoMainPassword),
+            |s| s.set(id, kind, value),
+        )
     }
     fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
-        match self.try_primary(|p| p.remove(id)) {
-            Some(()) => Ok(()),
-            None => self.session.remove(id),
-        }
+        self.with_active(|| Ok(()), |s| s.remove(id))
     }
     fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
-        match self.try_primary(|p| p.remove_kind(id, kind)) {
-            Some(()) => Ok(()),
-            None => self.session.remove_kind(id, kind),
+        self.with_active(|| Ok(()), |s| s.remove_kind(id, kind))
+    }
+    fn entries(&self, ids: &[ProfileId]) -> Result<Vec<SecretEntry>, SecretError> {
+        self.with_active(|| Ok(Vec::new()), |s| s.entries(ids))
+    }
+    fn set_many(&self, items: &[SecretEntry]) -> Result<(), SecretError> {
+        self.with_active(|| Err(SecretError::NoMainPassword), |s| s.set_many(items))
+    }
+    fn remove_many(&self, ids: &[ProfileId]) -> Result<(), SecretError> {
+        self.with_active(|| Ok(()), |s| s.remove_many(ids))
+    }
+
+    /// Unlock the vault (whether or not it is in use). An open vault accepts any answer.
+    fn unlock_vault(&self, main_password: &str) -> Result<(), SecretError> {
+        if self.vault.is_unlocked() {
+            return Ok(());
         }
+        self.vault.unlock(&self.vault_path, main_password)
     }
 }
 
@@ -265,22 +524,6 @@ mod tests {
 
     fn pid() -> ProfileId {
         ProfileId(uuid::Uuid::new_v4())
-    }
-
-    struct FailingStore;
-    impl SecretStore for FailingStore {
-        fn get(&self, _: &ProfileId, _: SecretKind) -> Result<Option<String>, SecretError> {
-            Err(SecretError::Backend("denied".into()))
-        }
-        fn set(&self, _: &ProfileId, _: SecretKind, _: &str) -> Result<(), SecretError> {
-            Err(SecretError::Backend("denied".into()))
-        }
-        fn remove(&self, _: &ProfileId) -> Result<(), SecretError> {
-            Err(SecretError::Backend("denied".into()))
-        }
-        fn remove_kind(&self, _: &ProfileId, _: SecretKind) -> Result<(), SecretError> {
-            Err(SecretError::Backend("denied".into()))
-        }
     }
 
     #[test]
@@ -320,20 +563,6 @@ mod tests {
         s.remove_kind(&pid(), SecretKind::Password).unwrap();
     }
 
-    #[test]
-    fn fallback_remove_kind_uses_the_session_store_when_degraded() {
-        let s = FallbackStore::with_primary(Box::new(FailingStore));
-        let id = pid();
-        s.set(&id, SecretKind::Password, "pw").unwrap();
-        s.set(&id, SecretKind::KeyPassphrase, "pp").unwrap();
-        s.remove_kind(&id, SecretKind::Password).unwrap();
-        assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
-        assert_eq!(
-            s.get(&id, SecretKind::KeyPassphrase).unwrap().as_deref(),
-            Some("pp")
-        );
-    }
-
     fn entry(id: ProfileId, kind: SecretKind, value: &str) -> SecretEntry {
         (id, kind, Zeroizing::new(value.to_owned()))
     }
@@ -360,19 +589,379 @@ mod tests {
         assert!(s.entries(&[]).unwrap().is_empty());
     }
 
-    #[test]
-    fn fallback_serves_session_secrets_when_primary_fails() {
-        let s = FallbackStore::with_primary(Box::new(FailingStore));
-        let id = pid();
-        assert!(!s.degraded());
-        s.set(&id, SecretKind::Password, "pw").unwrap();
-        assert!(s.degraded());
-        assert_eq!(
-            s.get(&id, SecretKind::Password).unwrap().as_deref(),
-            Some("pw")
-        );
-        s.remove(&id).unwrap();
-        assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
+    /// The switcher between the system storage and the vault, over the fake DPAPI codec
+    /// (or an in-memory store) and a vault in a temporary folder.
+    mod backend {
+        use super::*;
+        use crate::dpapi::CodecStore;
+        use crate::dpapi::test_codec::Fake;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const MAIN: &str = "main password for backend tests";
+
+        /// A shared view of a system store, so a test can look at it after handing it over.
+        #[derive(Clone)]
+        struct Shared(Arc<dyn SecretStore>);
+        impl SecretStore for Shared {
+            fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError> {
+                self.0.get(id, kind)
+            }
+            fn set(
+                &self,
+                id: &ProfileId,
+                kind: SecretKind,
+                value: &str,
+            ) -> Result<(), SecretError> {
+                self.0.set(id, kind, value)
+            }
+            fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
+                self.0.remove(id)
+            }
+            fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+                self.0.remove_kind(id, kind)
+            }
+            fn entries(&self, ids: &[ProfileId]) -> Result<Vec<SecretEntry>, SecretError> {
+                self.0.entries(ids)
+            }
+            fn set_many(&self, items: &[SecretEntry]) -> Result<(), SecretError> {
+                self.0.set_many(items)
+            }
+        }
+
+        /// A system storage that is not there at all (no secret service).
+        struct Unavailable;
+        impl SecretStore for Unavailable {
+            fn get(&self, _: &ProfileId, _: SecretKind) -> Result<Option<String>, SecretError> {
+                Err(SecretError::Backend("no secret service".into()))
+            }
+            fn set(&self, _: &ProfileId, _: SecretKind, _: &str) -> Result<(), SecretError> {
+                Err(SecretError::Backend("no secret service".into()))
+            }
+            fn remove(&self, _: &ProfileId) -> Result<(), SecretError> {
+                Err(SecretError::Backend("no secret service".into()))
+            }
+            fn remove_kind(&self, _: &ProfileId, _: SecretKind) -> Result<(), SecretError> {
+                Err(SecretError::Backend("no secret service".into()))
+            }
+        }
+
+        /// A store over `inner` whose reads fail while `fail_reads` is set, and which
+        /// counts removals and can drop writes silently.
+        #[derive(Default)]
+        struct Flaky {
+            inner: MemoryStore,
+            fail_reads: AtomicBool,
+            fail_writes: AtomicBool,
+            lose_writes: AtomicBool,
+            removals: AtomicUsize,
+        }
+        impl Flaky {
+            fn read(&self) -> Result<(), SecretError> {
+                if self.fail_reads.load(Ordering::SeqCst) {
+                    return Err(SecretError::Backend("read denied".into()));
+                }
+                Ok(())
+            }
+            fn write(&self) -> Result<bool, SecretError> {
+                if self.fail_writes.load(Ordering::SeqCst) {
+                    return Err(SecretError::Backend("write denied".into()));
+                }
+                Ok(!self.lose_writes.load(Ordering::SeqCst))
+            }
+        }
+        impl SecretStore for Flaky {
+            fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError> {
+                self.read()?;
+                self.inner.get(id, kind)
+            }
+            fn set(
+                &self,
+                id: &ProfileId,
+                kind: SecretKind,
+                value: &str,
+            ) -> Result<(), SecretError> {
+                if self.write()? {
+                    self.inner.set(id, kind, value)?;
+                }
+                Ok(())
+            }
+            fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
+                self.removals.fetch_add(1, Ordering::SeqCst);
+                self.inner.remove(id)
+            }
+            fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+                self.removals.fetch_add(1, Ordering::SeqCst);
+                self.inner.remove_kind(id, kind)
+            }
+        }
+
+        fn dpapi_store(dir: &Path) -> Arc<dyn SecretStore> {
+            let path = Paths {
+                config_dir: dir.to_path_buf(),
+            }
+            .dpapi();
+            Arc::new(CodecStore::with_codec(path, Fake::default()))
+        }
+
+        fn backend(
+            setting: SecretStorage,
+            system: Arc<dyn SecretStore>,
+            dir: &Path,
+        ) -> SecretBackend {
+            let paths = Paths {
+                config_dir: dir.to_path_buf(),
+            };
+            SecretBackend::with_system(setting, Box::new(Shared(system)), paths.vault())
+        }
+
+        /// Two profiles' secrets: a password, and a password plus a passphrase.
+        fn sample() -> (Vec<ProfileId>, Vec<SecretEntry>) {
+            let (a, b) = (pid(), pid());
+            let items = vec![
+                entry(a, SecretKind::Password, "pw-a-5c1e"),
+                entry(b, SecretKind::Password, "pw-b-\u{e9}"),
+                entry(b, SecretKind::KeyPassphrase, "pp-b-77d0"),
+            ];
+            (vec![a, b, pid()], items)
+        }
+
+        #[test]
+        fn auto_uses_keychain_when_it_works() {
+            let dir = tempfile::tempdir().unwrap();
+            let system = dpapi_store(dir.path());
+            let b = backend(SecretStorage::Auto, system.clone(), dir.path());
+            assert!(!b.detect_auto(), "the system storage works");
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(b.needs_main_password(), None);
+            let id = pid();
+            b.set(&id, SecretKind::Password, "pw").unwrap();
+            assert_eq!(
+                system.get(&id, SecretKind::Password).unwrap().as_deref(),
+                Some("pw")
+            );
+            assert_eq!(
+                b.get(&id, SecretKind::Password).unwrap().as_deref(),
+                Some("pw")
+            );
+            assert!(!b.vault_exists(), "no vault is made");
+        }
+
+        #[test]
+        fn auto_switches_when_keychain_unavailable() {
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(SecretStorage::Auto, Arc::new(Unavailable), dir.path());
+            assert!(b.detect_auto());
+            assert_eq!(b.active(), Storage::Vault);
+            // No vault yet: nothing is saved, and a save needs a main password first.
+            assert_eq!(b.needs_main_password(), Some(MainPassword::Set));
+            let id = pid();
+            assert_eq!(b.get(&id, SecretKind::Password).unwrap(), None);
+            assert!(b.entries(&[id]).unwrap().is_empty());
+            b.remove(&id).unwrap();
+            assert!(matches!(
+                b.set(&id, SecretKind::Password, "pw"),
+                Err(SecretError::NoMainPassword)
+            ));
+            assert!(!b.detect_auto(), "probed once: already switched");
+
+            b.create_vault(MAIN).unwrap();
+            assert_eq!(b.needs_main_password(), None);
+            b.set(&id, SecretKind::Password, "pw").unwrap();
+            assert_eq!(
+                b.get(&id, SecretKind::Password).unwrap().as_deref(),
+                Some("pw")
+            );
+
+            // An explicit keychain choice is kept even when the keychain fails.
+            let other = tempfile::tempdir().unwrap();
+            let b = backend(SecretStorage::Keychain, Arc::new(Unavailable), other.path());
+            assert!(!b.detect_auto());
+            assert_eq!(b.active(), Storage::System);
+        }
+
+        #[test]
+        fn switch_to_vault_moves_everything() {
+            let dir = tempfile::tempdir().unwrap();
+            let system = dpapi_store(dir.path());
+            let (ids, items) = sample();
+            system.set_many(&items).unwrap();
+            let b = backend(SecretStorage::Keychain, system.clone(), dir.path());
+
+            assert!(matches!(
+                b.switch_to(Storage::Vault, None, &ids),
+                Err(SecretError::NoMainPassword)
+            ));
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(plain(system.entries(&ids).unwrap()), plain(items.clone()));
+
+            b.switch_to(Storage::Vault, Some(MAIN), &ids).unwrap();
+            assert_eq!(b.active(), Storage::Vault);
+            assert!(
+                system.entries(&ids).unwrap().is_empty(),
+                "moved, not copied"
+            );
+            assert_eq!(plain(b.entries(&ids).unwrap()), plain(items.clone()));
+
+            // The file holds them: a fresh vault opened with the main password sees them all.
+            let fresh = VaultStore::new();
+            fresh.unlock(b.vault_path(), MAIN).unwrap();
+            assert_eq!(plain(fresh.entries(&ids).unwrap()), plain(items));
+            // Switching to the storage in use changes nothing.
+            b.switch_to(Storage::Vault, None, &ids).unwrap();
+        }
+
+        #[test]
+        fn switch_back_to_keychain_moves_everything() {
+            let dir = tempfile::tempdir().unwrap();
+            let system = dpapi_store(dir.path());
+            let (ids, items) = sample();
+            let b = backend(SecretStorage::Vault, system.clone(), dir.path());
+            b.create_vault(MAIN).unwrap();
+            b.set_many(&items).unwrap();
+
+            // A new session: the vault is locked until the main password is given.
+            let b = backend(SecretStorage::Vault, system.clone(), dir.path());
+            assert_eq!(b.needs_main_password(), Some(MainPassword::Unlock));
+            assert!(matches!(
+                b.get(&ids[0], SecretKind::Password),
+                Err(SecretError::Locked)
+            ));
+            assert!(matches!(
+                b.switch_to(Storage::System, None, &ids),
+                Err(SecretError::Locked)
+            ));
+            assert!(matches!(
+                b.switch_to(Storage::System, Some("not it"), &ids),
+                Err(SecretError::WrongMainPassword)
+            ));
+            assert_eq!(b.active(), Storage::Vault);
+
+            b.switch_to(Storage::System, Some(MAIN), &ids).unwrap();
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(plain(system.entries(&ids).unwrap()), plain(items.clone()));
+            assert_eq!(plain(b.entries(&ids).unwrap()), plain(items));
+            // The vault no longer holds them.
+            let fresh = VaultStore::new();
+            fresh.unlock(b.vault_path(), MAIN).unwrap();
+            assert!(fresh.entries(&ids).unwrap().is_empty());
+        }
+
+        #[test]
+        fn switch_aborts_when_old_store_unreadable() {
+            let dir = tempfile::tempdir().unwrap();
+            let flaky = Arc::new(Flaky::default());
+            let (ids, items) = sample();
+            flaky.set_many(&items).unwrap();
+            let b = backend(SecretStorage::Keychain, flaky.clone(), dir.path());
+
+            // The keychain errors on read: nothing moved, nothing deleted, no vault made.
+            flaky.fail_reads.store(true, Ordering::SeqCst);
+            let err = b.switch_to(Storage::Vault, Some(MAIN), &ids).unwrap_err();
+            assert!(matches!(err, SecretError::Backend(_)), "{err:?}");
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(flaky.removals.load(Ordering::SeqCst), 0);
+            assert!(!b.vault_exists());
+            flaky.fail_reads.store(false, Ordering::SeqCst);
+            assert_eq!(plain(flaky.entries(&ids).unwrap()), plain(items.clone()));
+
+            // Into the vault and back, with the keychain refusing the write: the vault keeps
+            // everything and stays in use.
+            b.switch_to(Storage::Vault, Some(MAIN), &ids).unwrap();
+            assert!(flaky.entries(&ids).unwrap().is_empty());
+            let removals = flaky.removals.load(Ordering::SeqCst);
+            flaky.fail_writes.store(true, Ordering::SeqCst);
+            assert!(b.switch_to(Storage::System, None, &ids).is_err());
+            assert_eq!(b.active(), Storage::Vault);
+            assert_eq!(plain(b.entries(&ids).unwrap()), plain(items.clone()));
+
+            // A write that reads back different: cancelled, nothing removed from the vault.
+            flaky.fail_writes.store(false, Ordering::SeqCst);
+            flaky.lose_writes.store(true, Ordering::SeqCst);
+            let err = b.switch_to(Storage::System, None, &ids).unwrap_err();
+            assert!(matches!(err, SecretError::NotVerified), "{err:?}");
+            assert_eq!(b.active(), Storage::Vault);
+            assert_eq!(plain(b.entries(&ids).unwrap()), plain(items));
+            assert_eq!(flaky.removals.load(Ordering::SeqCst), removals);
+        }
+
+        #[test]
+        fn reset_vault_forgets_secrets_and_asks_for_a_new_main_password() {
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            );
+            b.create_vault(MAIN).unwrap();
+            let id = pid();
+            b.set(&id, SecretKind::Password, "pw").unwrap();
+            b.reset_vault().unwrap();
+            assert!(!b.vault_exists());
+            assert!(!b.vault_unlocked());
+            assert_eq!(b.active(), Storage::Vault, "still the vault");
+            assert_eq!(b.needs_main_password(), Some(MainPassword::Set));
+            assert_eq!(b.get(&id, SecretKind::Password).unwrap(), None);
+            // A locked vault resets too (a forgotten main password).
+            b.create_vault("another").unwrap();
+            let b = backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            );
+            assert_eq!(b.needs_main_password(), Some(MainPassword::Unlock));
+            b.reset_vault().unwrap();
+            assert!(!b.vault_exists());
+        }
+
+        #[test]
+        fn unlock_opens_the_vault_in_use() {
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            );
+            b.create_vault(MAIN).unwrap();
+            let id = pid();
+            b.set(&id, SecretKind::Password, "pw").unwrap();
+            let b = backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            );
+            assert!(matches!(
+                b.unlock_vault("wrong"),
+                Err(SecretError::WrongMainPassword)
+            ));
+            assert!(!b.vault_unlocked());
+            b.unlock_vault(MAIN).unwrap();
+            assert_eq!(
+                b.get(&id, SecretKind::Password).unwrap().as_deref(),
+                Some("pw")
+            );
+            // Already open: any answer does (the app may answer a waiting connect late).
+            b.unlock_vault("").unwrap();
+        }
+
+        #[test]
+        fn memory_backend_switches_in_a_temporary_folder() {
+            let b = SecretBackend::in_memory(SecretStorage::Auto);
+            let folder = b.vault_path().parent().unwrap().to_path_buf();
+            assert!(folder.starts_with(std::env::temp_dir()));
+            let (ids, items) = sample();
+            b.set_many(&items).unwrap();
+            b.switch_to(Storage::Vault, Some(MAIN), &ids).unwrap();
+            assert!(b.vault_exists());
+            drop(b);
+            assert!(!folder.exists(), "removed with the backend");
+        }
+
+        #[test]
+        fn backend_is_send_and_sync() {
+            fn check<T: Send + Sync>() {}
+            check::<SecretBackend>();
+        }
     }
 
     /// The OS keychain store (not built on Windows, whose system storage is DPAPI).
@@ -431,15 +1020,17 @@ mod tests {
         }
 
         #[test]
-        fn fallback_remove_kind_reaches_the_keychain() {
+        fn backend_remove_kind_reaches_the_keychain() {
             let mock = Arc::new(MockBlob::default());
-            let s = FallbackStore::with_primary(Box::new(KeychainStore::with_backend(Box::new(
-                mock.clone(),
-            ))));
+            let dir = tempfile::tempdir().unwrap();
+            let s = SecretBackend::with_system(
+                SecretStorage::Keychain,
+                Box::new(KeychainStore::with_backend(Box::new(mock.clone()))),
+                dir.path().join("secrets.fbvault"),
+            );
             let id = pid();
             s.set(&id, SecretKind::Password, "pw").unwrap();
             s.remove_kind(&id, SecretKind::Password).unwrap();
-            assert!(!s.degraded());
             assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
             assert!(!mock.blob.lock().clone().unwrap().contains("pw"));
         }

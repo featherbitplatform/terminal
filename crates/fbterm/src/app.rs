@@ -9,7 +9,7 @@ use std::time::Duration;
 use fbterm_config::{
     ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, Settings, discover_shells,
 };
-use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
+use fbterm_secrets::{SecretBackend, SecretStore};
 use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
@@ -165,6 +165,10 @@ pub enum Message {
     /// Exporting a tab to a file.
     Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
+    /// The main password dialogs and moving saved secrets.
+    Vault(crate::saved_secrets::VaultMsg),
+    /// The secret changes of profile editor save `seq` ran.
+    EditorSecrets(u64, Delivered<Result<crate::editor::SecretResults, String>>),
     Shoot,
     Shot(Screenshot),
     /// The OS close button (or equivalent) was used on a window; see [`App::close_requested`].
@@ -226,8 +230,13 @@ pub struct App {
     /// While set, nothing may save the profile store: that would overwrite the user's file.
     pub profiles_error: Option<ConfigError>,
     pub(crate) paths: Paths,
+    /// Saved secrets, wherever `secret_storage` keeps them: the same store as `backend`,
+    /// shared with the connection pool, the editor and the archive window. Every call may
+    /// reach the vault, so none is made on the UI thread.
     pub(crate) secrets: Arc<dyn fbterm_secrets::SecretStore>,
-    pub(crate) fallback: Option<Arc<FallbackStore>>,
+    pub(crate) backend: Arc<SecretBackend>,
+    /// The main password dialogs, moving secrets and the Settings section's state.
+    pub(crate) vault: crate::saved_secrets::VaultUi,
     pub(crate) pool: Arc<SshPool>,
     /// Every tunnel that has run, with its state (see [`crate::tunnels`]).
     pub(crate) tunnels: Tunnels,
@@ -271,6 +280,8 @@ pub struct App {
     pub find_box: Option<FindAll>,
     /// The profile editor window, when open.
     pub editor: Option<(window::Id, EditorState)>,
+    /// Numbers the editor's saves, so the result of one for a replaced editor is dropped.
+    pub(crate) editor_seq: u64,
     /// The Settings window, when open.
     pub settings_win: Option<(window::Id, SettingsState)>,
     /// The Color schemes window, when open.
@@ -347,6 +358,31 @@ pub struct App {
     pub(crate) exporting: Option<window::Id>,
     /// The last export's outcome, shown in the window it ran in until dismissed.
     pub(crate) export_notice: Option<crate::export::ExportNotice>,
+}
+
+impl App {
+    /// Run `job` on the blocking pool and deliver its result as `done(result)`: at once
+    /// when `blocking_inline` (tests, whose tasks never run). `fallback` stands in for the
+    /// result if the job panics.
+    pub(crate) fn run_blocking<T: Send + 'static>(
+        &mut self,
+        job: impl FnOnce() -> T + Send + 'static,
+        fallback: fn(String) -> T,
+        done: impl FnOnce(T) -> Message + Send + 'static,
+    ) -> Task<Message> {
+        if self.blocking_inline {
+            let msg = done(job());
+            return self.update(msg);
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(job)
+                    .await
+                    .unwrap_or_else(|e| fallback(e.to_string()))
+            },
+            done,
+        )
+    }
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -469,12 +505,12 @@ impl App {
         let profiles_seen = std::fs::read_to_string(paths.profiles()).ok();
         let settings_seen = std::fs::read_to_string(paths.settings()).ok();
 
-        let (secrets, fallback): (Arc<dyn SecretStore>, _) = if memory_secrets {
-            (Arc::new(MemoryStore::new()), None)
+        let backend = Arc::new(if memory_secrets {
+            SecretBackend::in_memory(settings.secret_storage)
         } else {
-            let store = Arc::new(FallbackStore::new(&paths));
-            (store.clone(), Some(store))
-        };
+            SecretBackend::new(settings.secret_storage, &paths)
+        });
+        let secrets: Arc<dyn SecretStore> = backend.clone();
         let known_hosts = directories::BaseDirs::new()
             .map(|d| d.home_dir().join(".ssh").join("known_hosts"))
             .unwrap_or_else(|| PathBuf::from("known_hosts"));
@@ -507,7 +543,8 @@ impl App {
             profiles_error,
             paths,
             secrets,
-            fallback,
+            backend,
+            vault: Default::default(),
             pool,
             events,
             receiver: EventReceiver::new(rx),
@@ -528,6 +565,7 @@ impl App {
             hover_generation: 0,
             find_box: None,
             editor: None,
+            editor_seq: 0,
             settings_win: None,
             schemes_win: None,
             tunnels_win: None,
@@ -579,6 +617,12 @@ impl App {
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
+        // The in-memory store always works: only a real system storage is checked.
+        let detect = if memory_secrets {
+            Task::none()
+        } else {
+            app.detect_auto_storage()
+        };
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -594,7 +638,8 @@ impl App {
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
         task = task.chain(app.open_debug_files());
-        (app, task)
+        let demo_vault = app.open_debug_vault();
+        (app, Task::batch([detect, demo_vault, task]))
     }
 
     /// The first local profile, preferring the user's login shell.
@@ -612,7 +657,7 @@ impl App {
             .map(|(id, _)| id)
     }
 
-    /// Notices to show: config problems and a degraded keychain.
+    /// Notices to show: config problems, and the move to the vault when Auto made it.
     pub fn visible_notices(&self) -> Vec<String> {
         if self.notices_dismissed {
             return Vec::new();
@@ -620,9 +665,6 @@ impl App {
         let mut out = self.notices.clone();
         if self.profiles_error.is_some() {
             out.push("Profiles are read-only until profiles.toml is fixed".into());
-        }
-        if self.fallback.as_ref().is_some_and(|f| f.degraded()) {
-            out.push("Keychain unavailable: passwords are kept for this session only".into());
         }
         out
     }
@@ -876,6 +918,7 @@ impl App {
                 if self.archive_window() == Some(id) {
                     self.archive_win = None;
                 }
+                self.vault_window_closed(id);
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
                 // stop saving.
@@ -978,6 +1021,11 @@ impl App {
             Message::Tunnels(msg) => self.tunnels_msg(msg),
             Message::Archive(msg) => self.archive_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
+            Message::Vault(msg) => self.vault_msg(msg),
+            Message::EditorSecrets(seq, results) => {
+                self.editor_secrets_done(seq, results);
+                Task::none()
+            }
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
                     self.os_scales.insert(id, s);
@@ -1092,7 +1140,7 @@ impl App {
     }
 
     fn shoot(&mut self) -> Task<Message> {
-        if self.shooting {
+        if self.shooting || self.vault.demo_pending {
             return Task::none();
         }
         let target = match self.screenshot_window {

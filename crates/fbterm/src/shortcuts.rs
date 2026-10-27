@@ -15,6 +15,7 @@ use crate::find::all::FindAllMsg;
 use crate::keys::{self, Action, Bindings};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
+use crate::saved_secrets::VaultMsg;
 use crate::schemes_window::{ImportChoice, SchemesMsg};
 use crate::settings_window::SettingsMsg;
 use crate::tunnels_window::TunnelsMsg;
@@ -46,6 +47,9 @@ pub(crate) enum Mode {
     Panel,
     /// A connection dialog: Escape cancels, Enter submits; other keys go to its field.
     Prompt,
+    /// A main password dialog (`crate::saved_secrets`): Escape cancels, Enter submits, no
+    /// shortcut acts; other keys go to its fields.
+    Vault,
     /// The profile editor window: Cmd+W closes it, Cmd+S saves, Settings and Quit work; other
     /// shortcuts do nothing.
     Editor,
@@ -181,6 +185,15 @@ fn key_message(
                 Some(Some(Message::Prompt(PromptMsg::Cancel(w))))
             }
             keyboard::Key::Named(Named::Enter) => Some(Some(Message::Prompt(PromptMsg::Submit(w)))),
+            _ => shortcut.map(|_| None),
+        },
+        Mode::Vault => match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => {
+                Some(Some(Message::Vault(VaultMsg::Cancel)))
+            }
+            keyboard::Key::Named(Named::Enter) if !repeat => {
+                Some(Some(Message::Vault(VaultMsg::Submit)))
+            }
             _ => shortcut.map(|_| None),
         },
         Mode::Editor => {

@@ -50,6 +50,7 @@ pub const SCHEMES_STALE: &str =
     "The color schemes changed since the archive was opened. Open it again to import.";
 pub const SEALING: &str = "Encrypting the archive\u{2026}";
 pub const OPENING: &str = "Opening the archive\u{2026}";
+pub const STORING: &str = "Storing saved secrets\u{2026}";
 /// What an unmatched profile's row says in the match column.
 pub const NEW: &str = "New";
 
@@ -128,6 +129,8 @@ pub enum ArchiveMsg {
     KeyFolderChosen(u64, Option<PathBuf>),
     /// `Import`: apply the preview.
     Import,
+    /// The imported saved secrets were stored (how many), or why not.
+    SecretsStored(u64, Result<usize, String>),
 }
 
 /// What the window is waiting for in the background.
@@ -135,6 +138,8 @@ pub enum ArchiveMsg {
 pub enum Busy {
     Sealing,
     Opening,
+    /// Storing the imported saved secrets.
+    Storing,
 }
 
 /// A line under the form: the outcome of the last export or import.
@@ -198,6 +203,9 @@ pub struct ImportForm {
     /// Why the last step failed (open, plan, apply).
     pub problem: Option<String>,
     pub notice: Option<Notice>,
+    /// An import whose files are written, waiting for its saved secrets to be stored: what
+    /// it wrote, and whether color schemes were among it.
+    pub storing: Option<(ImportSummary, bool)>,
 }
 
 impl std::fmt::Debug for ExportForm {
@@ -263,6 +271,7 @@ impl ArchiveState {
                 key_dir: None,
                 problem: None,
                 notice: None,
+                storing: None,
             },
             busy: None,
             dialog: None,
