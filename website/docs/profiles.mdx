@@ -64,17 +64,17 @@ Without an accent, both look the same: a plain tab. The tint follows the backgro
 
 | Form | Meaning |
 | --- | --- |
-| `auth = { type = "password" }` | Ask for a password. The app can store it in the keychain. |
+| `auth = { type = "password" }` | Ask for a password. The app can remember it in the system keychain or the encrypted vault. |
 | `auth = { type = "key", path = "~/.ssh/id_ed25519" }` | Use a private key file. A leading `~` is your home directory. |
 | `auth = { type = "key", path = "~/.ssh/id_ed25519", passphrase = true }` | Same, and the key has a passphrase. `passphrase` defaults to `false`. |
-| `auth = { type = "key" }` | A private key file not chosen yet. Connecting asks you to choose it (`Choose the private key for {profile}`, opening in `~/.ssh`), and once it logs in the file is written into the profile as its `path`. |
+| `auth = { type = "key" }` | A private key file not chosen yet. Connecting asks you to choose it (`Choose the private key for {profile}`, opening in `~/.ssh`), and once the server accepts the key the file is written into the profile as its `path`. |
 | `auth = { type = "agent" }` | Use the running SSH agent. |
 
-In the profile editor, leaving the private key field empty saves a key profile without a `path`. If `profiles.toml` cannot be written (it failed to load, or the folder is read-only), the chosen file is used until the app quits and asked for again next time. Automatic reconnects and tunnels restarting in the background never ask: they stop with "needs your input" until you connect the profile once yourself.
+In the profile editor, leaving the private key field empty saves a key profile without a `path`. A profile can also arrive without a key file in an [imported archive](export-import). The chosen file is kept in memory only, until the app quits and you are asked again next time, when `profiles.toml` cannot be read, cannot be written, or was edited on disk and not reloaded yet (writing then would overwrite your edit). Automatic reconnects and tunnels restarting in the background never ask: they stop with "needs your input" until you connect the profile once yourself.
 
 When a login uses an RSA private key (from a key file or the SSH agent), the profile editor and the tab show a one-line warning suggesting an ed25519 key (`ssh-keygen -t ed25519`); the connection still works. Verifying a server's RSA host key does not warn.
 
-The file never contains a password or a passphrase. The `passphrase = true` flag only records that the key has one. The values themselves are kept in the system keychain (service `fbterm`, account `secrets`), or asked for when you connect.
+The file never contains a password or a passphrase. The `passphrase = true` flag only records that the key has one. The values themselves are kept where [saved secrets](saved-secrets) live (the system keychain or an encrypted vault), or asked for when you connect.
 
 ### Host keys
 
@@ -91,7 +91,7 @@ You can chain in two ways, and they combine:
 - **Several ids in one `jump`.** `jump = [a, b]` connects to `a`, then `b`, then the target.
 - **A hop that has its own `jump`.** In the example, `db-1` jumps through `api-1`, which itself jumps through `bastion`. Opening `db-1` connects `bastion`, then `api-1`, then `db-1`. A hop's own jumps are expanded first.
 
-Each hop authenticates with its own profile, so every hop needs a working `auth`. Tabs that share a hop reuse its connection, so opening a second host behind `bastion` does not log in to `bastion` again. [Tunnels](tunnels) ride the same connection and its jump chain.
+A profile may go through at most 32 jump hosts once every hop's own jumps are expanded; real chains are a handful. Each hop authenticates with its own profile, so every hop needs a working `auth`. Tabs that share a hop reuse its connection, so opening a second host behind `bastion` does not log in to `bastion` again. [Tunnels](tunnels) ride the same connection and its jump chain.
 
 ## Validation
 
@@ -103,8 +103,11 @@ The app validates `profiles.toml` when it loads it. Each problem is shown as a n
 | `jump` names an id that does not exist | `profile "<name>" jumps through unknown profile <id>` |
 | `jump` names a local profile | `profile "<name>" jumps through a non-SSH profile` |
 | Profiles jump through each other in a loop | `profile "<name>" has a jump cycle` |
+| A profile goes through more than 32 jump hosts (expanded) | `profile "<name>" goes through more than 32 jump hosts` |
 | `host` is empty or blank | `profile "<name>" has an empty host` |
 | A tunnel has no name, or two tunnels of a profile share one | `profile "<name>" has a tunnel without a name`, `profile "<name>" has two tunnels named "<tunnel>"` |
 | A `local` or `socks` tunnel has port `0`, a tunnel has no target port, or an empty bind address or host | `tunnel "<tunnel>" of profile "<name>" needs a port above 0` and similar |
+
+A file with a jump chain that is too long still loads, and shows the notice; the profile editor will not save until the chain is shortened.
 
 A file that is not valid TOML, or has a bad value (for example `accent = "red"`, which must be `"#rrggbb"`), is reported with its path and line number, for example `profiles.toml:12: invalid colour "red": expected "#rrggbb"`. A malformed file is never modified or overwritten, and profiles are read-only until you fix it.

@@ -9,6 +9,8 @@ const sidebars: SidebarsConfig = {
     'color-schemes',
     'tunnels',
     'file-panel',
+    'export-import',
+    'saved-secrets',
     'keyboard-shortcuts',
     'files',
   ],

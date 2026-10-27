@@ -21,6 +21,8 @@ The directory is created the first time the app writes a file. All files are TOM
 | `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles, with their tunnels. See [Profiles and jump hosts](profiles) and [Tunnels](tunnels). |
 | `settings.toml` | you (and the Settings window) | Font, scrollback, theme, background, keyboard protocol and changed keyboard shortcuts. |
 | `schemes/` | you (and the Color schemes window) | One `<id>.toml` file per color scheme of yours. See [Color schemes](color-schemes#files-and-sharing). |
+| `secrets.fbvault` | the app | Your saved passwords and passphrases, encrypted with your main password. Only exists once you use the encrypted vault. See [Saved secrets](saved-secrets). |
+| `secrets.dpapi` | the app | Windows only: your saved passwords and passphrases, encrypted for your Windows account, when saved secrets use the system storage. See [Saved secrets](saved-secrets). |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
 
 `profiles.toml` and `settings.toml` are reloaded while the app runs. If a file has a syntax error, the app reports the file and line, keeps what it had loaded, and never overwrites the broken file.
@@ -44,6 +46,7 @@ background_opacity = 1.0
 background_blur = false
 max_fps = 60
 tunnel_max_retries = 10
+secret_storage = "auto"
 ```
 
 | Field | Type | Default | Meaning |
@@ -58,6 +61,7 @@ tunnel_max_retries = 10
 | `background_blur` | `true` or `false` | `false` | Blur what shows through a see-through background. Takes effect only for windows opened while `background_opacity` is below `1.0`, so open a new window after changing it. macOS only for now. |
 | `max_fps` | integer, `30` to `240`, or `"display"` | `60` | Most redraws per second caused by program output. Typing, scrolling, selecting and resizing always redraw at once. `"display"` follows the refresh rate of the screen your windows are on (the fastest one, if they are on several screens); where the rate cannot be detected (Linux and Windows for now) it means `60`. Higher values use more CPU while output streams. Applies at once. |
 | `tunnel_max_retries` | integer, `0` to `100` | `10` | How many times a [tunnel](tunnels#reconnecting) tries to reconnect on its own after its connection drops. `0` turns automatic reconnecting off. In the Settings window this is **Reconnect attempts** under Tunnels. Applies at once. |
+| `secret_storage` | `"auto"`, `"keychain"` or `"vault"` | `"auto"` | Where [saved secrets](saved-secrets) are kept: the system storage where there is one (else the encrypted vault), the system storage, or the vault. In the Settings window this is **Saved secrets**, which also moves the secrets when you change it. A change made by hand while the app runs takes effect at the next launch and moves nothing, so prefer Settings. |
 
 ### Redraw rate
 
@@ -75,16 +79,9 @@ This file belongs to the app. It records which windows and tabs were open, each 
 
 It also keeps the [file panel](file-panel#in-statetoml)'s width (`file_panel_width`) and, once you turn hidden files off, `file_panel_show_hidden = false`.
 
-## Secrets and the keychain
+## Saved secrets
 
-Passwords and key passphrases are never written to any of these files. They are stored in the system keychain as a single item:
-
-| Field | Value |
-| --- | --- |
-| Service | `fbterm` |
-| Account | `secrets` |
-
-The item holds all saved secrets, keyed by profile. If you delete a profile its secrets are removed. If the keychain is unavailable, the app keeps typed passwords for the current session only and says so in the profile editor.
+Passwords and key passphrases are never written to `profiles.toml`, `settings.toml` or `state.toml`. They are kept in one of three places, chosen by the `secret_storage` setting: the system keychain (one item, service `fbterm`, account `secrets`) on macOS and Linux, a DPAPI-encrypted file `secrets.dpapi` in this directory on Windows, or the encrypted vault `secrets.fbvault` in this directory. If you delete a profile its secrets are removed. See [Saved secrets](saved-secrets).
 
 ## Host keys
 

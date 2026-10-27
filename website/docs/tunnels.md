@@ -64,7 +64,7 @@ In the palette every tunnel is a row `Tunnel: <profile> / <name>` with its state
 
 When the connection under a running tunnel drops (an on-demand tunnel, or a **With the shell** one you switched on by hand with no shell open), the app tries again by itself and shows `Reconnecting`. The waits are 1, 2, 4, 8 and 16 seconds, then 30 seconds between further attempts, up to the **Reconnect attempts** setting (`tunnel_max_retries`, default `10`, `0` to `100`; `0` turns automatic reconnecting off). Change it in Settings under **Tunnels** or in [`settings.toml`](files#settingstoml).
 
-An automatic attempt never asks you anything. If reconnecting needs you (a changed host key, a password that is not in the keychain, a key passphrase), the tunnel fails at once with `needs your input`; **Retry** then asks as a shell would.
+An automatic attempt never asks you anything. If reconnecting needs you (a changed host key, a password that is not saved, a key passphrase), the tunnel fails at once with `needs your input`; **Retry** then asks as a shell would.
 
 When the attempts run out, or a tunnel cannot start (the port is in use, the server refuses the forward), the tunnel turns red as `Failed: <reason>` and a banner says `Tunnel "db" (db-host) failed: <reason>`. A local or SOCKS tunnel whose port is in use fails before it connects, so it never asks you to sign in first.
 

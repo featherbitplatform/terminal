@@ -13,7 +13,7 @@ featherbit terminal (`fbterm`) is a native terminal emulator built around SSH. I
 - **SSH as a first-class citizen.** Saved connection profiles carry the host, user, port and how to authenticate. Several tabs on the same profile share one SSH connection.
 - **Jump hosts built in.** A profile can name one or more other profiles to hop through, so reaching a machine behind a bastion is one click or one palette entry.
 - **Keyboard first.** A palette (`Cmd+Shift+P` on macOS) finds any profile or action by typing a few letters.
-- **Secrets stay out of your files.** Passwords and key passphrases live in the system keychain. Your profiles file contains none.
+- **Secrets stay out of your files.** Passwords and key passphrases live in the system keychain or an encrypted vault of your choice (see [Saved secrets](saved-secrets)). Your profiles file contains none.
 
 ## How it is configured
 
