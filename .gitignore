@@ -5,3 +5,4 @@
 *.dmg
 /website/.docusaurus
 .DS_Store
+/sast-out

@@ -1,0 +1,9 @@
+{
+  "$schema": "https://github.com/IBM/audit-ci/raw/main/docs/schema.json",
+  // npm dependency CVE gate for the docs site: fails on high/critical, reports
+  // the rest. Same thresholds as the other scanners (see
+  // .github/workflows/security.yml and dev/sast.sh). Every allowlist entry
+  // needs a comment and a removal condition; no silent suppression.
+  "high": true,
+  "allowlist": []
+}
