@@ -13,17 +13,17 @@ Each release provides two files:
 - `fbterm-<version>-macos-universal.dmg`, the disk image
 - `fbterm-<version>-macos-universal.dmg.sha256`, its checksum
 
-For example, version 0.1.0 is `fbterm-0.1.0-macos-universal.dmg`.
+For example, version 0.2.0 is `fbterm-0.2.0-macos-universal.dmg`.
 
 ## Verify the download
 
 Put both files in the same folder and run this from that folder:
 
 ```bash
-shasum -a 256 -c fbterm-0.1.0-macos-universal.dmg.sha256
+shasum -a 256 -c fbterm-0.2.0-macos-universal.dmg.sha256
 ```
 
-The command prints `fbterm-0.1.0-macos-universal.dmg: OK` when the file is intact. Replace the version with the one you downloaded.
+The command prints `fbterm-0.2.0-macos-universal.dmg: OK` when the file is intact. Replace the version with the one you downloaded.
 
 ## Install
 
