@@ -435,25 +435,59 @@ fn claimed(profile: &Profile, kind: ArchiveKind) -> Option<Profile> {
     Some(p)
 }
 
-/// Whether a key path from an archive may be used as it is: a local absolute path or one
-/// under the home folder (`~/`), never a network share (`\\host\share`, `//host/share`), a
-/// device (`/dev/...`, `\\.\...`), a path that climbs out with `..`, or a relative path
-/// (which would depend on the folder fbterm runs in). Reading a key from such a path on the
-/// first connect could leak credentials (Windows sends them to a share) or hang.
+/// Whether a key path from an archive may be used as it is: a local absolute path, or one
+/// under the home folder (`~/`). Refused, so the profile asks for a key file on its first
+/// connect:
+/// - network shares and other namespaces: any Windows prefix but a plain drive (`C:`), so
+///   `\\host\share`, `\\?\...`, `\\.\...`; a path starting `//` or `\\` on any
+///   system; and an NT path (`\??\...`);
+/// - device and process trees: a first folder named `dev` or `proc`, in any case (`/DEV` is
+///   `/dev` on a case-insensitive disk), with `.` components skipped (`/./dev`);
+/// - `..` anywhere, relative paths (they would depend on the folder fbterm runs in), and
+///   `~user/` forms.
+///
+/// Reading a key from such a path on the first connect could leak credentials (Windows
+/// signs in to a share) or hang. The connect also refuses any key file that is not a regular
+/// file of key size.
 pub(crate) fn archive_key_path_ok(path: &Path) -> bool {
-    use std::path::Component;
+    use std::path::{Component, Prefix};
     let text = path.to_string_lossy();
-    let slashed = text.replace('\\', "/");
-    if slashed.starts_with("//") {
+    if text.starts_with("//") || text.starts_with("\\\\") {
         return false;
     }
-    if slashed == "/dev" || slashed.starts_with("/dev/") {
-        return false;
+    let mut parts = path
+        .components()
+        .filter(|c| *c != Component::CurDir)
+        .peekable();
+    let home = matches!(parts.peek(), Some(Component::Normal(s)) if *s == "~");
+    if home {
+        parts.next();
+    } else {
+        if let Some(Component::Prefix(p)) = parts.peek() {
+            if !matches!(p.kind(), Prefix::Disk(_)) {
+                return false;
+            }
+            parts.next();
+        }
+        if parts.next() != Some(Component::RootDir) {
+            return false;
+        }
     }
-    if path.components().any(|c| c == Component::ParentDir) || slashed.contains("/../") {
-        return false;
+    let mut names = 0;
+    for part in parts {
+        let Component::Normal(name) = part else {
+            // `..`, or a second root or prefix.
+            return false;
+        };
+        if names == 0 && !home {
+            let first = name.to_string_lossy().to_ascii_lowercase();
+            if matches!(first.as_str(), "dev" | "proc" | "??") {
+                return false;
+            }
+        }
+        names += 1;
     }
-    slashed.starts_with("~/") || path.has_root()
+    names > 0
 }
 
 /// The secret a profile's method uses, if any: the password of a password profile, the

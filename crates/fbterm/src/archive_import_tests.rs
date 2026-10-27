@@ -439,16 +439,41 @@ fn only_local_key_paths_are_taken_from_an_archive() {
     use crate::archive_import::archive_key_path_ok as ok;
     use std::path::Path;
     assert!(ok(Path::new("~/.ssh/id_ed25519")));
+    assert!(ok(Path::new("~/./.ssh/id_ed25519")));
     assert!(ok(Path::new("/home/me/.ssh/id_ed25519")));
+    // Rooted on the current drive on Windows: still local.
+    assert!(ok(Path::new("/x")));
+    // Only the first folder is a device tree: a key inside a folder named dev is fine.
+    assert!(ok(Path::new("/home/me/dev/id_ed25519")));
     #[cfg(windows)]
-    assert!(ok(Path::new("C:\\Users\\me\\.ssh\\id_ed25519")));
+    {
+        assert!(ok(Path::new("C:\\Users\\me\\.ssh\\id_ed25519")));
+        // A drive without a root depends on that drive's current folder.
+        assert!(!ok(Path::new("C:id_ed25519")));
+        assert!(!ok(Path::new("\\\\server\\share\\id")));
+        assert!(!ok(Path::new("\\\\?\\UNC\\server\\share\\id")));
+    }
+    // Not a local path anywhere but Windows.
+    #[cfg(not(windows))]
+    assert!(!ok(Path::new("C:\\Users\\me\\.ssh\\id_ed25519")));
     for hostile in [
         "\\\\host\\share\\id",
+        "\\\\server\\x",
         "//host/share/id",
+        "//server/x",
         "\\\\.\\pipe\\id",
         "\\\\?\\C:\\id",
+        "\\??\\UNC\\host\\share\\x",
+        "/??/UNC/host/share/x",
         "/dev/zero",
         "/dev",
+        "/./dev/zero",
+        "/.//dev/zero",
+        "/DEV/zero",
+        "/Dev/zero",
+        "/proc/self/fd/0",
+        "/PROC/self/fd/0",
+        "/home/../dev/zero",
         "/home/me/../../dev/zero",
         "~/../../dev/zero",
         "id_ed25519",
