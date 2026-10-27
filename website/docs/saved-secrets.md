@@ -16,13 +16,13 @@ The system storage holds every secret as one item (service `fbterm`, account `se
 
 ## Automatic
 
-Automatic uses the system storage. The one exception is a machine that has no system storage at all, for example a Linux desktop without a Secret Service. There the app switches to the vault, once: it writes `secret_storage = "vault"`, says `The system keychain is not available, so saved secrets now use an encrypted vault.` and asks you to set a main password when you next save a secret.
+Automatic uses the system storage. The one exception is a machine that has no system storage at all, which only happens on Linux, on a desktop without a Secret Service; macOS and Windows never switch by themselves. There the app switches to the vault, once: it writes `secret_storage = "vault"`, says `The system keychain is not available, so saved secrets now use an encrypted vault.` and asks you to set a main password when you next save a secret.
 
 The app only looks at the system storage when a secret is first needed, so launching it never prompts. A storage that exists but refuses (access denied, a locked keychain, a cancelled prompt) never makes Automatic switch, because that would hide the secrets already in it; the connection asks for its password as if none were saved.
 
 ## The encrypted vault
 
-The vault opens with a main password. The first time a connection needs a saved secret in a session, **Unlock saved secrets** asks for it, and the vault stays open until you quit. Cancelling means that connection asks for its password or passphrase as if none were saved.
+The vault opens with a main password. The first time a connection needs a saved secret in a session, **Unlock saved secrets** asks for it, and the vault stays open until you quit. Cancelling means that connection asks for its password or passphrase as if none were saved, and later connections stop asking you to unlock for the rest of the session (they ask for their secrets as if none were saved). Cancelling **Set a main password** when a connection offers to remember a secret means remembered secrets are not saved, without asking again, for the rest of the session. Actions you start yourself still ask: switching storage in Settings, a full export, an import and saving in the profile editor.
 
 The first time you save a secret with the vault in use and no vault yet, **Set a main password** asks for the password twice. Choose it carefully: **a forgotten main password cannot be recovered**. The vault is encrypted with it, and there is no other way in.
 

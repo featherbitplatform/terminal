@@ -41,11 +41,13 @@ A profile that jumps through other profiles needs them to work, so those are inc
 
 Keep an archive with key files as carefully as the keys themselves.
 
+A full archive carries saved secrets, so with the encrypted vault in use and locked, exporting asks for the main password first.
+
 ## Importing
 
 Open **Import profiles…** from the palette, or **Import…** in the profile editor's footer (the `import_profiles` action, also without a default shortcut). Choose the file, type its password and press **Open**. Nothing is changed yet: the window shows a preview.
 
-A wrong password says `Wrong password, or the file is not an fbterm archive.` An archive made by a newer version of the app says `This archive was made by a newer fbterm.`; update the app to open it. A damaged file says so too. An archive with an unreasonable amount in it (more than 1000 profiles, 200 color schemes or 200 key files, or a profile with more than 16 jumps) is refused as a whole with `This archive is too large or malformed to import.`
+A wrong password says `Wrong password, or the file is not an fbterm archive.` An archive made by a newer version of the app says `This archive was made by a newer fbterm.`; update the app to open it. A damaged file says so too. An archive with an unreasonable amount in it (more than 1000 profiles, 200 color schemes or 200 key files, a profile with more than 16 jumps or the same jump twice, or more than 2000 saved secrets) is refused as a whole with `This archive is too large or malformed to import.` A file over 64 MB says `The file is too large to be an fbterm archive.`
 
 ### The preview
 
@@ -74,7 +76,7 @@ When the archive carries key files for profiles you import, a **Key files** sect
 
 ### Saved secrets
 
-The saved passwords and passphrases of a full archive are stored where you keep [saved secrets](saved-secrets). With the encrypted vault in use, the import asks for the main password first when the vault is locked.
+The saved passwords and passphrases of a full archive are stored where you keep [saved secrets](saved-secrets). With the encrypted vault in use, the import asks for the main password first when the vault is locked, or asks you to set a main password when there is no vault yet.
 
 ### When import is not available
 
@@ -85,4 +87,4 @@ The import writes key files, then color schemes, then `profiles.toml`, then secr
 
 ## Files and size
 
-An archive is a normal file; copy it anywhere. Opening and sealing take about a second on purpose, because the password is stretched against guessing.
+An archive is a normal file; copy it anywhere. Opening and sealing take about a second on purpose, because the password is stretched against guessing. A file over 64 MB is refused as too large; real archives are far smaller (each key file is at most 1 MB).
