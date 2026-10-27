@@ -1,7 +1,7 @@
 //! Text selection over the emulator grid.
 
 use feathercritty::grid::{Dimensions, RowReader};
-use feathercritty::index::{Column, Point};
+use feathercritty::index::{Column, Line, Point};
 use feathercritty::term::cell::Flags;
 
 use crate::Terminal;
@@ -19,6 +19,14 @@ impl Selection {
             anchor: point,
             head: point,
         }
+    }
+
+    /// Columns `first..=last` of one grid line (`0` is the top line of the screen, negative lines
+    /// are history).
+    pub fn on_line(line: i32, first: usize, last: usize) -> Self {
+        let mut sel = Self::start(Point::new(Line(line), Column(first)));
+        sel.update(Point::new(Line(line), Column(last)));
+        sel
     }
 
     pub fn update(&mut self, point: Point) {
@@ -140,5 +148,11 @@ mod tests {
         let mut s = Selection::start(p(0, 3));
         s.update(p(0, 1));
         assert_eq!(s.text(&t), "ell");
+    }
+    #[test]
+    fn on_line_selects_columns_of_one_line() {
+        let mut t = term();
+        t.feed(b"one\r\nab word");
+        assert_eq!(Selection::on_line(1, 3, 6).text(&t), "word");
     }
 }

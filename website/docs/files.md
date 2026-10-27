@@ -18,8 +18,9 @@ The directory is created the first time the app writes a file. All files are TOM
 
 | File | Written by | Purpose |
 | --- | --- | --- |
-| `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles. See [Profiles and jump hosts](profiles). |
+| `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles, with their tunnels. See [Profiles and jump hosts](profiles) and [Tunnels](tunnels). |
 | `settings.toml` | you (and the Settings window) | Font, scrollback, theme, background, keyboard protocol and changed keyboard shortcuts. |
+| `schemes/` | you (and the Color schemes window) | One `<id>.toml` file per color scheme of yours. See [Color schemes](color-schemes#files-and-sharing). |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
 
 `profiles.toml` and `settings.toml` are reloaded while the app runs. If a file has a syntax error, the app reports the file and line, keeps what it had loaded, and never overwrites the broken file.
@@ -37,10 +38,12 @@ font_family = "Geist Mono"
 font_size = 13.0
 scrollback_lines = 10000
 theme = "dark"
+color_scheme = "graphite"
 kitty_keyboard = false
 background_opacity = 1.0
 background_blur = false
 max_fps = 60
+tunnel_max_retries = 10
 ```
 
 | Field | Type | Default | Meaning |
@@ -49,10 +52,12 @@ max_fps = 60
 | `font_size` | number, `6.0` to `72.0` | `13.0` | Font size in points. |
 | `scrollback_lines` | integer, `0` to `1000000` | `10000` | Lines of history kept per tab, open tabs included. A change applies at once. Raising it keeps everything; lowering it drops the oldest lines of open tabs that hold more, and in the Settings window that asks first (Apply or Cancel), because it cannot be undone. Lowering it in the file applies when you save and a banner says how many tabs lost lines. Above `100000`, resizing a window can pause briefly while the history rewraps. |
 | `theme` | `"dark"` or `"light"` | `"dark"` | Color theme. |
+| `color_scheme` | string (scheme id) | `"graphite"` | Color scheme for every session; a profile can override it. An id that matches no scheme uses Graphite and is reported in the banner. See [Color schemes](color-schemes). |
 | `kitty_keyboard` | `true` or `false` | `false` | Let programs turn on the kitty keyboard protocol, which reports keys such as Esc, Ctrl and Alt chords, and optionally every key and key releases, as unambiguous escape codes. When `false`, programs' requests for it are ignored and keys use the classic encoding. A change applies to open tabs at once: turning it off returns every tab to the classic encoding, turning it on lets programs enable the protocol from then on (restart a program that asked for it earlier). |
 | `background_opacity` | number, `0.05` to `1.0` | `1.0` | Opacity of the terminal's background and of the tab bar, from `0.05` (nearly see-through) to `1.0` (opaque). Text, the cursor, the selection and cells a program gives their own background color stay opaque. On macOS a change applies to open windows at once; on Linux and Windows a window can only become see-through if it was opened while the value was below `1.0`, so open a new window after lowering it. |
 | `background_blur` | `true` or `false` | `false` | Blur what shows through a see-through background. Takes effect only for windows opened while `background_opacity` is below `1.0`, so open a new window after changing it. macOS only for now. |
 | `max_fps` | integer, `30` to `240`, or `"display"` | `60` | Most redraws per second caused by program output. Typing, scrolling, selecting and resizing always redraw at once. `"display"` follows the refresh rate of the screen your windows are on (the fastest one, if they are on several screens); where the rate cannot be detected (Linux and Windows for now) it means `60`. Higher values use more CPU while output streams. Applies at once. |
+| `tunnel_max_retries` | integer, `0` to `100` | `10` | How many times a [tunnel](tunnels#reconnecting) tries to reconnect on its own after its connection drops. `0` turns automatic reconnecting off. In the Settings window this is **Reconnect attempts** under Tunnels. Applies at once. |
 
 ### Redraw rate
 

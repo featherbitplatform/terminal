@@ -76,12 +76,14 @@ fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Ssh(SshProfile {
             host: host.into(),
             port: 22,
             user: "fb".into(),
             auth: AuthMethod::Agent,
             jump,
+            tunnels: Vec::new(),
         }),
     }
 }
@@ -93,6 +95,7 @@ fn local(name: &str) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             program: "/bin/zsh".into(),
             args: vec!["-l".into()],
@@ -599,4 +602,345 @@ fn clearing_the_accent_resets_color_as_to_the_stripe() {
             .unwrap()
             .contains("accent_style")
     );
+}
+
+#[test]
+fn editor_scheme_choice_saves_with_profile() {
+    let shell = local("zsh");
+    let mut store = ProfileStore {
+        profiles: vec![shell.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(shell.id));
+    ed.update(EditorMsg::ColorScheme(Some("ember".into())));
+    let path = file();
+    ed.save(&mut store, &path).unwrap();
+    assert_eq!(
+        store.get(shell.id).unwrap().color_scheme.as_deref(),
+        Some("ember")
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("color_scheme = \"ember\"")
+    );
+}
+
+#[test]
+fn editor_use_global_clears_override() {
+    let mut shell = local("zsh");
+    shell.color_scheme = Some("harbor".into());
+    let mut store = ProfileStore {
+        profiles: vec![shell.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(shell.id));
+    ed.update(EditorMsg::ColorScheme(None));
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(store.get(shell.id).unwrap().color_scheme, None);
+}
+
+#[test]
+fn draft_keeps_color_scheme() {
+    let mut p = ssh("web", "example.test", vec![]);
+    p.color_scheme = Some("user-1234".into());
+    let d = Draft::from_profile(&p);
+    assert_eq!(d.color_scheme.as_deref(), Some("user-1234"));
+    assert_eq!(d.to_profile().color_scheme.as_deref(), Some("user-1234"));
+}
+
+fn tunnels_of(ed: &EditorState, id: ProfileId) -> Vec<TunnelDef> {
+    match &ed.draft(id).unwrap().kind {
+        DraftKind::Ssh(s) => s.tunnels.clone(),
+        DraftKind::Local(_) => unreachable!(),
+    }
+}
+
+/// A one-profile editor with one fresh tunnel added.
+fn with_tunnel() -> (EditorState, ProfileId, ProfileStore) {
+    let web = ssh("web", "10.0.0.5", vec![]);
+    let store = ProfileStore {
+        profiles: vec![web.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::TunnelAdd);
+    (ed, web.id, store)
+}
+
+#[test]
+fn add_edit_and_save_tunnel() {
+    let (mut ed, id, mut store) = with_tunnel();
+    let t = tunnels_of(&ed, id);
+    assert_eq!(t.len(), 1);
+    assert_eq!(t[0].bind(), "127.0.0.1", "binds to loopback by default");
+    assert_eq!(t[0].start, StartMode::OnDemand);
+    ed.update(EditorMsg::TunnelName(0, "db".into()));
+    ed.update(EditorMsg::TunnelPort(0, "5432".into()));
+    ed.update(EditorMsg::TunnelHost(0, "db.internal".into()));
+    ed.update(EditorMsg::TunnelHostPort(0, "5432".into()));
+    ed.update(EditorMsg::TunnelStart(0, StartMode::WithShell));
+    assert!(ed.dirty);
+    ed.save(&mut store, &file()).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(
+        s.tunnels,
+        vec![TunnelDef {
+            name: "db".into(),
+            kind: TunnelKind::Local {
+                bind: "127.0.0.1".into(),
+                port: 5432,
+                host: "db.internal".into(),
+                host_port: 5432,
+            },
+            start: StartMode::WithShell,
+        }]
+    );
+
+    // Switching the kind keeps the shared fields; SOCKS drops the target.
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Socks));
+    let t = tunnels_of(&ed, id);
+    assert_eq!(
+        t[0].kind,
+        TunnelKind::Socks {
+            bind: "127.0.0.1".into(),
+            port: 5432
+        }
+    );
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Remote));
+    assert!(matches!(
+        tunnels_of(&ed, id)[0].kind,
+        TunnelKind::Remote { port: 5432, .. }
+    ));
+    ed.update(EditorMsg::TunnelRemove(0));
+    assert!(tunnels_of(&ed, id).is_empty());
+}
+
+#[test]
+fn tunnel_port_filters_input() {
+    let (mut ed, id, _) = with_tunnel();
+    let port = |ed: &EditorState| match &tunnels_of(ed, id)[0].kind {
+        TunnelKind::Local { port, .. } => *port,
+        _ => unreachable!(),
+    };
+    ed.update(EditorMsg::TunnelPort(0, "8080".into()));
+    ed.update(EditorMsg::TunnelPort(0, "80x".into()));
+    ed.update(EditorMsg::TunnelPort(0, "70000".into()));
+    ed.update(EditorMsg::TunnelPort(0, "0".into()));
+    assert_eq!(port(&ed), 8080, "bad input is ignored");
+    ed.update(EditorMsg::TunnelPort(0, String::new()));
+    assert_eq!(port(&ed), 0, "emptying the field clears it");
+    ed.update(EditorMsg::TunnelHostPort(0, "5x".into()));
+    assert!(matches!(
+        tunnels_of(&ed, id)[0].kind,
+        TunnelKind::Local { host_port: 0, .. }
+    ));
+    // A remote bind may ask the server to pick the port.
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Remote));
+    ed.update(EditorMsg::TunnelPort(0, "0".into()));
+    ed.update(EditorMsg::TunnelPort(0, "9".into()));
+    ed.update(EditorMsg::TunnelPort(0, "0".into()));
+    assert!(matches!(
+        tunnels_of(&ed, id)[0].kind,
+        TunnelKind::Remote { port: 0, .. }
+    ));
+}
+
+#[test]
+fn duplicate_tunnel_blocks_save() {
+    let (mut ed, _, mut store) = with_tunnel();
+    ed.update(EditorMsg::TunnelAdd);
+    for i in 0..2 {
+        ed.update(EditorMsg::TunnelName(i, "db".into()));
+        ed.update(EditorMsg::TunnelPort(i, (5000 + i).to_string()));
+        ed.update(EditorMsg::TunnelHost(i, "db.internal".into()));
+        ed.update(EditorMsg::TunnelHostPort(i, "5432".into()));
+    }
+    let path = file();
+    let Err(SaveError::Invalid(errs)) = ed.save(&mut store, &path) else {
+        panic!("refused")
+    };
+    assert_eq!(
+        errs,
+        vec![ValidationError::DuplicateTunnel {
+            profile: "web".into(),
+            name: "db".into()
+        }]
+    );
+    assert!(!path.exists());
+    ed.update(EditorMsg::TunnelName(1, "cache".into()));
+    ed.save(&mut store, &path).unwrap();
+}
+
+#[test]
+fn non_loopback_shows_warning() {
+    let (mut ed, id, _) = with_tunnel();
+    let warning = |ed: &EditorState| {
+        let DraftKind::Ssh(s) = &ed.draft(id).unwrap().kind else {
+            unreachable!()
+        };
+        tunnel_warning(&s.tunnels[0])
+    };
+    assert_eq!(warning(&ed), None);
+    ed.update(EditorMsg::TunnelBind(0, "0.0.0.0".into()));
+    assert_eq!(
+        warning(&ed).as_deref(),
+        Some("Listens on 0.0.0.0: other machines can reach this tunnel.")
+    );
+    ed.update(EditorMsg::TunnelBind(0, "localhost".into()));
+    assert_eq!(warning(&ed), None);
+}
+
+#[test]
+fn empty_bind_or_host_blocks_save() {
+    let (mut ed, _, mut store) = with_tunnel();
+    ed.update(EditorMsg::TunnelName(0, "db".into()));
+    ed.update(EditorMsg::TunnelPort(0, "5432".into()));
+    ed.update(EditorMsg::TunnelHostPort(0, "5432".into()));
+    ed.update(EditorMsg::TunnelBind(0, "  ".into()));
+    let Err(SaveError::Invalid(errs)) = ed.save(&mut store, &file()) else {
+        panic!("refused")
+    };
+    let p = || "web".to_owned();
+    let n = || "db".to_owned();
+    assert_eq!(
+        errs,
+        vec![
+            ValidationError::EmptyTunnelBind {
+                profile: p(),
+                name: n()
+            },
+            ValidationError::EmptyTunnelHost {
+                profile: p(),
+                name: n()
+            },
+        ]
+    );
+    assert!(errs[0].to_string().contains("\"db\""));
+    // SOCKS has no target host.
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Socks));
+    ed.update(EditorMsg::TunnelBind(0, "127.0.0.1".into()));
+    ed.save(&mut store, &file()).unwrap();
+}
+
+/// Fill a fresh local tunnel so only the field under test is wrong.
+fn fill(ed: &mut EditorState) {
+    ed.update(EditorMsg::TunnelName(0, "db".into()));
+    ed.update(EditorMsg::TunnelPort(0, "5432".into()));
+    ed.update(EditorMsg::TunnelHost(0, "db.internal".into()));
+    ed.update(EditorMsg::TunnelHostPort(0, "5432".into()));
+}
+
+fn refused(ed: &mut EditorState, store: &mut ProfileStore) -> Vec<ValidationError> {
+    match ed.save(store, &file()) {
+        Err(SaveError::Invalid(e)) => e,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn blank_target_port_blocks_save() {
+    let (mut ed, _, mut store) = with_tunnel();
+    fill(&mut ed);
+    ed.update(EditorMsg::TunnelHostPort(0, String::new()));
+    let err = ValidationError::TunnelTargetPort {
+        profile: "web".into(),
+        name: "db".into(),
+    };
+    assert_eq!(refused(&mut ed, &mut store), vec![err.clone()]);
+    assert_eq!(
+        err.to_string(),
+        "tunnel \"db\" of profile \"web\" needs a target port"
+    );
+    // The same on a remote tunnel; SOCKS has no target.
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Remote));
+    assert_eq!(refused(&mut ed, &mut store), vec![err]);
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Socks));
+    ed.save(&mut store, &file()).unwrap();
+}
+
+#[test]
+fn empty_name_and_zero_ports_block_save() {
+    let (mut ed, _, mut store) = with_tunnel();
+    fill(&mut ed);
+    ed.update(EditorMsg::TunnelName(0, " ".into()));
+    assert_eq!(
+        refused(&mut ed, &mut store),
+        vec![ValidationError::EmptyTunnelName {
+            profile: "web".into()
+        }]
+    );
+    ed.update(EditorMsg::TunnelName(0, "db".into()));
+    ed.update(EditorMsg::TunnelPort(0, String::new()));
+    let port0 = ValidationError::TunnelPort {
+        profile: "web".into(),
+        name: "db".into(),
+    };
+    assert_eq!(refused(&mut ed, &mut store), vec![port0.clone()]);
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Socks));
+    assert_eq!(refused(&mut ed, &mut store), vec![port0]);
+    // A remote listen port may be blank: the server picks.
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Remote));
+    ed.update(EditorMsg::TunnelHost(0, "localhost".into()));
+    ed.update(EditorMsg::TunnelHostPort(0, "22".into()));
+    ed.save(&mut store, &file()).unwrap();
+}
+
+#[test]
+fn untouched_tunnels_round_trip() {
+    let mut web = ssh("web", "10.0.0.5", vec![]);
+    let defs = vec![
+        TunnelDef {
+            name: "db".into(),
+            kind: TunnelKind::Remote {
+                bind: "0.0.0.0".into(),
+                port: 0,
+                host: "localhost".into(),
+                host_port: 22,
+            },
+            start: StartMode::WithShell,
+        },
+        TunnelDef {
+            name: "proxy".into(),
+            kind: TunnelKind::Socks {
+                bind: "127.0.0.1".into(),
+                port: 1080,
+            },
+            start: StartMode::OnDemand,
+        },
+    ];
+    if let ProfileKind::Ssh(s) = &mut web.kind {
+        s.tunnels = defs.clone();
+    }
+    let mut store = ProfileStore {
+        profiles: vec![web.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Name("web2".into()));
+    ed.save(&mut store, &file()).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        unreachable!()
+    };
+    assert_eq!(s.tunnels, defs);
+}
+
+#[test]
+fn local_target_survives_a_socks_detour() {
+    let (mut ed, id, _) = with_tunnel();
+    fill(&mut ed);
+    let before = tunnels_of(&ed, id);
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Socks));
+    ed.update(EditorMsg::TunnelKind(0, KindChoice::Local));
+    assert_eq!(tunnels_of(&ed, id), before);
+}
+
+#[test]
+fn port_filter_is_digits_only() {
+    let (mut ed, id, _) = with_tunnel();
+    ed.update(EditorMsg::TunnelPort(0, "+80".into()));
+    assert!(matches!(
+        tunnels_of(&ed, id)[0].kind,
+        TunnelKind::Local { port: 0, .. }
+    ));
 }

@@ -148,6 +148,30 @@ impl App {
         self.open_settings()
     }
 
+    /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
+    /// value selects the scheme of that name.
+    pub(crate) fn open_debug_schemes(&mut self) -> Task<Message> {
+        let Some(value) = debug_env("FBTERM_OPEN_SCHEMES") else {
+            return Task::none();
+        };
+        let value = value.to_string_lossy();
+        let select = self
+            .schemes
+            .all()
+            .iter()
+            .find(|s| s.name == value)
+            .map(|s| s.id.clone());
+        self.open_schemes(select)
+    }
+
+    /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the Tunnels window at startup.
+    pub(crate) fn open_debug_tunnels(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_OPEN_TUNNELS").is_none() {
+            return Task::none();
+        }
+        self.open_tunnels()
+    }
+
     /// `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (debug aids): the find bar of the first
     /// window's active tab, or the find-in-all-tabs box, open with that query once the tabs
     /// have had a second to print something.

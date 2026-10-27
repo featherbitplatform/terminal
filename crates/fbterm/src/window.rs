@@ -23,7 +23,7 @@ use crate::tab_look::{Surroundings, look};
 use crate::tabs::{Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
-use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_USERS, ICON_X, icon};
+use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_TUNNELS, ICON_USERS, ICON_X, icon};
 use crate::windows::{Carry, DragMsg};
 
 /// Gap between the top of the tab bar and the top of a tab.
@@ -37,11 +37,12 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         && *eid == id
     {
         let degraded = app.fallback.as_ref().is_some_and(|f| f.degraded());
+        let schemes = app.scheme_choices(true);
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id));
         }
-        let content = content.push(crate::editor::view::view(t, state, degraded));
+        let content = content.push(crate::editor::view::view(t, state, schemes, degraded));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -57,7 +58,10 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             content = content.push(crate::ui::window_header(t, id));
         }
         let notice = app.settings_notice.as_deref();
-        let content = content.push(crate::settings_window::view::view(t, state, notice));
+        let schemes = app.scheme_choices(false);
+        let content = content.push(crate::settings_window::view::view(
+            t, state, schemes, notice,
+        ));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -69,6 +73,50 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             bindings: &app.bindings,
         });
     }
+    if let Some((sid, state)) = &app.schemes_win
+        && *sid == id
+    {
+        let mut content = column![];
+        if Chrome::current().draws_title_bar() {
+            content = content.push(crate::ui::window_header(t, id));
+        }
+        let content = content.push(crate::schemes_window::view::view(t, state, &app.style));
+        return Element::new(Shortcuts {
+            content: content.into(),
+            window: id,
+            mode: if state.confirm.is_some() {
+                Mode::SchemesConfirm
+            } else if state.import.is_some() {
+                Mode::SchemesImport
+            } else {
+                Mode::Schemes
+            },
+            bindings: &app.bindings,
+        });
+    }
+    if let Some((tid, state)) = &app.tunnels_win
+        && *tid == id
+    {
+        let mut content = column![];
+        if Chrome::current().draws_title_bar() {
+            content = content.push(crate::ui::window_header(t, id));
+        }
+        let groups = crate::tunnels_window::groups(&app.profiles, &app.tunnels, &state.query);
+        let any = crate::tunnels_window::any_defined(&app.profiles);
+        let content = content.push(crate::tunnels_window::view::view(
+            t,
+            &state.query,
+            &state.input,
+            groups,
+            any,
+        ));
+        return Element::new(Shortcuts {
+            content: content.into(),
+            window: id,
+            mode: Mode::Tunnels,
+            bindings: &app.bindings,
+        });
+    }
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };
@@ -76,12 +124,16 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let find = win
         .active_tab()
         .and_then(|t| t.focused_pane().find.as_ref());
-    let style = &app.style;
     // The default background and the chrome around it take the background opacity; text,
     // cursor, selection and cells with their own background stay opaque (the terminal widget
-    // draws those and leaves its default background to the container below).
+    // draws those and leaves its default background to the container below, and the tiles
+    // to each pane's scheme where it differs). The container and the active tab's fade into
+    // it take the focused pane's scheme.
     let opacity = app.settings.background_opacity;
-    let term_bg = to_color(style.scheme.background).scale_alpha(opacity);
+    let focused_bg = win.active_tab().map_or(app.style.scheme.background, |tab| {
+        app.pane_background(tab.focused_pane())
+    });
+    let term_bg = to_color(focused_bg).scale_alpha(opacity);
     let bar_bg = t.surface.scale_alpha(opacity);
     let palette = app.palettes.get(&id);
     let find_box = app.find_box.as_ref().filter(|f| f.window == id);
@@ -92,7 +144,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         window: id,
         bar_bg,
         around: Surroundings {
-            terminal: to_color(style.scheme.background),
+            terminal: to_color(focused_bg),
             bar: t.surface,
             opacity,
         },
@@ -102,6 +154,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         demo_tip: app.demo_tip,
         bindings: &app.bindings,
         carry,
+        tunnels_up: app.tunnels.up_count(),
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -122,7 +175,15 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 .panes
                 .iter()
                 .filter(|pane| shown.contains(&pane.id))
-                .map(|pane| (pane.id, pane_view(app, id, tab, pane)))
+                .map(|pane| {
+                    let bg = to_color(app.pane_background(pane));
+                    (
+                        pane.id,
+                        pane_view(app, id, tab, pane),
+                        bg,
+                        pane.accent.map(to_color),
+                    )
+                })
                 .collect();
             let incoming = match carry {
                 Some(Carry::Tab(source)) => {
@@ -142,7 +203,11 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
                 .grids
                 .get(&tab.focused)
                 .map(|g| Size::new(g.cell_width, g.cell_height));
-            crate::tiles::tiles(t, id, tab, panes, !modal, incoming, cell)
+            let ground = crate::tiles::Ground {
+                under: to_color(focused_bg),
+                opacity,
+            };
+            crate::tiles::tiles(t, id, tab, panes, ground, !modal, incoming, cell)
         }
         None if win.tabs.is_empty() => container(
             text("No shells found. Add a profile in profiles.toml.")
@@ -247,7 +312,7 @@ fn pane_view<'a>(
             .lock()
             .mode()
             .contains(fbterm_term::TermMode::ALT_SCREEN);
-        app.highlight(bar, alt)
+        app.highlight(bar, alt, app.pane_background(pane))
     });
     let pid = pane.id;
     let view = highlighted_terminal_view(
@@ -313,6 +378,8 @@ struct TabBar<'b> {
     bindings: &'b Bindings,
     /// A tab or tile being dragged in this window.
     carry: Option<Carry>,
+    /// How many tunnels are up (the indicator's count).
+    tunnels_up: usize,
 }
 
 fn tab_bar<'a>(
@@ -328,6 +395,7 @@ fn tab_bar<'a>(
         modal,
         demo_tip,
         bindings,
+        tunnels_up,
         ..
     } = bar;
     let tabs_bar = bar;
@@ -353,6 +421,22 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::Profiles))
         .padding(7)
         .style(move |_, status| ghost(t, status));
+    let mut indicator = row![icon(ICON_TUNNELS, 14.0, t.text_muted)]
+        .spacing(5)
+        .align_y(Alignment::Center);
+    if let Some(n) = crate::tunnels_window::indicator_count(tunnels_up) {
+        indicator = indicator.push(
+            text(n)
+                .font(UI_FONT)
+                .size(12)
+                .line_height(text::LineHeight::Absolute(14.0.into()))
+                .color(t.success),
+        );
+    }
+    let tunnels = button(indicator)
+        .on_press(msg(TabBarMsg::Tunnels))
+        .padding(7)
+        .style(move |_, status| ghost(t, status));
     let settings = button(icon(ICON_SETTINGS, 14.0, t.text_muted))
         .on_press(msg(TabBarMsg::Settings))
         .padding(7)
@@ -369,6 +453,12 @@ fn tab_bar<'a>(
         tooltip_text("Edit profiles", Action::EditProfiles, bindings),
         demo_tip == Some(DemoTip::Profiles),
     );
+    let tunnels = tip(
+        t,
+        tunnels,
+        tooltip_text("Tunnels", Action::Tunnels, bindings),
+        demo_tip == Some(DemoTip::Tunnels),
+    );
     let settings = tip(
         t,
         settings,
@@ -381,6 +471,9 @@ fn tab_bar<'a>(
             .center_y(height),
     );
     bar = bar.push(container(profiles).center_y(height));
+    // After the tab buttons, like every trailing button: `BarBackground` measures the tabs as
+    // the row's first children.
+    bar = bar.push(container(tunnels).center_y(height));
     bar = bar.push(container(settings).center_y(height));
     let bar = container(bar)
         .padding(Padding {
@@ -1536,6 +1629,8 @@ mod tests {
                 demo_tip: None,
                 bindings: &bindings,
                 carry,
+                // The indicator with a count sits after the tabs; tabs are measured as before.
+                tunnels_up: 3,
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(

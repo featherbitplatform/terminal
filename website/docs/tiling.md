@@ -10,6 +10,8 @@ A tab can hold several panes, side by side or one above the other, to any depth.
 
 A tab with one pane looks and behaves as it always did: no outline, no dimming, no handle. The focused pane of a split tab has a thin accent outline and the others are slightly dimmed. The tab shows the focused pane's profile name and accent, and a small indicator when any other pane of the tab is disconnected or its program has exited.
 
+A pane whose profile has an accent color also gets a thin border in that accent while the tab shows more than one pane, so hosts stay recognizable side by side; the focused pane's outline then uses its accent. Each pane also uses its own profile's [color scheme](color-schemes).
+
 ## Splitting and moving around
 
 | Action | macOS | Linux and Windows |

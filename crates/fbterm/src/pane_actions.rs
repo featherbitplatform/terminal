@@ -65,6 +65,7 @@ impl App {
                 let from = tab.focused_pane();
                 Pane {
                     accent_style: from.accent_style,
+                    scheme: from.scheme.clone(),
                     ..Pane::new(from.profile, from.name.clone(), from.accent)
                 }
             }
@@ -135,6 +136,7 @@ impl App {
         let freed = crate::memory::weak_terminals(std::iter::once(&pane));
         self.forget_panes(&[pane.id]);
         drop(pane);
+        self.sync_all_shell_tunnels();
         self.save_state();
         self.release_closed(freed);
         // Takes the pending redraw of the panes now shown (a maximized pane that closed shows

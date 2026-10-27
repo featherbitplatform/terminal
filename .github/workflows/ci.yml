@@ -58,6 +58,8 @@ jobs:
         run: dev/ssh-test/wait-ready.sh
       - name: Live SSH tests
         run: FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
+      - name: Live tunnel tests
+        run: FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_tunnels
       - name: Container logs
         if: failure()
         run: docker compose -f dev/ssh-test/compose.yaml logs

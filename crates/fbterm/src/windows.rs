@@ -145,6 +145,7 @@ impl App {
         let gone: Vec<_> = closed.tab.panes.iter().map(|p| p.id).collect();
         self.forget_panes(&gone);
         drop(closed.tab);
+        self.sync_all_shell_tunnels();
         self.save_state();
         self.release_closed(freed);
         if closed.window_empty {
@@ -249,6 +250,8 @@ impl App {
             .copied()
             .chain(self.editor_window())
             .chain(self.settings_window())
+            .chain(self.schemes_window())
+            .chain(self.tunnels_window())
             .collect();
         self.closing.extend(ids.iter().copied());
         Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
@@ -260,6 +263,8 @@ impl App {
         }
         if self.editor_window() == Some(id)
             || self.settings_window() == Some(id)
+            || self.schemes_window() == Some(id)
+            || self.tunnels_window() == Some(id)
             || self.windows.len() > 1
         {
             self.close_window(id)
@@ -542,9 +547,9 @@ mod tests {
         (0..)
             .map_while(|i| state.at(i))
             .map(|item| match item {
-                PaletteItem::Choice { label, .. } | PaletteItem::Action { label, .. } => {
-                    label.clone()
-                }
+                PaletteItem::Choice { label, .. }
+                | PaletteItem::Action { label, .. }
+                | PaletteItem::Tunnel { label, .. } => label.clone(),
                 PaletteItem::Profile { name, .. } => name.clone(),
             })
             .collect()
