@@ -572,3 +572,96 @@ fn restart_waits_for_the_old_instance() {
     assert_eq!(app.tunnels.state(&k), TunnelState::Off);
     drop(app);
 }
+
+#[test]
+fn added_with_shell_tunnel_starts_when_shell_open() {
+    let mut w = world();
+    let pane = w.open_shell();
+    w.edit(|p| tunnels_of(p).push(local("cache", 16379, StartMode::WithShell)));
+    assert!(
+        w.running("cache"),
+        "a shell is connected: it starts at once"
+    );
+    assert!(!w.app.tunnels.entries[&key(&w.srv, "cache")].manual);
+    assert!(!w.running("web"), "on-demand tunnels still wait");
+    w.close_tab_of(pane);
+    assert!(!w.running("cache"), "and it stops with the last shell");
+}
+
+#[test]
+fn renamed_with_shell_tunnel_keeps_running() {
+    let mut w = world();
+    let _pane = w.open_shell();
+    assert!(w.running("db"));
+    w.edit(|p| tunnels_of(p)[1].name = "postgres".into());
+    assert!(!w.running("db"));
+    assert!(!w.app.tunnels.entries.contains_key(&key(&w.srv, "db")));
+    assert!(w.running("postgres"), "the renamed tunnel runs on");
+    assert_eq!(w.fake.count("postgres"), 1);
+}
+
+#[test]
+fn switching_to_with_shell_starts_when_shell_open() {
+    let mut w = world();
+    let pane = w.open_shell();
+    assert!(!w.running("web"));
+    w.edit(|p| tunnels_of(p)[0].start = StartMode::WithShell);
+    assert!(w.running("web"));
+    assert!(!w.app.tunnels.entries[&key(&w.srv, "web")].manual);
+    w.close_tab_of(pane);
+    assert!(!w.running("web"));
+}
+
+#[test]
+fn tunnel_switched_off_by_hand_stays_off_after_edit() {
+    let mut w = world();
+    let pane = w.open_shell();
+    assert!(w.running("db"));
+    w.toggle("db");
+    assert!(!w.running("db"));
+    // An edit to the tunnel, or to another one, does not bring it back.
+    w.edit(|p| tunnels_of(p)[0].kind = local("web", 18081, StartMode::OnDemand).kind);
+    w.edit(|p| tunnels_of(p)[1].kind = local("db", 15433, StartMode::WithShell).kind);
+    assert!(!w.running("db"));
+    // A second shell is not a first shell.
+    let second = w.open_shell();
+    assert!(!w.running("db"));
+    // The next first shell is.
+    w.close_tab_of(pane);
+    w.close_tab_of(second);
+    let _third = w.open_shell();
+    assert!(w.running("db"));
+    assert_eq!(w.fake.count("db"), 2);
+}
+
+#[test]
+fn failed_with_shell_tunnel_waits_through_edits() {
+    let mut w = world();
+    let _pane = w.open_shell();
+    let k = key(&w.srv, "db");
+    let _ = w
+        .app
+        .update(Message::Tunnel(k, TunnelState::Failed("refused".into())));
+    w.edit(|p| tunnels_of(p)[0].kind = local("web", 18081, StartMode::OnDemand).kind);
+    assert!(!w.running("db"), "an edit does not retry a failed tunnel");
+    assert_eq!(w.fake.count("db"), 1);
+}
+
+#[test]
+fn closing_the_last_pane_stops_with_shell_tunnels() {
+    let mut w = world();
+    let (a, b) = (Pane::for_profile(&w.srv), Pane::for_profile(&w.srv));
+    let (ia, ib) = (a.id, b.id);
+    let mut tab = Tab::single(a);
+    tab.layout.split(ia, crate::layout::Side::Right, ib);
+    tab.panes.push(b);
+    tab.focused = ib;
+    w.app.windows.get_mut(&w.wid).unwrap().push(tab);
+    w.connect(ia);
+    w.connect(ib);
+    assert!(w.running("db"));
+    let _ = w.app.close_focused_pane(w.wid);
+    assert!(w.running("db"), "one pane is still connected");
+    w.disconnect(ia);
+    assert!(!w.running("db"));
+}

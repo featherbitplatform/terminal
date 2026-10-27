@@ -84,6 +84,7 @@ pub struct TunnelHandle {
 impl TunnelHandle {
     /// A handle with no tunnel behind it, already stopped: stands in for a real one where code
     /// that keeps handles is tested without a network.
+    #[doc(hidden)]
     pub fn inert() -> Self {
         let (stop, _) = watch::channel(false);
         let (_, done) = watch::channel(());

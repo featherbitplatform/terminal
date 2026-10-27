@@ -173,6 +173,9 @@ pub(crate) struct Tunnels {
     /// Profiles with at least one connected shell when last counted: the 0-to-1 and 1-to-0
     /// transitions of [`App::sync_shell_tunnels`] are against this.
     shells_up: BTreeSet<ProfileId>,
+    /// `with_shell` tunnels the user switched off by hand: they stay off, also through profile
+    /// edits, until the next first shell of their profile (or until switched on again).
+    off_by_hand: BTreeSet<TunnelKey>,
 }
 
 impl Tunnels {
@@ -184,6 +187,7 @@ impl Tunnels {
             receiver: TunnelReceiver(Arc::new(Mutex::new(Some(rx)))),
             starter: Arc::new(PoolStarter(pool)),
             shells_up: BTreeSet::new(),
+            off_by_hand: BTreeSet::new(),
         }
     }
 
@@ -224,13 +228,12 @@ impl Tunnels {
         }
     }
 
-    /// Let go of an instance that is stopped or has ended. If it is still releasing what it
-    /// held, a waiter sends `Off` once it is done and starts under `key` wait until then.
+    /// Let go of an instance that is stopped or has ended. A waiter sends `Off` once it has
+    /// released what it held; starts in its profile wait until then. The waiter runs even for
+    /// an instance that has already ended: its `Off` then queues behind any report the instance
+    /// sent last, so no such report reaches the next instance.
     fn retire(entry: &mut Entry, key: &TunnelKey, handle: TunnelHandle, sink: &TunnelSink) {
         handle.stop();
-        if handle.is_stopped() {
-            return;
-        }
         // Outside a runtime (unit tests) there is no task to wait for.
         let Ok(rt) = tokio::runtime::Handle::try_current() else {
             return;
@@ -256,6 +259,7 @@ impl App {
     pub(crate) fn tunnel_toggle(&mut self, key: &TunnelKey) -> Task<Message> {
         if self.tunnels.running(key) {
             self.tunnels.stop(key);
+            self.tunnels.off_by_hand.insert(key.clone());
         } else if let Some(def) = definition(&self.profiles, key) {
             let manual = def.start == StartMode::OnDemand || self.shell_count(key.profile) == 0;
             self.launch(key, self.focused_window(), manual);
@@ -279,11 +283,18 @@ impl App {
     }
 
     /// Start `key` with its current definition, asking over `window`. Waits (queued) while a
-    /// previous instance is still releasing.
+    /// stopped instance of the same profile is still releasing: its own previous instance, or
+    /// the one it was renamed from, may hold the same port.
     fn launch(&mut self, key: &TunnelKey, window: Option<window::Id>, manual: bool) {
         let Some(def) = definition(&self.profiles, key) else {
             return;
         };
+        self.tunnels.off_by_hand.remove(key);
+        let blocked = self
+            .tunnels
+            .entries
+            .iter()
+            .any(|(k, e)| k.profile == key.profile && e.releasing);
         if let Some(profile) = self.profiles.get(key.profile) {
             let prefix = failure_prefix(&key.name, &profile.name);
             self.notices.retain(|n| !n.starts_with(&prefix));
@@ -296,7 +307,7 @@ impl App {
         entry.manual = manual;
         entry.restart_to_apply = false;
         entry.state = TunnelState::Starting;
-        if entry.releasing {
+        if blocked {
             entry.queued = Some(window);
             return;
         }
@@ -321,11 +332,10 @@ impl App {
         match state {
             TunnelState::Off => {
                 entry.releasing = false;
-                if let Some((window, manual)) = entry.queued.take().map(|w| (w, entry.manual)) {
-                    self.launch(&key, window, manual);
-                } else if !entry.running() && definition(&self.profiles, &key).is_none() {
+                if !entry.running() && definition(&self.profiles, &key).is_none() {
                     self.tunnels.entries.remove(&key);
                 }
+                self.launch_queued(key.profile);
             }
             // A late report of an instance already stopped.
             _ if entry.handle.is_none() => {}
@@ -338,15 +348,58 @@ impl App {
                     .profiles
                     .get(key.profile)
                     .map_or_else(|| key.profile.to_string(), |p| p.name.clone());
-                let line = format!("{}{reason}", failure_prefix(&key.name, &profile));
-                if !self.notices.contains(&line) {
-                    self.notices.push(line);
-                }
+                let prefix = failure_prefix(&key.name, &profile);
+                self.notices.retain(|n| !n.starts_with(&prefix));
+                self.notices.push(format!("{prefix}{reason}"));
                 self.notices_dismissed = false;
             }
             state => entry.state = state,
         }
         Task::none()
+    }
+
+    /// Start the queued tunnels of `profile` once none of its stopped instances is releasing.
+    fn launch_queued(&mut self, profile: ProfileId) {
+        let entries = &self.tunnels.entries;
+        if entries
+            .iter()
+            .any(|(k, e)| k.profile == profile && e.releasing)
+        {
+            return;
+        }
+        let ready: Vec<(TunnelKey, Option<window::Id>, bool)> = entries
+            .iter()
+            .filter(|(k, _)| k.profile == profile)
+            .filter_map(|(k, e)| e.queued.map(|w| (k.clone(), w, e.manual)))
+            .collect();
+        for (key, window, manual) in ready {
+            self.launch(&key, window, manual);
+        }
+    }
+
+    /// Start `profile`'s `with_shell` tunnels that are not running, except those switched off
+    /// by hand and, with `keep_failed`, those that failed.
+    fn start_with_shell(&mut self, profile: ProfileId, keep_failed: bool) {
+        let names: Vec<String> = match self.profiles.get(profile).map(|p| &p.kind) {
+            Some(ProfileKind::Ssh(s)) => s
+                .tunnels
+                .iter()
+                .filter(|t| t.start == StartMode::WithShell)
+                .map(|t| t.name.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let window = self.focused_window();
+        for name in names {
+            let key = TunnelKey { profile, name };
+            let failed = matches!(self.tunnels.state(&key), TunnelState::Failed(_));
+            if !self.tunnels.running(&key)
+                && !self.tunnels.off_by_hand.contains(&key)
+                && !(keep_failed && failed)
+            {
+                self.launch(&key, window, false);
+            }
+        }
     }
 
     /// Connected shell panes of `profile`, in every window.
@@ -366,22 +419,9 @@ impl App {
         let was = self.tunnels.shells_up.contains(&profile);
         if up && !was {
             self.tunnels.shells_up.insert(profile);
-            let names: Vec<String> = match self.profiles.get(profile).map(|p| &p.kind) {
-                Some(ProfileKind::Ssh(s)) => s
-                    .tunnels
-                    .iter()
-                    .filter(|t| t.start == StartMode::WithShell)
-                    .map(|t| t.name.clone())
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let window = self.focused_window();
-            for name in names {
-                let key = TunnelKey { profile, name };
-                if !self.tunnels.running(&key) {
-                    self.launch(&key, window, false);
-                }
-            }
+            // The first shell: the mode applies again to tunnels switched off by hand.
+            self.tunnels.off_by_hand.retain(|k| k.profile != profile);
+            self.start_with_shell(profile, false);
         } else if !up && was {
             self.tunnels.shells_up.remove(&profile);
             let stop: Vec<TunnelKey> = self
@@ -415,13 +455,17 @@ impl App {
     }
 
     /// The profiles changed: running tunnels whose definition or connection changed are marked
-    /// `restart_to_apply`; deleted tunnels (or tunnels of deleted profiles) stop.
+    /// `restart_to_apply`; deleted tunnels (or tunnels of deleted profiles) stop. A `with_shell`
+    /// tunnel that appears while a shell of its profile is connected (added, renamed, or
+    /// switched from on demand) starts at once, unless switched off by hand; a failed one waits
+    /// for Retry or the next first shell.
     pub(crate) fn tunnels_profiles_changed(&mut self) {
         let keys: Vec<TunnelKey> = self.tunnels.entries.keys().cloned().collect();
         for key in keys {
             match definition(&self.profiles, &key) {
                 None => {
                     self.tunnels.stop(&key);
+                    self.tunnels.off_by_hand.remove(&key);
                     if self.tunnels.entries.get(&key).is_some_and(|e| !e.releasing) {
                         self.tunnels.entries.remove(&key);
                     }
@@ -436,6 +480,10 @@ impl App {
                     }
                 }
             }
+        }
+        let up: Vec<ProfileId> = self.tunnels.shells_up.iter().copied().collect();
+        for profile in up {
+            self.start_with_shell(profile, true);
         }
     }
 }

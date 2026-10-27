@@ -111,6 +111,7 @@ pub struct SessionHandle {
 impl SessionHandle {
     /// A handle with no session behind it, writing nowhere: stands in for a connected session
     /// where code that keeps handles is tested without a program or a network.
+    #[doc(hidden)]
     pub fn inert(terminal: SharedTerminal) -> Self {
         Self {
             id: SessionId::next(),
