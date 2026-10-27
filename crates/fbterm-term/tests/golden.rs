@@ -442,7 +442,10 @@ fn search_and_selection_match_the_golden_files() {
             let mut bar = Vec::new();
             for (label, pat) in queries() {
                 let o = run_search(shared, &pat, MATCH_CAP, false);
-                let visible = shared.lock().visible_matches(&pat);
+                // No time limit: a slow CI machine must not cut the list short.
+                let visible = shared
+                    .lock()
+                    .visible_matches_within(&pat, std::time::Duration::MAX);
                 bar.push(json!({
                     "query": label,
                     "matches": outcome_json(&o),

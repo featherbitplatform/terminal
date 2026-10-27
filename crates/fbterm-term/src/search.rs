@@ -430,8 +430,19 @@ impl Terminal {
     }
 
     /// Matches on the lines in view (whole logical lines, so a wrapped match half off screen
-    /// still counts), top to bottom.
+    /// still counts), top to bottom. Stops after [`VIEW_BUDGET`], showing the matches found so
+    /// far.
     pub fn visible_matches(&self, pattern: &SearchPattern) -> Vec<SearchMatch> {
+        self.visible_matches_within(pattern, VIEW_BUDGET)
+    }
+
+    /// [`Self::visible_matches`] with its own time limit; `Duration::MAX` finds them all, as
+    /// tests that compare against fixed output need on a slow machine.
+    pub fn visible_matches_within(
+        &self,
+        pattern: &SearchPattern,
+        budget: Duration,
+    ) -> Vec<SearchMatch> {
         let grid = self.term.grid();
         let offset = grid.display_offset() as i32;
         let (top, bottom) = (grid.topmost_line().0, grid.bottommost_line().0);
@@ -449,7 +460,7 @@ impl Terminal {
         let mut reader = RowReader::new();
         let mut out = Vec::new();
         let mut start = first;
-        while start <= last && started.elapsed() < VIEW_BUDGET {
+        while start <= last && started.elapsed() < budget {
             let mut end = start;
             while end < last && self.wraps(end) {
                 end += 1;
@@ -881,6 +892,18 @@ mod tests {
         );
         assert!(out.cancelled);
         assert!(out.hits.is_empty());
+    }
+
+    #[test]
+    fn visible_matches_stop_at_their_time_limit() {
+        let mut t = term(20, 5, 100);
+        for i in 0..5 {
+            t.feed(format!("hit {i}\r\n").as_bytes());
+        }
+        let p = pattern("hit", false);
+        assert!(t.visible_matches_within(&p, Duration::ZERO).is_empty());
+        let all = t.visible_matches_within(&p, Duration::MAX);
+        assert_eq!(all.len(), 4, "every line in view: {all:?}");
     }
 
     #[test]
