@@ -109,6 +109,9 @@ pub(crate) struct TransferRow {
     pub(crate) cancel: Option<CancelFn>,
     /// What the transfer does, for `Retry`; `None` for a row that cannot be retried.
     pub(crate) job: Option<Job>,
+    /// An upload writing over the existing file in place: cancelling it may leave that file
+    /// incomplete ([`fbterm_session::ssh::transfer::TransferEvent::InPlace`]).
+    pub(crate) in_place: bool,
 }
 
 impl TransferRow {
@@ -124,6 +127,7 @@ impl TransferRow {
             state: RowState::Running,
             cancel: Some(cancel),
             job: None,
+            in_place: false,
         }
     }
 
@@ -153,6 +157,7 @@ impl TransferRow {
             state,
             cancel: None,
             job: None,
+            in_place: false,
         }
     }
 

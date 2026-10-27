@@ -8,7 +8,9 @@ use std::sync::Arc;
 use fbterm_config::{AuthMethod, Paths, Profile, ProfileId, ProfileKind, SavedState, SshProfile};
 use fbterm_session::SessionHandle;
 use fbterm_session::ssh::sftp::{Entry, EntryKind, Sftp, SftpError};
-use fbterm_session::ssh::transfer::{TransferEvent, TransferId, TransferSink, UploadMode};
+use fbterm_session::ssh::transfer::{
+    DownloadMode, TransferEvent, TransferId, TransferSink, UploadMode,
+};
 use iced::window;
 use parking_lot::Mutex;
 
@@ -31,6 +33,8 @@ struct Fake {
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     /// Downloads started: the remote path, the destination and the transfer's id.
     downloads: Mutex<Vec<(String, PathBuf, TransferId)>>,
+    /// What each download started may do with an existing destination, in order.
+    download_modes: Mutex<Vec<DownloadMode>>,
     /// Transfers cancelled.
     cancels: Arc<Mutex<Vec<TransferId>>>,
     /// Save dialogs opened: the window and the name offered.
@@ -77,6 +81,7 @@ impl Backend for Fake {
         _sink: TransferSink,
     ) -> Result<super::Started, String> {
         let id = TransferId::next();
+        self.download_modes.lock().push(request.mode);
         self.downloads.lock().push((request.path, request.dest, id));
         let cancels = self.cancels.clone();
         Ok(super::Started {
@@ -1566,6 +1571,8 @@ fn download_goes_to_downloads_with_free_name() {
         dir.join("app (1).log"),
         "a free name, never over a file"
     );
+    // Never over a file that appears meanwhile either: the session takes the next free name.
+    assert_eq!(*w.fake.download_modes.lock(), [DownloadMode::FreeName]);
     // The row: the name, nothing done yet, running.
     assert_eq!(w.rows().len(), 1);
     assert_eq!(w.rows()[0].name, "app.log");
@@ -1587,17 +1594,18 @@ fn download_goes_to_downloads_with_free_name() {
         },
     );
     assert_eq!((w.rows()[0].done, w.rows()[0].total), (512, Some(2048)));
+    // Something took `app (1).log` meanwhile: the row offers where the file really went.
     w.transfer(
         id,
         TransferEvent::Finished {
             note: None,
-            local: Some(dir.join("app (1).log")),
+            local: Some(dir.join("app (4).log")),
         },
     );
     assert!(!w.rows()[0].is_running());
     assert_eq!(
         w.rows()[0].revealable(),
-        Some(dir.join("app (1).log").as_path())
+        Some(dir.join("app (4).log").as_path())
     );
     assert_eq!(
         super::REVEAL_LABEL,
@@ -1645,6 +1653,8 @@ fn download_as_uses_chosen_path() {
     assert_eq!(w.downloads().len(), 1);
     assert_eq!(w.downloads()[0].0, "/home/user/app.log");
     assert_eq!(w.downloads()[0].1, chosen, "exactly where the user chose");
+    // The user agreed to replace it in the save dialog.
+    assert_eq!(*w.fake.download_modes.lock(), [DownloadMode::Replace]);
 
     // Cancelling the dialog starts nothing.
     w.download_as();
@@ -2606,12 +2616,19 @@ fn a_transfer_finding_the_session_gone_lets_it_go() {
     flaky.0.store(false, std::sync::atomic::Ordering::Relaxed);
     w.transfer(
         id,
-        TransferEvent::Failed("The SFTP session has ended.".into()),
+        TransferEvent::Failed(
+            "File may be incomplete. The connection to the server was lost.".into(),
+        ),
     );
     assert!(w.panel().sftp.is_none());
+    // The folder says the session is gone, not what happened to that one file.
     assert_eq!(
         w.shows().as_deref(),
         Some("error: The SFTP session has ended.")
+    );
+    assert_eq!(
+        w.rows()[0].failed(),
+        Some("File may be incomplete. The connection to the server was lost.")
     );
     // Retry opens a new one.
     let opens = w.opens(&db);
@@ -2653,4 +2670,188 @@ fn close_question_stays_current_and_quit_falls_back() {
     assert!(!w.app.quitting);
     let _ = w.msg(FilePanelMsg::QuitWaited);
     assert!(w.app.quitting);
+}
+
+#[test]
+fn replace_answered_in_two_windows_starts_one_upload() {
+    let (mut w, dir) = World::uploading(vec![file("app.conf")], &["app.conf"]);
+    let (a, b) = (w.wid, window::Id::unique());
+    let db = w.db.clone();
+    // A second window shows the same profile and folder.
+    w.app.windows.insert(b, WindowState::new());
+    w.wid = b;
+    w.open_tab(&db);
+    w.toggle();
+    // Each asks about the same listed name while nothing of it is uploading.
+    let local = dir.join("app.conf");
+    w.pick(vec![local.clone()]);
+    w.wid = a;
+    w.pick(vec![local.clone()]);
+    assert!(matches!(w.app.prompts.front(a), Some(Dialog::Clash(_))));
+    assert!(matches!(w.app.prompts.front(b), Some(Dialog::Clash(_))));
+    assert!(w.uploads().is_empty());
+    // Both answer Replace: only one upload starts, the other says why not.
+    w.prompt(PromptMsg::ClashReplace(a));
+    w.prompt(PromptMsg::ClashReplace(b));
+    assert_eq!(
+        summary(&w.uploads()),
+        [uploaded(&local, "app.conf", UploadMode::Replace)]
+    );
+    let last = w.rows().last().unwrap();
+    assert_eq!(last.note(), Some("Already uploading app.conf"));
+    assert!(!last.is_running());
+    assert_eq!(w.rows().iter().filter(|r| r.is_running()).count(), 1);
+}
+
+#[test]
+fn retry_colliding_with_an_upload_in_flight_keeps_its_retry() {
+    let (mut w, dir) = World::uploading(vec![file("b.conf")], &["a.conf"]);
+    let (wid, db) = (w.wid, w.db.clone());
+    let local = dir.join("a.conf");
+    w.pick(vec![local.clone()]);
+    let first = w.uploads()[0].id;
+    w.transfer(first, TransferEvent::Failed("Disk full.".into()));
+    w.answer_list(&db, vec![file("b.conf")]);
+    // The same file again, as a new upload that is running now.
+    w.pick(vec![local.clone()]);
+    assert_eq!(w.uploads().len(), 2);
+    // Retry of the failed one: not a second upload of that name, and it can be retried later.
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, first));
+    assert_eq!(w.uploads().len(), 2);
+    assert!(w.dialog().is_none());
+    let row = w
+        .rows()
+        .iter()
+        .find(|r| r.id == first)
+        .expect("the row stays");
+    assert_eq!(row.failed(), Some("Already uploading a.conf"));
+    assert!(row.retryable());
+    assert_eq!(w.rows()[0].id, first, "in its place");
+    // Once that upload ended, Retry goes ahead.
+    let second = w.uploads()[1].id;
+    w.transfer(second, TransferEvent::Failed("Disk full.".into()));
+    w.answer_list(&db, vec![file("b.conf")]);
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, first));
+    assert_eq!(
+        summary(&w.uploads())[2],
+        uploaded(&local, "a.conf", UploadMode::New)
+    );
+}
+
+#[test]
+fn a_replace_retried_while_the_name_uploads_waits_its_turn() {
+    // An in-place replace failed; the user uploaded the name again meanwhile.
+    let (mut w, dir) = World::uploading(vec![file("app.conf")], &["app.conf"]);
+    let (wid, db) = (w.wid, w.db.clone());
+    let local = dir.join("app.conf");
+    w.pick(vec![local.clone()]);
+    w.prompt(PromptMsg::ClashReplace(wid));
+    let first = w.uploads()[0].id;
+    w.transfer(
+        first,
+        TransferEvent::Failed("File may be incomplete.".into()),
+    );
+    w.answer_list(&db, vec![file("app.conf")]);
+    w.pick(vec![local.clone()]);
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert_eq!(w.uploads().len(), 2);
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, first));
+    assert_eq!(w.uploads().len(), 2, "never two uploads of one name");
+    let row = w.rows().iter().find(|r| r.id == first).unwrap();
+    assert_eq!(row.failed(), Some("Already uploading app.conf"));
+    assert!(row.retryable());
+}
+
+#[test]
+fn close_question_count_follows_a_failed_reopen() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log"), file("db.dump")]);
+    let (wid, db) = (w.wid, w.db.clone());
+    w.select("app.log");
+    w.download();
+    w.select("db.dump");
+    w.download();
+    let first = w.downloads()[0].2;
+    w.transfer(
+        first,
+        TransferEvent::Failed("The connection was lost.".into()),
+    );
+    // Retry waits for the session to open again; meanwhile the user quits.
+    w.app.file_panels.by_profile.get_mut(&db.id).unwrap().sftp = Some(Arc::new(DeadRemote));
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, first));
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    assert_eq!(w.running_asked(), Some(2));
+    // The session cannot be opened: the waiting row fails, and the question counts one.
+    let (_, token) = w.last_open(&db).unwrap();
+    w.event(PanelEvent::Opened {
+        profile: db.id,
+        token,
+        result: Err("Connection refused".into()),
+    });
+    assert!(w.rows()[0].failed().is_some());
+    assert_eq!(w.running_asked(), Some(1));
+}
+
+#[test]
+fn closing_warns_when_a_replace_runs_in_place() {
+    let (mut w, dir) = World::uploading(vec![file("app.conf")], &["app.conf", "new.conf"]);
+    let wid = w.wid;
+    // A new upload: closing only asks about the count.
+    w.pick(vec![dir.join("new.conf")]);
+    let fresh = w.uploads()[0].id;
+    assert_eq!(w.app.quit_asking().units(), 1);
+    assert_eq!(w.transfers_asked(), Some((1, false)));
+    w.prompt(PromptMsg::Cancel(wid));
+    // A replace through a part file: still nothing more to say.
+    w.pick(vec![dir.join("app.conf")]);
+    w.prompt(PromptMsg::ClashReplace(wid));
+    let replace = w.uploads()[1].id;
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    assert_eq!(w.transfers_asked(), Some((2, false)));
+    // It turns into an in-place write: the open question says so at once.
+    w.transfer(replace, TransferEvent::InPlace);
+    assert!(w.rows()[1].is_running(), "still running");
+    assert_eq!(w.transfers_asked(), Some((2, true)));
+    w.prompt(PromptMsg::Cancel(wid));
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Close(0)));
+    assert_eq!(w.transfers_asked(), Some((2, true)));
+    assert_eq!(
+        super::queue::IN_PLACE_WARNING,
+        "Some files being replaced may be left incomplete."
+    );
+    w.prompt(PromptMsg::Cancel(wid));
+    // Once it ended, the line goes.
+    w.transfer(
+        replace,
+        TransferEvent::Finished {
+            note: Some("Replaced in place".into()),
+            local: None,
+        },
+    );
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    assert_eq!(w.transfers_asked(), Some((1, false)));
+    let _ = fresh;
+}
+
+#[test]
+fn the_quit_question_brings_its_window_forward() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log")]);
+    w.select("app.log");
+    w.download();
+    // The question is pushed with a task that focuses its window (`window::gain_focus`).
+    assert_eq!(w.app.quit_asking().units(), 1);
+    assert!(w.running_asked().is_some());
+}
+
+impl World {
+    /// The close confirmation shown: its count and whether it warns about in-place replaces.
+    fn transfers_asked(&self) -> Option<(usize, bool)> {
+        match self.dialog()? {
+            Dialog::Transfers {
+                count, in_place, ..
+            } => Some((*count, *in_place)),
+            _ => None,
+        }
+    }
 }

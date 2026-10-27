@@ -64,10 +64,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::{ProfileId, ProfileKind, ProfileStore};
-use fbterm_session::ssh::sftp::{Entry, Sftp, SftpError, SortKey, sort_entries};
+use fbterm_session::ssh::sftp::{Entry, SESSION_ENDED, Sftp, SftpError, SortKey, sort_entries};
 use fbterm_session::ssh::transfer::{
-    self, MAY_BE_INCOMPLETE, TransferEvent, TransferId, TransferSink, UploadMode,
-    free_name_avoiding, safe_local_name, same_destination,
+    self, DownloadMode, MAY_BE_INCOMPLETE, TransferEvent, TransferId, TransferSink, UploadMode,
+    free_name_avoiding, is_unsafe_char, safe_local_name, same_destination,
 };
 use fbterm_session::ssh::{Prompter, SshError, SshPool};
 use iced::futures::Stream;
@@ -80,7 +80,7 @@ use crate::prompts::UiPrompter;
 use crate::tabs::{TabState, WindowState};
 #[cfg(test)]
 pub(crate) use queue::remote_free_name;
-pub(crate) use queue::{ClashAnswer, clash_message, running_message};
+pub(crate) use queue::{ClashAnswer, IN_PLACE_WARNING, clash_message, running_message};
 use state::{CancelFn, Job, PendingSave, TransferRow};
 pub(crate) use state::{FilePanels, Listing, ProfilePanel};
 
@@ -164,6 +164,9 @@ pub(crate) struct DownloadRequest {
     pub path: String,
     /// The local file to write (through a part file next to it).
     pub dest: PathBuf,
+    /// Whether a file at `dest` by the time it completes is replaced (`Download as…`) or
+    /// left alone, the download taking the next free name (`Download`).
+    pub mode: DownloadMode,
 }
 
 /// What uploading a file takes.
@@ -328,7 +331,7 @@ impl Backend for PoolBackend {
         if runtime().is_none() {
             return Err(format!("Could not start: {NO_RUNTIME}."));
         }
-        let handle = transfer::download(sftp, r.path, r.dest, sink);
+        let handle = transfer::download(sftp, r.path, r.dest, r.mode, sink);
         let id = handle.id();
         Ok(Started {
             id,
@@ -728,31 +731,13 @@ pub(crate) enum Body<'a> {
     Entries(&'a ProfilePanel),
 }
 
-/// A remote name (or a server's message) as plain text: control characters (escape
-/// sequences, new lines), bidirectional controls (which could reorder what is shown, e.g. a
-/// `.exe` shown as `.pdf`), line and paragraph separators and invisible zero-width characters
-/// become `?`. The joiners U+200C and U+200D stay: names in many scripts need them.
+/// A remote name (or a server's message) as plain text: each character of
+/// [`is_unsafe_char`] (control and bidirectional characters, line separators, invisible
+/// zero-width characters) becomes `?`. Local names use the same set ([`safe_local_name`]).
 pub(crate) fn plain_name(name: &str) -> String {
     name.chars()
         .map(|c| if is_unsafe_char(c) { '?' } else { c })
         .collect()
-}
-
-fn is_unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{200E}'
-                | '\u{200F}'
-                | '\u{061C}'
-                | '\u{2028}'
-                | '\u{2029}'
-                | '\u{200B}'
-                | '\u{2060}'
-                | '\u{FEFF}'
-        )
 }
 
 impl App {
@@ -1037,7 +1022,10 @@ impl App {
                 continue;
             };
             let row = &mut panel.transfers[i];
-            let ends = !matches!(event, TransferEvent::Progress { .. });
+            let ends = !matches!(
+                event,
+                TransferEvent::Progress { .. } | TransferEvent::InPlace
+            );
             if ends && let Some(Job::Upload { folder, .. }) = &row.job {
                 ended_upload = Some((*profile, folder.clone()));
             }
@@ -1046,18 +1034,20 @@ impl App {
                     row.done = done;
                     row.total = total;
                 }
+                TransferEvent::InPlace => row.in_place = true,
                 TransferEvent::Finished { local, note } => {
                     row.state = state::RowState::Finished { local, note };
                     row.cancel = None;
                 }
                 TransferEvent::Failed(reason) => {
-                    row.state = state::RowState::Failed(reason.clone());
+                    row.state = state::RowState::Failed(reason);
                     row.cancel = None;
                     // The session is gone (not just this file): let it go, so browsing and
-                    // `Retry` open a new one.
+                    // `Retry` open a new one. The folder says so plainly; the row keeps what
+                    // happened to its file.
                     if panel.sftp.as_ref().is_some_and(|s| !s.is_alive()) {
                         panel.sftp = None;
-                        panel.listing = Listing::Failed(reason);
+                        panel.listing = Listing::Failed(SESSION_ENDED.into());
                         panel.shown.clear();
                     }
                 }

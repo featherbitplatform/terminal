@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use fbterm_config::{AuthMethod, Profile, ProfileId, ProfileKind, ProfileStore, SshProfile};
 use fbterm_secrets::{MemoryStore, SecretKind};
-use fbterm_session::ssh::transfer::{TransferEvent, TransferId, UploadMode};
+use fbterm_session::ssh::transfer::{DownloadMode, TransferEvent, TransferId, UploadMode};
 use fbterm_session::ssh::{Prompter, SecretAnswer, SshContext, SshPool};
 use iced::window;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
@@ -98,6 +98,7 @@ async fn fetch(
                 remote: remote.clone(),
                 path,
                 dest: dest.clone(),
+                mode: DownloadMode::FreeName,
             },
             tx,
         )
@@ -216,6 +217,7 @@ async fn pool_backend_uploads_and_downloads() {
                 remote: remote.clone(),
                 path: format!("{folder}/{name}"),
                 dest: dest.clone(),
+                mode: DownloadMode::Replace,
             },
             tx.clone(),
         )

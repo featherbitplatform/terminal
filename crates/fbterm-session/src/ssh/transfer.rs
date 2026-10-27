@@ -2,13 +2,17 @@
 //!
 //! Each transfer is a task that reports to a [`TransferSink`]: a first
 //! [`TransferEvent::Progress`] with the total, further progress at most every
-//! [`PROGRESS_INTERVAL`] (only when bytes moved; there is no timer otherwise), then exactly one
-//! final event, preceded by a last progress event when the count changed since the previous
-//! one. The channel then has nothing more for that transfer.
+//! [`PROGRESS_INTERVAL`] (only when bytes moved; there is no timer otherwise), at most one
+//! [`TransferEvent::InPlace`] for an upload that starts writing over the existing file, then
+//! exactly one final event, preceded by a last progress event when the count changed since the
+//! previous one. The channel then has nothing more for that transfer.
 //!
 //! Nothing is ever left half-written under a name the user knows:
-//! - A download writes `.<name>.fbterm-part` next to its destination and renames it over the
-//!   destination when complete; cancelling or failing removes the part file. It reads until
+//! - A download writes `.<name>.fbterm-part` next to its destination and moves it there when
+//!   complete; cancelling or failing removes the part file. With [`DownloadMode::Replace`]
+//!   (a destination the user chose) the part file is renamed over the destination. With
+//!   [`DownloadMode::FreeName`] nothing is ever replaced: a file that took the name meanwhile
+//!   makes the download take the next free name ([`save_without_replacing`]). It reads until
 //!   the end of the remote file, so a file that changes size meanwhile is not an error (the
 //!   size from `stat` is only shown as the total).
 //! - An upload writes `.<name>.fbterm-part` in the target folder and renames it into place
@@ -88,6 +92,9 @@ impl TransferId {
 pub enum TransferEvent {
     /// Bytes moved so far, of `total` (the size when the transfer started, for display).
     Progress { done: u64, total: Option<u64> },
+    /// An upload is about to write over the existing file in place: stopping it from now on
+    /// may leave that file incomplete. Sent at most once, before the final event.
+    InPlace,
     /// Done. `note` is [`REPLACED_IN_PLACE`] for an in-place replace; `local` is where a
     /// download was saved.
     Finished {
@@ -102,6 +109,16 @@ pub enum TransferEvent {
 
 /// Where transfers send their events, tagged with their id.
 pub type TransferSink = mpsc::UnboundedSender<(TransferId, TransferEvent)>;
+
+/// What a download may do when its destination exists when it completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownloadMode {
+    /// Replace it (a destination the user chose, and agreed to replace, in the save dialog).
+    Replace,
+    /// Never replace: a file that took the name meanwhile makes the download take the next
+    /// free name, reported in [`TransferEvent::Finished`].
+    FreeName,
+}
 
 /// What an upload may do when its name exists in the target folder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,18 +154,20 @@ impl TransferHandle {
     }
 }
 
-/// Download the remote file `remote` (a link is followed) to the local path `dest`, replacing
-/// `dest` when complete. Must be called within a tokio runtime.
+/// Download the remote file `remote` (a link is followed) to the local path `dest`; `mode`
+/// says what happens when `dest` exists by the time it completes. Must be called within a
+/// tokio runtime.
 pub fn download(
     sftp: Arc<Sftp>,
     remote: String,
     dest: PathBuf,
+    mode: DownloadMode,
     events: TransferSink,
 ) -> TransferHandle {
     let handle = TransferHandle::new();
     let mut run = Run::new(handle.id, events, handle.cancel.clone());
     tokio::spawn(async move {
-        let outcome = run_download(&mut run, &sftp, &remote, &dest).await;
+        let outcome = run_download(&mut run, &sftp, &remote, &dest, mode).await;
         run.end(outcome);
     });
     handle
@@ -216,12 +235,33 @@ pub fn same_destination(a: &Path, b: &Path) -> bool {
         }
 }
 
-/// `remote` (a remote file name) as a local file name: path separators and control
-/// characters become `_` (on Windows also the characters it forbids, trailing dots and
+/// Whether `c` must not be shown or used as it is in a name from a server: control characters
+/// (escape sequences, new lines), bidirectional controls (which could reorder what is shown,
+/// e.g. a `.exe` shown as `.pdf`), line and paragraph separators and invisible zero-width
+/// characters. The joiners U+200C and U+200D are not: names in many scripts need them.
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{061C}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{200B}'
+                | '\u{2060}'
+                | '\u{FEFF}'
+        )
+}
+
+/// `remote` (a remote file name) as a local file name: path separators and the characters of
+/// [`is_unsafe_char`] become `_` (on Windows also the characters it forbids, trailing dots and
 /// spaces go, and device names get a `_` in front); empty, `.` and `..` become `download`.
 pub fn safe_local_name(remote: &str) -> String {
     let forbidden = |c: char| {
-        c == '/' || c == '\\' || c.is_control() || (cfg!(windows) && "<>:\"|?*".contains(c))
+        c == '/' || c == '\\' || is_unsafe_char(c) || (cfg!(windows) && "<>:\"|?*".contains(c))
     };
     let mut name: String = remote
         .chars()
@@ -245,10 +285,10 @@ pub fn safe_local_name(remote: &str) -> String {
     }
 }
 
-/// `name` for messages: control characters shown as `?`.
+/// `name` for messages: the characters of [`is_unsafe_char`] shown as `?`.
 fn shown(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if is_unsafe_char(c) { '?' } else { c })
         .collect()
 }
 
@@ -439,6 +479,7 @@ async fn run_download(
     sftp: &Sftp,
     remote: &str,
     dest: &Path,
+    mode: DownloadMode,
 ) -> Result<TransferEvent, Stop> {
     let name = shown(remote.rsplit('/').next().unwrap_or(remote));
     let entry = match run.step(sftp.stat(remote)).await? {
@@ -499,19 +540,75 @@ async fn run_download(
     close_quietly(sftp, &handle, remote).await;
     let saved = match copied {
         Ok(()) if run.cancel.is_cancelled() => Err(Stop::Cancelled),
-        Ok(()) => tokio::fs::rename(&part, dest)
-            .await
-            .map_err(|e| local_error("save", dest, &e)),
+        Ok(()) => match mode {
+            DownloadMode::Replace => tokio::fs::rename(&part, dest)
+                .await
+                .map(|()| dest.to_owned())
+                .map_err(|e| local_error("save", dest, &e)),
+            DownloadMode::FreeName => {
+                let (from, to) = (part.clone(), dest.to_owned());
+                match tokio::task::spawn_blocking(move || save_without_replacing(&from, &to)).await
+                {
+                    Ok(saved) => saved.map_err(|e| local_error("save", dest, &e)),
+                    Err(e) => Err(Stop::Failed(format!(
+                        "Could not save {}: {e}.",
+                        dest.display()
+                    ))),
+                }
+            }
+        },
         Err(stop) => Err(stop),
     };
-    if let Err(stop) = saved {
-        let _ = tokio::fs::remove_file(&part).await;
-        return Err(stop);
+    match saved {
+        Ok(local) => Ok(TransferEvent::Finished {
+            note: None,
+            local: Some(local),
+        }),
+        Err(stop) => {
+            let _ = tokio::fs::remove_file(&part).await;
+            Err(stop)
+        }
     }
-    Ok(TransferEvent::Finished {
-        note: None,
-        local: Some(dest.to_owned()),
-    })
+}
+
+/// Move the complete `part` file to `dest` without ever replacing a file: when something took
+/// that name meanwhile, the next free name in the same folder ([`free_name`]) is used instead.
+/// Returns where the file went. A hard link claims a name atomically (it fails when the name
+/// exists); where the disk has no hard links (FAT, exFAT) the part file is renamed to a name
+/// found free just before.
+pub fn save_without_replacing(part: &Path, dest: &Path) -> std::io::Result<PathBuf> {
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let name = dest
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut target = dest.to_owned();
+    loop {
+        match std::fs::hard_link(part, &target) {
+            Ok(()) => {
+                // The file is saved under `target`; the part name is only a second link.
+                let _ = std::fs::remove_file(part);
+                return Ok(target);
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => target = free_name(dir, &name),
+            Err(e) if links_unsupported(&e) => {
+                if target.symlink_metadata().is_ok() {
+                    target = free_name(dir, &name);
+                }
+                std::fs::rename(part, &target)?;
+                return Ok(target);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Whether `e`, from making a hard link, says the disk cannot have them.
+fn links_unsupported(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        ErrorKind::Unsupported | ErrorKind::PermissionDenied
+    ) || (cfg!(windows) && matches!(e.raw_os_error(), Some(1 | 50)))
 }
 
 /// Create the local part file; one left over from an earlier run is replaced.
@@ -848,6 +945,7 @@ impl Upload<'_> {
             return Err(Stop::Cancelled);
         }
         let incomplete = |reason: String| Stop::Failed(format!("{MAY_BE_INCOMPLETE}. {reason}"));
+        run.progress.send(TransferEvent::InPlace);
         let handle = match run.settle(sftp.open_truncate(self.target)).await {
             Ok(Ok(handle)) => handle,
             // The server may or may not have emptied the file before the session went.

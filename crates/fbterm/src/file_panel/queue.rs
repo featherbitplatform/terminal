@@ -27,7 +27,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use fbterm_config::ProfileId;
-use fbterm_session::ssh::transfer::{UploadMode, free_name_avoiding, same_destination};
+use fbterm_session::ssh::transfer::{
+    DownloadMode, TransferId, UploadMode, free_name_avoiding, same_destination,
+};
 use iced::{Task, window};
 
 use super::state::{AllChoice, Batch, Direction, Job, Listing, RowState, TransferRow};
@@ -67,6 +69,10 @@ pub(crate) fn running_message(count: usize) -> String {
         format!("{count} transfers are still running.")
     }
 }
+
+/// The close confirmation's second line, while an upload it would cancel writes over an
+/// existing file in place.
+pub(crate) const IN_PLACE_WARNING: &str = "Some files being replaced may be left incomplete.";
 
 /// The first of `name`, `name (1).ext`, `name (2).ext`, … that `taken` does not claim.
 pub(crate) fn remote_free_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
@@ -223,10 +229,23 @@ impl App {
     /// Whether a running upload into `profile`'s `folder` writes `name` (ignoring case, as
     /// [`same_destination`] does): a second upload there would share its part file.
     fn uploading_same(&self, profile: ProfileId, folder: &str, name: &str) -> bool {
+        self.uploading_same_except(profile, folder, name, None)
+    }
+
+    /// [`App::uploading_same`], not counting the row `except` (a row waiting to start again
+    /// is running already, and must not block itself).
+    fn uploading_same_except(
+        &self,
+        profile: ProfileId,
+        folder: &str,
+        name: &str,
+        except: Option<TransferId>,
+    ) -> bool {
         let name = name.to_lowercase();
         self.file_panels.by_profile.get(&profile).is_some_and(|p| {
             p.transfers
                 .iter()
+                .filter(|r| Some(r.id) != except)
                 .filter_map(|r| r.uploading_into(folder))
                 .any(|n| n.to_lowercase() == name)
         })
@@ -438,17 +457,38 @@ impl App {
 
     /// Start `job` on `profile`'s session, with a row in its queue.
     pub(super) fn start_job(&mut self, profile: ProfileId, job: Job) {
-        let row = self.launch_job(profile, job);
+        let row = self.launch_job(profile, job, None);
         self.add_row(profile, row);
     }
 
     /// Start `job` on `profile`'s session: its row, running, or failed with why it could not
-    /// start (and `Retry`).
-    fn launch_job(&self, profile: ProfileId, job: Job) -> TransferRow {
+    /// start (and `Retry`). `again` is the row a `Retry` starts again, if it is one.
+    ///
+    /// Every upload starts here, so this is where two uploads of one name into one folder are
+    /// kept apart (they would share a part file, and one could rename the other's half-written
+    /// file into place): an upload whose name another row is uploading there does not start.
+    /// A new row is skipped with `Already uploading {name}`; a row started again fails with
+    /// that reason and keeps its `Retry`.
+    fn launch_job(&self, profile: ProfileId, job: Job, again: Option<TransferId>) -> TransferRow {
         let (name, direction) = match &job {
             Job::Download { name, .. } => (plain_name(name), Direction::Download),
             Job::Upload { name, .. } => (plain_name(name), Direction::Upload),
         };
+        if let Job::Upload {
+            folder,
+            name: remote,
+            ..
+        } = &job
+            && self.uploading_same_except(profile, folder, remote, again)
+        {
+            let note = already_uploading(&name);
+            if again.is_none() {
+                return TransferRow::stopped(name, direction, RowState::Skipped(note));
+            }
+            let mut row = TransferRow::stopped(name, direction, RowState::Failed(note));
+            row.job = Some(job);
+            return row;
+        }
         let session = self
             .file_panels
             .by_profile
@@ -460,12 +500,22 @@ impl App {
                 let sink = self.file_panel_work.transfer_sink.clone();
                 match &job {
                     Job::Download {
-                        remote: path, dest, ..
+                        remote: path,
+                        dest,
+                        chosen,
+                        ..
                     } => self.file_panel_work.backend.download(
                         DownloadRequest {
                             remote,
                             path: path.clone(),
                             dest: dest.clone(),
+                            // Only a destination the user chose (and agreed to replace in the
+                            // save dialog) is replaced; `Download` never replaces anything.
+                            mode: if *chosen {
+                                DownloadMode::Replace
+                            } else {
+                                DownloadMode::FreeName
+                            },
                         },
                         sink,
                     ),
@@ -529,6 +579,15 @@ impl App {
             return;
         };
         match &mut job {
+            // A name being uploaded there now: not a second upload of it, and the row keeps
+            // its `Retry` for later.
+            Job::Upload { folder, name, .. } if self.uploading_same(profile, folder, name) => {
+                let note = already_uploading(&plain_name(name));
+                if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                    panel.transfers[index].state = RowState::Failed(note);
+                }
+                return;
+            }
             // A name now in the folder is asked about before anything is replaced.
             Job::Upload {
                 local,
@@ -579,13 +638,6 @@ impl App {
                     });
                 }
             }
-            Job::Upload { folder, name, .. } if self.uploading_same(profile, folder, name) => {
-                let note = already_uploading(&plain_name(name));
-                if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
-                    panel.transfers[index].state = RowState::Failed(note);
-                }
-                return;
-            }
             Job::Upload { .. } => {}
         }
         let alive = self
@@ -595,7 +647,7 @@ impl App {
             .and_then(|p| p.sftp.as_ref())
             .is_some_and(|s| s.is_alive());
         if alive {
-            let row = self.launch_job(profile, job);
+            let row = self.launch_job(profile, job, Some(id));
             if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
                 panel.transfers[index] = row;
             }
@@ -638,7 +690,7 @@ impl App {
                 .job
                 .clone();
             let row = match (opened, job) {
-                (Ok(()), Some(job)) => self.launch_job(profile, job),
+                (Ok(()), Some(job)) => self.launch_job(profile, job, Some(id)),
                 (Err(reason), job) => {
                     let row = &self.file_panels.by_profile[&profile].transfers[index];
                     let mut failed = TransferRow::stopped(
@@ -655,6 +707,8 @@ impl App {
                 panel.transfers[index] = row;
             }
         }
+        // Rows that failed no longer run: a close confirmation counts them no more.
+        self.refresh_transfer_questions();
     }
 
     /// A row's dismiss button: rows that no longer run leave the queue.
@@ -703,12 +757,29 @@ impl App {
 
     /// Running transfers of `profiles`.
     fn running_of(&self, profiles: &[ProfileId]) -> usize {
-        profiles
+        self.running_rows(Some(profiles)).count()
+    }
+
+    /// The running rows of `profiles` (every profile with `None`).
+    fn running_rows<'a>(
+        &'a self,
+        profiles: Option<&'a [ProfileId]>,
+    ) -> impl Iterator<Item = &'a TransferRow> + 'a {
+        self.file_panels
+            .by_profile
             .iter()
-            .filter_map(|p| self.file_panels.by_profile.get(p))
-            .flat_map(|p| p.transfers.iter())
+            .filter(move |(p, _)| profiles.is_none_or(|ps| ps.contains(p)))
+            .flat_map(|(_, panel)| panel.transfers.iter())
             .filter(|r| r.is_running())
-            .count()
+    }
+
+    /// What a close confirmation about `profiles` (every profile with `None`) says: how many
+    /// transfers run, and whether one of them writes over an existing file in place.
+    fn running_question(&self, profiles: Option<&[ProfileId]>) -> (usize, bool) {
+        self.running_rows(profiles)
+            .fold((0, false), |(n, in_place), r| {
+                (n + 1, in_place || r.in_place)
+            })
     }
 
     /// macOS: the app menu's Quit keeps `Cmd+Q` only while no transfer runs; while some do,
@@ -723,12 +794,7 @@ impl App {
     }
 
     fn running_total(&self) -> usize {
-        self.file_panels
-            .by_profile
-            .values()
-            .flat_map(|p| p.transfers.iter())
-            .filter(|r| r.is_running())
-            .count()
+        self.running_rows(None).count()
     }
 
     /// The profiles with transfers running that closing `panes` would leave without any
@@ -771,41 +837,47 @@ impl App {
         panes: &[PaneId],
         then: Closing,
     ) -> bool {
-        let count = self.running_of(&self.ended_by(panes));
+        let (count, in_place) = self.running_question(Some(&self.ended_by(panes)));
         if count == 0 {
             return false;
         }
         if !self.prompts.has_transfers(wid, then) {
-            self.prompts
-                .push(wid, None, Dialog::Transfers { count, then });
+            self.prompts.push(
+                wid,
+                None,
+                Dialog::Transfers {
+                    count,
+                    in_place,
+                    then,
+                },
+            );
         }
         true
     }
 
-    /// What a close confirmation for `then` over `wid` counts now.
-    fn running_for(&self, wid: window::Id, then: Closing) -> usize {
-        match then {
-            Closing::Quit => self.running_total(),
-            Closing::Window => self.running_of(&self.ended_by(&self.window_panes(wid))),
-            Closing::Pane(pane) => self.running_of(&self.ended_by(&[pane])),
-            Closing::Tab(tab) => {
-                let panes: Vec<PaneId> = self
-                    .windows
-                    .get(&wid)
-                    .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
-                    .map(|t| t.panes.iter().map(|p| p.id).collect())
-                    .unwrap_or_default();
-                self.running_of(&self.ended_by(&panes))
-            }
-        }
+    /// What a close confirmation for `then` over `wid` says now ([`App::running_question`]).
+    fn running_for(&self, wid: window::Id, then: Closing) -> (usize, bool) {
+        let panes = match then {
+            Closing::Quit => return self.running_question(None),
+            Closing::Window => self.window_panes(wid),
+            Closing::Pane(pane) => vec![pane],
+            Closing::Tab(tab) => self
+                .windows
+                .get(&wid)
+                .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                .map(|t| t.panes.iter().map(|p| p.id).collect())
+                .unwrap_or_default(),
+        };
+        self.running_question(Some(&self.ended_by(&panes)))
     }
 
-    /// A transfer ended: the close confirmations say how many still run, and go once none
-    /// does (nothing is closed by itself: the user asks again).
+    /// A transfer ended or began writing in place: the close confirmations say how many still
+    /// run (and whether one writes in place), and go once none does (nothing is closed by
+    /// itself: the user asks again).
     pub(super) fn refresh_transfer_questions(&mut self) {
         for (wid, then) in self.prompts.transfer_questions() {
-            let count = self.running_for(wid, then);
-            self.prompts.set_transfers(wid, then, count);
+            let (count, in_place) = self.running_for(wid, then);
+            self.prompts.set_transfers(wid, then, count, in_place);
         }
     }
 
@@ -820,7 +892,7 @@ impl App {
         if self.quitting {
             return Task::none();
         }
-        let count = self.running_total();
+        let (count, in_place) = self.running_question(None);
         if count == 0 {
             return self.quit();
         }
@@ -834,10 +906,13 @@ impl App {
                     None,
                     Dialog::Transfers {
                         count,
+                        in_place,
                         then: Closing::Quit,
                     },
                 );
-                Task::none()
+                // The question may be in a window behind others or minimised (Quit pressed in
+                // another window, or with the app in the background): bring it forward.
+                window::gain_focus(wid)
             }
             // Nowhere to ask: what runs is cancelled, as the user is leaving.
             None => self.stop_transfers_and_close(None, Closing::Quit),

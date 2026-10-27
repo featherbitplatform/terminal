@@ -248,8 +248,14 @@ pub enum Dialog {
     CloseTab { tab: TabId, panes: usize },
     /// An upload's name exists in its folder: `Replace`, `Rename` or `Cancel`.
     Clash(Clash),
-    /// Closing (or quitting) would end `count` running transfers: asked first.
-    Transfers { count: usize, then: Closing },
+    /// Closing (or quitting) would end `count` running transfers: asked first. With
+    /// `in_place`, one of them is a replace writing over the existing file in place, which
+    /// cancelling may leave incomplete: the question says so.
+    Transfers {
+        count: usize,
+        in_place: bool,
+        then: Closing,
+    },
     Secret {
         profile: String,
         kind: SecretKind,
@@ -463,9 +469,15 @@ impl PromptQueues {
             .collect()
     }
 
-    /// Set the count of `window`'s close confirmation for `then`; at 0 there is nothing left
-    /// to ask about, and it goes.
-    pub fn set_transfers(&mut self, window: window::Id, then: Closing, count: usize) {
+    /// Set the count of `window`'s close confirmation for `then`, and whether it warns about
+    /// in-place replaces; at 0 there is nothing left to ask about, and it goes.
+    pub fn set_transfers(
+        &mut self,
+        window: window::Id,
+        then: Closing,
+        count: usize,
+        in_place: bool,
+    ) {
         let Some(q) = self.0.get_mut(&window) else {
             return;
         };
@@ -477,10 +489,15 @@ impl PromptQueues {
             return;
         }
         for p in q.iter_mut() {
-            if let Dialog::Transfers { count: c, then: t } = &mut p.dialog
+            if let Dialog::Transfers {
+                count: c,
+                in_place: i,
+                then: t,
+            } = &mut p.dialog
                 && *t == then
             {
                 *c = count;
+                *i = in_place;
             }
         }
     }

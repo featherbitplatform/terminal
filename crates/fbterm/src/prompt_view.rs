@@ -136,14 +136,25 @@ pub fn view<'a>(
         .spacing(14)
         .into(),
         Dialog::Clash(clash) => clash_view(t, window, clash),
-        Dialog::Transfers { count, .. } => column![
+        Dialog::Transfers {
+            count, in_place, ..
+        } => column![
             header(
                 t,
                 ui::ICON_WARNING,
                 t.warning,
                 crate::file_panel::running_message(*count)
             ),
-            buttons(vec![
+        ]
+        // Cancelling may leave a file being written in place incomplete: said only then.
+        .extend(in_place.then(|| {
+            text(crate::file_panel::IN_PLACE_WARNING)
+                .font(UI_FONT)
+                .size(13)
+                .color(t.text_secondary)
+                .into()
+        }))
+        .push(buttons(vec![
                 ui::text_button(t, "Keep open", Some(msg(PromptMsg::Cancel(window))), ui::secondary)
                     .into(),
                 ui::text_button(
@@ -153,8 +164,7 @@ pub fn view<'a>(
                     ui::primary,
                 )
                 .into(),
-            ]),
-        ]
+            ]))
         .spacing(14)
         .into(),
         Dialog::Secret {

@@ -20,7 +20,7 @@ use fbterm_config::{AuthMethod, Profile, ProfileId, ProfileKind, ProfileStore, S
 use fbterm_secrets::{MemoryStore, SecretKind};
 use fbterm_session::ssh::sftp::{Entry, EntryKind, Sftp, SftpError};
 use fbterm_session::ssh::transfer::{
-    REPLACED_IN_PLACE, TransferEvent, TransferId, UploadMode, download, upload,
+    DownloadMode, REPLACED_IN_PLACE, TransferEvent, TransferId, UploadMode, download, upload,
 };
 use fbterm_session::ssh::{Prompter, SecretAnswer, SshContext, SshPool};
 use fbterm_session::{EventSink, SessionHandle};
@@ -472,7 +472,13 @@ async fn download_round_trip() {
     for name in ["data.bin", "link", "broken", "pipe", "Sub"] {
         let (tx, mut rx) = unbounded_channel();
         let dest = local.path().join(format!("got-{name}"));
-        let handle = download(sftp.clone(), format!("{dir}/{name}"), dest, tx);
+        let handle = download(
+            sftp.clone(),
+            format!("{dir}/{name}"),
+            dest,
+            DownloadMode::FreeName,
+            tx,
+        );
         results.push(events(&mut rx, handle.id()).await);
     }
     // Checksums of what arrived, made by the same shell tool on the server side for comparison.
@@ -559,7 +565,13 @@ async fn cancel_download_leaves_nothing() {
     let sftp = Arc::new(w.sftp(w.bastion).await);
     let local = tempfile::tempdir().unwrap();
     let (tx, mut rx) = unbounded_channel();
-    let handle = download(sftp, format!("{dir}/big"), local.path().join("big"), tx);
+    let handle = download(
+        sftp,
+        format!("{dir}/big"),
+        local.path().join("big"),
+        DownloadMode::FreeName,
+        tx,
+    );
     // Cancel mid-transfer, once data has reached the part file.
     until_moving(&mut rx, handle.id()).await;
     let part_before = local_names(local.path());
@@ -737,6 +749,7 @@ async fn replace_without_folder_write_writes_in_place() {
             local: None,
         }
     );
+    assert!(got.contains(&TransferEvent::InPlace), "{got:?}");
     assert_eq!(text, "new");
     assert_eq!(mode, "600");
     let names: Vec<String> = names.unwrap().into_iter().map(|e| e.name).collect();
@@ -838,7 +851,13 @@ async fn progress_is_coalesced() {
     let local = tempfile::tempdir().unwrap();
     let (tx, mut rx) = unbounded_channel();
     let started = Instant::now();
-    let handle = download(sftp, format!("{dir}/big"), local.path().join("big"), tx);
+    let handle = download(
+        sftp,
+        format!("{dir}/big"),
+        local.path().join("big"),
+        DownloadMode::FreeName,
+        tx,
+    );
     let got = timed_events(&mut rx, handle.id()).await;
     let took = started.elapsed();
     remove(&shell, &dir).await;

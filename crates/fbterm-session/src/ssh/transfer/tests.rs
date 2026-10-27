@@ -129,6 +129,15 @@ fn download_name_is_sanitized() {
     assert_eq!(safe_local_name("../../etc/passwd"), ".._.._etc_passwd");
     assert_eq!(safe_local_name("\u{1b}[31mred\n"), "_[31mred_");
     assert_eq!(safe_local_name("nul\0byte"), "nul_byte");
+    // Characters that reorder or hide what is shown never reach a local name: Finder would
+    // show this one as `invoiceexe.pdf`.
+    assert_eq!(safe_local_name("invoice\u{202E}fdp.exe"), "invoice_fdp.exe");
+    assert_eq!(
+        safe_local_name("a\u{2066}b\u{2028}c\u{200B}d\u{2060}e\u{FEFF}f\u{200E}g"),
+        "a_b_c_d_e_f_g"
+    );
+    // Joiners stay: names in many scripts need them.
+    assert_eq!(safe_local_name("a\u{200D}b"), "a\u{200D}b");
     for bad in ["", ".", ".."] {
         assert_eq!(safe_local_name(bad), "download", "{bad:?}");
     }
@@ -185,7 +194,13 @@ async fn download_reads_to_the_end() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("data.bin");
     let (tx, mut rx) = unbounded_channel();
-    let handle = download(sftp, "/r/data.bin".into(), dest.clone(), tx);
+    let handle = download(
+        sftp,
+        "/r/data.bin".into(),
+        dest.clone(),
+        DownloadMode::Replace,
+        tx,
+    );
     let events = all(&mut rx, handle.id()).await;
     assert_eq!(
         last(&events),
@@ -215,7 +230,13 @@ async fn download_refuses_folders_and_special_files() {
     let dir = tempfile::tempdir().unwrap();
     for (remote, says) in [("/r/sub", "folder"), ("/r/pipe", "not a regular file")] {
         let (tx, mut rx) = unbounded_channel();
-        let handle = download(sftp.clone(), remote.into(), dir.path().join("x"), tx);
+        let handle = download(
+            sftp.clone(),
+            remote.into(),
+            dir.path().join("x"),
+            DownloadMode::Replace,
+            tx,
+        );
         let events = all(&mut rx, handle.id()).await;
         match last(&events) {
             TransferEvent::Failed(m) => assert!(m.contains(says), "{m}"),
@@ -233,7 +254,13 @@ async fn cancel_is_idempotent_and_removes_the_part_file() {
     let sftp = Arc::new(fake::session(server.clone()).await);
     let dir = tempfile::tempdir().unwrap();
     let (tx, mut rx) = unbounded_channel();
-    let handle = download(sftp, "/r/big".into(), dir.path().join("big"), tx);
+    let handle = download(
+        sftp,
+        "/r/big".into(),
+        dir.path().join("big"),
+        DownloadMode::FreeName,
+        tx,
+    );
     assert!(matches!(
         next(&mut rx, handle.id()).await,
         Some(TransferEvent::Progress { .. })
@@ -269,12 +296,25 @@ async fn cancel_after_finish_does_nothing_and_drop_does_not_cancel() {
 
     // Dropped at once: the download still completes.
     let (tx, mut rx) = unbounded_channel();
-    let id = download(sftp.clone(), "/r/small".into(), dest.clone(), tx).id();
+    let id = download(
+        sftp.clone(),
+        "/r/small".into(),
+        dest.clone(),
+        DownloadMode::FreeName,
+        tx,
+    )
+    .id();
     let events = all(&mut rx, id).await;
     assert!(matches!(last(&events), TransferEvent::Finished { .. }));
 
     let (tx, mut rx) = unbounded_channel();
-    let handle = download(sftp, "/r/small".into(), dir.path().join("again"), tx);
+    let handle = download(
+        sftp,
+        "/r/small".into(),
+        dir.path().join("again"),
+        DownloadMode::Replace,
+        tx,
+    );
     let events = all(&mut rx, handle.id()).await;
     assert!(matches!(last(&events), TransferEvent::Finished { .. }));
     handle.cancel();
@@ -376,6 +416,7 @@ async fn replace_keeps_mode_through_a_part_file() {
             local: None,
         }
     );
+    assert!(!events.contains(&TransferEvent::InPlace), "{events:?}");
     assert_eq!(
         server.get("/up/run.sh"),
         Some(b"#!/bin/sh\necho new\n".to_vec())
@@ -399,6 +440,15 @@ async fn replace_without_the_rename_extension_writes_in_place() {
             note: Some(REPLACED_IN_PLACE.into()),
             local: None,
         }
+    );
+    // Said once, before the file is touched: a stop from then on may leave it incomplete.
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| **e == TransferEvent::InPlace)
+            .count(),
+        1,
+        "{events:?}"
     );
     assert_eq!(server.get("/up/conf"), Some(b"new".to_vec()));
     assert_eq!(server.mode("/up/conf"), Some(0o640));
@@ -566,6 +616,94 @@ async fn refused_rename_falls_back_to_in_place() {
 }
 
 #[tokio::test]
+async fn download_into_a_free_name_never_replaces_a_file_that_appeared() {
+    let content = pattern(400_000);
+    let server = fake::Server::new(true);
+    server.put("/r/report.pdf", &content, 0o644);
+    server.set_read_delay(Duration::from_millis(20));
+    let sftp = Arc::new(fake::session(server).await);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("report.pdf");
+    let (tx, mut rx) = unbounded_channel();
+    let handle = download(
+        sftp,
+        "/r/report.pdf".into(),
+        dest.clone(),
+        DownloadMode::FreeName,
+        tx,
+    );
+    assert!(matches!(
+        next(&mut rx, handle.id()).await,
+        Some(TransferEvent::Progress { .. })
+    ));
+    // Something else saves under the same name while the download runs.
+    std::fs::write(&dest, "theirs").unwrap();
+    let events = all(&mut rx, handle.id()).await;
+    let saved = dir.path().join("report (1).pdf");
+    assert_eq!(
+        last(&events),
+        &TransferEvent::Finished {
+            note: None,
+            local: Some(saved.clone()),
+        }
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"theirs");
+    assert_eq!(std::fs::read(&saved).unwrap(), content);
+    assert_eq!(files_in(dir.path()), ["report (1).pdf", "report.pdf"]);
+}
+
+#[test]
+fn saving_without_replacing_takes_the_next_free_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    for (name, data) in [
+        ("notes.txt", "one"),
+        ("notes (1).txt", "two"),
+        (".notes.txt.fbterm-part", "mine"),
+    ] {
+        std::fs::write(d.join(name), data).unwrap();
+    }
+    let saved =
+        save_without_replacing(&d.join(".notes.txt.fbterm-part"), &d.join("notes.txt")).unwrap();
+    assert_eq!(saved, d.join("notes (2).txt"));
+    assert_eq!(std::fs::read(&saved).unwrap(), b"mine");
+    assert_eq!(std::fs::read(d.join("notes.txt")).unwrap(), b"one");
+    assert_eq!(
+        files_in(d),
+        ["notes (1).txt", "notes (2).txt", "notes.txt"],
+        "the part file is gone"
+    );
+}
+
+#[tokio::test]
+async fn download_as_replaces_the_chosen_file() {
+    let server = fake::Server::new(true);
+    server.put("/r/report.pdf", b"new", 0o644);
+    let sftp = Arc::new(fake::session(server).await);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("chosen.pdf");
+    std::fs::write(&dest, "old").unwrap();
+    let (tx, mut rx) = unbounded_channel();
+    let handle = download(
+        sftp,
+        "/r/report.pdf".into(),
+        dest.clone(),
+        DownloadMode::Replace,
+        tx,
+    );
+    let events = all(&mut rx, handle.id()).await;
+    assert_eq!(
+        last(&events),
+        &TransferEvent::Finished {
+            note: None,
+            local: Some(dest.clone()),
+        }
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), b"new");
+    assert_eq!(files_in(dir.path()), ["chosen.pdf"]);
+}
+
+#[tokio::test]
 async fn overlong_reads_are_cut_to_what_was_asked() {
     let content = pattern(200_000);
     let server = fake::Server::new(true);
@@ -575,7 +713,13 @@ async fn overlong_reads_are_cut_to_what_was_asked() {
     let dir = tempfile::tempdir().unwrap();
     let dest = dir.path().join("data.bin");
     let (tx, mut rx) = unbounded_channel();
-    let handle = download(sftp, "/r/data.bin".into(), dest.clone(), tx);
+    let handle = download(
+        sftp,
+        "/r/data.bin".into(),
+        dest.clone(),
+        DownloadMode::FreeName,
+        tx,
+    );
     let events = all(&mut rx, handle.id()).await;
     assert!(
         matches!(last(&events), TransferEvent::Finished { .. }),
