@@ -36,6 +36,13 @@ pub fn view<'a>(
                 .padding(Padding::from([20.0, 28.0]))
                 .max_width(FORM_WIDTH + 56.0),
         )
+        // The default scrollbar, kept clear of the window's resize edge.
+        .direction(scrollable::Direction::Vertical(ui::edge_scrollbar(
+            crate::chrome::Chrome::current().draws_controls(),
+            10.0,
+            10.0,
+            0.0,
+        )))
         .height(Length::Fill)
         .into(),
         None => container(text("")).height(Length::Fill).into(),

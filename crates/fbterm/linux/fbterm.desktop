@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=featherbit terminal
+GenericName=Terminal
+Comment=SSH-first terminal with saved profiles, tabs and split panes
+Exec=fbterm
+Icon=fbterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=shell;ssh;sftp;terminal;console;
+StartupWMClass=fbterm

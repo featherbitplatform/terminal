@@ -25,4 +25,10 @@ Everything you set up is plain TOML in one directory, written atomically and rel
 
 ## Platforms
 
-macOS is the first supported platform and ships as a universal disk image. See [Install on macOS](install-macos). The code base also builds for Linux and Windows; the shortcut and file location pages cover those systems too.
+featherbit terminal ships for macOS, Linux and Windows:
+
+- macOS: a universal disk image. See [Install on macOS](install-macos).
+- Linux: `.deb`, `.rpm` and `.tar.gz` packages for x86-64 and Arm. See [Install on Linux](install-linux).
+- Windows 11: an `.msi` installer. See [Install on Windows](install-windows).
+
+On Linux and Windows the window's title bar is drawn in the tab bar; the shortcut and file location pages cover every system.

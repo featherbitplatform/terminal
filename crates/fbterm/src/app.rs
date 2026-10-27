@@ -20,7 +20,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
 use crate::archive_window::{ArchiveMsg, ArchiveState};
-use crate::chrome::{self, BarAction};
+use crate::chrome::{self, BarAction, Chrome};
 use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
 use crate::find::FindMsg;
@@ -116,6 +116,8 @@ pub enum Message {
     },
     NewWindow,
     WindowOpened(window::Id),
+    /// Any window (terminal, editor, Settings, ...) opened.
+    AnyWindowOpened(window::Id),
     WindowFocused(window::Id),
     WindowUnfocused(window::Id),
     /// A terminal window became visible (`true`) or stopped being visible.
@@ -125,8 +127,13 @@ pub enum Message {
     WindowClosed(window::Id),
     /// A click in a window's tab bar; acts on that window whatever has focus.
     TabBar(window::Id, TabBarMsg),
-    /// A press on empty title-bar space (unified title bar): move or zoom that window.
+    /// A press on empty title-bar space, a drawn window control or a drawn window's edge:
+    /// move, zoom, minimize, close or resize that window.
     TitleBar(window::Id, BarAction),
+    /// Seen on a window while a move or resize request is watched (see [`crate::move_watch`]).
+    MoveSeen(window::Id, crate::move_watch::Seen),
+    /// The answer time of the watched move or resize request (its token) passed.
+    MoveCheck(u64),
     Shortcut(window::Id, Action),
     DismissNotices,
     /// Palette input for one window.
@@ -179,6 +186,8 @@ pub enum Message {
     WindowScale(window::Id, f32),
     /// A window's mode, asked after a resize (entering or leaving full screen resizes).
     WindowMode(window::Id, window::Mode),
+    /// Whether a window is maximized, asked after a resize where the chrome is drawn.
+    WindowMaximized(window::Id, bool),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
     SaveState(u64),
     /// `profiles.toml`, `settings.toml` and/or a file in `schemes/` changed on disk.
@@ -318,6 +327,24 @@ pub struct App {
     pub(crate) sizes: HashMap<window::Id, (f32, f32)>,
     /// Windows in full screen (terminal windows and the editor).
     pub fullscreen: std::collections::HashSet<window::Id>,
+    /// Maximized windows, where the chrome is drawn (their edges do not resize, and the
+    /// maximize control restores).
+    pub maximized: std::collections::HashSet<window::Id>,
+    /// Every open window, of any kind (their decorations switch with the chrome).
+    pub(crate) open_windows: std::collections::HashSet<window::Id>,
+    /// The chrome in use: [`chrome::CHROME`], or in tests a cell of the app's own.
+    pub(crate) chrome: &'static chrome::ChromeCell,
+    /// Whose window conventions this run follows and the chrome it started with (see
+    /// [`chrome::chrome_for_setting`]).
+    pub(crate) chrome_base: (chrome::Platform, Chrome),
+    /// Whether move and resize requests are watched for a desktop refusing them (Linux).
+    pub(crate) watch_moves: bool,
+    pub(crate) move_watch: crate::move_watch::MoveWatch,
+    /// The desktop refused a move or resize: the system title bar for the rest of the session
+    /// (until `window_decorations` is set to `"fbterm"` again from the Settings window).
+    pub(crate) chrome_fell_back: bool,
+    /// The fallback notice was shown (once per session).
+    pub(crate) chrome_notice_shown: bool,
     /// Counts resizes, so only the last one of a burst saves.
     pub(crate) resize_count: u64,
     /// The text of `profiles.toml` / `settings.toml` as last loaded or written by us: a change
@@ -443,16 +470,39 @@ pub(crate) fn load_profiles(
 }
 
 /// Ask for `id`'s mode now and once the full-screen animation is over (the last resize can
-/// arrive before the OS reports the window as full screen).
-fn query_mode(id: window::Id) -> Task<Message> {
+/// arrive before the OS reports the window as full screen). Where the chrome is `drawn`, ask
+/// whether it is maximized too.
+fn query_mode(id: window::Id, drawn: bool) -> Task<Message> {
+    let after_settling = || {
+        Task::perform(
+            async { tokio::time::sleep(Duration::from_millis(800)).await },
+            |()| (),
+        )
+    };
     let now = window::mode(id).map(move |m| Message::WindowMode(id, m));
-    let settled = Task::perform(
-        async { tokio::time::sleep(Duration::from_millis(800)).await },
-        |()| (),
-    )
-    .then(move |()| window::mode(id))
-    .map(move |m| Message::WindowMode(id, m));
-    Task::batch([now, settled])
+    let settled = after_settling()
+        .then(move |()| window::mode(id))
+        .map(move |m| Message::WindowMode(id, m));
+    if !drawn {
+        return Task::batch([now, settled]);
+    }
+    // Maximizing and restoring resize the window too. The window manager may report the
+    // maximized state only after the resize (X11 updates it separately), so ask again later.
+    let maximized = window::is_maximized(id).map(move |m| Message::WindowMaximized(id, m));
+    let maximized_settled = after_settling()
+        .then(move |()| window::is_maximized(id))
+        .map(move |m| Message::WindowMaximized(id, m));
+    Task::batch([now, settled, maximized, maximized_settled])
+}
+
+/// The chrome cell the app switches: the one every window reads, or in tests one of its own,
+/// so a test that switches cannot change the chrome other tests see.
+fn app_chrome_cell() -> &'static chrome::ChromeCell {
+    if cfg!(test) {
+        Box::leak(Box::new(chrome::ChromeCell::new()))
+    } else {
+        &chrome::CHROME
+    }
 }
 
 /// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`, ...); release
@@ -602,6 +652,14 @@ impl App {
             closing: Default::default(),
             sizes: HashMap::new(),
             fullscreen: Default::default(),
+            maximized: Default::default(),
+            open_windows: Default::default(),
+            chrome: app_chrome_cell(),
+            chrome_base: (chrome::setup().look, chrome::setup().chrome),
+            watch_moves: chrome::Platform::current() == chrome::Platform::Linux,
+            move_watch: crate::move_watch::MoveWatch::for_session(chrome::wayland_session()),
+            chrome_fell_back: false,
+            chrome_notice_shown: false,
             resize_count: 0,
             profiles_seen,
             settings_seen,
@@ -634,6 +692,8 @@ impl App {
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
+        // Before any window opens: the Linux `window_decorations` setting picks the chrome.
+        let _ = app.reapply_chrome();
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -721,6 +781,7 @@ impl App {
             Subscription::run_with(self.receiver.clone(), session_stream)
                 .map(|(id, ev)| Message::Session(id, ev)),
             iced::event::listen_with(|event, _, id| match event {
+                Event::Window(window::Event::Opened { .. }) => Some(Message::AnyWindowOpened(id)),
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
@@ -761,6 +822,10 @@ impl App {
             subs.push(iced::time::every(Duration::from_millis(1500)).map(|_| Message::Shoot));
         }
         subs.push(window::resize_events().map(|(id, size)| Message::WindowResized(id, size)));
+        if self.move_watch.watching() {
+            // Only while a move or resize request is watched (at most `ANSWER_TIME`).
+            subs.push(iced::event::listen_with(crate::move_watch::watch_event));
+        }
         subs.push(
             Subscription::run_with(
                 ConfigDir(self.paths.config_dir.clone()),
@@ -843,13 +908,36 @@ impl App {
             Message::WindowOpened(id) => {
                 self.focused.get_or_insert(id);
                 if self.windows.contains_key(&id) {
+                    let backdrop = Chrome::current().backdrop(
+                        self.settings.background_opacity,
+                        self.settings.background_blur,
+                    );
+                    // Not gated on `blur_here`: on Windows its probe may still run when the
+                    // first window opens, and a build without backdrops refuses harmlessly.
+                    let blur = if backdrop.blur {
+                        chrome::system_backdrop(id)
+                    } else {
+                        Task::none()
+                    };
                     Task::batch([
                         visibility::watch(id, &self.visibility),
                         display_rate::watch(id, &self.display),
                         window::scale_factor(id).map(move |s| Message::WindowScale(id, s)),
+                        blur,
                     ])
                 } else {
                     Task::none()
+                }
+            }
+            Message::AnyWindowOpened(id) => {
+                self.open_windows.insert(id);
+                // The chrome switched after this window was asked for: give it the current
+                // decorations, as the switch gave every window already open.
+                match chrome::take_created(id) {
+                    Some(made) if chrome::needs_toggle(made, self.chrome.get()) => {
+                        window::toggle_decorations(id)
+                    }
+                    _ => Task::none(),
                 }
             }
             Message::WindowVisible(id, visible) => {
@@ -909,7 +997,16 @@ impl App {
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }
-            Message::TitleBar(wid, action) => chrome::perform(wid, action),
+            // A drawn close control is the OS close button.
+            Message::TitleBar(wid, BarAction::Close) => self.close_requested(wid),
+            Message::TitleBar(wid, action) => {
+                Task::batch([chrome::perform(wid, action), self.watch_move(wid, action)])
+            }
+            Message::MoveSeen(wid, seen) => {
+                self.move_watch.seen(wid, seen);
+                Task::none()
+            }
+            Message::MoveCheck(token) => self.check_move(token),
             Message::WindowClosed(id) => {
                 if self.editor_window() == Some(id) {
                     self.editor = None;
@@ -962,6 +1059,8 @@ impl App {
                 self.sizes.remove(&id);
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
+                self.maximized.remove(&id);
+                self.open_windows.remove(&id);
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
                 self.file_panels.ui.remove(&id);
@@ -1044,13 +1143,22 @@ impl App {
                 Task::none()
             }
             Message::WindowResized(id, size) => {
-                Task::batch([self.window_resized(id, size), query_mode(id)])
+                let drawn = self.chrome.get().draws_controls();
+                Task::batch([self.window_resized(id, size), query_mode(id, drawn)])
             }
             Message::WindowMode(id, mode) => {
                 if mode == window::Mode::Fullscreen {
                     self.fullscreen.insert(id);
                 } else {
                     self.fullscreen.remove(&id);
+                }
+                Task::none()
+            }
+            Message::WindowMaximized(id, maximized) => {
+                if maximized {
+                    self.maximized.insert(id);
+                } else {
+                    self.maximized.remove(&id);
                 }
                 Task::none()
             }
@@ -1167,5 +1275,21 @@ impl App {
         };
         self.shooting = true;
         window::screenshot(wid).map(Message::Shot)
+    }
+}
+
+#[cfg(test)]
+mod query_mode_tests {
+    use super::query_mode;
+    use iced::window;
+
+    #[test]
+    fn drawn_chrome_asks_for_the_maximized_state_again_once_settled() {
+        let id = window::Id::unique();
+        // The mode now and once settled.
+        assert_eq!(query_mode(id, false).units(), 2);
+        // And the maximized state now and once settled: an X11 window manager can update it
+        // after the resize, and the controls' glyph and the edges follow it.
+        assert_eq!(query_mode(id, true).units(), 4);
     }
 }

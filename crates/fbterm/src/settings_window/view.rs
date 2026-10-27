@@ -3,7 +3,7 @@
 
 use fbterm_config::keys::{Action, ActionGroup, Bindings, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
-use fbterm_config::{SecretStorage, ThemeMode};
+use fbterm_config::{SecretStorage, ThemeMode, WindowDecorations};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, text, text_input, toggler,
 };
@@ -11,6 +11,7 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
+use crate::chrome::{self, Platform};
 use crate::saved_secrets::{SectionInfo, choice_label, storage_note};
 use crate::schemes::SchemeChoice;
 use crate::theme::{Tokens, UI_FONT};
@@ -26,13 +27,15 @@ fn msg(m: SettingsMsg) -> Message {
 }
 
 /// `notice`: the banner line about `settings.toml` (a load error or clamped values), if any.
-/// `secrets`: what the `Saved secrets` section shows.
+/// `secrets`: what the `Saved secrets` section shows. `chrome_fell_back`: the desktop refused
+/// drawn chrome this session (the `Title bar` row then shows `System`).
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
     schemes: Vec<SchemeChoice>,
     notice: Option<&'a str>,
     secrets: SectionInfo,
+    chrome_fell_back: bool,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut body = column![
@@ -54,7 +57,7 @@ pub fn view<'a>(
         .push(section(
             t,
             "Appearance",
-            appearance(t, state, schemes, editable),
+            appearance(t, state, schemes, editable, chrome_fell_back),
         ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
         .push(section(t, "Tunnels", tunnels(t, state, editable)))
@@ -70,12 +73,12 @@ pub fn view<'a>(
             .center_x(Length::Fill),
     )
     .id(state.page.clone())
-    .direction(scrollable::Direction::Vertical(
-        scrollable::Scrollbar::new()
-            .width(6)
-            .scroller_width(6)
-            .margin(3),
-    ))
+    .direction(scrollable::Direction::Vertical(crate::ui::edge_scrollbar(
+        crate::chrome::Chrome::current().draws_controls(),
+        6.0,
+        6.0,
+        3.0,
+    )))
     .style(move |theme, status| {
         let mut s = scrollable::default(theme, status);
         s.vertical_rail.background = None;
@@ -206,6 +209,7 @@ fn appearance<'a>(
     state: &'a SettingsState,
     schemes: Vec<SchemeChoice>,
     editable: bool,
+    chrome_fell_back: bool,
 ) -> Vec<Element<'a, Message>> {
     let v = &state.values;
     let theme = row![
@@ -301,8 +305,7 @@ fn appearance<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let (blur_hint, blur_inert) = blur_hint(cfg!(target_os = "macos"), v.background_opacity);
-    vec![
+    let mut rows = vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
         setting(t, "Color scheme", None, false, scheme),
@@ -314,20 +317,77 @@ fn appearance<'a>(
             false,
             opacity,
         ),
-        setting(
+        blur_setting(
             t,
-            "Background blur",
-            Some(blur_hint),
-            blur_inert,
-            switch(
-                t,
-                v.background_blur,
-                editable,
-                blur_inert,
-                SettingsMsg::Blur,
-            ),
+            v.background_blur,
+            editable,
+            chrome::blur_here(),
+            v.background_opacity,
         ),
-    ]
+    ];
+    if shows_title_bar_row(chrome::setup().look) {
+        let shown = title_bar_shown(v.window_decorations, chrome_fell_back);
+        let title_bar = row![
+            segment(
+                t,
+                "fbterm",
+                shown == WindowDecorations::Fbterm,
+                editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::Fbterm))),
+            ),
+            segment(
+                t,
+                "System",
+                shown == WindowDecorations::System,
+                editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::System))),
+            ),
+        ]
+        .spacing(2);
+        let title_bar = container(title_bar).padding(2).style(move |_| well(t));
+        rows.push(setting(t, "Title bar", None, false, title_bar));
+    }
+    rows
+}
+
+/// The `Background blur` row: the switch for `on`, usable only when `editable` and the system
+/// can blur (`supported`), with the hint for `opacity` (see [`blur_row`]).
+pub(super) fn blur_setting<'a>(
+    t: &'static Tokens,
+    on: bool,
+    editable: bool,
+    supported: bool,
+    opacity: f32,
+) -> Element<'a, Message> {
+    let blur = blur_row(supported, opacity);
+    setting(
+        t,
+        "Background blur",
+        Some(blur.hint),
+        blur.inert,
+        switch(
+            t,
+            on,
+            editable && blur.enabled,
+            blur.inert,
+            SettingsMsg::Blur,
+        ),
+    )
+}
+
+/// What the `Title bar` row shows as chosen: what is on screen. After the desktop refused
+/// drawn chrome that is `System` even though the setting stays `"fbterm"`, so one click on
+/// `fbterm` tries drawn chrome again.
+pub fn title_bar_shown(setting: WindowDecorations, fell_back: bool) -> WindowDecorations {
+    if fell_back {
+        WindowDecorations::System
+    } else {
+        setting
+    }
+}
+
+/// Whether the Settings window offers the `Title bar` choice: only where windows follow
+/// Linux's conventions (the `window_decorations` setting is ignored elsewhere).
+pub fn shows_title_bar_row(look: Platform) -> bool {
+    look == Platform::Linux
 }
 
 fn terminal<'a>(
@@ -901,15 +961,31 @@ fn number<'a>(
         .into()
 }
 
-/// The blur row's hint, and whether blur has no effect now (it is still saved): only macOS
-/// blurs for now, and only below full opacity.
-pub fn blur_hint(mac: bool, opacity: f32) -> (&'static str, bool) {
-    if !mac {
-        ("macOS only for now", true)
+/// How the blur row shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlurRow {
+    pub hint: &'static str,
+    /// Drawn muted: blur has no effect now (a switch that can be used is still saved).
+    pub inert: bool,
+    /// The switch can be used.
+    pub enabled: bool,
+}
+
+/// The blur row where the system can blur (`supported`, see [`chrome::blur_supported`]) at
+/// `opacity`: blur only shows below full opacity; where it is not supported the switch cannot
+/// be used at all.
+pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
+    let (hint, inert, enabled) = if !supported {
+        ("Not supported on this system", true, false)
     } else if opacity >= 1.0 {
-        ("Needs opacity below 100%", true)
+        ("Needs opacity below 100%", true, true)
     } else {
-        ("Applies to new windows", false)
+        ("Applies to new windows", false, true)
+    };
+    BlurRow {
+        hint,
+        inert,
+        enabled,
     }
 }
 

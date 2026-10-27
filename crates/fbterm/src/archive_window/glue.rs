@@ -18,7 +18,6 @@ use super::{
 };
 use crate::app::{App, Delivered, Message};
 use crate::archive_import::{self, Choice};
-use crate::chrome::Chrome;
 use crate::editor::EditorState;
 
 /// No key folder to put key files in (no home folder and none chosen).
@@ -35,12 +34,12 @@ impl App {
             state.mode = mode;
             return window::gain_focus(*id);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(720.0, 700.0),
             min_size: Some(iced::Size::new(560.0, 420.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         self.archive_win = Some((id, ArchiveState::new(mode)));
         self.refresh_export_preview();
         open.discard()

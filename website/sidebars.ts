@@ -4,6 +4,8 @@ const sidebars: SidebarsConfig = {
   docs: [
     'intro',
     'install-macos',
+    'install-linux',
+    'install-windows',
     'profiles',
     'tiling',
     'color-schemes',

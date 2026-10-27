@@ -468,10 +468,17 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
 4. File panel (done 2026-10-27; see 5.8 and `2026-10-27-file-panel-design.md`).
 5. Export/import, optional main-password vault (done 2026-10-27; see 5.4, 5.9 and
    `2026-10-27-export-vault-design.md`).
-6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
-   (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
-   Windows and Linux: draw OS-styled window controls in the tab bar (no OS title bar),
-   drag/double-click/resize from edges; background blur where the platform supports it.
+6. Releases and later items.
+   - Windows and Linux release artifacts: done 2026-10-27 (design in
+     `2026-10-27-linux-windows-releases-design.md`): `.deb`, `.rpm` and `.tar.gz` for x86_64 and
+     aarch64, a Windows x86-64 `.msi`, one release workflow publishing them with the macOS `.dmg`;
+     drawn window controls in the tab bar (no OS title bar; the Linux `window_decorations`
+     setting with automatic fallback), drag, double-click and edge resize; background blur on
+     Windows 11 22H2+ and KDE Plasma under Wayland. Checks that need real machines are listed in
+     `CLAUDE.md` ("Hardware checks").
+   - Later: reading `~/.ssh/config` hosts into the palette; signing (when decided); deferred auth
+     methods (2FA, FIDO keys, certificates, agent forwarding); winget, apt and dnf repositories,
+     auto-update and Flatpak.
 
 Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVisualEffectView
 (follows Reduce transparency, native vibrancy).
@@ -545,9 +552,13 @@ with full default scrollback at most 200 MB resident (scenario E), measured at 1
   session backends (pty, ssh), profiles/config/secrets, app/UI).
 - `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo deny` in CI; security scanning in
   the spirit of the gateway's (gitleaks etc.) *(builder's call)*.
-- Release workflow on `v*` tags: build macOS universal (or per-arch) `.app` bundled into `.dmg`,
-  attach to the GitHub release with checksums. Docs explain the unsigned first-launch step
-  (right-click > Open, or `xattr -d com.apple.quarantine`).
+- Release workflow on `v*` tags: builds the macOS universal `.dmg`, the Linux `.deb`, `.rpm` and
+  `.tar.gz` (x86_64, aarch64) and the Windows x86-64 `.msi`, smoke-tests them, and attaches
+  everything to one GitHub release with a `.sha256` for each (done; the tag must match the
+  workspace version). Docs explain the unsigned first-launch step on each system (macOS: Open
+  Anyway or `xattr -d com.apple.quarantine`; Windows: SmartScreen `More info`, `Run anyway`) in
+  `website/docs/install-*.md`.
+- Not yet (later): winget, apt and dnf repositories, auto-update, Flatpak, code signing.
 - A `CLAUDE.md` for the repo is written once this design is approved.
 
 ## 9. Left to the builder

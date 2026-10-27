@@ -50,14 +50,17 @@ impl App {
             self.settings.background_opacity,
             self.settings.background_blur,
         );
-        let (id, open) = window::open(chrome.window_settings(window::Settings {
-            size: iced::Size::new(size.0, size.1),
-            min_size: Some(iced::Size::new(360.0, 200.0)),
-            exit_on_close_request: false,
-            transparent: backdrop.transparent,
-            blur: backdrop.blur,
-            ..window::Settings::default()
-        }));
+        let (id, open) = crate::chrome::open_window_as(
+            chrome,
+            window::Settings {
+                size: iced::Size::new(size.0, size.1),
+                min_size: Some(iced::Size::new(360.0, 200.0)),
+                exit_on_close_request: false,
+                transparent: backdrop.transparent,
+                blur: backdrop.blur,
+                ..window::Settings::default()
+            },
+        );
         self.windows.insert(id, WindowState::new());
         self.sizes.insert(id, size);
         (id, open.map(Message::WindowOpened))

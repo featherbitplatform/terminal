@@ -11,7 +11,9 @@ use fbterm_config::settings::{
     DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE, SCROLLBACK_WARN_ABOVE,
     TUNNEL_RETRIES_RANGE,
 };
-use fbterm_config::{ConfigError, MaxFps, SecretStorage, SettingChange, Settings, ThemeMode};
+use fbterm_config::{
+    ConfigError, MaxFps, SecretStorage, SettingChange, Settings, ThemeMode, WindowDecorations,
+};
 
 mod fonts;
 mod glue;
@@ -51,6 +53,8 @@ pub enum SettingsMsg {
     OpacityText(String),
     OpacitySubmit,
     Blur(bool),
+    /// Who draws the title bar (Linux).
+    TitleBar(WindowDecorations),
     ScrollbackText(String),
     ScrollbackSubmit,
     /// Confirm lowering the scrollback below what an open tab holds: save and trim.
@@ -437,6 +441,7 @@ impl SettingsState {
             SettingsMsg::Font(f) => self.change(SettingChange::FontFamily(f.family), false),
             SettingsMsg::ColorScheme(id) => self.change(SettingChange::ColorScheme(id), false),
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
+            SettingsMsg::TitleBar(v) => self.change(SettingChange::WindowDecorations(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),
             SettingsMsg::Record(action)

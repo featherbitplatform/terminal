@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use fbterm_config::Settings;
+use fbterm_config::{Settings, WindowDecorations};
 use fbterm_term::{ColorScheme, TerminalStyle};
 use iced::{Font, Task, window};
 use parking_lot::Mutex;
@@ -104,6 +104,15 @@ impl App {
             }
             SettingsMsg::SecretStorage(choice) => self.choose_secret_storage(choice),
             SettingsMsg::ResetVault => self.ask_reset_vault(),
+            // The row shows `System` after the desktop refused drawn chrome while the setting
+            // stays "fbterm": choosing fbterm tries drawn chrome again (nothing to write).
+            SettingsMsg::TitleBar(WindowDecorations::Fbterm)
+                if self.chrome_fell_back
+                    && self.settings.window_decorations == WindowDecorations::Fbterm =>
+            {
+                self.chrome_fell_back = false;
+                self.reapply_chrome()
+            }
             other => {
                 // Locking every open terminal is only worth it for what reads the answer: a typed
                 // or submitted scrollback, and the debounce of a lowered one held back.
@@ -159,12 +168,12 @@ impl App {
         if let Some(id) = self.settings_window() {
             return window::gain_focus(id);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(640.0, 720.0),
             min_size: Some(iced::Size::new(520.0, 420.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         let read_only = Settings::load(&self.paths.settings()).err();
         let mut state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
         state.display_hz = self.display_hz();
@@ -299,6 +308,7 @@ impl App {
     /// `background_opacity` is read each frame too; a window can only show through if it was
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
+    /// `window_decorations` (Linux) switches every open window's title bar at once.
     ///
     /// Returns the find refreshes a scrollback lowering asks for.
     pub(crate) fn apply_settings(
@@ -358,6 +368,7 @@ impl App {
         self.tunnel_retries
             .store(new.tunnel_max_retries, std::sync::atomic::Ordering::Relaxed);
         let rate_changed = new.max_fps != self.settings.max_fps;
+        let decorations_changed = new.window_decorations != self.settings.window_decorations;
         let scheme_changed = new.color_scheme != self.settings.color_scheme;
         let before = scheme_changed.then(|| self.pane_colors());
         self.settings = new;
@@ -366,6 +377,10 @@ impl App {
         }
         if let Some(before) = before {
             self.schemes_moved(&before);
+        }
+        if decorations_changed {
+            let chrome = self.window_decorations_changed(self.settings.window_decorations);
+            return Task::batch([task, chrome]);
         }
         task
     }

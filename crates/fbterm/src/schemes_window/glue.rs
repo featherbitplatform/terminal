@@ -12,7 +12,6 @@ use iced::{Task, window};
 
 use super::{DeleteAsk, ImportAsk, ImportChoice, SchemesMsg, SchemesState};
 use crate::app::{App, Message, SettingsSource};
-use crate::chrome::Chrome;
 
 /// What the global setting falls back to when its scheme is deleted.
 const FALLBACK: &str = "graphite";
@@ -30,12 +29,12 @@ impl App {
             state.update(SchemesMsg::Select(select));
             return window::gain_focus(*id);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(980.0, 780.0),
             min_size: Some(iced::Size::new(760.0, 520.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         let state = SchemesState::new(
             &self.schemes,
             Some(&select),
