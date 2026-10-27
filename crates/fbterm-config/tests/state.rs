@@ -31,6 +31,7 @@ fn round_trips() {
         ],
         recency: BTreeMap::from([(a, 1_700_000_000), (b, 42)]),
         file_panel_width: Some(412.5),
+        file_panel_show_hidden: Some(false),
     };
     let path = tmp("state.toml");
     state.save(&path).unwrap();
@@ -112,6 +113,7 @@ fn split_tab_round_trips() {
         }],
         recency: BTreeMap::new(),
         file_panel_width: None,
+        file_panel_show_hidden: None,
     };
     let path = tmp("state.toml");
     state.save(&path).unwrap();

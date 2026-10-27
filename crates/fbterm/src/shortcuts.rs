@@ -8,6 +8,7 @@ use iced::{Element, Event, Length, Rectangle, Size, Vector, keyboard, mouse, win
 
 use crate::app::Message;
 use crate::editor::EditorMsg;
+use crate::file_panel::{FilePanelMsg, PanelKey};
 use crate::find::FindMsg;
 use crate::find::all::FindAllMsg;
 use crate::keys::{self, Action, Bindings};
@@ -35,6 +36,12 @@ pub(crate) enum Mode {
     /// move between matches, Escape closes the bar, application shortcuts act, and typing goes
     /// to the bar's field, never to the terminal (the terminal is drawn unfocused).
     Find,
+    /// A window whose file panel has the keyboard: application shortcuts act, keys go to the
+    /// panel's fields first, and what they leave (arrows, Enter, Backspace, Escape, typing)
+    /// drives the panel. Nothing reaches the terminal (the dock sends key presses to the panel
+    /// only). With `editing`, the path field is open and Escape leaves it before the field
+    /// sees it.
+    Panel { editing: bool },
     /// A connection dialog: Escape cancels, Enter submits; other keys go to its field.
     Prompt,
     /// The profile editor window: Cmd+W closes it, Cmd+S saves, Settings and Quit work; other
@@ -157,6 +164,12 @@ fn key_message(
             Some(m) => Some(Some(Message::Find(w, m))),
             None => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
         },
+        Mode::Panel { editing } => match key {
+            keyboard::Key::Named(Named::Escape) if editing && !repeat => Some(Some(
+                Message::FilePanel(FilePanelMsg::Key(w, PanelKey::Escape)),
+            )),
+            _ => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
+        },
         Mode::Prompt => match key {
             keyboard::Key::Named(Named::Escape) => {
                 Some(Some(Message::Prompt(PromptMsg::Cancel(w))))
@@ -251,6 +264,29 @@ fn recording_key(key: &keyboard::Key, mods: keyboard::Modifiers, repeat: bool) -
     Some(Message::Settings(SettingsMsg::Pressed(keys::press_chord(
         key, mods,
     ))))
+}
+
+/// What a key press the panel's fields left means to the panel.
+fn panel_key(event: &Event) -> Option<PanelKey> {
+    use keyboard::key::Named;
+    let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return None;
+    };
+    if modifiers.command() || modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return typed_text(event).map(PanelKey::Type);
+    }
+    Some(match key {
+        keyboard::Key::Named(Named::ArrowUp) => PanelKey::Up,
+        keyboard::Key::Named(Named::ArrowDown) => PanelKey::Down,
+        keyboard::Key::Named(Named::Home) => PanelKey::Home,
+        keyboard::Key::Named(Named::End) => PanelKey::End,
+        keyboard::Key::Named(Named::PageUp) => PanelKey::PageUp,
+        keyboard::Key::Named(Named::PageDown) => PanelKey::PageDown,
+        keyboard::Key::Named(Named::Enter) => PanelKey::Enter,
+        keyboard::Key::Named(Named::Backspace) => PanelKey::Backspace,
+        keyboard::Key::Named(Named::Escape) => PanelKey::Escape,
+        _ => return typed_text(event).map(PanelKey::Type),
+    })
 }
 
 /// Printable text a key press types (no Cmd, Ctrl or Alt held).
@@ -357,6 +393,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
             shell,
             viewport,
         );
+        // The panel's fields did not take the key: the panel acts on it.
+        if let Mode::Panel { .. } = self.mode
+            && !shell.is_event_captured()
+            && let Some(key) = panel_key(event)
+        {
+            shell.publish(Message::FilePanel(FilePanelMsg::Key(self.window, key)));
+            shell.capture_event();
+        }
         // Typing the bar's field did not take (it lost focus to a click): the bar takes it.
         if self.mode == Mode::Find
             && !shell.is_event_captured()
@@ -441,6 +485,61 @@ mod tests {
             mods |= keyboard::Modifiers::SHIFT;
         }
         (keyboard::Key::Character(c.into()), mods)
+    }
+
+    #[test]
+    fn panel_mode_keeps_shortcuts_and_hands_other_keys_to_the_panel() {
+        use keyboard::key::Named;
+        let panel = Mode::Panel { editing: false };
+        assert!(matches!(
+            press(panel, "t", false),
+            Some(Some(Message::Shortcut(_, Action::NewTab)))
+        ));
+        let named = |mode, key| {
+            key_message(
+                &defaults(),
+                mode,
+                window::Id::unique(),
+                &keyboard::Key::Named(key),
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        // Plain keys go on to the panel's fields first.
+        assert!(named(panel, Named::Backspace).is_none());
+        assert!(named(panel, Named::Escape).is_none());
+        // While a path is typed, Escape leaves the field before the field sees it.
+        assert!(matches!(
+            named(Mode::Panel { editing: true }, Named::Escape),
+            Some(Some(Message::FilePanel(FilePanelMsg::Key(
+                _,
+                PanelKey::Escape
+            ))))
+        ));
+        let event = |key: keyboard::Key, text: Option<&str>| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: text.map(Into::into),
+                repeat: false,
+            })
+        };
+        assert_eq!(
+            panel_key(&event(keyboard::Key::Named(Named::Backspace), None)),
+            Some(PanelKey::Backspace)
+        );
+        assert_eq!(
+            panel_key(&event(keyboard::Key::Named(Named::ArrowDown), None)),
+            Some(PanelKey::Down)
+        );
+        assert_eq!(
+            panel_key(&event(keyboard::Key::Character("a".into()), Some("a"))),
+            Some(PanelKey::Type("a".into()))
+        );
     }
 
     fn press(mode: Mode, c: &str, shift: bool) -> Option<Option<Message>> {

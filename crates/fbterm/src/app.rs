@@ -476,7 +476,10 @@ impl App {
         let tunnel_retries = Arc::new(AtomicU32::new(settings.tunnel_max_retries));
         let mut app = Self {
             tunnels: Tunnels::new(pool.clone()),
-            file_panels: crate::file_panel::FilePanels::new(saved.file_panel_width),
+            file_panels: crate::file_panel::FilePanels::new(
+                saved.file_panel_width,
+                saved.file_panel_show_hidden.unwrap_or(true),
+            ),
             file_panel_work: crate::file_panel::Work::new(pool.clone()),
             tunnel_retries,
             bindings: Bindings::current(&settings.keys.map),
@@ -700,7 +703,10 @@ impl App {
         // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
         // shows its focused pane's profile.
         self.sync_file_panels();
-        task
+        match self.sync_panel_focus() {
+            Some(unfocus) => Task::batch([task, unfocus]),
+            None => task,
+        }
     }
 
     fn dispatch(&mut self, message: Message) -> Task<Message> {
@@ -863,6 +869,7 @@ impl App {
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
+                self.file_panels.ui.remove(&id);
                 if self.carry.is_some_and(|(w, _)| w == id) {
                     self.carry = None;
                     self.hover = None;

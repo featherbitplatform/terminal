@@ -23,10 +23,25 @@
 //!   on (a newer open or read, a released session) are dropped by their token.
 //! - **Width.** One width for every window, dragged at the panel's left edge, clamped to
 //!   [`state::MIN_WIDTH`]..=[`state::MAX_WIDTH`] and saved in `state.toml` when the drag ends.
+//! - **Browsing** (each profile's [`ProfilePanel`], drawn by [`view`]). Folders first, then
+//!   files, by the clicked column (again reverses; `sort_entries`); a `..` row and Backspace
+//!   go up, Enter or a double click opens a folder (or a link to one); one selected item. The
+//!   path bar's segments go to their folder; a click on its empty end, or typing `/` or `~`,
+//!   makes it a text field where Enter goes to the typed path. The filter box narrows the
+//!   loaded folder by a case-insensitive part of the name; `Show hidden files` (on unless
+//!   turned off, kept in `state.toml`) applies to every panel. Errors show inline with
+//!   `Retry`, which reopens a session that is gone (asking over the window it was pressed
+//!   in) or reads the folder again. Folders load in the background (`Loading…`), and only
+//!   the rows on screen are built, so a folder of 100000 items stays responsive.
+//! - **Keyboard.** A click in the panel gives it the keyboard; a click in the terminal,
+//!   Escape, another pane or tab taking focus, or a panel with nothing to browse gives it
+//!   back. While the panel has it, the terminal is drawn unfocused and the dock hands key
+//!   presses to the panel only (`Mode::Panel` in `shortcuts.rs`), so a key is never both.
 
 pub(crate) mod state;
 #[cfg(test)]
 mod tests;
+pub(crate) mod view;
 
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -35,16 +50,13 @@ use fbterm_config::{ProfileId, ProfileKind, ProfileStore};
 use fbterm_session::ssh::sftp::{Entry, Sftp, SftpError, SortKey, sort_entries};
 use fbterm_session::ssh::{Prompter, SshError, SshPool};
 use iced::futures::Stream;
-use iced::widget::{button, column, container, row, scrollable, text};
-use iced::{Element, Length, Padding, Task, window};
+use iced::{Task, window};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
 use crate::app::{App, Delivered, Message};
 use crate::prompts::UiPrompter;
 use crate::tabs::{TabState, WindowState};
-use crate::theme::{Tokens, UI_FONT};
-use crate::ui::{ICON_X, MONO, icon};
 pub(crate) use state::{FilePanels, Listing, ProfilePanel};
 
 /// An open SFTP session as the panel uses it: the real one, or a fake in tests.
@@ -207,23 +219,48 @@ pub(crate) struct Demo {
 }
 
 impl Demo {
-    /// `<folder>:<name>,<name>/,...` (names ending in `/` are folders).
+    /// `<folder>:<item>,<item>,...`; an item is `name` (a file), `name/` (a folder) or
+    /// `name -> target` (a link; a target ending in `/` is a folder), optionally followed by
+    /// `|size` in bytes and `|YYYY-MM-DDTHH:MM` (modified, UTC).
     pub(crate) fn parse(spec: &str) -> Self {
+        use fbterm_session::ssh::sftp::EntryKind;
         let (home, names) = spec.split_once(':').unwrap_or(("/", spec));
         let entries = names
             .split(',')
             .map(str::trim)
             .filter(|n| !n.is_empty())
-            .map(|n| {
-                let (name, kind) = match n.strip_suffix('/') {
-                    Some(name) => (name, fbterm_session::ssh::sftp::EntryKind::Dir),
-                    None => (n, fbterm_session::ssh::sftp::EntryKind::File),
+            .map(|item| {
+                let mut fields = item.split('|');
+                let n = fields.next().unwrap_or_default();
+                let size = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                let modified = fields
+                    .next()
+                    .and_then(|s| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M").ok())
+                    .and_then(|t| u64::try_from(t.and_utc().timestamp()).ok())
+                    .map(|secs| std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs));
+                let (name, kind) = if let Some((name, target)) = n.split_once(" -> ") {
+                    let to = if target.ends_with('/') {
+                        EntryKind::Dir
+                    } else {
+                        EntryKind::File
+                    };
+                    (
+                        name,
+                        EntryKind::Link {
+                            target: target.trim_end_matches('/').to_owned(),
+                            to: Some(Box::new(to)),
+                        },
+                    )
+                } else if let Some(name) = n.strip_suffix('/') {
+                    (name, EntryKind::Dir)
+                } else {
+                    (n, EntryKind::File)
                 };
                 Entry {
                     name: name.to_owned(),
                     kind,
-                    size: 0,
-                    modified: None,
+                    size,
+                    modified,
                     mode: None,
                 }
             })
@@ -300,6 +337,50 @@ pub enum FilePanelMsg {
     ResizeEnd,
     /// The panel's close button in this window.
     Close(window::Id),
+    /// The panel of this window takes the keyboard (`true`, a click in it) or gives it back to
+    /// the terminal (`false`, a click in the terminal).
+    Focus(window::Id, bool),
+    /// A click on a row: select it (an entry's name, or [`state::PARENT`]).
+    Select(window::Id, String),
+    /// A double click on a row: open it when it is a folder ([`state::PARENT`] goes up).
+    Activate(window::Id, String),
+    /// Go to this folder (a path bar segment).
+    Navigate(window::Id, String),
+    /// The path bar becomes a text field (a click on its empty end).
+    EditPath(window::Id),
+    PathInput(window::Id, String),
+    /// Enter in the path field: go where it says.
+    PathSubmit(window::Id),
+    Filter(window::Id, String),
+    /// A column header: sort by it, or reverse when it already sorts.
+    Sort(window::Id, SortKey),
+    /// `Show hidden files`, for every panel.
+    ShowHidden(bool),
+    /// The `Retry` of an inline error.
+    Retry(window::Id),
+    /// The list scrolled: its offset and visible height.
+    Scrolled(window::Id, f32, f32),
+    /// A key the panel's fields did not take, while the panel has the keyboard.
+    Key(window::Id, PanelKey),
+}
+
+/// The keys the panel acts on when it has the keyboard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PanelKey {
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    /// Opens the selected folder, or goes where the path field says.
+    Enter,
+    /// Goes up.
+    Backspace,
+    /// Leaves the path field, else clears the filter, else gives the keyboard back.
+    Escape,
+    /// Printable text: `/` or `~` starts typing a path, anything else types in the filter.
+    Type(String),
 }
 
 /// The panel's background work and where it reports.
@@ -329,12 +410,14 @@ enum Shown {
 }
 
 /// What the panel of a window shows.
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Body<'a> {
-    /// A line instead of a listing (`Not connected`, `Local session`, an error).
+    /// A line instead of a listing (`Not connected`, `Local session`).
     Note(String),
+    /// An error, inline with `Retry`: the server's message, or `SFTP is not available: ...`.
+    Error(String),
     Loading,
-    Entries(&'a [Entry]),
+    /// The loaded folder: its entries and which are shown.
+    Entries(&'a ProfilePanel),
 }
 
 /// A remote name as plain text: control characters (escape sequences, new lines) become `?`.
@@ -368,8 +451,11 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return Task::none();
         }
-        if !self.file_panels.open.remove(&wid) {
-            self.file_panels.open.insert(wid);
+        if self.file_panels.open.remove(&wid) {
+            self.file_panels.ui.remove(&wid);
+        } else {
+            // Shown with the shortcut or the palette: the user means to browse.
+            self.file_panels.show(wid);
             if let Some(Shown::Remote(p)) = self.panel_shows(wid)
                 && let Some(panel) = self.file_panels.by_profile.get_mut(&p)
                 && panel.sftp.is_none()
@@ -392,9 +478,344 @@ impl App {
             FilePanelMsg::ResizeEnd => self.save_state(),
             FilePanelMsg::Close(wid) => {
                 self.file_panels.open.remove(&wid);
+                self.file_panels.ui.remove(&wid);
+            }
+            FilePanelMsg::ShowHidden(on) => {
+                self.file_panels.show_hidden = on;
+                for panel in self.file_panels.by_profile.values_mut() {
+                    panel.refresh(on);
+                }
+                self.save_state();
+            }
+            FilePanelMsg::Focus(wid, focused) => return self.focus_file_panel(wid, focused),
+            FilePanelMsg::Select(wid, name) => {
+                if let Some(panel) = self.shown_panel_mut(wid) {
+                    panel.selected = Some(name);
+                }
+            }
+            FilePanelMsg::Activate(wid, name) => return self.activate(wid, &name),
+            FilePanelMsg::Navigate(wid, path) => return self.go_to(wid, path, None),
+            FilePanelMsg::EditPath(wid) => return self.edit_path(wid, None),
+            FilePanelMsg::PathInput(wid, text) => {
+                if let Some(ui) = self.file_panels.ui.get_mut(&wid)
+                    && ui.editing.is_some()
+                {
+                    ui.editing = Some(text);
+                }
+            }
+            FilePanelMsg::PathSubmit(wid) => return self.submit_path(wid),
+            FilePanelMsg::Filter(wid, text) => self.set_filter(wid, text),
+            FilePanelMsg::Sort(wid, key) => {
+                let show_hidden = self.file_panels.show_hidden;
+                if let Some(panel) = self.shown_panel_mut(wid) {
+                    if panel.sort == key {
+                        panel.descending = !panel.descending;
+                    } else {
+                        panel.sort = key;
+                        panel.descending = false;
+                    }
+                    panel.sort_and_refresh(show_hidden);
+                }
+            }
+            FilePanelMsg::Retry(wid) => self.retry(wid),
+            FilePanelMsg::Scrolled(wid, offset, height) => {
+                if let Some(ui) = self.file_panels.ui.get_mut(&wid) {
+                    ui.offset = offset;
+                    ui.height = height;
+                }
+            }
+            FilePanelMsg::Key(wid, key) => {
+                if self.file_panels.has_focus(wid) {
+                    return self.panel_key(wid, key);
+                }
             }
         }
         Task::none()
+    }
+
+    /// The profile `wid`'s panel shows, when it shows a server.
+    fn shown_profile(&self, wid: window::Id) -> Option<ProfileId> {
+        if !self.file_panels.is_open(wid) {
+            return None;
+        }
+        match self.panel_shows(wid)? {
+            Shown::Remote(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    fn shown_panel_mut(&mut self, wid: window::Id) -> Option<&mut ProfilePanel> {
+        let p = self.shown_profile(wid)?;
+        self.file_panels.by_profile.get_mut(&p)
+    }
+
+    /// Give `wid`'s panel the keyboard, or give it back to the terminal; the panel's fields
+    /// let go of it then, so nothing types into them or blinks there.
+    fn focus_file_panel(&mut self, wid: window::Id, focused: bool) -> Task<Message> {
+        let Some(ui) = self.file_panels.ui.get_mut(&wid) else {
+            return Task::none();
+        };
+        ui.focused = focused;
+        if focused {
+            return Task::none();
+        }
+        ui.editing = None;
+        view::unfocus_fields(ui)
+    }
+
+    /// Go to `path` in `wid`'s panel, selecting `select` there; the filter starts empty and
+    /// the list at the top.
+    fn go_to(&mut self, wid: window::Id, path: String, select: Option<String>) -> Task<Message> {
+        let Some(profile) = self.shown_profile(wid) else {
+            return Task::none();
+        };
+        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
+            return Task::none();
+        };
+        panel.folder = path;
+        panel.filter.clear();
+        panel.selected = select;
+        panel.shown.clear();
+        self.read_folder(profile);
+        // Every panel showing this profile starts the new folder at the top.
+        let showing: Vec<window::Id> = self
+            .file_panels
+            .open
+            .iter()
+            .copied()
+            .filter(|&w| self.shown_profile(w) == Some(profile))
+            .collect();
+        let mut tasks = Vec::new();
+        for w in showing {
+            if let Some(ui) = self.file_panels.ui.get_mut(&w) {
+                ui.editing = None;
+                ui.offset = 0.0;
+                tasks.push(iced::widget::operation::snap_to(
+                    ui.list_id.clone(),
+                    iced::widget::operation::RelativeOffset::START,
+                ));
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    /// Open `name` in `wid`'s panel: a folder (or a link to one) is entered, [`state::PARENT`]
+    /// goes up; anything else stays selected.
+    fn activate(&mut self, wid: window::Id, name: &str) -> Task<Message> {
+        let Some(panel) = self.shown_panel_mut(wid) else {
+            return Task::none();
+        };
+        if name == state::PARENT {
+            return self.go_up(wid);
+        }
+        panel.selected = Some(name.to_owned());
+        let Listing::Loaded(entries) = &panel.listing else {
+            return Task::none();
+        };
+        if !entries.iter().any(|e| e.name == name && e.is_folder()) {
+            return Task::none();
+        }
+        let path = state::resolve_path(&panel.folder, "/", "");
+        let path = if path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{path}/{name}")
+        };
+        self.go_to(wid, path, None)
+    }
+
+    /// Up one folder, selecting the folder left.
+    fn go_up(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(panel) = self.shown_panel_mut(wid) else {
+            return Task::none();
+        };
+        if !state::has_parent(&panel.folder) {
+            return Task::none();
+        }
+        let left = panel
+            .folder
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|n| !n.is_empty())
+            .map(str::to_owned);
+        let parent = state::parent_of(&panel.folder);
+        self.go_to(wid, parent, left)
+    }
+
+    /// The path bar becomes a text field holding `text` (the folder when `None`).
+    fn edit_path(&mut self, wid: window::Id, text: Option<String>) -> Task<Message> {
+        let Some(folder) = self.shown_panel_mut(wid).map(|p| p.folder.clone()) else {
+            return Task::none();
+        };
+        let Some(ui) = self.file_panels.ui.get_mut(&wid) else {
+            return Task::none();
+        };
+        ui.focused = true;
+        ui.editing = Some(text.unwrap_or(folder));
+        let id = ui.path_id.clone();
+        Task::batch([
+            iced::widget::operation::focus(id.clone()),
+            iced::widget::operation::move_cursor_to_end(id),
+        ])
+    }
+
+    fn submit_path(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(typed) = self
+            .file_panels
+            .ui
+            .get_mut(&wid)
+            .and_then(|ui| ui.editing.take())
+        else {
+            return Task::none();
+        };
+        let Some(panel) = self.shown_panel_mut(wid) else {
+            return Task::none();
+        };
+        let path = state::resolve_path(&panel.folder, &panel.home, &typed);
+        self.go_to(wid, path, None)
+    }
+
+    fn set_filter(&mut self, wid: window::Id, text: String) {
+        let show_hidden = self.file_panels.show_hidden;
+        if let Some(panel) = self.shown_panel_mut(wid) {
+            panel.filter = text;
+            panel.refresh(show_hidden);
+        }
+    }
+
+    /// `Retry` in `wid`'s panel: a session that is gone (or never opened) is opened again,
+    /// asking over this window; otherwise the folder is read again.
+    fn retry(&mut self, wid: window::Id) {
+        let Some(profile) = self.shown_profile(wid) else {
+            return;
+        };
+        let has_session = self
+            .file_panels
+            .by_profile
+            .get(&profile)
+            .is_some_and(|p| p.sftp.is_some());
+        if has_session {
+            self.read_folder(profile);
+        } else {
+            if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                panel.release();
+            }
+            self.open_sftp(profile, wid);
+        }
+    }
+
+    /// A key for `wid`'s panel, which has the keyboard.
+    fn panel_key(&mut self, wid: window::Id, key: PanelKey) -> Task<Message> {
+        let editing = self
+            .file_panels
+            .ui
+            .get(&wid)
+            .is_some_and(|ui| ui.editing.is_some());
+        match key {
+            PanelKey::Enter if editing => self.submit_path(wid),
+            PanelKey::Escape if editing => {
+                if let Some(ui) = self.file_panels.ui.get_mut(&wid) {
+                    ui.editing = None;
+                }
+                Task::none()
+            }
+            // The path field takes its own typing.
+            _ if editing => Task::none(),
+            PanelKey::Enter => {
+                let selected = self.shown_panel_mut(wid).and_then(|p| p.selected.clone());
+                match selected {
+                    Some(name) => self.activate(wid, &name),
+                    None => Task::none(),
+                }
+            }
+            PanelKey::Backspace => self.go_up(wid),
+            PanelKey::Escape => {
+                let filtered = self
+                    .shown_panel_mut(wid)
+                    .is_some_and(|p| !p.filter.is_empty());
+                if filtered {
+                    self.set_filter(wid, String::new());
+                    Task::none()
+                } else {
+                    self.focus_file_panel(wid, false)
+                }
+            }
+            PanelKey::Type(text) if text.starts_with('/') || text.starts_with('~') => {
+                self.edit_path(wid, Some(text))
+            }
+            PanelKey::Type(text) => {
+                let filter = match self.shown_panel_mut(wid) {
+                    Some(panel) => format!("{}{text}", panel.filter),
+                    None => return Task::none(),
+                };
+                self.set_filter(wid, filter);
+                match self.file_panels.ui.get(&wid) {
+                    Some(ui) => Task::batch([
+                        iced::widget::operation::focus(ui.filter_id.clone()),
+                        iced::widget::operation::move_cursor_to_end(ui.filter_id.clone()),
+                    ]),
+                    None => Task::none(),
+                }
+            }
+            PanelKey::Up
+            | PanelKey::Down
+            | PanelKey::Home
+            | PanelKey::End
+            | PanelKey::PageUp
+            | PanelKey::PageDown => self.move_selection(wid, &key),
+        }
+    }
+
+    /// Move the selection by `key` and scroll it into view.
+    fn move_selection(&mut self, wid: window::Id, key: &PanelKey) -> Task<Message> {
+        let Some(ui) = self.file_panels.ui.get(&wid) else {
+            return Task::none();
+        };
+        let (offset, height) = (ui.offset, ui.height);
+        let list = ui.list_id.clone();
+        let Some(panel) = self.shown_panel_mut(wid) else {
+            return Task::none();
+        };
+        let names: Vec<&str> = panel.row_names().collect();
+        if names.is_empty() {
+            return Task::none();
+        }
+        let last = names.len() - 1;
+        let current = panel
+            .selected
+            .as_deref()
+            .and_then(|s| names.iter().position(|n| *n == s));
+        let page = (view::visible_height(height) / view::ROW_HEIGHT)
+            .floor()
+            .max(1.0) as usize;
+        let next = match (key, current) {
+            (PanelKey::Home, _) => 0,
+            (PanelKey::End, _) => last,
+            (PanelKey::Down, None) | (PanelKey::PageDown, None) => 0,
+            (PanelKey::Up, None) | (PanelKey::PageUp, None) => last,
+            (PanelKey::Down, Some(i)) => (i + 1).min(last),
+            (PanelKey::Up, Some(i)) => i.saturating_sub(1),
+            (PanelKey::PageDown, Some(i)) => (i + page).min(last),
+            (PanelKey::PageUp, Some(i)) => i.saturating_sub(page),
+            _ => return Task::none(),
+        };
+        panel.selected = Some(names[next].to_owned());
+        match view::scroll_into_view(next, offset, height) {
+            Some(to) => {
+                if let Some(ui) = self.file_panels.ui.get_mut(&wid) {
+                    ui.offset = to;
+                }
+                iced::widget::operation::scroll_to(
+                    list,
+                    iced::widget::operation::AbsoluteOffset {
+                        x: None,
+                        y: Some(to),
+                    },
+                )
+            }
+            None => Task::none(),
+        }
     }
 
     fn file_panel_event(&mut self, event: PanelEvent) {
@@ -415,6 +836,9 @@ impl App {
                     Err(reason) => panel.listing = Listing::Unavailable(reason),
                     Ok(Opened { remote, home }) => {
                         panel.sftp = Some(remote);
+                        if let Ok(home) = &home {
+                            panel.home.clone_from(home);
+                        }
                         if panel.folder.is_empty() {
                             match home {
                                 Ok(home) => panel.folder = home,
@@ -442,7 +866,7 @@ impl App {
                 }
                 panel.listing = match result {
                     Ok(mut entries) => {
-                        sort_entries(&mut entries, SortKey::Name, false);
+                        sort_entries(&mut entries, panel.sort, panel.descending);
                         Listing::Loaded(entries)
                     }
                     Err(e) => {
@@ -453,6 +877,7 @@ impl App {
                         Listing::Failed(e.to_string())
                     }
                 };
+                panel.refresh(self.file_panels.show_hidden);
             }
         }
     }
@@ -504,6 +929,37 @@ impl App {
 
     /// Every open panel shows its focused pane's profile: sessions are opened for the
     /// profiles shown and let go for those no panel needs any more (see the module docs).
+    /// A panel keeps the keyboard only while it shows a server and its window's focused pane
+    /// stays the same: another pane or tab taking focus gives the keyboard back to the
+    /// terminal.
+    /// Returns the task that lets go of the fields of panels that lost the keyboard, if any.
+    pub(crate) fn sync_panel_focus(&mut self) -> Option<Task<Message>> {
+        if self.file_panels.ui.is_empty() {
+            return None;
+        }
+        let mut tasks = Vec::new();
+        let windows: Vec<window::Id> = self.file_panels.ui.keys().copied().collect();
+        for wid in windows {
+            let pane = self
+                .windows
+                .get(&wid)
+                .and_then(WindowState::active_tab)
+                .map(|tab| tab.focused);
+            let remote = matches!(self.panel_shows(wid), Some(Shown::Remote(_)));
+            let Some(ui) = self.file_panels.ui.get_mut(&wid) else {
+                continue;
+            };
+            let moved = ui.pane.is_some() && ui.pane != pane;
+            ui.pane = pane;
+            if ui.focused && (moved || !remote) {
+                ui.focused = false;
+                ui.editing = None;
+                tasks.push(view::unfocus_fields(ui));
+            }
+        }
+        (!tasks.is_empty()).then(|| Task::batch(tasks))
+    }
+
     pub(crate) fn sync_file_panels(&mut self) {
         let panels = &self.file_panels;
         let holding = |p: &ProfilePanel| p.sftp.is_some() || p.listing == Listing::Opening;
@@ -562,17 +1018,17 @@ impl App {
             Shown::NotConnected => Body::Note("Not connected".into()),
             Shown::Remote(p) => match self.file_panels.by_profile.get(&p).map(|p| &p.listing) {
                 None | Some(Listing::Closed | Listing::Opening | Listing::Loading) => Body::Loading,
-                Some(Listing::Loaded(entries)) => Body::Entries(entries),
-                Some(Listing::Failed(e)) => Body::Note(e.clone()),
+                Some(Listing::Loaded(_)) => Body::Entries(&self.file_panels.by_profile[&p]),
+                Some(Listing::Failed(e)) => Body::Error(e.clone()),
                 Some(Listing::Unavailable(reason)) => {
-                    Body::Note(format!("SFTP is not available: {reason}"))
+                    Body::Error(format!("SFTP is not available: {reason}"))
                 }
             },
         })
     }
 
     /// The folder `wid`'s panel shows, when it shows one.
-    fn file_panel_folder(&self, wid: window::Id) -> Option<&str> {
+    pub(crate) fn file_panel_folder(&self, wid: window::Id) -> Option<&str> {
         match self.panel_shows(wid)? {
             Shown::Remote(p) => self
                 .file_panels
@@ -583,101 +1039,4 @@ impl App {
             _ => None,
         }
     }
-}
-
-/// The most rows the panel builds at once (browsing large folders comes with the list view).
-const MAX_ROWS: usize = 500;
-
-/// `wid`'s panel and its width, when it is open.
-pub(crate) fn view(app: &App, wid: window::Id) -> Option<(Element<'_, Message>, f32)> {
-    let body = app.file_panel_body(wid)?;
-    let t = app.tokens;
-    let title = app
-        .windows
-        .get(&wid)
-        .and_then(WindowState::active_tab)
-        .map(|tab| tab.focused_pane().name.clone())
-        .unwrap_or_default();
-    let close = button(icon(ICON_X, 14.0, t.text_muted))
-        .on_press(Message::FilePanel(FilePanelMsg::Close(wid)))
-        .padding(4)
-        .style(move |_, status| crate::ui::ghost(t, status));
-    let mut heading = column![
-        text(title)
-            .font(UI_FONT)
-            .size(12)
-            .color(t.text_secondary)
-            .wrapping(text::Wrapping::None)
-    ]
-    .spacing(2)
-    .width(Length::Fill);
-    if let Some(folder) = app.file_panel_folder(wid) {
-        heading = heading.push(
-            text(plain_name(folder))
-                .font(MONO)
-                .size(12)
-                .color(t.text)
-                .wrapping(text::Wrapping::None),
-        );
-    }
-    let header = row![heading, close]
-        .spacing(8)
-        .align_y(iced::Alignment::Center)
-        .padding(Padding::from([8.0, 12.0]));
-    let content: Element<'_, Message> = match body {
-        Body::Note(line) => note(t, line),
-        Body::Loading => note(t, "Loading\u{2026}".into()),
-        Body::Entries(entries) => entry_list(t, entries),
-    };
-    let rule = container(text(""))
-        .width(1)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(t.border.into()),
-            ..container::Style::default()
-        });
-    let opacity = app.settings.background_opacity;
-    let surface = t.surface.scale_alpha(opacity);
-    let panel = container(column![header, content])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(surface.into()),
-            ..container::Style::default()
-        });
-    Some((row![rule, panel].into(), app.file_panels.width))
-}
-
-fn note<'a>(t: &Tokens, line: String) -> Element<'a, Message> {
-    container(text(line).font(UI_FONT).size(13).color(t.text_muted))
-        .padding(Padding::from([8.0, 12.0]))
-        .width(Length::Fill)
-        .into()
-}
-
-/// The folder's items, one per row, folders first (as sorted).
-fn entry_list<'a>(t: &Tokens, entries: &'a [Entry]) -> Element<'a, Message> {
-    let mut rows = column![].width(Length::Fill);
-    for entry in entries.iter().take(MAX_ROWS) {
-        let (name, color) = if entry.is_folder() {
-            (format!("{}/", plain_name(&entry.name)), t.text)
-        } else {
-            (plain_name(&entry.name), t.text_secondary)
-        };
-        rows = rows.push(
-            container(
-                text(name)
-                    .font(MONO)
-                    .size(12)
-                    .color(color)
-                    .wrapping(text::Wrapping::None),
-            )
-            .padding(Padding::from([3.0, 12.0]))
-            .width(Length::Fill),
-        );
-    }
-    if entries.len() > MAX_ROWS {
-        rows = rows.push(note(t, format!("{} more items", entries.len() - MAX_ROWS)));
-    }
-    scrollable(rows).height(Length::Fill).into()
 }

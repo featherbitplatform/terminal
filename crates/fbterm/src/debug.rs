@@ -172,9 +172,9 @@ impl App {
         self.open_tunnels()
     }
 
-    /// `FBTERM_DEMO_FILES=<folder>:<name>,<name>/,...` (debug aid): the first window's file
-    /// panel open, serving this sample listing for every SSH pane (connected or not) without
-    /// touching the network; names ending in `/` are folders.
+    /// `FBTERM_DEMO_FILES=<folder>:<item>,<item>,...` (debug aid): the first window's file
+    /// panel open, serving this sample listing for every SSH pane (connected or not) and every
+    /// folder without touching the network; see [`crate::file_panel::Demo::parse`].
     pub(crate) fn open_debug_files(&mut self) -> Task<Message> {
         let Some(spec) = debug_env("FBTERM_DEMO_FILES") else {
             return Task::none();
@@ -183,7 +183,7 @@ impl App {
         self.file_panel_work.backend = std::sync::Arc::new(demo);
         self.file_panels.demo = true;
         if let Some(&wid) = self.windows.keys().next() {
-            self.file_panels.open.insert(wid);
+            self.file_panels.show(wid);
         }
         self.sync_file_panels();
         Task::none()

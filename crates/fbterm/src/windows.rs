@@ -217,6 +217,7 @@ impl App {
         }
         let mut state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
         state.file_panel_width = self.file_panels.saved_width();
+        state.file_panel_show_hidden = self.file_panels.saved_show_hidden();
         if let Err(e) = state.save(&self.paths.state()) {
             tracing::warn!(error = %e, "could not save the session state");
         }

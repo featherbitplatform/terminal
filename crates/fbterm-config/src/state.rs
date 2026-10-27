@@ -72,6 +72,10 @@ pub struct SavedState {
     /// The file panel's width, when the user changed it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_panel_width: Option<f32>,
+    /// Whether the file panel shows hidden files (names starting with `.`), when the user
+    /// turned it off; shown by default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_panel_show_hidden: Option<bool>,
 }
 
 impl SavedState {

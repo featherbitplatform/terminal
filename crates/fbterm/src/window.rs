@@ -233,7 +233,19 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     // what is left, as they would in a narrower window.
     let panel = win
         .active_tab()
-        .and_then(|_| crate::file_panel::view(app, id));
+        .and_then(|_| crate::file_panel::view::panel(app, id))
+        .map(|(panel, width)| Docked {
+            panel,
+            width,
+            window: id,
+            focused: app.file_panels.has_focus(id),
+        });
+    let panel_focused = panel.as_ref().is_some_and(|p| p.focused);
+    let editing_path = app
+        .file_panels
+        .ui
+        .get(&id)
+        .is_some_and(|ui| ui.editing.is_some());
     body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
     // toggles still work, and not while a dialog waits for an answer.
@@ -259,6 +271,10 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         window: id,
         mode: if modal {
             covered
+        } else if panel_focused {
+            Mode::Panel {
+                editing: editing_path,
+            }
         } else if find.is_some() {
             Mode::Find
         } else {
@@ -309,32 +325,50 @@ pub(crate) const MIN_TERMINAL_WIDTH: f32 = 200.0;
 /// on the panel's side of the edge, so it never takes a press meant for the terminal.
 pub(crate) const DOCK_GRAB: f32 = 6.0;
 
+/// The file panel as docked beside a window's content.
+pub(crate) struct Docked<'a> {
+    pub panel: Element<'a, Message>,
+    pub width: f32,
+    pub window: window::Id,
+    /// The panel has the keyboard: key presses go to it, never to the content.
+    pub focused: bool,
+}
+
 /// `content` with the file panel (and its width) docked at its right edge. Without a panel
 /// the content is laid out exactly as it would be on its own. The same widget is used either
 /// way, so showing or hiding the panel keeps the content's widget state (terminal views, the
 /// find bar's focus).
 pub(crate) fn dock<'a>(
     content: Element<'a, Message>,
-    panel: Option<(Element<'a, Message>, f32)>,
+    panel: Option<Docked<'a>>,
 ) -> Element<'a, Message> {
-    let (panel, width) = match panel {
-        Some((panel, width)) => (Some(panel), width),
-        None => (None, 0.0),
+    let (panel, width, window, focused) = match panel {
+        Some(d) => (Some(d.panel), d.width, Some(d.window), d.focused),
+        None => (None, 0.0, None, false),
     };
     Element::new(Dock {
         content,
         panel,
         width,
+        window,
+        focused,
     })
 }
 
 /// The active tab's content and, when shown, the file panel beside it, whose left edge drags
 /// to resize it (reported as [`FilePanelMsg::Resize`], then [`FilePanelMsg::ResizeEnd`]; a
 /// drag also ends when the pointer leaves the window or the window loses focus).
+///
+/// It also decides who has the keyboard: a press in the panel gives it to the panel, a press
+/// in the content gives it back ([`FilePanelMsg::Focus`]); key presses and releases go only to
+/// the side that has it, so the terminal never sees the panel's keys and the panel never
+/// sees the terminal's.
 struct Dock<'a> {
     content: Element<'a, Message>,
     panel: Option<Element<'a, Message>>,
     width: f32,
+    window: Option<window::Id>,
+    focused: bool,
 }
 
 #[derive(Default)]
@@ -485,11 +519,37 @@ impl<'a> Widget<Message, iced::Theme, iced::Renderer> for Dock<'a> {
             }
             _ => {}
         }
-        for ((child, state), layout) in std::iter::once(&mut self.content)
+        // A press moves the keyboard to the side it lands on.
+        if let (Event::Mouse(mouse::Event::ButtonPressed(_)), Some(window), Some(panel)) =
+            (event, self.window, layout.children().nth(1))
+            && let Some(at) = cursor.position()
+        {
+            let in_panel = panel.bounds().contains(at);
+            let in_content = layout
+                .children()
+                .next()
+                .is_some_and(|c| c.bounds().contains(at));
+            if in_panel != self.focused && (in_panel || in_content) {
+                shell.publish(Message::FilePanel(FilePanelMsg::Focus(window, in_panel)));
+            }
+        }
+        let keys = matches!(
+            event,
+            Event::Keyboard(
+                iced::keyboard::Event::KeyPressed { .. }
+                    | iced::keyboard::Event::KeyReleased { .. }
+            )
+        );
+        let panel_has_keys = self.panel.is_some() && self.focused;
+        for (i, ((child, state), layout)) in std::iter::once(&mut self.content)
             .chain(self.panel.as_mut())
             .zip(&mut tree.children)
             .zip(layout.children())
+            .enumerate()
         {
+            if keys && (i == 1) != panel_has_keys {
+                continue;
+            }
             child.as_widget_mut().update(
                 state, event, layout, cursor, renderer, clipboard, shell, viewport,
             );
