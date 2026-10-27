@@ -76,10 +76,12 @@ pub fn not_saved_text(kind: fbterm_secrets::SecretKind, storage: Storage) -> Str
         fbterm_secrets::SecretKind::Password => "password",
         fbterm_secrets::SecretKind::KeyPassphrase => "key passphrase",
     };
-    format!(
-        "Your {what} could not be saved in {}, so fbterm will ask for it next time.",
-        place(storage)
-    )
+    let place = match storage {
+        Storage::Vault => "in the encrypted vault",
+        Storage::System if cfg!(windows) => "for your Windows account",
+        Storage::System => "in the system keychain",
+    };
+    format!("Your {what} could not be saved {place}, so fbterm will ask for it next time.")
 }
 
 /// A request for a main password dialog while another one is open: finish that first.

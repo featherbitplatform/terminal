@@ -852,11 +852,15 @@ fn a_failed_remember_is_said_once_a_session() {
     let before = app.notices.len();
     not_saved(&mut app, SecretKind::Password);
     let said = super::not_saved_text(SecretKind::Password, app.storage());
-    assert!(
-        said.starts_with("Your password could not be saved in ")
-            && said.ends_with(", so fbterm will ask for it next time."),
-        "{said}"
-    );
+    let expected = if cfg!(windows) {
+        "Your password could not be saved for your Windows account, so fbterm will ask for it \
+         next time."
+    } else {
+        "Your password could not be saved in the system keychain, so fbterm will ask for it \
+         next time."
+    };
+    assert_eq!(app.storage(), Storage::System);
+    assert_eq!(said, expected);
     assert!(app.visible_notices().contains(&said));
     not_saved(&mut app, SecretKind::Password);
     not_saved(&mut app, SecretKind::KeyPassphrase);
