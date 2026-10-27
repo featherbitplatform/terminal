@@ -9,14 +9,36 @@ workspace = true
 
 [dependencies]
 fbterm-config = { path = "../fbterm-config" }
-# Default `v1` feature selects macOS Keychain, Windows Credential Manager and
-# the Linux Secret Service (zbus, pure Rust) stores.
-keyring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
+age.workspace = true
+zeroize.workspace = true
+base64.workspace = true
+toml.workspace = true
+
+[target.'cfg(not(windows))'.dependencies]
+# The system storage on macOS (Keychain) and Linux (Secret Service via zbus, pure Rust).
+# Windows uses DPAPI instead, so the keyring crate is not built there.
+keyring.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only to tell "no Secret Service at all" from other failures in the errors keyring passes
+# on (it boxes them). The versions keyring already uses; no features of our own.
+secret-service = { version = "5.2.0", default-features = false }
+zbus = { version = "5.19.0", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (CryptProtectData/CryptUnprotectData, LocalFree) for the Windows system storage.
+windows-sys.workspace = true
+
+[features]
+# `archive::open_plaintext` for tests in other crates that search a decrypted archive; the
+# app never enables it.
+test-support = []
 
 [dev-dependencies]
 uuid.workspace = true
+tempfile = "3"

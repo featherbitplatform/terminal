@@ -19,11 +19,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use fbterm_config::{Profile, ProfileId, ProfileKind, ProfileStore, SshProfile, ValidationError};
+use fbterm_config::{
+    AuthMethod, Profile, ProfileId, ProfileKind, ProfileStore, SshProfile, ValidationError,
+};
 use fbterm_term::{GridSize, SharedTerminal, Terminal};
 use futures_util::future::{BoxFuture, FutureExt, Shared};
 use parking_lot::Mutex;
@@ -219,6 +222,29 @@ fn route_of(chain: &[Profile], target: &Profile) -> Route {
         .collect()
 }
 
+/// What a dialled connection adds to the route it was dialled on, before the pool records it.
+trait Settle<R> {
+    fn settle(&self, route: R) -> R {
+        route
+    }
+}
+
+/// A key profile that named no key file was dialled with the file the user chose, which the
+/// app then writes into the profile: the connection's route names that file, so callers whose
+/// profile now names it share the connection instead of dialling again.
+impl Settle<Route> for Connection {
+    fn settle(&self, mut route: Route) -> Route {
+        for (hop, chosen) in route.iter_mut().zip(&self.chosen_keys) {
+            if let (AuthMethod::Key { path, .. }, Some(chosen)) = (&mut hop.auth, chosen)
+                && path.is_none()
+            {
+                *path = Some(chosen.clone());
+            }
+        }
+        route
+    }
+}
+
 /// One profile's SSH connection: the target plus every hop in front of it, shared by the
 /// profile's shells and tunnels and closed (hops included) when the last of them lets go.
 /// Get one from [`SshPool::acquire`].
@@ -229,6 +255,9 @@ pub struct Connection {
     dead: AtomicBool,
     /// What authenticating any hop of the chain turned up; every shell reports it once.
     warnings: Vec<AuthWarning>,
+    /// Per hop in connection order (the target last): the key file the user chose for a key
+    /// profile that named none.
+    chosen_keys: Vec<Option<PathBuf>>,
     /// The remote forwards requested on the target; its handler routes forwarded channels
     /// only to these.
     forwards: Forwards,
@@ -496,6 +525,11 @@ async fn dial(
         .filter_map(|h| h.warning)
         .collect();
     warnings.dedup();
+    let chosen_keys = hops
+        .iter()
+        .chain(std::iter::once(&current))
+        .map(|h| h.chosen_key.clone())
+        .collect();
     Ok(Connection {
         chain: Some(Chain {
             hops,
@@ -503,6 +537,7 @@ async fn dial(
         }),
         dead: AtomicBool::new(false),
         warnings,
+        chosen_keys,
         forwards,
         runtime: tokio::runtime::Handle::current(),
     })
@@ -792,7 +827,7 @@ impl<C, R> Drop for Waiter<'_, C, R> {
     }
 }
 
-impl<C: Send + Sync + 'static, R: PartialEq + Clone + Send + Sync> Slots<C, R> {
+impl<C: Settle<R> + Send + Sync + 'static, R: PartialEq + Clone + Send + Sync> Slots<C, R> {
     /// The profile's live connection (`true`: reused), or the result of the connect in
     /// flight for it, or of a new connect made with `dial` (`false`). `can_ask` says whether
     /// `dial`'s prompter can ask the user: such a caller does not join a dial in flight that
@@ -885,7 +920,7 @@ impl<C: Send + Sync + 'static, R: PartialEq + Clone + Send + Sync> Slots<C, R> {
             {
                 match &result {
                     Ok(c) => {
-                        map.insert(id, Slot::Live(Arc::downgrade(c), route));
+                        map.insert(id, Slot::Live(Arc::downgrade(c), c.settle(route)));
                     }
                     Err(_) => {
                         map.remove(&id);
@@ -1027,7 +1062,9 @@ mod tests {
         }
     }
 
-    impl<C: Send + Sync + 'static> Slots<C, ()> {
+    impl<R> Settle<R> for Fake {}
+
+    impl<C: Settle<()> + Send + Sync + 'static> Slots<C, ()> {
         /// [`Slots::get_or_dial_on`] for tests where every caller is on the same route.
         async fn get_or_dial<F>(
             &self,

@@ -17,15 +17,24 @@
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
-//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels`: capture the profile editor,
-//!   the Settings window, the Color schemes window or the Tunnels window instead.
+//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels|archive`: capture the profile
+//!   editor, the Settings window, the Color schemes window, the Tunnels window or the export
+//!   and import window instead.
 //! - `FBTERM_OPEN_EDITOR=<profile name>`: open the profile editor at startup, that profile
 //!   selected.
-//! - `FBTERM_OPEN_SETTINGS=1`: open the Settings window at startup.
+//! - `FBTERM_OPEN_SETTINGS=1`: open the Settings window at startup (`secrets`: scrolled to the
+//!   Saved secrets section).
+//! - `FBTERM_DEMO_VAULT=1`: with `FBTERM_SECRETS=memory`, make the in-memory backend's vault
+//!   (in its temporary folder, main password `demo`) so Settings shows `Reset vault`.
 //! - `FBTERM_OPEN_SCHEMES=1`: open the Color schemes window at startup (any other value: the
 //!   name of the scheme to select).
 //! - `FBTERM_OPEN_TUNNELS=1`: open the Tunnels window at startup.
-//! - `FBTERM_DEMO_PROMPT=hostkey|password|changed`: show a sample connection dialog in the first
+//! - `FBTERM_OPEN_ARCHIVE=export|import`: open the export and import window at startup in that
+//!   mode. With `FBTERM_DEMO_ARCHIVE=1` as well, export starts with the jump hosts unchecked
+//!   and key files on, and import shows a sample archive built in memory (its key folder in
+//!   the temporary folder).
+//! - `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword`: show a sample
+//!   connection or main password dialog (`setpassword` only with `FBTERM_SECRETS=memory`) in the first
 //!   window (nothing waits for the answer).
 //! - `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close`: keep that tab-bar button's
 //!   tooltip showing (for screenshots; `close` is the first tab's).
@@ -36,6 +45,13 @@
 
 mod actions;
 mod app;
+mod archive_build;
+#[cfg(test)]
+mod archive_build_tests;
+mod archive_import;
+#[cfg(test)]
+mod archive_import_tests;
+mod archive_window;
 mod chrome;
 mod config_files;
 mod debug;
@@ -58,6 +74,7 @@ mod redact;
 mod restore;
 #[cfg(test)]
 mod restore_tests;
+mod saved_secrets;
 mod schemes;
 #[cfg(test)]
 mod schemes_tests;

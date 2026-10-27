@@ -15,6 +15,7 @@ struct Recording {
     /// Every call in order: "set", "remove_kind", "remove".
     log: Mutex<Vec<&'static str>>,
     fail_set: AtomicBool,
+    fail_remove_kind: AtomicBool,
 }
 
 impl SecretStore for Recording {
@@ -35,6 +36,9 @@ impl SecretStore for Recording {
     }
     fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
         self.log.lock().push("remove_kind");
+        if self.fail_remove_kind.load(Ordering::SeqCst) {
+            return Err(SecretError::Backend("denied".into()));
+        }
         self.removed_kinds.lock().push((*id, kind));
         self.inner.remove_kind(id, kind)
     }
@@ -429,7 +433,7 @@ fn secrets_of_an_auth_no_longer_used_are_removed() {
     let key = ssh_with(
         "key",
         AuthMethod::Key {
-            path: "~/.ssh/id_ed25519".into(),
+            path: Some("~/.ssh/id_ed25519".into()),
             passphrase: true,
         },
     );
@@ -462,6 +466,64 @@ fn secrets_of_an_auth_no_longer_used_are_removed() {
 }
 
 #[test]
+fn failed_kind_removals_are_retried_on_the_next_save() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let db = ssh_with("db", AuthMethod::Password);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone(), db.clone()],
+    };
+    let (mut ed, secrets) = editor(&store);
+    // web stops using a password; db gets a new one, which the store refuses: the batch
+    // fails, so web's old password was not removed either.
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Auth(AuthChoice::Agent));
+    ed.update(EditorMsg::Select(db.id));
+    ed.update(EditorMsg::Secret(Redacted("db-pw".into())));
+    secrets.fail_set.store(true, Ordering::SeqCst);
+    assert!(ed.save(&mut store, &file()).is_err());
+    assert!(secrets.removed_kinds.lock().is_empty());
+    // The next save retries it (the profiles on disk no longer say web had a password).
+    secrets.fail_set.store(false, Ordering::SeqCst);
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(
+        *secrets.removed_kinds.lock(),
+        vec![(web.id, SecretKind::Password)]
+    );
+    secrets.removed_kinds.lock().clear();
+    ed.update(EditorMsg::Select(db.id));
+    ed.update(EditorMsg::Name("db2".into()));
+    ed.save(&mut store, &file()).unwrap();
+    assert!(secrets.removed_kinds.lock().is_empty(), "retried once");
+}
+
+#[test]
+fn a_retried_kind_removal_is_dropped_once_the_kind_is_used_again() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone()],
+    };
+    let (mut ed, secrets) = editor(&store);
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Auth(AuthChoice::Agent));
+    secrets.fail_remove_kind.store(true, Ordering::SeqCst);
+    assert!(ed.save(&mut store, &file()).is_err());
+    secrets.fail_remove_kind.store(false, Ordering::SeqCst);
+    // Back to a password with a new one typed: the queued removal would delete it.
+    ed.update(EditorMsg::Auth(AuthChoice::Password));
+    ed.update(EditorMsg::Secret(Redacted("new-pw".into())));
+    secrets.removed_kinds.lock().clear();
+    ed.save(&mut store, &file()).unwrap();
+    assert!(secrets.removed_kinds.lock().is_empty());
+    assert_eq!(
+        secrets
+            .get(&web.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("new-pw")
+    );
+}
+
+#[test]
 fn debug_output_never_shows_a_typed_secret() {
     let msg = EditorMsg::Secret(Redacted("hunter2-secret".into()));
     let app_msg = crate::app::Message::Editor(msg.clone());
@@ -489,6 +551,83 @@ fn debug_output_never_shows_a_typed_secret() {
 }
 
 #[test]
+fn empty_key_path_saves_as_none() {
+    let key = ssh_with(
+        "key",
+        AuthMethod::Key {
+            path: Some("~/.ssh/id_ed25519".into()),
+            passphrase: false,
+        },
+    );
+    let mut store = ProfileStore {
+        profiles: vec![key.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(key.id));
+    ed.update(EditorMsg::KeyPath("   ".into()));
+    let path = file();
+    ed.save(&mut store, &path).unwrap();
+    let ProfileKind::Ssh(s) = &store.get(key.id).unwrap().kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        }
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("path"), "{text}");
+    // Loaded back, the draft shows an empty field, and saving again keeps it so.
+    let (ed, _) = editor(&store);
+    let DraftKind::Ssh(d) = &ed.draft(key.id).unwrap().kind else {
+        panic!("ssh")
+    };
+    assert_eq!(d.key_path, "");
+    assert_eq!(d.auth, AuthChoice::Key);
+}
+
+#[test]
+fn remembered_key_file_fills_an_empty_field_only() {
+    let key = ssh_with(
+        "key",
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        },
+    );
+    let typed = ssh_with(
+        "typed",
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        },
+    );
+    let store = ProfileStore {
+        profiles: vec![key.clone(), typed.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(typed.id));
+    ed.update(EditorMsg::KeyPath("~/.ssh/mine".into()));
+    ed.dirty = false;
+    let chosen = PathBuf::from("/keys/id_ed25519");
+    ed.key_file_remembered(key.id, &chosen);
+    ed.key_file_remembered(typed.id, &chosen);
+    let path_of = |ed: &EditorState, id| match &ed.draft(id).unwrap().kind {
+        DraftKind::Ssh(s) => s.key_path.clone(),
+        DraftKind::Local(_) => panic!("ssh"),
+    };
+    assert_eq!(path_of(&ed, key.id), "/keys/id_ed25519");
+    assert_eq!(
+        path_of(&ed, typed.id),
+        "~/.ssh/mine",
+        "a typed path is kept"
+    );
+    assert!(!ed.dirty, "the saved profiles already have it");
+}
+
+#[test]
 fn rsa_key_file_shows_a_warning_that_follows_the_path() {
     let dir = std::env::temp_dir().join(format!("fbterm-keys-{}", ProfileId::new()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -504,7 +643,7 @@ fn rsa_key_file_shows_a_warning_that_follows_the_path() {
     let p = ssh_with(
         "k",
         AuthMethod::Key {
-            path: rsa.clone(),
+            path: Some(rsa.clone()),
             passphrase: false,
         },
     );
@@ -531,7 +670,7 @@ fn rsa_warning_does_not_outlive_the_selected_profile() {
     let a = ssh_with(
         "a",
         AuthMethod::Key {
-            path: rsa,
+            path: Some(rsa),
             passphrase: false,
         },
     );

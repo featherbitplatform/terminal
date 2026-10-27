@@ -9,7 +9,7 @@ use std::time::Duration;
 use fbterm_config::{
     ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, Settings, discover_shells,
 };
-use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
+use fbterm_secrets::{SecretBackend, SecretStore};
 use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
@@ -19,6 +19,7 @@ use iced::{Event, Subscription, Task, Theme};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::archive_window::{ArchiveMsg, ArchiveState};
 use crate::chrome::{self, BarAction};
 use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
@@ -159,9 +160,15 @@ pub enum Message {
     Schemes(SchemesMsg),
     /// The Tunnels window.
     Tunnels(TunnelsMsg),
+    /// The export and import window.
+    Archive(ArchiveMsg),
     /// Exporting a tab to a file.
     Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
+    /// The main password dialogs and moving saved secrets.
+    Vault(crate::saved_secrets::VaultMsg),
+    /// The secret changes of profile editor save `seq` ran.
+    EditorSecrets(u64, Delivered<Result<crate::editor::SecretResults, String>>),
     Shoot,
     Shot(Screenshot),
     /// The OS close button (or equivalent) was used on a window; see [`App::close_requested`].
@@ -208,6 +215,7 @@ pub(crate) enum ShotWindow {
     Settings,
     Schemes,
     Tunnels,
+    Archive,
 }
 
 pub struct App {
@@ -222,8 +230,13 @@ pub struct App {
     /// While set, nothing may save the profile store: that would overwrite the user's file.
     pub profiles_error: Option<ConfigError>,
     pub(crate) paths: Paths,
+    /// Saved secrets, wherever `secret_storage` keeps them: the same store as `backend`,
+    /// shared with the connection pool, the editor and the archive window. Every call may
+    /// reach the vault, so none is made on the UI thread.
     pub(crate) secrets: Arc<dyn fbterm_secrets::SecretStore>,
-    pub(crate) fallback: Option<Arc<FallbackStore>>,
+    pub(crate) backend: Arc<SecretBackend>,
+    /// The main password dialogs, moving secrets and the Settings section's state.
+    pub(crate) vault: crate::saved_secrets::VaultUi,
     pub(crate) pool: Arc<SshPool>,
     /// Every tunnel that has run, with its state (see [`crate::tunnels`]).
     pub(crate) tunnels: Tunnels,
@@ -267,12 +280,22 @@ pub struct App {
     pub find_box: Option<FindAll>,
     /// The profile editor window, when open.
     pub editor: Option<(window::Id, EditorState)>,
+    /// Numbers the editor's saves, so the result of one for a replaced editor is dropped.
+    pub(crate) editor_seq: u64,
     /// The Settings window, when open.
     pub settings_win: Option<(window::Id, SettingsState)>,
     /// The Color schemes window, when open.
     pub schemes_win: Option<(window::Id, SchemesState)>,
     /// The Tunnels window, when open.
     pub tunnels_win: Option<(window::Id, TunnelsState)>,
+    /// The export and import window, when open.
+    pub archive_win: Option<(window::Id, ArchiveState)>,
+    /// Numbers the archive window's dialogs and background jobs, so a late answer for one it
+    /// no longer waits for (even from a window since closed) is dropped.
+    pub(crate) archive_seq: u64,
+    /// Tests: run the archive window's background work at once instead of on the blocking
+    /// pool (the app's tasks never run in tests).
+    pub(crate) blocking_inline: bool,
     /// Connection dialogs waiting per window.
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
@@ -318,8 +341,8 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels` (debug aid): capture that
-    /// window instead.
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels|archive` (debug aid): capture
+    /// that window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
     /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close` (debug aid): that tab-bar
@@ -335,6 +358,31 @@ pub struct App {
     pub(crate) exporting: Option<window::Id>,
     /// The last export's outcome, shown in the window it ran in until dismissed.
     pub(crate) export_notice: Option<crate::export::ExportNotice>,
+}
+
+impl App {
+    /// Run `job` on the blocking pool and deliver its result as `done(result)`: at once
+    /// when `blocking_inline` (tests, whose tasks never run). `fallback` stands in for the
+    /// result if the job panics.
+    pub(crate) fn run_blocking<T: Send + 'static>(
+        &mut self,
+        job: impl FnOnce() -> T + Send + 'static,
+        fallback: fn(String) -> T,
+        done: impl FnOnce(T) -> Message + Send + 'static,
+    ) -> Task<Message> {
+        if self.blocking_inline {
+            let msg = done(job());
+            return self.update(msg);
+        }
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(job)
+                    .await
+                    .unwrap_or_else(|e| fallback(e.to_string()))
+            },
+            done,
+        )
+    }
 }
 
 pub(crate) fn unix_now() -> i64 {
@@ -426,6 +474,21 @@ impl App {
     }
 
     pub(crate) fn build(paths: Paths, memory_secrets: bool) -> (Self, Task<Message>) {
+        Self::build_with(paths, move |settings, paths| {
+            if memory_secrets {
+                SecretBackend::in_memory(settings.secret_storage)
+            } else {
+                SecretBackend::new(settings.secret_storage, paths)
+            }
+        })
+    }
+
+    /// [`Self::build`] with the secret backend `make` gives for the loaded settings. Nothing
+    /// asks the secret storage here: with `"auto"` the first secret needed checks it.
+    pub(crate) fn build_with(
+        paths: Paths,
+        make: impl FnOnce(&Settings, &Paths) -> SecretBackend,
+    ) -> (Self, Task<Message>) {
         let mut notices = Vec::new();
         let mut settings_notice = None;
         // A settings warning (a value out of range, already clamped) is shown like an error,
@@ -457,16 +520,18 @@ impl App {
         let profiles_seen = std::fs::read_to_string(paths.profiles()).ok();
         let settings_seen = std::fs::read_to_string(paths.settings()).ok();
 
-        let (secrets, fallback): (Arc<dyn SecretStore>, _) = if memory_secrets {
-            (Arc::new(MemoryStore::new()), None)
-        } else {
-            let store = Arc::new(FallbackStore::new());
-            (store.clone(), Some(store))
-        };
+        let backend = Arc::new(make(&settings, &paths));
+        let secrets: Arc<dyn SecretStore> = backend.clone();
         let known_hosts = directories::BaseDirs::new()
             .map(|d| d.home_dir().join(".ssh").join("known_hosts"))
             .unwrap_or_else(|| PathBuf::from("known_hosts"));
         let (prompt_tx, prompt_rx) = unbounded_channel();
+        // Auto checks the system storage on the first secret needed (off the UI thread): a
+        // move to the vault reaches the update loop with the prompt events.
+        let switched_tx = prompt_tx.clone();
+        backend.on_auto_switch(move || {
+            let _ = switched_tx.send(PromptEvent::StorageAutoSwitched);
+        });
         // Dials pass a prompter for their own window; this one asks over the focused window.
         let pool = Arc::new(SshPool::new(SshContext {
             known_hosts,
@@ -495,7 +560,8 @@ impl App {
             profiles_error,
             paths,
             secrets,
-            fallback,
+            backend,
+            vault: Default::default(),
             pool,
             events,
             receiver: EventReceiver::new(rx),
@@ -516,9 +582,13 @@ impl App {
             hover_generation: 0,
             find_box: None,
             editor: None,
+            editor_seq: 0,
             settings_win: None,
             schemes_win: None,
             tunnels_win: None,
+            archive_win: None,
+            archive_seq: 0,
+            blocking_inline: false,
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
@@ -548,6 +618,7 @@ impl App {
                 Some(w) if w == "settings" => ShotWindow::Settings,
                 Some(w) if w == "schemes" => ShotWindow::Schemes,
                 Some(w) if w == "tunnels" => ShotWindow::Tunnels,
+                Some(w) if w == "archive" => ShotWindow::Archive,
                 _ => ShotWindow::Terminal,
             },
             shooting: false,
@@ -574,10 +645,12 @@ impl App {
         task = task.chain(app.open_debug_settings());
         task = task.chain(app.open_debug_schemes());
         task = task.chain(app.open_debug_tunnels());
+        task = task.chain(app.open_debug_archive());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
         task = task.chain(app.open_debug_files());
-        (app, task)
+        let demo_vault = app.open_debug_vault();
+        (app, Task::batch([demo_vault, task]))
     }
 
     /// The first local profile, preferring the user's login shell.
@@ -595,7 +668,7 @@ impl App {
             .map(|(id, _)| id)
     }
 
-    /// Notices to show: config problems and a degraded keychain.
+    /// Notices to show: config problems, and the move to the vault when Auto made it.
     pub fn visible_notices(&self) -> Vec<String> {
         if self.notices_dismissed {
             return Vec::new();
@@ -603,9 +676,6 @@ impl App {
         let mut out = self.notices.clone();
         if self.profiles_error.is_some() {
             out.push("Profiles are read-only until profiles.toml is fixed".into());
-        }
-        if self.fallback.as_ref().is_some_and(|f| f.degraded()) {
-            out.push("Keychain unavailable: passwords are kept for this session only".into());
         }
         out
     }
@@ -622,6 +692,9 @@ impl App {
         }
         if self.tunnels_window() == Some(id) {
             return "Tunnels · fbterm".into();
+        }
+        if self.archive_window() == Some(id) {
+            return self.archive_title().into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title()),
@@ -704,6 +777,7 @@ impl App {
             ShotWindow::Settings if self.settings_win.is_none() => return false,
             ShotWindow::Schemes if self.schemes_win.is_none() => return false,
             ShotWindow::Tunnels if self.tunnels_win.is_none() => return false,
+            ShotWindow::Archive if self.archive_win.is_none() => return false,
             _ => {}
         }
         self.windows
@@ -851,6 +925,11 @@ impl App {
                 if self.tunnels_window() == Some(id) {
                     self.tunnels_win = None;
                 }
+                // Dropping the state wipes typed passwords and an opened archive.
+                if self.archive_window() == Some(id) {
+                    self.archive_win = None;
+                }
+                self.vault_window_closed(id);
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
                 // stop saving.
@@ -921,6 +1000,7 @@ impl App {
                     && self.settings_win.is_none()
                     && self.schemes_win.is_none()
                     && self.tunnels_win.is_none()
+                    && self.archive_win.is_none()
                 {
                     iced::exit()
                 } else if self.quitting {
@@ -950,7 +1030,13 @@ impl App {
             Message::Settings(msg) => self.settings_msg(msg),
             Message::Schemes(msg) => self.schemes_msg(msg),
             Message::Tunnels(msg) => self.tunnels_msg(msg),
+            Message::Archive(msg) => self.archive_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
+            Message::Vault(msg) => self.vault_msg(msg),
+            Message::EditorSecrets(seq, results) => {
+                self.editor_secrets_done(seq, results);
+                Task::none()
+            }
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
                     self.os_scales.insert(id, s);
@@ -1065,7 +1151,7 @@ impl App {
     }
 
     fn shoot(&mut self) -> Task<Message> {
-        if self.shooting {
+        if self.shooting || self.vault.demo_pending {
             return Task::none();
         }
         let target = match self.screenshot_window {
@@ -1073,6 +1159,7 @@ impl App {
             ShotWindow::Settings => self.settings_window(),
             ShotWindow::Schemes => self.schemes_window(),
             ShotWindow::Tunnels => self.tunnels_window(),
+            ShotWindow::Archive => self.archive_window(),
             ShotWindow::Terminal => self.windows.keys().next().copied(),
         };
         let Some(wid) = target else {

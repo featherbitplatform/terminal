@@ -25,7 +25,7 @@ pub fn view<'a>(
     t: &'static Tokens,
     state: &'a EditorState,
     schemes: Vec<SchemeChoice>,
-    degraded: bool,
+    storage: fbterm_secrets::Storage,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut main = column![];
@@ -34,7 +34,7 @@ pub fn view<'a>(
     }
     let form: Element<'a, Message> = match state.selected_draft() {
         Some(d) => scrollable(
-            container(form(t, state, d, schemes, editable, degraded))
+            container(form(t, state, d, schemes, editable, storage))
                 .padding(Padding::from([20.0, 28.0]))
                 .max_width(FORM_WIDTH + 56.0),
         )
@@ -321,7 +321,7 @@ fn form<'a>(
     d: &'a Draft,
     schemes: Vec<SchemeChoice>,
     editable: bool,
-    degraded: bool,
+    storage: fbterm_secrets::Storage,
 ) -> Element<'a, Message> {
     let on = |f: fn(String) -> EditorMsg| editable.then_some(f);
     let mut col = column![
@@ -414,7 +414,7 @@ fn form<'a>(
                 )
                 .push(field(t, "User", "user", &s.user, true, on(EditorMsg::User)))
                 .push(section(t, "Authentication"))
-                .push(auth(t, s, editable, degraded, state.selected_key_is_rsa()))
+                .push(auth(t, s, editable, storage, state.selected_key_is_rsa()))
                 .push(section(t, "Jump hosts"))
                 .push(jumps(t, state, d.id, s, editable))
                 .push(section(t, "Tunnels"))
@@ -512,12 +512,14 @@ fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Ele
                 (editable && has_selection).then(|| msg(EditorMsg::Delete)),
                 ui::danger_ghost
             ),
+            ui::text_button(t, "Export\u{2026}", Some(msg(EditorMsg::Export)), ui::ghost),
+            ui::text_button(t, "Import\u{2026}", Some(msg(EditorMsg::Import)), ui::ghost),
             messages,
             ui::text_button(t, "Close", Some(msg(EditorMsg::Close)), ui::secondary),
             ui::text_button(
                 t,
                 "Save",
-                (editable && state.dirty).then(|| msg(EditorMsg::Save)),
+                (editable && state.dirty && state.saving.is_none()).then(|| msg(EditorMsg::Save)),
                 ui::primary
             ),
         ]

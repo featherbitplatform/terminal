@@ -23,8 +23,10 @@ pub struct SchemeColors {
     pub ansi: [Rgb; 16],
 }
 
-/// A named color scheme, optionally with a font preference.
-#[derive(Clone, PartialEq, Debug)]
+/// A named color scheme, optionally with a font preference. Serializes as a scheme file
+/// (the `builtin` flag is never written; a deserialized scheme is never built-in).
+#[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
+#[serde(try_from = "SchemeFile", into = "SchemeFile")]
 pub struct Scheme {
     /// Stable id: a built-in id or `user-<uuid>`.
     pub id: String,
@@ -74,6 +76,40 @@ struct SchemeFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     font_size: Option<f32>,
     colors: ColorsFile,
+}
+
+impl From<Scheme> for SchemeFile {
+    fn from(scheme: Scheme) -> Self {
+        Self {
+            colors: ColorsFile::from(&scheme.colors),
+            id: scheme.id,
+            name: scheme.name,
+            font_family: scheme.font_family,
+            font_size: scheme.font_size,
+        }
+    }
+}
+
+impl TryFrom<SchemeFile> for Scheme {
+    type Error = String;
+
+    /// Checks what the file format cannot: a non-empty id and name, a positive font size.
+    fn try_from(file: SchemeFile) -> Result<Self, String> {
+        if file.id.is_empty() || file.name.trim().is_empty() {
+            return Err("a scheme needs a non-empty id and name".into());
+        }
+        if file.font_size.is_some_and(|f| !f.is_finite() || f <= 0.0) {
+            return Err("font_size must be a positive number".into());
+        }
+        Ok(Scheme {
+            id: file.id,
+            name: file.name,
+            colors: file.colors.into(),
+            font_family: file.font_family,
+            font_size: file.font_size,
+            builtin: false,
+        })
+    }
 }
 
 impl From<&SchemeColors> for ColorsFile {
@@ -295,41 +331,13 @@ pub fn read_file(path: &Path) -> Result<Scheme, ConfigError> {
         let line = e.span().map(|s| line_of(&text, s.start));
         ConfigError::new(path, line, e.message().to_string())
     })?;
-    if file.id.is_empty() || file.name.trim().is_empty() {
-        return Err(ConfigError::new(
-            path,
-            None,
-            "a scheme needs a non-empty id and name".into(),
-        ));
-    }
-    if file.font_size.is_some_and(|f| !f.is_finite() || f <= 0.0) {
-        return Err(ConfigError::new(
-            path,
-            None,
-            "font_size must be a positive number".into(),
-        ));
-    }
-    Ok(Scheme {
-        id: file.id,
-        name: file.name,
-        colors: file.colors.into(),
-        font_family: file.font_family,
-        font_size: file.font_size,
-        builtin: false,
-    })
+    Scheme::try_from(file).map_err(|m| ConfigError::new(path, None, m))
 }
 
 /// Write a scheme file atomically. The `builtin` flag is never written.
 pub fn write_file(path: &Path, scheme: &Scheme) -> Result<(), ConfigError> {
-    let file = SchemeFile {
-        id: scheme.id.clone(),
-        name: scheme.name.clone(),
-        font_family: scheme.font_family.clone(),
-        font_size: scheme.font_size,
-        colors: ColorsFile::from(&scheme.colors),
-    };
     let text =
-        toml::to_string_pretty(&file).map_err(|e| ConfigError::new(path, None, e.to_string()))?;
+        toml::to_string_pretty(scheme).map_err(|e| ConfigError::new(path, None, e.to_string()))?;
     atomic_write(path, text.as_bytes())
 }
 
@@ -363,6 +371,22 @@ fn check_user_id(dir: &Path, id: &str) -> Result<PathBuf, ConfigError> {
         ));
     }
     Ok(path)
+}
+
+/// Whether a user scheme from elsewhere (an imported archive) could be a scheme file: a plain,
+/// non-built-in id, at most [`MAX_FILE_BYTES`] once written, and loading back unchanged
+/// through the scheme file checks.
+pub fn is_valid_user(scheme: &Scheme) -> bool {
+    if scheme.builtin || check_user_id(Path::new(""), &scheme.id).is_err() {
+        return false;
+    }
+    let Ok(text) = toml::to_string_pretty(scheme) else {
+        return false;
+    };
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return false;
+    }
+    toml::from_str::<Scheme>(&text).is_ok_and(|back| back == *scheme)
 }
 
 /// Save a user scheme as `<dir>/<id>.toml`. Built-ins are refused.
@@ -456,6 +480,64 @@ impl SchemeSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scheme_serde_round_trips_and_validates() {
+        let mut scheme = builtins().remove(2);
+        scheme.font_family = Some("Geist Mono".into());
+        scheme.font_size = Some(13.5);
+        let text = toml::to_string_pretty(&scheme).unwrap();
+        assert!(!text.contains("builtin"));
+        let back: Scheme = toml::from_str(&text).unwrap();
+        assert_eq!(
+            back,
+            Scheme {
+                builtin: false,
+                ..scheme
+            }
+        );
+
+        let bad = text.replace("font_size = 13.5", "font_size = -1.0");
+        assert!(toml::from_str::<Scheme>(&bad).is_err());
+    }
+
+    #[test]
+    fn valid_user_schemes_follow_the_file_rules() {
+        let mut ok = builtins().remove(1);
+        ok.builtin = false;
+        ok.id = "user-1".into();
+        assert!(is_valid_user(&ok));
+
+        let builtin = builtins().remove(0);
+        assert!(!is_valid_user(&builtin));
+        let builtin_id = Scheme {
+            id: "graphite".into(),
+            ..ok.clone()
+        };
+        assert!(!is_valid_user(&builtin_id));
+        for id in ["", "../x", "User-1", "a/b", &"x".repeat(101)] {
+            let bad = Scheme {
+                id: id.into(),
+                ..ok.clone()
+            };
+            assert!(!is_valid_user(&bad), "{id:?}");
+        }
+        let nameless = Scheme {
+            name: " ".into(),
+            ..ok.clone()
+        };
+        assert!(!is_valid_user(&nameless));
+        let bad_size = Scheme {
+            font_size: Some(f32::NAN),
+            ..ok.clone()
+        };
+        assert!(!is_valid_user(&bad_size));
+        let huge = Scheme {
+            font_family: Some("f".repeat(MAX_FILE_BYTES as usize)),
+            ..ok
+        };
+        assert!(!is_valid_user(&huge));
+    }
 
     #[test]
     fn growing_read_is_bounded() {

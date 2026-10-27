@@ -8,12 +8,12 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 | License | Where it appears |
 | --- | --- |
-| Apache-2.0 | Most of the dependency tree, including `russh`, `russh-sftp` (the file panel's SFTP client), `feathercritty`, `iced` support crates and `wgpu`. |
-| MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also the Lucide icons derived from Feather (see below). |
+| Apache-2.0 | Most of the dependency tree, including `russh`, `russh-sftp` (the file panel's SFTP client), `feathercritty`, `iced` support crates and `wgpu`; also `age` (profile archives, MIT or Apache-2.0) with its RustCrypto dependencies (`scrypt`, `chacha20poly1305`, `secrecy`), `zeroize` and `base64`; and `windows-sys` (MIT or Apache-2.0), used directly on Windows for DPAPI, the system storage for saved secrets there. |
+| MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also `i18n-embed`, `rust-embed` and `bech32`, which `age` uses for its own messages and key encoding; also the Lucide icons derived from Feather (see below); also `secret-service` and `zbus`, already in the tree through `keyring` and used directly on Linux only to recognize a missing Secret Service. |
 | BSD-2-Clause | `arrayref`, `serial2`, `zerocopy`. |
-| BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `subtle`, `tiny-skia`, `num_enum`. |
+| BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `x25519-dalek` (via `age`), `subtle`, `tiny-skia`, `num_enum`. |
 | ISC | `ring`, `untrusted`, `libloading`, `inotify`, and the bundled Lucide icon font (see below). |
-| Unicode-3.0 | `unicode-ident` (Unicode data tables). |
+| Unicode-3.0 | `unicode-ident` (Unicode data tables); `tinystr`, `zerovec` and `zerofrom` (via `age`'s message localization). |
 | Zlib | `bytemuck`, `foldhash`, `slotmap`, `tinyvec`, the `objc2-*` bindings, `raw-window-handle`. |
 | MPL-2.0 | `nucleo-matcher` (palette fuzzy search) and `option-ext`; used unmodified. |
 | OFL-1.1 | The bundled fonts, see below. |

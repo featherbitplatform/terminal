@@ -1,6 +1,6 @@
 //! The dialog drawn over a terminal window: trust a host key, a changed host key, a password /
-//! key passphrase, confirm closing a split tab, an upload's name clash, or closing while
-//! transfers run.
+//! key passphrase, which key file, confirm closing a split tab, an upload's name clash, or
+//! closing while transfers run.
 
 use fbterm_secrets::SecretKind;
 use iced::widget::{Space, button, checkbox, column, container, opaque, row, text, text_input};
@@ -15,10 +15,12 @@ use crate::ui::{self, MONO};
 
 const CARD_WIDTH: f32 = 460.0;
 
+/// `storage`: where a remembered secret goes, for the `Remember` checkbox.
 pub fn view<'a>(
     t: &'static Tokens,
     window: window::Id,
     dialog: &'a Dialog,
+    storage: fbterm_secrets::Storage,
 ) -> Element<'a, Message> {
     let msg = move |m| Message::Prompt(m);
     let body: Element<'a, Message> = match dialog {
@@ -136,6 +138,33 @@ pub fn view<'a>(
         .spacing(14)
         .into(),
         Dialog::Clash(clash) => clash_view(t, window, clash),
+        Dialog::KeyFile {
+            profile, choosing, ..
+        } => column![
+            header(
+                t,
+                ui::ICON_LOCK,
+                t.accent_edge,
+                crate::prompts::key_file_title(profile)
+            ),
+            text("This profile has no private key file yet. The file you choose is remembered in the profile once it logs in.")
+                .font(UI_FONT)
+                .size(13)
+                .color(t.text_secondary),
+            buttons(vec![
+                ui::text_button(t, "Cancel", Some(msg(PromptMsg::Cancel(window))), ui::secondary)
+                    .into(),
+                ui::text_button(
+                    t,
+                    "Choose\u{2026}",
+                    (!*choosing).then(|| msg(PromptMsg::ChooseKey(window))),
+                    ui::primary,
+                )
+                .into(),
+            ]),
+        ]
+        .spacing(14)
+        .into(),
         Dialog::Transfers {
             count, in_place, ..
         } => column![
@@ -208,7 +237,7 @@ pub fn view<'a>(
                 .align_y(Alignment::Center),
                 field_col,
                 checkbox(*remember)
-                    .label("Remember in keychain")
+                    .label(crate::saved_secrets::remember_label(storage))
                     .on_toggle(move |b| msg(PromptMsg::Remember(window, b)))
                     .font(UI_FONT)
                     .text_size(13)

@@ -14,7 +14,7 @@ use fbterm_config::{
     AccentStyle, AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind,
     ProfileStore, Rgb, SshProfile, StartMode, TunnelDef, TunnelKind, ValidationError,
 };
-use fbterm_secrets::{SecretKind, SecretStore};
+use fbterm_secrets::{SecretChange, SecretKind, SecretStore, Zeroizing};
 
 use crate::redact::Redacted;
 
@@ -56,12 +56,19 @@ pub enum EditorMsg {
     Open,
     Close,
     Save,
+    /// Save without asking for the main password first (it was asked, or cancelled: the
+    /// secret changes then fail and are reported).
+    SaveNoAsk,
     /// Re-read `profiles.toml` (offered while it failed to load).
     Reload,
     /// Open the file picker for the key path.
     PickKey,
     /// Open the Color schemes window.
     EditSchemes,
+    /// `Export…`: the archive window in its Export mode.
+    Export,
+    /// `Import…`: the archive window in its Import mode.
+    Import,
     KeyPicked(Option<PathBuf>),
 
     Select(ProfileId),
@@ -78,7 +85,7 @@ pub enum EditorMsg {
     Port(String),
     User(String),
     Auth(AuthChoice),
-    /// The typed password or key passphrase (stored in the keychain on save).
+    /// The typed password or key passphrase (saved to secret storage on save).
     Secret(Redacted),
     KeyPath(String),
     KeyPassphrase(bool),
@@ -288,7 +295,7 @@ pub struct SshDraft {
     pub tunnels: Vec<TunnelDef>,
     /// Per tunnel, the target a SOCKS switch set aside, so Local, SOCKS, Local keeps it.
     parked: Vec<(String, u16)>,
-    /// Typed secret for the chosen auth; empty keeps whatever the keychain has.
+    /// Typed secret for the chosen auth; empty keeps whatever is saved.
     pub secret: String,
 }
 
@@ -341,9 +348,13 @@ impl Draft {
             ProfileKind::Ssh(s) => {
                 let (auth, key_path, key_passphrase) = match &s.auth {
                     AuthMethod::Password => (AuthChoice::Password, String::new(), false),
-                    AuthMethod::Key { path, passphrase } => {
-                        (AuthChoice::Key, path.display().to_string(), *passphrase)
-                    }
+                    AuthMethod::Key { path, passphrase } => (
+                        AuthChoice::Key,
+                        path.as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        *passphrase,
+                    ),
                     AuthMethod::Agent => (AuthChoice::Agent, String::new(), false),
                 };
                 DraftKind::Ssh(SshDraft {
@@ -388,8 +399,11 @@ impl Draft {
                 user: s.user.trim().to_owned(),
                 auth: match s.auth {
                     AuthChoice::Password => AuthMethod::Password,
+                    // No path yet: connecting asks for the key file and remembers it.
                     AuthChoice::Key => AuthMethod::Key {
-                        path: PathBuf::from(s.key_path.trim()),
+                        path: Some(s.key_path.trim())
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from),
                         passphrase: s.key_passphrase,
                     },
                     AuthChoice::Agent => AuthMethod::Agent,
@@ -421,6 +435,17 @@ impl Draft {
         matches!(self.kind, DraftKind::Ssh(_))
     }
 
+    /// Whether this draft's authentication uses a saved secret of `kind`.
+    fn uses_kind(&self, kind: SecretKind) -> bool {
+        match &self.kind {
+            DraftKind::Ssh(s) => match kind {
+                SecretKind::Password => s.auth == AuthChoice::Password,
+                SecretKind::KeyPassphrase => s.auth == AuthChoice::Key && s.key_passphrase,
+            },
+            DraftKind::Local(_) => false,
+        }
+    }
+
     /// The secret typed for this draft and the kind it is stored as, if any.
     fn typed_secret(&self) -> Option<(SecretKind, &str)> {
         let DraftKind::Ssh(s) = &self.kind else {
@@ -443,6 +468,9 @@ pub struct EditorState {
     pub selected: Option<ProfileId>,
     /// Saved profiles deleted in the editor; their secrets go on the next save.
     removed: Vec<ProfileId>,
+    /// Kinds of secret a saved profile no longer uses whose removal failed; retried on the
+    /// next save unless the profile uses that kind again by then.
+    removed_kinds: Vec<(ProfileId, SecretKind)>,
     /// Problems found by the last save attempt.
     pub errors: Vec<ValidationError>,
     /// A one-line message: a refused delete, a failed write, "Saved".
@@ -451,6 +479,8 @@ pub struct EditorState {
     pub read_only: Option<ConfigError>,
     /// Unsaved edits exist.
     pub dirty: bool,
+    /// The secret changes of this save number run in the background: Save waits.
+    pub saving: Option<u64>,
     secrets: Arc<dyn SecretStore>,
     /// Whether the key file at this path (as typed) is an RSA private key; refreshed when the
     /// path or the selection changes, so drawing never touches the disk.
@@ -493,10 +523,12 @@ impl EditorState {
             selected: drafts.first().map(|d| d.id),
             drafts,
             removed: Vec::new(),
+            removed_kinds: Vec::new(),
             errors: Vec::new(),
             notice: None,
             read_only,
             dirty: false,
+            saving: None,
             secrets,
             key_check: None,
         };
@@ -522,6 +554,36 @@ impl EditorState {
         }
         let rsa = key_file_is_rsa(&path);
         self.key_check = Some((path, rsa));
+    }
+
+    /// A connection remembered the key file chosen for key profile `id` (already saved in the
+    /// profiles): its draft shows it, unless a path was typed there meanwhile.
+    pub fn key_file_remembered(&mut self, id: ProfileId, path: &Path) {
+        if let Some(DraftKind::Ssh(s)) = self
+            .drafts
+            .iter_mut()
+            .find(|d| d.id == id)
+            .map(|d| &mut d.kind)
+            && s.auth == AuthChoice::Key
+            && s.key_path.trim().is_empty()
+        {
+            s.key_path = path.display().to_string();
+        }
+        self.refresh_key_check();
+    }
+
+    /// A connection saved the key passphrase of key profile `id` (the profile is already
+    /// marked as having one): its draft says so too, so a later save does not remove it.
+    pub fn passphrase_remembered(&mut self, id: ProfileId) {
+        if let Some(DraftKind::Ssh(s)) = self
+            .drafts
+            .iter_mut()
+            .find(|d| d.id == id)
+            .map(|d| &mut d.kind)
+            && s.auth == AuthChoice::Key
+        {
+            s.key_passphrase = true;
+        }
     }
 
     /// Whether the selected draft uses a key file that is an RSA private key.
@@ -797,6 +859,13 @@ impl EditorState {
                 });
             }
         }
+        for &(id, kind) in &self.removed_kinds {
+            let retry = SecretOp::RemoveKind { id, kind };
+            let still_unused = self.draft(id).is_some_and(|d| !d.uses_kind(kind));
+            if still_unused && !removes.contains(&retry) {
+                removes.push(retry);
+            }
+        }
         removes.extend(self.removed.iter().map(|&id| SecretOp::Remove(id)));
         sets.extend(removes);
         Ok(Prepared { store, ops: sets })
@@ -805,50 +874,76 @@ impl EditorState {
     /// Save: validate, write `path` atomically, then replace `store` and apply the secret
     /// changes (stores first, then removals). A refused or failed write changes nothing: the
     /// drafts keep their typed secrets. A secret the store refuses stays typed in its draft and
-    /// the editor stays dirty.
+    /// the editor stays dirty. Runs the secret changes here: the app runs them on the
+    /// blocking pool instead ([`Self::write`], [`run_secret_ops`], [`Self::finish`]).
+    #[cfg(test)]
     pub fn save(&mut self, store: &mut ProfileStore, path: &Path) -> Result<(), SaveError> {
+        let ops = self.write(store, path)?;
+        let results = run_secret_ops(self.secrets.as_ref(), ops);
+        self.finish(results)
+    }
+
+    /// The store the secret changes of a save go to.
+    pub fn secret_store(&self) -> Arc<dyn SecretStore> {
+        self.secrets.clone()
+    }
+
+    /// The first half of a save: validate, write `path` atomically and replace `store`.
+    /// Returns the secret changes still to make.
+    pub fn write(
+        &mut self,
+        store: &mut ProfileStore,
+        path: &Path,
+    ) -> Result<Vec<SecretOp>, SaveError> {
         let prepared = self.prepare(store).map_err(SaveError::Invalid)?;
         prepared.store.save(path).map_err(SaveError::Write)?;
         *store = prepared.store;
         self.errors.clear();
         self.removed.clear();
+        self.removed_kinds.clear();
+        Ok(prepared.ops)
+    }
+
+    /// The second half of a save: take in how each secret change went. A stored secret is
+    /// cleared from its draft (unless something else was typed there meanwhile); a failed
+    /// removal of a deleted profile's secrets is retried on the next save.
+    pub fn finish(&mut self, results: SecretResults) -> Result<(), SaveError> {
         let mut failures = Vec::new();
-        for op in prepared.ops {
+        for (op, result) in results {
             let name = |id: ProfileId| {
                 self.draft(id)
                     .map_or_else(|| id.to_string(), |d| d.name.clone())
             };
-            let (result, what) = match &op {
-                SecretOp::Set { id, kind, value } => (
-                    self.secrets.set(id, *kind, &value.0),
-                    format!("store the {} of {}", kind_name(*kind), name(*id)),
-                ),
-                SecretOp::RemoveKind { id, kind } => (
-                    self.secrets.remove_kind(id, *kind),
-                    format!("remove the old {} of {}", kind_name(*kind), name(*id)),
-                ),
-                SecretOp::Remove(id) => (
-                    self.secrets.remove(id),
-                    format!("remove the secrets of a deleted profile ({id})"),
-                ),
+            let what = match &op {
+                SecretOp::Set { id, kind, .. } => {
+                    format!("store the {} of {}", kind_name(*kind), name(*id))
+                }
+                SecretOp::RemoveKind { id, kind } => {
+                    format!("remove the old {} of {}", kind_name(*kind), name(*id))
+                }
+                SecretOp::Remove(id) => format!("remove the secrets of a deleted profile ({id})"),
             };
             match result {
                 Ok(()) => {
-                    if let SecretOp::Set { id, .. } = op
+                    if let SecretOp::Set { id, value, .. } = op
                         && let Some(DraftKind::Ssh(s)) = self
                             .drafts
                             .iter_mut()
                             .find(|d| d.id == id)
                             .map(|d| &mut d.kind)
+                        && s.secret == value.0
                     {
                         s.secret.clear();
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "keychain change failed after saving profiles");
+                    tracing::warn!(error = %e, "a secret change failed after saving profiles");
                     if let SecretOp::Remove(id) = op {
                         // Retried on the next save.
                         self.removed.push(id);
+                    }
+                    if let SecretOp::RemoveKind { id, kind } = op {
+                        self.removed_kinds.push((id, kind));
                     }
                     failures.push(format!("could not {what}: {e}"));
                 }
@@ -862,6 +957,53 @@ impl EditorState {
             Err(SaveError::Secrets(failures))
         }
     }
+
+    /// Whether the secret changes a save would make now need the vault: any, when it must
+    /// be unlocked; only stores, when it does not exist yet (nothing to remove then).
+    pub fn needs_vault(
+        &mut self,
+        current: &ProfileStore,
+        need: fbterm_secrets::MainPassword,
+    ) -> bool {
+        let errors = self.errors.clone();
+        let needs = match self.prepare(current) {
+            Ok(p) => match need {
+                fbterm_secrets::MainPassword::Unlock => !p.ops.is_empty(),
+                fbterm_secrets::MainPassword::Set => {
+                    p.ops.iter().any(|op| matches!(op, SecretOp::Set { .. }))
+                }
+            },
+            Err(_) => false,
+        };
+        // Only a real save reports problems.
+        self.errors = errors;
+        needs
+    }
+}
+
+/// How each secret change of a save went (errors as sentences, never secret values).
+pub type SecretResults = Vec<(SecretOp, Result<(), String>)>;
+
+/// Make the secret changes of a save as one batch ([`SecretStore::apply_changes`]: one
+/// vault write), in order. Every change gets the batch's outcome: the vault's batch is all or
+/// nothing, and on a failure the drafts keep their typed secrets and deleted profiles are
+/// retried, so saving again is safe. May reach the vault: never on the UI thread.
+pub fn run_secret_ops(secrets: &dyn SecretStore, ops: Vec<SecretOp>) -> SecretResults {
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    let changes: Vec<SecretChange> = ops
+        .iter()
+        .map(|op| match op {
+            SecretOp::Set { id, kind, value } => {
+                SecretChange::Set((*id, *kind, Zeroizing::new(value.0.clone())))
+            }
+            SecretOp::RemoveKind { id, kind } => SecretChange::RemoveKind(*id, *kind),
+            SecretOp::Remove(id) => SecretChange::Remove(*id),
+        })
+        .collect();
+    let result = secrets.apply_changes(&changes).map_err(|e| e.to_string());
+    ops.into_iter().map(|op| (op, result.clone())).collect()
 }
 
 fn kind_name(kind: SecretKind) -> &'static str {

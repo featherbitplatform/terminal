@@ -32,13 +32,13 @@ pub mod tunnel;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fbterm_config::{Profile, ProfileKind, SshProfile, ValidationError};
-use fbterm_secrets::{SecretKind, SecretStore};
+use fbterm_config::{Profile, ProfileId, ProfileKind, SshProfile, ValidationError};
+use fbterm_secrets::{SecretKind, SecretStore, Zeroizing};
 use parking_lot::Mutex;
 use russh::client::{self, DisconnectReason, Handle, Msg, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
@@ -96,6 +96,39 @@ pub trait Prompter: Send + Sync {
         retry: bool,
     ) -> Option<SecretAnswer>;
 
+    /// Ask which private key file to use for a key profile that names none yet. `None`
+    /// means the user cancelled (or nobody can be asked).
+    async fn ask_key_file(&self, profile_name: &str) -> Option<PathBuf>;
+
+    /// The key file the user chose for `profile` (with [`Prompter::ask_key_file`]) was
+    /// accepted by the server: the app remembers it in the profile. Never called before the
+    /// key logged in, nor for a key file the profile already names.
+    fn key_file_accepted(&self, _profile: ProfileId, _path: &Path) {}
+
+    /// A typed key passphrase for `profile` was accepted (the server logged in with the key)
+    /// and saved because the user asked to remember it: the app marks the profile's key as
+    /// having a passphrase, so exports and the editor know a passphrase is saved for it.
+    fn passphrase_remembered(&self, _profile: ProfileId) {}
+
+    /// A secret the user asked to remember could not be saved (the storage refused or
+    /// failed, or the vault stayed locked): the app says so, once a session. Not called when
+    /// the user declined to set a main password, which is their choice.
+    fn secret_not_saved(&self, _kind: SecretKind) {}
+
+    /// Saved secrets are in the encrypted vault and it is locked: ask for its main password
+    /// (`Unlock saved secrets`). The connect unlocks the vault with the answer. `None` means
+    /// cancelled, or nobody can be asked: the connect then asks for its secret as if none
+    /// were saved. The app asks once per session; after a cancel it answers `None` at once
+    /// until the user unlocks from Settings or an export.
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>>;
+
+    /// Saved secrets use the encrypted vault and it does not exist yet (after fbterm moved to
+    /// it on its own, or a `Reset vault`), and the user asked to remember a secret: ask for a
+    /// new main password (`Set a main password`, typed twice). The connect makes the vault
+    /// with the answer and saves. `None` means cancelled, or nobody can be asked: the secret
+    /// is not saved.
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>>;
+
     /// Whether this prompter can reach a person at all. `false` for [`NoPrompt`]: a connect
     /// that would have needed a question then fails with [`SshError::NeedsInput`].
     fn can_ask(&self) -> bool {
@@ -121,6 +154,18 @@ impl Prompter for NoPrompt {
         _kind: SecretKind,
         _retry: bool,
     ) -> Option<SecretAnswer> {
+        None
+    }
+
+    async fn ask_key_file(&self, _profile_name: &str) -> Option<PathBuf> {
+        None
+    }
+
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        None
+    }
+
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
         None
     }
 
@@ -175,6 +220,10 @@ pub enum SshError {
     Jump(ValidationError),
     #[error("ssh error: {0}")]
     Protocol(String),
+    /// A key file that must not be read as a private key (not a regular file, too large):
+    /// a plain sentence naming it.
+    #[error("{0}")]
+    KeyFile(String),
     /// A connect made without prompts ([`NoPrompt`]) needed the user: an unknown host key or
     /// a secret that is not saved.
     #[error("needs your input")]
@@ -197,6 +246,7 @@ impl SshError {
             Self::Connect(e) => Self::Connect(std::io::Error::new(e.kind(), e.to_string())),
             Self::Jump(e) => Self::Jump(e.clone()),
             Self::Protocol(m) => Self::Protocol(m.clone()),
+            Self::KeyFile(m) => Self::KeyFile(m.clone()),
             Self::NeedsInput => Self::NeedsInput,
         }
     }
@@ -646,6 +696,33 @@ impl Prompter for ClockedPrompter {
         self.inner.ask_secret(profile_name, kind, retry).await
     }
 
+    async fn ask_key_file(&self, profile_name: &str) -> Option<PathBuf> {
+        let _paused = self.clock.pause();
+        self.inner.ask_key_file(profile_name).await
+    }
+
+    fn key_file_accepted(&self, profile: ProfileId, path: &Path) {
+        self.inner.key_file_accepted(profile, path);
+    }
+
+    fn passphrase_remembered(&self, profile: ProfileId) {
+        self.inner.passphrase_remembered(profile);
+    }
+
+    fn secret_not_saved(&self, kind: SecretKind) {
+        self.inner.secret_not_saved(kind);
+    }
+
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        let _paused = self.clock.pause();
+        self.inner.unlock_vault().await
+    }
+
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
+        let _paused = self.clock.pause();
+        self.inner.set_vault_password().await
+    }
+
     fn can_ask(&self) -> bool {
         self.inner.can_ask()
     }
@@ -715,6 +792,9 @@ pub(crate) struct Hop {
     pub ended: watch::Receiver<bool>,
     /// Set when authentication succeeded in a way the user should hear about.
     pub warning: Option<AuthWarning>,
+    /// The key file the user chose for a key profile that named none (see
+    /// [`Prompter::ask_key_file`]).
+    pub chosen_key: Option<PathBuf>,
 }
 
 /// Run SSH over `stream` to the host of `profile`: verify its host key and authenticate.
@@ -772,7 +852,10 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     )
     .await??;
     clock.restart();
-    let warning = bounded(
+    let auth::Authenticated {
+        warning,
+        chosen_key,
+    } = bounded(
         &clock,
         limit,
         || {
@@ -790,6 +873,7 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         lost,
         ended,
         warning,
+        chosen_key,
     })
 }
 
@@ -893,11 +977,24 @@ mod tests {
 
     #[async_trait]
     impl Prompter for Slow {
+        async fn ask_key_file(&self, _: &str) -> Option<PathBuf> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+
         async fn confirm_host_key(&self, _: &str, _: u16, _: &str) -> bool {
             tokio::time::sleep(self.0).await;
             true
         }
         async fn ask_secret(&self, _: &str, _: SecretKind, _: bool) -> Option<SecretAnswer> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+        async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+        async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
             tokio::time::sleep(self.0).await;
             None
         }

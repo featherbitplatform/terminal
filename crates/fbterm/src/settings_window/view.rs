@@ -1,9 +1,9 @@
 //! The Settings window: Appearance, Terminal and Keyboard cards of labelled controls, and a
 //! footer with the settings file actions.
 
-use fbterm_config::ThemeMode;
 use fbterm_config::keys::{Action, ActionGroup, Bindings, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
+use fbterm_config::{SecretStorage, ThemeMode};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, text, text_input, toggler,
 };
@@ -11,22 +11,28 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
+use crate::saved_secrets::{SectionInfo, choice_label, storage_note};
 use crate::schemes::SchemeChoice;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
 const CONTENT_WIDTH: f32 = 560.0;
 
+/// The `Saved secrets` section's line while secrets move.
+const MOVING: &str = "Moving saved secrets\u{2026}";
+
 fn msg(m: SettingsMsg) -> Message {
     Message::Settings(m)
 }
 
 /// `notice`: the banner line about `settings.toml` (a load error or clamped values), if any.
+/// `secrets`: what the `Saved secrets` section shows.
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
     schemes: Vec<SchemeChoice>,
     notice: Option<&'a str>,
+    secrets: SectionInfo,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut body = column![
@@ -52,12 +58,18 @@ pub fn view<'a>(
         ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
         .push(section(t, "Tunnels", tunnels(t, state, editable)))
+        .push(section(
+            t,
+            "Saved secrets",
+            saved_secrets(t, secrets, editable),
+        ))
         .push(keyboard(t, state, editable));
     let page = scrollable(
         container(container(body).max_width(CONTENT_WIDTH))
             .padding(Padding::from([24.0, 32.0]))
             .center_x(Length::Fill),
     )
+    .id(state.page.clone())
     .direction(scrollable::Direction::Vertical(
         scrollable::Scrollbar::new()
             .width(6)
@@ -201,15 +213,13 @@ fn appearance<'a>(
             t,
             "Dark",
             v.theme == ThemeMode::Dark,
-            editable,
-            ThemeMode::Dark
+            editable.then(|| msg(SettingsMsg::Theme(ThemeMode::Dark))),
         ),
         segment(
             t,
             "Light",
             v.theme == ThemeMode::Light,
-            editable,
-            ThemeMode::Light
+            editable.then(|| msg(SettingsMsg::Theme(ThemeMode::Light))),
         ),
     ]
     .spacing(2);
@@ -393,6 +403,76 @@ fn tunnels<'a>(
         false,
         retries,
     )]
+}
+
+/// Where saved passwords and passphrases live, with a line for a move under way or its
+/// outcome, and `Reset vault` while a vault exists.
+fn saved_secrets<'a>(
+    t: &'static Tokens,
+    info: SectionInfo,
+    editable: bool,
+) -> Vec<Element<'a, Message>> {
+    let free = editable && !info.busy;
+    let mut choices = row![].spacing(2);
+    for choice in [
+        SecretStorage::Auto,
+        SecretStorage::Keychain,
+        SecretStorage::Vault,
+    ] {
+        choices = choices.push(segment(
+            t,
+            choice_label(choice),
+            info.choice == choice,
+            free.then(|| msg(SettingsMsg::SecretStorage(choice))),
+        ));
+    }
+    let choices = container(choices).padding(2).style(move |_| well(t));
+    let hint = format!("{}.", storage_note(info.active));
+    let mut storage = column![
+        row![
+            column![
+                text("Storage").font(UI_FONT).size(13).color(t.text),
+                text(hint).font(UI_FONT).size(12).color(t.text_muted),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            choices,
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(8)
+    .padding(Padding::from([12.0, 16.0]));
+    let status = if info.busy {
+        Some((MOVING.to_owned(), t.text_secondary))
+    } else {
+        info.notice
+            .map(|n| (n.text, if n.error { t.danger } else { t.text_secondary }))
+    };
+    if let Some((line, color)) = status {
+        storage = storage.push(
+            text(line)
+                .font(UI_FONT)
+                .size(12)
+                .color(color)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
+    let mut rows = vec![storage.into()];
+    if info.vault_exists {
+        let reset = button(text("Reset vault").font(UI_FONT).size(12))
+            .on_press_maybe(free.then(|| msg(SettingsMsg::ResetVault)))
+            .padding(Padding::from([3.0, 10.0]))
+            .style(move |_, status| ui::danger_ghost(t, status));
+        rows.push(setting(
+            t,
+            "Encrypted vault",
+            Some("Forgot the main password? Reset deletes the saved secrets; profiles are kept."),
+            false,
+            reset,
+        ));
+    }
+    rows
 }
 
 /// The Scrollback row. While a lowered value waits, a warning with Apply and Cancel sits under
@@ -848,15 +928,15 @@ fn switch<'a>(
         .into()
 }
 
+/// One button of a segmented control; `on_press`: `None` while it cannot change.
 fn segment<'a>(
     t: &'static Tokens,
     caption: &'a str,
     selected: bool,
-    editable: bool,
-    mode: ThemeMode,
+    on_press: Option<Message>,
 ) -> Element<'a, Message> {
     button(text(caption).font(UI_FONT).size(12.5))
-        .on_press_maybe(editable.then(|| msg(SettingsMsg::Theme(mode))))
+        .on_press_maybe(on_press)
         .padding(Padding::from([4.0, 14.0]))
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);

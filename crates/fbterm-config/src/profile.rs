@@ -237,7 +237,10 @@ impl TunnelDef {
 pub enum AuthMethod {
     Password,
     Key {
-        path: PathBuf,
+        /// The private key file. `None` until one is chosen: connecting asks the user for the
+        /// file and remembers it here (a shared archive carries key profiles without a path).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<PathBuf>,
         #[serde(default)]
         passphrase: bool,
     },

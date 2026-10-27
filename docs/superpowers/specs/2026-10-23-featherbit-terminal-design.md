@@ -92,6 +92,9 @@ Success: the owner uses it as their only terminal for full working days, startin
 - Docs site: Docusaurus in `website/`, deployed by a `.github/workflows/docs.yml` to
   `https://featherbitplatform.github.io/terminal/` (same pattern as `gateway/website`,
   `baseUrl: '/terminal/'`).
+- Secrets and archives use `age` with a passphrase recipient and never home-grown crypto; a shared
+  archive can never carry a password, passphrase, private key or key path. Done 2026-10-27
+  (milestone 5; see 5.4, 5.9 and `2026-10-27-export-vault-design.md`).
 
 ## 5. How it works
 
@@ -163,12 +166,16 @@ screen) and the panes of other tabs when their tab is first shown.
   are stored as **one** OS-keychain item (a serialized map keyed by profile id), not one item per
   profile: unsigned macOS builds change code identity on every release, so macOS re-asks for keychain
   access after each update, and one item keeps that to a single prompt instead of one per profile.
-- **Optional main password** *(later milestone)*: for machines where the OS keychain is not trusted,
-  secrets go into an `age`-encrypted vault file unlocked once per app start.
+- **Optional main password** *(done 2026-10-27, milestone 5)*: for machines where the OS keychain is
+  not trusted, secrets go into an `age`-encrypted vault file (`secrets.fbvault`) unlocked once per
+  app session. The `secret_storage` setting picks Automatic, the system storage (the OS keychain;
+  on Windows a DPAPI-encrypted file, `secrets.dpapi`) or the vault; switching moves every secret.
+  Key profiles may have no key file: connecting asks for one and remembers it. See
+  `2026-10-27-export-vault-design.md`.
 - **Jump chain:** an ordered list of references to other saved SSH profiles (so a bastion is defined
   once). The app connects to hop 1, opens a `direct-tcpip` channel to hop 2 through it, runs SSH over
   that channel, and so on. Each hop authenticates with its own profile's credentials. Up to at least
-  two hops; no hard limit.
+  two hops; at most 32 hops once expanded (done 2026-10-27, milestone 5).
 - **Host keys:** read and write `~/.ssh/known_hosts` (shared with OpenSSH). Unknown host: show the
   fingerprint and ask (trust-on-first-use). Changed key: refuse and explain; never auto-accept.
 - **Local shell discovery:** on first run, detect available shells (`$SHELL`, `/etc/shells` on
@@ -237,6 +244,7 @@ Export picks profiles (all or a selection) and a mode:
 
 Import decrypts, previews, and merges by name with "skip / overwrite / keep both" on conflict.
 Jump-chain references are exported together with the profiles they point to.
+Done 2026-10-27 (milestone 5); see `2026-10-27-export-vault-design.md`.
 
 ### 5.10 Theming
 
@@ -458,7 +466,8 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    `2026-10-26-tiling-design.md`; measurements in `dev/perf/README.md`, scenario H).
 3. Tunnels (done 2026-10-27; see 5.7 and `2026-10-27-tunnels-design.md`).
 4. File panel (done 2026-10-27; see 5.8 and `2026-10-27-file-panel-design.md`).
-5. Export/import, optional main-password vault.
+5. Export/import, optional main-password vault (done 2026-10-27; see 5.4, 5.9 and
+   `2026-10-27-export-vault-design.md`).
 6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
    (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
    Windows and Linux: draw OS-styled window controls in the tab bar (no OS title bar),

@@ -17,7 +17,7 @@ Download the `.dmg` from the [latest release](https://github.com/featherbitplatf
 ## Features
 
 - **SSH profiles**: password, private key (with or without passphrase) and ssh-agent authentication, jump hosts through other saved profiles, one shared connection per profile. Host keys are checked against `~/.ssh/known_hosts`, with a prompt for unknown hosts; changed keys are refused.
-- **Secrets in the keychain**: passwords and passphrases live in the macOS keychain, never in config files.
+- **Saved secrets**: passwords and passphrases live in the system storage or an encrypted vault with a main password, never in config files.
 - **Quick-launch palette** (Cmd+Shift+P): fuzzy search over profiles and app actions.
 - **Tabs and windows**: multiple windows, per-profile tab colors, layout restored on relaunch.
 - **Find**: in a tab's scrollback or across all tabs; export a tab's history to a file.

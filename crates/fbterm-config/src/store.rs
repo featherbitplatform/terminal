@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -37,19 +37,50 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
+/// The most hops a profile's expanded jump chain may have.
+pub const MAX_JUMP_CHAIN: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValidationError {
     DuplicateName(String),
-    MissingJump { profile: String, missing: ProfileId },
-    JumpNotSsh { profile: String },
-    JumpCycle { profile: String },
+    MissingJump {
+        profile: String,
+        missing: ProfileId,
+    },
+    JumpNotSsh {
+        profile: String,
+    },
+    JumpCycle {
+        profile: String,
+    },
+    /// The expanded jump chain has more than [`MAX_JUMP_CHAIN`] hops.
+    JumpChainTooLong {
+        profile: String,
+    },
     EmptyHost(String),
-    EmptyTunnelName { profile: String },
-    DuplicateTunnel { profile: String, name: String },
-    TunnelPort { profile: String, name: String },
-    TunnelTargetPort { profile: String, name: String },
-    EmptyTunnelBind { profile: String, name: String },
-    EmptyTunnelHost { profile: String, name: String },
+    EmptyTunnelName {
+        profile: String,
+    },
+    DuplicateTunnel {
+        profile: String,
+        name: String,
+    },
+    TunnelPort {
+        profile: String,
+        name: String,
+    },
+    TunnelTargetPort {
+        profile: String,
+        name: String,
+    },
+    EmptyTunnelBind {
+        profile: String,
+        name: String,
+    },
+    EmptyTunnelHost {
+        profile: String,
+        name: String,
+    },
 }
 
 impl fmt::Display for ValidationError {
@@ -66,6 +97,10 @@ impl fmt::Display for ValidationError {
                 write!(f, "profile {profile:?} jumps through a non-SSH profile")
             }
             Self::JumpCycle { profile } => write!(f, "profile {profile:?} has a jump cycle"),
+            Self::JumpChainTooLong { profile } => write!(
+                f,
+                "profile {profile:?} goes through more than {MAX_JUMP_CHAIN} jump hosts"
+            ),
             Self::EmptyHost(n) => write!(f, "profile {n:?} has an empty host"),
             Self::EmptyTunnelName { profile } => {
                 write!(f, "profile {profile:?} has a tunnel without a name")
@@ -176,6 +211,8 @@ impl ProfileStore {
     }
 
     pub fn validate(&self) -> Vec<ValidationError> {
+        let index: HashMap<ProfileId, &Profile> = self.profiles.iter().map(|p| (p.id, p)).collect();
+        let (cycles, too_long) = self.chain_facts(&index);
         let mut errors = Vec::new();
         let mut seen = HashSet::new();
         let mut reported = HashSet::new();
@@ -240,7 +277,7 @@ impl ProfileStore {
                 }
             }
             for &j in &ssh.jump {
-                match self.get(j) {
+                match index.get(&j).copied() {
                     None => errors.push(ValidationError::MissingJump {
                         profile: p.name.clone(),
                         missing: j,
@@ -254,11 +291,12 @@ impl ProfileStore {
                     Some(_) => {}
                 }
             }
-            if matches!(
-                self.jump_chain(p.id),
-                Err(ValidationError::JumpCycle { .. })
-            ) {
+            if cycles.contains(&p.id) {
                 errors.push(ValidationError::JumpCycle {
+                    profile: p.name.clone(),
+                });
+            } else if too_long.contains(&p.id) {
+                errors.push(ValidationError::JumpChainTooLong {
                     profile: p.name.clone(),
                 });
             }
@@ -266,29 +304,122 @@ impl ProfileStore {
         errors
     }
 
+    /// The SSH profiles whose jump chain reaches a cycle (through hops that exist and are SSH
+    /// profiles), and those whose expanded chain (as [`Self::jump_chain`] builds it) has more
+    /// than [`MAX_JUMP_CHAIN`] hops. An iterative depth-first search with white, grey and black
+    /// states and saturating hop counts, linear in profiles plus jumps: hand-edited files and
+    /// imported archives can hold any shape, so no recursion, no repeated walks and no chain
+    /// is ever expanded.
+    fn chain_facts(
+        &self,
+        index: &HashMap<ProfileId, &Profile>,
+    ) -> (HashSet<ProfileId>, HashSet<ProfileId>) {
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            White,
+            Grey,
+            Black,
+        }
+        const CAP: usize = MAX_JUMP_CHAIN + 1;
+        let hops = |id: ProfileId| -> &[ProfileId] {
+            match index.get(&id).map(|p| &p.kind) {
+                Some(ProfileKind::Ssh(ssh)) => &ssh.jump,
+                _ => &[],
+            }
+        };
+        let is_ssh =
+            |id: &ProfileId| matches!(index.get(id).map(|p| &p.kind), Some(ProfileKind::Ssh(_)));
+        let mut state: HashMap<ProfileId, State> = HashMap::new();
+        let mut bad: HashSet<ProfileId> = HashSet::new();
+        // Expanded chain length of each finished profile, saturating at CAP.
+        let mut length: HashMap<ProfileId, usize> = HashMap::new();
+        for root in &self.profiles {
+            if !is_ssh(&root.id) || state.get(&root.id).is_some_and(|s| *s != State::White) {
+                continue;
+            }
+            // (profile, index of the next hop to look at)
+            let mut stack = vec![(root.id, 0usize)];
+            state.insert(root.id, State::Grey);
+            while let Some(top) = stack.last_mut() {
+                let (id, next) = *top;
+                let Some(&hop) = hops(id).get(next) else {
+                    stack.pop();
+                    state.insert(id, State::Black);
+                    // Each hop contributes itself plus its own expanded chain; a hop that
+                    // closes a cycle or does not exist is reported elsewhere.
+                    let total = hops(id).iter().fold(0usize, |sum, h| {
+                        let below = length.get(h).copied().unwrap_or(0);
+                        sum.saturating_add(1 + below).min(CAP)
+                    });
+                    length.insert(id, total);
+                    if bad.contains(&id)
+                        && let Some((parent, _)) = stack.last()
+                    {
+                        bad.insert(*parent);
+                    }
+                    continue;
+                };
+                top.1 += 1;
+                if !is_ssh(&hop) {
+                    continue;
+                }
+                match state.get(&hop).copied().unwrap_or(State::White) {
+                    State::White => {
+                        state.insert(hop, State::Grey);
+                        stack.push((hop, 0));
+                    }
+                    // Back to a profile on the current path: a cycle.
+                    State::Grey => {
+                        bad.insert(id);
+                    }
+                    State::Black => {
+                        if bad.contains(&hop) {
+                            bad.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+        let too_long = length
+            .into_iter()
+            .filter(|&(_, n)| n > MAX_JUMP_CHAIN)
+            .map(|(id, _)| id)
+            .collect();
+        (bad, too_long)
+    }
+
     /// Hops to traverse before reaching `id`, in connection order (target
-    /// excluded). Hops that themselves jump are expanded first.
+    /// excluded). Hops that themselves jump are expanded first. Iterative and bounded: a chain
+    /// of more than [`MAX_JUMP_CHAIN`] hops (however deep or wide) is an error, found after at
+    /// most that many hops, so a hand-edited file can never make this hang or overflow.
     pub fn jump_chain(&self, id: ProfileId) -> Result<Vec<&Profile>, ValidationError> {
         let target = self.get(id).ok_or(ValidationError::MissingJump {
             profile: id.to_string(),
             missing: id,
         })?;
-        let mut out = Vec::new();
-        let mut stack = vec![id];
-        self.walk(target, &mut stack, &mut out)?;
-        Ok(out)
-    }
-
-    fn walk<'a>(
-        &'a self,
-        profile: &'a Profile,
-        stack: &mut Vec<ProfileId>,
-        out: &mut Vec<&'a Profile>,
-    ) -> Result<(), ValidationError> {
-        let ProfileKind::Ssh(SshProfile { jump, .. }) = &profile.kind else {
-            return Ok(());
+        let too_long = || ValidationError::JumpChainTooLong {
+            profile: target.name.clone(),
         };
-        for &j in jump {
+        let mut out = Vec::new();
+        // The profiles being expanded, outermost first, with the index of their next hop.
+        // Every one but the target ends up in `out`, so the path stays within the cap too.
+        let mut path: Vec<(&Profile, usize)> = vec![(target, 0)];
+        while let Some(&mut (profile, ref mut next)) = path.last_mut() {
+            let jump: &[ProfileId] = match &profile.kind {
+                ProfileKind::Ssh(SshProfile { jump, .. }) => jump,
+                ProfileKind::Local(_) => &[],
+            };
+            let Some(&j) = jump.get(*next) else {
+                path.pop();
+                if !path.is_empty() {
+                    out.push(profile);
+                    if out.len() > MAX_JUMP_CHAIN {
+                        return Err(too_long());
+                    }
+                }
+                continue;
+            };
+            *next += 1;
             let hop = self.get(j).ok_or_else(|| ValidationError::MissingJump {
                 profile: profile.name.clone(),
                 missing: j,
@@ -298,16 +429,16 @@ impl ProfileStore {
                     profile: profile.name.clone(),
                 });
             }
-            if stack.contains(&j) {
+            if path.iter().any(|(p, _)| p.id == j) {
                 return Err(ValidationError::JumpCycle {
                     profile: profile.name.clone(),
                 });
             }
-            stack.push(j);
-            self.walk(hop, stack, out)?;
-            stack.pop();
-            out.push(hop);
+            if out.len() + path.len() > MAX_JUMP_CHAIN {
+                return Err(too_long());
+            }
+            path.push((hop, 0));
         }
-        Ok(())
+        Ok(out)
     }
 }

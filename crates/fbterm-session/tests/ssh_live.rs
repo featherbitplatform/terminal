@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use fbterm_config::SecretStorage;
 use fbterm_config::{AuthMethod, Profile, ProfileId, ProfileKind, SshProfile};
-use fbterm_secrets::{MemoryStore, SecretKind, SecretStore};
+use fbterm_secrets::{MemoryStore, SecretBackend, SecretKind, SecretStore, Zeroizing};
 use fbterm_session::ssh::HostKeyStatus;
 use fbterm_session::ssh::{
     ClientHandler, Prompter, SecretAnswer, SshContext, SshError, check_host_key, connect_direct,
@@ -64,15 +65,44 @@ struct Script {
     answers: parking_lot::Mutex<Vec<Option<SecretAnswer>>>,
     host_key_calls: AtomicUsize,
     secret_calls: parking_lot::Mutex<Vec<(SecretKind, bool)>>,
+    /// Answers to key file questions, in order (`None` once they run out).
+    key_files: parking_lot::Mutex<Vec<Option<PathBuf>>>,
+    /// The profile names asked for a key file.
+    key_file_calls: parking_lot::Mutex<Vec<String>>,
+    /// Chosen key files reported as accepted.
+    accepted_keys: parking_lot::Mutex<Vec<(ProfileId, PathBuf)>>,
+    /// The answer to `Unlock saved secrets` (`None`: cancel), and how often it was asked.
+    unlock: parking_lot::Mutex<Option<String>>,
+    unlock_calls: AtomicUsize,
+    /// The answer to `Set a main password` (`None`: cancel), and how often it was asked.
+    set_password: parking_lot::Mutex<Option<String>>,
+    set_calls: AtomicUsize,
+    /// Profiles reported with a remembered key passphrase.
+    remembered: parking_lot::Mutex<Vec<ProfileId>>,
 }
 
 impl Script {
     fn new(trust: bool, answers: Vec<Option<SecretAnswer>>) -> Arc<Self> {
+        Self::with_key_files(trust, answers, vec![])
+    }
+    fn with_key_files(
+        trust: bool,
+        answers: Vec<Option<SecretAnswer>>,
+        key_files: Vec<Option<PathBuf>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             trust,
             answers: parking_lot::Mutex::new(answers),
             host_key_calls: AtomicUsize::new(0),
             secret_calls: parking_lot::Mutex::new(vec![]),
+            key_files: parking_lot::Mutex::new(key_files),
+            key_file_calls: parking_lot::Mutex::new(vec![]),
+            accepted_keys: parking_lot::Mutex::new(vec![]),
+            unlock: parking_lot::Mutex::new(None),
+            unlock_calls: AtomicUsize::new(0),
+            set_password: parking_lot::Mutex::new(None),
+            set_calls: AtomicUsize::new(0),
+            remembered: parking_lot::Mutex::new(vec![]),
         })
     }
     fn host_key_calls(&self) -> usize {
@@ -105,6 +135,36 @@ impl Prompter for Script {
         } else {
             answers.remove(0)
         }
+    }
+
+    async fn ask_key_file(&self, profile_name: &str) -> Option<PathBuf> {
+        self.key_file_calls.lock().push(profile_name.to_owned());
+        let mut files = self.key_files.lock();
+        if files.is_empty() {
+            None
+        } else {
+            files.remove(0)
+        }
+    }
+
+    fn key_file_accepted(&self, profile: ProfileId, path: &Path) {
+        self.accepted_keys
+            .lock()
+            .push((profile, path.to_path_buf()));
+    }
+
+    fn passphrase_remembered(&self, profile: ProfileId) {
+        self.remembered.lock().push(profile);
+    }
+
+    async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        self.unlock_calls.fetch_add(1, Ordering::SeqCst);
+        self.unlock.lock().clone().map(Zeroizing::new)
+    }
+
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
+        self.set_calls.fetch_add(1, Ordering::SeqCst);
+        self.set_password.lock().clone().map(Zeroizing::new)
     }
 }
 
@@ -207,7 +267,7 @@ async fn key_auth_with_passphrase() {
     }
     let fx = Fixture::new();
     let p = profile(AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519_pass"),
+        path: Some(keys_dir().join("fb_test_ed25519_pass")),
         passphrase: true,
     });
     fx.store
@@ -226,7 +286,7 @@ async fn key_auth_prompts_for_passphrase_and_remembers() {
     }
     let fx = Fixture::new();
     let p = profile(AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519_pass"),
+        path: Some(keys_dir().join("fb_test_ed25519_pass")),
         passphrase: true,
     });
     let script = Script::new(
@@ -252,19 +312,106 @@ async fn key_auth_prompts_for_passphrase_and_remembers() {
 }
 
 #[tokio::test]
+async fn a_remembered_passphrase_is_reported_even_when_not_flagged() {
+    if !enabled() {
+        return;
+    }
+    // The profile does not say its key has a passphrase; the key does, and the user types
+    // it with Remember on: the app hears about it (it then sets the flag).
+    let fx = Fixture::new();
+    let p = profile(AuthMethod::Key {
+        path: Some(keys_dir().join("fb_test_ed25519_pass")),
+        passphrase: false,
+    });
+    let script = Script::new(true, vec![answer(KEY_PASSPHRASE, true)]);
+    let handle = connect(&p, &fx.ctx(script.clone())).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(*script.remembered.lock(), vec![p.id]);
+    // Typed without Remember: nothing saved, nothing reported.
+    let fx = Fixture::new();
+    let script = Script::new(true, vec![answer(KEY_PASSPHRASE, false)]);
+    let handle = connect(&p, &fx.ctx(script.clone())).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert!(script.remembered.lock().is_empty());
+}
+
+#[tokio::test]
 async fn key_auth_without_passphrase() {
     if !enabled() {
         return;
     }
     let fx = Fixture::new();
     let p = profile(AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519"),
+        path: Some(keys_dir().join("fb_test_ed25519")),
         passphrase: false,
     });
     let script = Script::new(true, vec![]);
     let handle = connect(&p, &fx.ctx(script.clone())).await.unwrap();
     assert_echo_ok(&handle).await;
     assert!(script.secret_calls.lock().is_empty());
+}
+
+#[tokio::test]
+async fn connect_without_key_path_asks_and_remembers() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let p = profile(AuthMethod::Key {
+        path: None,
+        passphrase: false,
+    });
+    let chosen = keys_dir().join("fb_test_ed25519_pass");
+    let script = Script::with_key_files(
+        true,
+        vec![answer(KEY_PASSPHRASE, false)],
+        vec![Some(chosen.clone())],
+    );
+    let handle = connect(&p, &fx.ctx(script.clone())).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(*script.key_file_calls.lock(), vec!["bastion".to_owned()]);
+    // The chosen key is unlocked like a configured one.
+    assert_eq!(
+        *script.secret_calls.lock(),
+        vec![(SecretKind::KeyPassphrase, false)]
+    );
+    assert_eq!(*script.accepted_keys.lock(), vec![(p.id, chosen)]);
+}
+
+#[tokio::test]
+async fn cancel_key_choice_fails_cleanly() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let p = profile(AuthMethod::Key {
+        path: None,
+        passphrase: false,
+    });
+    let script = Script::with_key_files(true, vec![], vec![None]);
+    let err = connect(&p, &fx.ctx(script.clone())).await.err().unwrap();
+    assert!(matches!(err, SshError::Cancelled), "{err:?}");
+    assert_eq!(script.key_file_calls.lock().len(), 1);
+    assert!(script.secret_calls.lock().is_empty());
+    assert!(script.accepted_keys.lock().is_empty(), "nothing remembered");
+}
+
+#[tokio::test]
+async fn rejected_chosen_key_is_not_remembered() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    // A chosen file that is not a private key fails to load, and nothing is remembered.
+    let not_a_key = keys_dir().join("README.md");
+    let p = profile(AuthMethod::Key {
+        path: None,
+        passphrase: false,
+    });
+    let script = Script::with_key_files(true, vec![], vec![Some(not_a_key)]);
+    let err = connect(&p, &fx.ctx(script.clone())).await.err().unwrap();
+    assert!(!matches!(err, SshError::Cancelled), "{err:?}");
+    assert!(script.accepted_keys.lock().is_empty());
 }
 
 #[tokio::test]
@@ -436,6 +583,132 @@ async fn cancelled_prompt_gives_cancelled() {
     assert_eq!(fx.store.get(&p.id, SecretKind::Password).unwrap(), None);
 }
 
+/// The main password of the sample vaults.
+const MAIN: &str = "main-pw-for-live-tests";
+
+/// A secret backend using a locked vault (in `dir`) that holds `p`'s password.
+fn locked_vault_with_password(dir: &Path, p: &Profile) -> Arc<SecretBackend> {
+    let vault = dir.join("secrets.fbvault");
+    let setup = SecretBackend::with_system(
+        SecretStorage::Vault,
+        Box::new(MemoryStore::new()),
+        vault.clone(),
+    );
+    setup.create_vault(MAIN).unwrap();
+    setup.set(&p.id, SecretKind::Password, PASSWORD).unwrap();
+    // A new session: the vault starts locked.
+    Arc::new(SecretBackend::with_system(
+        SecretStorage::Vault,
+        Box::new(MemoryStore::new()),
+        vault,
+    ))
+}
+
+#[tokio::test]
+async fn cancel_unlock_asks_for_password_instead() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = locked_vault_with_password(dir.path(), &p);
+    let script = Script::new(true, vec![answer(PASSWORD, false)]);
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.unlock_calls.load(Ordering::SeqCst), 1);
+    // As if nothing were saved: asked once, not as a retry.
+    assert_eq!(
+        *script.secret_calls.lock(),
+        vec![(SecretKind::Password, false)]
+    );
+    assert!(!secrets.vault_unlocked());
+}
+
+#[tokio::test]
+async fn locked_vault_unlocks_through_the_prompter() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = locked_vault_with_password(dir.path(), &p);
+    let script = Script::new(true, vec![]);
+    *script.unlock.lock() = Some(MAIN.into());
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.unlock_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        script.secret_calls.lock().is_empty(),
+        "the saved password was used"
+    );
+    assert!(secrets.vault_unlocked());
+}
+
+/// A backend using the vault in `dir`, which has no vault file yet.
+fn vault_without_file(dir: &Path) -> Arc<SecretBackend> {
+    Arc::new(SecretBackend::with_system(
+        SecretStorage::Vault,
+        Box::new(MemoryStore::new()),
+        dir.join("secrets.fbvault"),
+    ))
+}
+
+#[tokio::test]
+async fn remember_with_no_vault_sets_a_main_password() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = vault_without_file(dir.path());
+    let script = Script::new(true, vec![answer(PASSWORD, true)]);
+    *script.set_password.lock() = Some(MAIN.into());
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.set_calls.load(Ordering::SeqCst), 1);
+    assert!(secrets.vault_exists());
+    assert_eq!(
+        secrets.get(&p.id, SecretKind::Password).unwrap().as_deref(),
+        Some(PASSWORD)
+    );
+}
+
+#[tokio::test]
+async fn cancel_set_password_does_not_save() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = vault_without_file(dir.path());
+    let script = Script::new(true, vec![answer(PASSWORD, true)]);
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.set_calls.load(Ordering::SeqCst), 1);
+    assert!(!secrets.vault_exists());
+    assert_eq!(secrets.get(&p.id, SecretKind::Password).unwrap(), None);
+}
+
 #[tokio::test]
 async fn learned_key_is_known_to_check_host_key() {
     if !enabled() {
@@ -578,6 +851,18 @@ mod pool {
 
     #[async_trait]
     impl Prompter for TrustAll {
+        async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+
         async fn confirm_host_key(&self, host: &str, port: u16, _fp: &str) -> bool {
             self.host_key_calls.lock().push((host.to_owned(), port));
             true
@@ -605,7 +890,7 @@ mod pool {
                 port: PORT,
                 user: USER.into(),
                 auth: AuthMethod::Key {
-                    path: keys_dir().join("fb_test_ed25519"),
+                    path: Some(keys_dir().join("fb_test_ed25519")),
                     passphrase: false,
                 },
                 jump,
@@ -779,7 +1064,7 @@ mod pool {
         let mut rsa = ssh("rsa", HOST, vec![]);
         if let ProfileKind::Ssh(s) = &mut rsa.kind {
             s.auth = AuthMethod::Key {
-                path: keys_dir().join("fb_test_rsa"),
+                path: Some(keys_dir().join("fb_test_rsa")),
                 passphrase: false,
             };
         }
@@ -1079,6 +1364,18 @@ mod pool {
 
     #[async_trait]
     impl Prompter for Gate {
+        async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+
         async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
             struct Pending<'a>(&'a AtomicUsize, bool);
             impl Drop for Pending<'_> {
@@ -1183,7 +1480,7 @@ mod access {
                 port: PORT,
                 user: USER.into(),
                 auth: AuthMethod::Key {
-                    path: keys_dir().join("fb_test_ed25519"),
+                    path: Some(keys_dir().join("fb_test_ed25519")),
                     passphrase: false,
                 },
                 jump,
@@ -1284,6 +1581,18 @@ mod access {
 
     #[async_trait]
     impl Prompter for TrustAny {
+        async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+            None
+        }
+
         async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
             true
         }
@@ -1561,5 +1870,69 @@ mod access {
             Some("wrong")
         );
         assert_eq!(pool.connected_profiles(), vec![key_id]);
+    }
+
+    /// A tunnel or file panel reconnecting without prompts never waits for a key file
+    /// nobody is asked for: it fails at once, as needing the user.
+    #[tokio::test]
+    async fn no_prompt_without_key_path_needs_input() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let mut p = key_profile("bastion", HOST, vec![]);
+        if let ProfileKind::Ssh(s) = &mut p.kind {
+            s.auth = AuthMethod::Key {
+                path: None,
+                passphrase: false,
+            };
+        }
+        let id = p.id;
+        let store = ProfileStore { profiles: vec![p] };
+        let none: Arc<dyn Prompter> = Arc::new(NoPrompt);
+        let pool = SshPool::new(fx.ctx(none.clone()));
+        // Trust the host first, so the key file is the only open question.
+        let script = Script::with_key_files(true, vec![], vec![None]);
+        let _ = connect(store.get(id).unwrap(), &fx.ctx(script.clone())).await;
+        assert_eq!(fx.known_hosts_lines().len(), 1);
+
+        let err = acquire(&pool, &store, id, none).await.err().unwrap();
+        assert!(matches!(err, SshError::NeedsInput), "{err:?}");
+        assert!(pool.connected_profiles().is_empty());
+    }
+
+    /// Once the chosen key file is remembered in the profile, later callers share the
+    /// connection it opened instead of dialling again.
+    #[tokio::test]
+    async fn remembered_key_file_shares_the_connection() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let mut p = key_profile("bastion", HOST, vec![]);
+        if let ProfileKind::Ssh(s) = &mut p.kind {
+            s.auth = AuthMethod::Key {
+                path: None,
+                passphrase: false,
+            };
+        }
+        let id = p.id;
+        let mut store = ProfileStore { profiles: vec![p] };
+        let chosen = keys_dir().join("fb_test_ed25519");
+        let script = Script::with_key_files(true, vec![], vec![Some(chosen.clone())]);
+        let pool = SshPool::new(fx.ctx(script.clone()));
+        let first = acquire(&pool, &store, id, script.clone()).await.unwrap();
+        assert_eq!(*script.accepted_keys.lock(), vec![(id, chosen.clone())]);
+
+        // The app writes the accepted path into the profile.
+        if let ProfileKind::Ssh(s) = &mut store.profiles[0].kind {
+            s.auth = AuthMethod::Key {
+                path: Some(chosen),
+                passphrase: false,
+            };
+        }
+        let second = acquire(&pool, &store, id, script.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "the same connection");
+        assert_eq!(script.key_file_calls.lock().len(), 1, "asked once");
     }
 }

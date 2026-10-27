@@ -69,7 +69,7 @@ fn key_profile_at(name: &str, host: &str, port: u16, jump: Vec<ProfileId>) -> Pr
             port,
             user: USER.into(),
             auth: AuthMethod::Key {
-                path: keys_dir().join("fb_test_ed25519"),
+                path: Some(keys_dir().join("fb_test_ed25519")),
                 passphrase: false,
             },
             jump,
@@ -83,6 +83,18 @@ struct TrustAny;
 
 #[async_trait]
 impl Prompter for TrustAny {
+    async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+        None
+    }
+
+    async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+        None
+    }
+
+    async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
     async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
         true
     }

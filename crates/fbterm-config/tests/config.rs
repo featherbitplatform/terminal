@@ -55,7 +55,7 @@ fn round_trip_profiles_toml() {
     let mut key = ssh("key", vec![]);
     if let ProfileKind::Ssh(s) = &mut key.kind {
         s.auth = AuthMethod::Key {
-            path: "/k".into(),
+            path: Some("/k".into()),
             passphrase: true,
         };
     }
@@ -67,6 +67,69 @@ fn round_trip_profiles_toml() {
     assert!(!text.contains("password"));
     assert!(text.contains("#ab0cff"));
     assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn key_without_path_round_trips() {
+    let path = tmp("profiles.toml");
+    let mut key = ssh("shared", vec![]);
+    if let ProfileKind::Ssh(s) = &mut key.kind {
+        s.auth = AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        };
+    }
+    let store = ProfileStore {
+        profiles: vec![key],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("path"), "no path is written: {text}");
+    assert!(text.contains("type = \"key\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+    // Written again, the file is byte for byte the same.
+    store.save(&path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn old_key_profiles_load() {
+    let path = tmp("profiles.toml");
+    let old = "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nport = 22\nuser = \"u\"\njump = []\n\n[profiles.auth]\ntype = \"key\"\npath = \"~/.ssh/id_ed25519\"\npassphrase = true\n";
+    std::fs::write(&path, old).unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: Some("~/.ssh/id_ed25519".into()),
+            passphrase: true,
+        }
+    );
+    // Saved again, an old file keeps its path.
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("path = \"~/.ssh/id_ed25519\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+    // A key profile written by hand without a path loads with none.
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"key\" }\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        }
+    );
 }
 
 #[test]
@@ -911,4 +974,155 @@ fn blank_target_port_blocks_save() {
     }
     store.profiles[0] = p;
     assert!(store.validate().is_empty());
+}
+
+#[test]
+fn cycle_errors_name_each_profile_that_reaches_the_cycle() {
+    let mut a = ssh("a", vec![]);
+    let b = ssh("b", vec![a.id]);
+    if let ProfileKind::Ssh(s) = &mut a.kind {
+        s.jump = vec![b.id];
+    }
+    let c = ssh("c", vec![a.id]);
+    let mut selfish = ssh("self", vec![]);
+    if let ProfileKind::Ssh(s) = &mut selfish.kind {
+        s.jump = vec![selfish.id];
+    }
+    let fine = ssh("fine", vec![]);
+    let store = ProfileStore {
+        profiles: vec![c, a, b, selfish, fine],
+    };
+    let cycle = |n: &str| ValidationError::JumpCycle {
+        profile: n.to_string(),
+    };
+    assert_eq!(
+        store.validate(),
+        vec![cycle("c"), cycle("a"), cycle("b"), cycle("self")]
+    );
+    assert_eq!(cycle("a").to_string(), "profile \"a\" has a jump cycle");
+}
+
+#[test]
+fn validate_is_linear_for_diamonds_and_long_chains() {
+    use std::time::{Duration, Instant};
+    // Each level jumps through the previous one twice: a naive walk takes 2^40 steps.
+    let mut diamond = vec![ssh("d0", vec![])];
+    for i in 1..=40 {
+        let prev = diamond[i - 1].id;
+        diamond.push(ssh(&format!("d{i}"), vec![prev, prev]));
+    }
+    // A chain far deeper than the stack allows recursion for, ending in a cycle.
+    let mut chain = vec![ssh("c0", vec![])];
+    for i in 1..10_000 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), vec![prev]));
+    }
+    let last = chain[9_999].id;
+    if let ProfileKind::Ssh(s) = &mut chain[0].kind {
+        s.jump = vec![last];
+    }
+    for (profiles, cycles) in [(diamond, 0), (chain, 10_000)] {
+        let store = ProfileStore { profiles };
+        let start = Instant::now();
+        let errors = store.validate();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let found = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::JumpCycle { .. }))
+            .count();
+        assert_eq!(found, cycles);
+    }
+}
+
+/// Forty levels of two profiles, each jumping through both profiles of the level below: the
+/// expanded chain doubles per level.
+fn two_wide_diamond(levels: usize) -> Vec<Profile> {
+    let mut out: Vec<Profile> = vec![ssh("a0", vec![]), ssh("b0", vec![])];
+    for i in 1..levels {
+        let below = vec![out[2 * i - 2].id, out[2 * i - 1].id];
+        out.push(ssh(&format!("a{i}"), below.clone()));
+        out.push(ssh(&format!("b{i}"), below));
+    }
+    out
+}
+
+#[test]
+fn chains_longer_than_32_hops_are_refused() {
+    use std::time::{Duration, Instant};
+    // 32 hops are fine, 33 are not.
+    let mut chain = vec![ssh("c0", vec![])];
+    for i in 1..=33 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), vec![prev]));
+    }
+    let store = ProfileStore {
+        profiles: chain.clone(),
+    };
+    assert_eq!(store.jump_chain(chain[32].id).unwrap().len(), 32);
+    assert_eq!(
+        store.validate(),
+        vec![ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        }]
+    );
+    assert_eq!(
+        store.jump_chain(chain[33].id),
+        Err(ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        })
+    );
+    assert_eq!(
+        ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        }
+        .to_string(),
+        "profile \"c33\" goes through more than 32 jump hosts"
+    );
+
+    // A diamond: few profiles, but an exponentially long expanded chain.
+    let diamond = two_wide_diamond(40);
+    let top = diamond[79].id;
+    let store = ProfileStore { profiles: diamond };
+    let start = Instant::now();
+    let errors = store.validate();
+    // Levels 0 to 4 expand to 0, 2, 6, 14 and 30 hops; every level above is too long.
+    assert_eq!(errors.len(), 70, "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(e, ValidationError::JumpChainTooLong { .. }))
+    );
+    assert!(matches!(
+        store.jump_chain(top),
+        Err(ValidationError::JumpChainTooLong { .. })
+    ));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A chain far deeper than recursion allows never overflows.
+    let mut deep = vec![ssh("d0", vec![])];
+    for i in 1..50_000 {
+        let prev = deep[i - 1].id;
+        deep.push(ssh(&format!("d{i}"), vec![prev]));
+    }
+    let last = deep[49_999].id;
+    let store = ProfileStore { profiles: deep };
+    let start = Instant::now();
+    assert!(matches!(
+        store.jump_chain(last),
+        Err(ValidationError::JumpChainTooLong { .. })
+    ));
+    assert_eq!(store.validate().len(), 49_999 - 32);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
 }

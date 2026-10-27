@@ -102,6 +102,8 @@ impl App {
                 let current = self.settings.color_scheme.clone();
                 self.open_schemes(Some(current))
             }
+            SettingsMsg::SecretStorage(choice) => self.choose_secret_storage(choice),
+            SettingsMsg::ResetVault => self.ask_reset_vault(),
             other => {
                 // Locking every open terminal is only worth it for what reads the answer: a typed
                 // or submitted scrollback, and the debounce of a lowered one held back.
@@ -301,9 +303,12 @@ impl App {
     /// Returns the find refreshes a scrollback lowering asks for.
     pub(crate) fn apply_settings(
         &mut self,
-        new: Settings,
+        mut new: Settings,
         source: SettingsSource,
     ) -> Task<Message> {
+        // Saved secrets move only through the Settings window (which writes the key itself):
+        // a hand edit of `secret_storage` applies on the next launch.
+        new.secret_storage = self.settings.secret_storage;
         if new == self.settings {
             return Task::none();
         }

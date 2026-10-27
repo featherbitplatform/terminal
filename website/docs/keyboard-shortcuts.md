@@ -115,6 +115,8 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Open settings file | Open [`settings.toml`](files#settingstoml) in your default app. If the file does not exist yet, it is first created with every setting written out as a comment, showing its default. |
 | Reveal config folder | Show the config folder in your file manager, with `settings.toml` selected on macOS when it exists. The folder is created if it is missing. |
 | Export tab to file… | Save the active tab's text to a file; see [Exporting a tab](#exporting-a-tab). |
+| Export profiles… | Open the [export window](export-import#exporting). It has no shortcut by default. |
+| Import profiles… | Open the [import window](export-import#importing). It has no shortcut by default. |
 | Quit | Save the layout and quit. |
 
 ## Inside the palette
@@ -164,6 +166,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | --- | --- |
 | `new_tab`, `close_tab`, `next_tab`, `previous_tab` | New tab, close pane (the tab when it is the last), next and previous tab |
 | `export_tab` | Export tab to file (no default shortcut) |
+| `export_profiles`, `import_profiles` | Export and import profiles (no default shortcuts) |
 | `split_right`, `split_down`, `maximize_pane` | Split the focused pane, maximize it |
 | `focus_left`, `focus_right`, `focus_up`, `focus_down` | Move focus to the neighbouring pane |
 | `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |

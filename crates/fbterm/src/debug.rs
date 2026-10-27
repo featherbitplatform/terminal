@@ -142,10 +142,48 @@ impl App {
 
     /// `FBTERM_OPEN_SETTINGS=1` (debug aid): open the Settings window at startup.
     pub(crate) fn open_debug_settings(&mut self) -> Task<Message> {
-        if debug_env("FBTERM_OPEN_SETTINGS").is_none() {
+        let Some(value) = debug_env("FBTERM_OPEN_SETTINGS") else {
+            return Task::none();
+        };
+        let open = self.open_settings();
+        let page = self.settings_win.as_ref().map(|(_, s)| s.page.clone());
+        match page {
+            // `secrets`: scrolled down to the Saved secrets section once it is laid out.
+            Some(page) if value == "secrets" => open.chain(
+                Task::perform(
+                    async { tokio::time::sleep(std::time::Duration::from_millis(400)).await },
+                    |()| (),
+                )
+                .then(move |()| {
+                    iced::widget::operation::scroll_to(
+                        page.clone(),
+                        iced::widget::operation::AbsoluteOffset { x: 0.0, y: 470.0 },
+                    )
+                }),
+            ),
+            _ => open,
+        }
+    }
+
+    /// `FBTERM_DEMO_VAULT=1` (debug aid, with `FBTERM_SECRETS=memory` only): make the
+    /// in-memory backend's vault in its temporary folder (main password `demo`) at startup,
+    /// on the blocking pool, so Settings shows `Reset vault`. A screenshot waits for it.
+    pub(crate) fn open_debug_vault(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_DEMO_VAULT").is_none() || !self.backend.is_in_memory() {
             return Task::none();
         }
-        self.open_settings()
+        self.vault.demo_pending = true;
+        let backend = self.backend.clone();
+        self.run_blocking(
+            move || {
+                if let Err(e) = fbterm_secrets::SecretStore::create_vault(backend.as_ref(), "demo")
+                {
+                    tracing::warn!(error = %e, "demo vault not made");
+                }
+            },
+            |_| (),
+            |()| Message::Vault(crate::saved_secrets::VaultMsg::DemoReady),
+        )
     }
 
     /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
@@ -170,6 +208,65 @@ impl App {
             return Task::none();
         }
         self.open_tunnels()
+    }
+
+    /// `FBTERM_OPEN_ARCHIVE=export|import` (debug aid): open the export and import window at
+    /// startup in that mode. With `FBTERM_DEMO_ARCHIVE=1`, export starts with the profiles
+    /// others jump through unchecked (so they show as included for jump hosts) and key files
+    /// on; import shows a sample archive built in memory against the current profiles (never
+    /// read from disk), with its key folder in the temporary folder, so pressing Import writes
+    /// only there and to the config folder in use.
+    pub(crate) fn open_debug_archive(&mut self) -> Task<Message> {
+        use crate::archive_window::ArchiveMode;
+        let Some(value) = debug_env("FBTERM_OPEN_ARCHIVE") else {
+            return Task::none();
+        };
+        let mode = if value == "import" {
+            ArchiveMode::Import
+        } else {
+            ArchiveMode::Export
+        };
+        let task = self.open_archive(mode);
+        if debug_env("FBTERM_DEMO_ARCHIVE").is_some() {
+            self.demo_archive(mode);
+        }
+        task
+    }
+
+    fn demo_archive(&mut self, mode: crate::archive_window::ArchiveMode) {
+        use crate::archive_window::ArchiveMode;
+        let profiles = self.profiles.clone();
+        let schemes = self.schemes.clone();
+        let Some((_, state)) = &mut self.archive_win else {
+            return;
+        };
+        match mode {
+            ArchiveMode::Export => {
+                for p in &profiles.profiles {
+                    if let fbterm_config::ProfileKind::Ssh(s) = &p.kind {
+                        state.export.unchecked.extend(s.jump.iter().copied());
+                    }
+                }
+                // Key files on, so a missing one shows in the warnings.
+                state.export.include_keys = true;
+                self.refresh_export_preview();
+            }
+            ArchiveMode::Import => {
+                let archive = crate::archive_window::demo_archive(&profiles);
+                match crate::archive_import::plan(&profiles, &archive, &schemes) {
+                    Ok(plan) => {
+                        state.import.file = Some(std::env::temp_dir().join(
+                            crate::archive_window::default_file_name(
+                                chrono::Local::now().date_naive(),
+                            ),
+                        ));
+                        state.import.key_dir = Some(std::env::temp_dir().join("fbterm-demo-keys"));
+                        state.import.opened = Some(crate::archive_window::Opened { archive, plan });
+                    }
+                    Err(e) => state.import.problem = Some(e),
+                }
+            }
+        }
     }
 
     /// `FBTERM_DEMO_FILES=<folder>:<item>,<item>,...` (debug aid): the first window's file
@@ -252,7 +349,7 @@ impl App {
         Task::batch([search, focus])
     }
 
-    /// `FBTERM_DEMO_PROMPT=hostkey|password|changed` (debug aid): show a sample dialog in the
+    /// `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword` (debug aid): show a sample dialog in the
     /// first window. Nothing waits for its answer.
     pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {
         let Some(kind) = debug_env("FBTERM_DEMO_PROMPT") else {
@@ -274,6 +371,30 @@ impl App {
                 retry: true,
                 reply: tokio::sync::oneshot::channel().0,
             },
+            "keyfile" => Ask::KeyFile {
+                profile: "bastion".into(),
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            // The main password dialogs, as a connect and Settings show them.
+            // `setpassword` would really move secrets: only over the in-memory backend.
+            "setpassword" if !self.backend.is_in_memory() => {
+                tracing::warn!("FBTERM_DEMO_PROMPT=setpassword needs FBTERM_SECRETS=memory");
+                return Task::none();
+            }
+            "unlock" | "setpassword" => {
+                let (kind, purpose) = if kind == "unlock" {
+                    (
+                        crate::saved_secrets::Kind::Unlock,
+                        crate::saved_secrets::Purpose::Connect,
+                    )
+                } else {
+                    (
+                        crate::saved_secrets::Kind::Set,
+                        crate::saved_secrets::Purpose::Switch(fbterm_config::SecretStorage::Vault),
+                    )
+                };
+                return self.open_vault_dialog(w, kind, purpose);
+            }
             "changed" => {
                 self.prompts.push(
                     w,
