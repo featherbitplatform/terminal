@@ -42,6 +42,11 @@
 //!   (about a second after startup, once output has arrived).
 //! - `FBTERM_FIND_ALL=<text>`: open the find-in-all-tabs box in the first window with this
 //!   query (also after about a second).
+//! - `FBTERM_DEMO_CHROME=windows|linux[:<button-layout>]`: draw that system's window controls
+//!   (in GNOME's `button-layout` form for Linux, e.g. `linux:close,minimize,maximize:`) on
+//!   any system, for screenshots.
+//!
+//! `fbterm --version` prints `fbterm <version>` and exits.
 
 mod actions;
 mod app;
@@ -107,7 +112,18 @@ const FONTS: [&[u8]; 5] = [
     include_bytes!("../assets/fonts/lucide-icons.ttf"),
 ];
 
+/// `fbterm --version` (or `-V`): the line it prints, `None` for any other run.
+fn version_line<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
+    args.into_iter()
+        .any(|a| a == "--version" || a == "-V")
+        .then(|| format!("fbterm {}", env!("CARGO_PKG_VERSION")))
+}
+
 fn main() -> iced::Result {
+    if let Some(line) = version_line(std::env::args().skip(1)) {
+        println!("{line}");
+        return Ok(());
+    }
     perf::init_from_env();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -123,5 +139,7 @@ fn main() -> iced::Result {
     for font in FONTS {
         daemon = daemon.font(font);
     }
+    // Before the first window opens: on Linux this reads the desktop's button layout.
+    chrome::init();
     daemon.run()
 }

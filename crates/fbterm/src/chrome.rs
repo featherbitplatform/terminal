@@ -5,15 +5,21 @@
 //! window buttons drawn over its leading end. Empty space in that bar moves the window and a
 //! double click zooms it.
 //!
-//! Linux and Windows keep the OS title bar and decorations for now. They are a separate
-//! [`Chrome`] strategy so drawn window controls can be added there later without touching the
-//! views.
+//! Windows and Linux draw their own: the window has no OS decorations, the tab bar (or the
+//! editor's header) is the title bar and holds drawn minimize, maximize and close controls
+//! ([`Chrome::Drawn`]). Windows puts them on the right; Linux follows the desktop's button
+//! layout ([`controls_layout`]). Empty bar space moves the window, a double click maximizes
+//! it, and an [`EDGE_BAND`] wide band along the window's edges resizes it ([`edges`]).
+//!
+//! [`Chrome::Native`] (the OS title bar) stays for a Linux desktop that refuses drawn chrome.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse::{self, click};
 use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
-use iced::{Element, Event, Length, Rectangle, Size, Vector, window};
+use iced::window::Direction;
+use iced::{Element, Event, Length, Point, Rectangle, Size, Vector, window};
+use std::sync::OnceLock;
 
 /// Whether the macOS app menu's Quit keeps `Cmd+Q` with `running` transfers: only while none
 /// runs. While some do, the key is taken from the menu so it reaches the app's own Quit, which
@@ -82,31 +88,386 @@ const NATIVE_BAR_HEIGHT: f32 = 36.0;
 /// Leading padding of the tab bar where nothing is drawn over it.
 const NATIVE_LEADING_INSET: f32 = 8.0;
 
+/// Height of the drawn title bar (Windows, Linux).
+const DRAWN_BAR_HEIGHT: f32 = 36.0;
+
+/// How wide the band along a window's edges is that resizes it where the chrome is drawn.
+pub const EDGE_BAND: f32 = 8.0;
+
+/// How far a corner's resize area reaches along each edge from the corner, so a corner is
+/// easier to hit than the band's own 8 by 8 px square.
+const CORNER_REACH: f32 = 16.0;
+
+/// The system whose window conventions apply: where the controls go and how they look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Platform {
+    MacOs,
+    Windows,
+    /// Linux and the other Unix desktops.
+    Linux,
+}
+
+impl Platform {
+    /// The system this build runs on.
+    pub const fn current() -> Self {
+        if cfg!(target_os = "macos") {
+            Self::MacOs
+        } else if cfg!(target_os = "windows") {
+            Self::Windows
+        } else {
+            Self::Linux
+        }
+    }
+}
+
 /// How a platform draws the top edge of a window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chrome {
     /// The tab bar is the title bar; the OS draws only its window buttons over it (macOS).
     Unified,
-    /// The OS draws a title bar with its decorations above the content (Linux, Windows).
+    /// The OS draws a title bar with its decorations above the content.
     Native,
+    /// No OS decorations: the tab bar is the title bar and fbterm draws the window controls
+    /// in it, and resizes the window from its edges (Windows, Linux).
+    Drawn,
 }
 
-/// What a press in the empty part of a title bar asks of the window.
+/// A drawn window control.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Minimize,
+    /// Maximize, or restore a maximized window.
+    Maximize,
+    Close,
+}
+
+/// Which end of the bar the drawn controls sit at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// Where the drawn controls go and in which order (left to right).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlsLayout {
+    pub side: Side,
+    pub order: Vec<Control>,
+}
+
+impl ControlsLayout {
+    /// Minimize, maximize, close on the right: Windows, and Linux when the desktop's layout
+    /// cannot be read.
+    fn standard() -> Self {
+        Self {
+            side: Side::Right,
+            order: vec![Control::Minimize, Control::Maximize, Control::Close],
+        }
+    }
+}
+
+/// The controls of `platform`. On Linux `desktop` is the desktop's button layout in GNOME's
+/// `button-layout` form (`"close,minimize,maximize:"`: names before the colon go left, after
+/// it right; KDE's setting is turned into it by `kde_layout`); anything unreadable gives the
+/// standard layout. Elsewhere `desktop` is ignored.
+pub fn controls_layout(platform: Platform, desktop: Option<&str>) -> ControlsLayout {
+    match platform {
+        Platform::Linux => desktop
+            .and_then(parse_button_layout)
+            .unwrap_or_else(ControlsLayout::standard),
+        Platform::Windows | Platform::MacOs => ControlsLayout::standard(),
+    }
+}
+
+/// A GNOME `button-layout` value as [`ControlsLayout`]. The controls sit together at one end:
+/// the side that names close (else the side naming more of them, the right on a tie), in the
+/// order the value names them. Close is always there (at the outer end if the value leaves it
+/// out), so a window can always be closed. `None` when the value names no control.
+fn parse_button_layout(value: &str) -> Option<ControlsLayout> {
+    let value = value.trim().trim_matches(|c| c == '\'' || c == '"').trim();
+    let (left, right) = value.split_once(':')?;
+    let names = |part: &str| -> Vec<Control> {
+        part.split(',')
+            .filter_map(|name| match name.trim() {
+                "minimize" => Some(Control::Minimize),
+                "maximize" => Some(Control::Maximize),
+                "close" => Some(Control::Close),
+                _ => None,
+            })
+            .collect()
+    };
+    let (left, right) = (names(left), names(right));
+    if left.is_empty() && right.is_empty() {
+        return None;
+    }
+    let side = if left.contains(&Control::Close) {
+        Side::Left
+    } else if right.contains(&Control::Close) || right.len() >= left.len() {
+        Side::Right
+    } else {
+        Side::Left
+    };
+    let mut order: Vec<Control> = Vec::new();
+    for c in left.into_iter().chain(right) {
+        if !order.contains(&c) {
+            order.push(c);
+        }
+    }
+    if !order.contains(&Control::Close) {
+        match side {
+            Side::Left => order.insert(0, Control::Close),
+            Side::Right => order.push(Control::Close),
+        }
+    }
+    Some(ControlsLayout { side, order })
+}
+
+/// KDE's button setting (`ButtonsOnLeft` / `ButtonsOnRight` in the `[org.kde.kdecoration2]`
+/// group of `kwinrc`, one letter per button: `I` minimize, `A` maximize, `X` close) in GNOME's
+/// `button-layout` form. A key left out has KDE's default. `None` when the group sets neither.
+#[cfg(any(test, target_os = "linux"))]
+fn kde_layout(kwinrc: &str) -> Option<String> {
+    let mut in_group = false;
+    let (mut left, mut right) = (None, None);
+    for line in kwinrc.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_group = line == "[org.kde.kdecoration2]";
+        } else if in_group && let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "ButtonsOnLeft" => left = Some(value.trim().to_owned()),
+                "ButtonsOnRight" => right = Some(value.trim().to_owned()),
+                _ => {}
+            }
+        }
+    }
+    if left.is_none() && right.is_none() {
+        return None;
+    }
+    let names = |letters: &str| -> String {
+        letters
+            .chars()
+            .filter_map(|c| match c {
+                'I' => Some("minimize"),
+                'A' => Some("maximize"),
+                'X' => Some("close"),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    Some(format!(
+        "{}:{}",
+        names(left.as_deref().unwrap_or("MS")),
+        names(right.as_deref().unwrap_or("HIAX"))
+    ))
+}
+
+/// The desktop's button layout, read once before the first window opens: KDE's `kwinrc`
+/// under KDE, else GNOME's `button-layout` through `gsettings` (a subprocess given at most
+/// `GSETTINGS_TIMEOUT`, killed after that). `None` when neither can be read.
+#[cfg(target_os = "linux")]
+fn desktop_layout() -> Option<String> {
+    let kde = std::env::var("XDG_CURRENT_DESKTOP")
+        .is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("kde")));
+    if kde {
+        let dir = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".config"))
+            })?;
+        let rc = std::fs::read_to_string(dir.join("kwinrc")).ok()?;
+        return kde_layout(&rc);
+    }
+    gsettings_button_layout()
+}
+
+/// How long the `gsettings` read may take before the standard layout is used.
+#[cfg(target_os = "linux")]
+const GSETTINGS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[cfg(target_os = "linux")]
+fn gsettings_button_layout() -> Option<String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new("gsettings")
+        .args(["get", "org.gnome.desktop.wm.preferences", "button-layout"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = Instant::now() + GSETTINGS_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                tracing::info!("gsettings did not answer; standard window controls");
+                return None;
+            }
+        }
+    };
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    status.success().then_some(out)
+}
+
+/// What this run draws, chosen once by [`init`] before the first window opens.
+#[derive(Debug)]
+pub struct Setup {
+    pub chrome: Chrome,
+    /// Whose conventions the drawn controls follow (look and default placement).
+    pub look: Platform,
+    pub controls: ControlsLayout,
+}
+
+static SETUP: OnceLock<Setup> = OnceLock::new();
+
+/// This run's chrome. Without [`init`] (tests) it is the platform's, with the standard
+/// controls.
+pub fn setup() -> &'static Setup {
+    SETUP.get_or_init(|| {
+        let platform = Platform::current();
+        Setup {
+            chrome: Chrome::for_platform(platform),
+            look: platform,
+            controls: controls_layout(platform, None),
+        }
+    })
+}
+
+/// Choose this run's chrome, before the first window opens (on Linux this reads the desktop's
+/// button layout: see `desktop_layout`). The Linux `window_decorations` setting, and the
+/// fallback to [`Chrome::Native`] where the desktop refuses drawn chrome, decide here too.
+///
+/// Debug aid: `FBTERM_DEMO_CHROME=windows|linux[:<button-layout>]` draws that system's
+/// controls on any system (e.g. `linux:close,minimize,maximize:`), for screenshots.
+pub fn init() {
+    let platform = Platform::current();
+    let demo =
+        crate::app::debug_env("FBTERM_DEMO_CHROME").and_then(|v| v.to_str().and_then(demo_chrome));
+    let setup = match demo {
+        Some((look, desktop)) => Setup {
+            chrome: Chrome::Drawn,
+            look,
+            controls: controls_layout(look, desktop.as_deref()),
+        },
+        None => {
+            let chrome = Chrome::for_platform(platform);
+            #[cfg(target_os = "linux")]
+            let desktop = (chrome == Chrome::Drawn).then(desktop_layout).flatten();
+            #[cfg(not(target_os = "linux"))]
+            let desktop: Option<String> = None;
+            Setup {
+                chrome,
+                look: platform,
+                controls: controls_layout(platform, desktop.as_deref()),
+            }
+        }
+    };
+    tracing::info!(chrome = ?setup.chrome, controls = ?setup.controls, "window chrome");
+    let _ = SETUP.set(setup);
+}
+
+/// `FBTERM_DEMO_CHROME`: the system to imitate and its button layout.
+fn demo_chrome(value: &str) -> Option<(Platform, Option<String>)> {
+    let (system, desktop) = match value.split_once(':') {
+        Some((system, rest)) => (system, Some(rest.to_owned())),
+        None => (value, None),
+    };
+    match system {
+        "windows" => Some((Platform::Windows, None)),
+        "linux" => Some((Platform::Linux, desktop)),
+        _ => None,
+    }
+}
+
+/// Where a point `point` (window coordinates) in a window of `size` resizes it from: the
+/// [`EDGE_BAND`] wide band along each edge, corners reaching `CORNER_REACH` along both edges.
+/// A maximized (or full-screen) window does not resize from its edges.
+pub fn edge_hit(size: Size, point: Point, maximized: bool) -> Option<Direction> {
+    let (x, y, w, h) = (point.x, point.y, size.width, size.height);
+    if maximized || x < 0.0 || y < 0.0 || x > w || y > h {
+        return None;
+    }
+    let (north, south) = (y < EDGE_BAND, y >= h - EDGE_BAND);
+    let (west, east) = (x < EDGE_BAND, x >= w - EDGE_BAND);
+    if !(north || south || west || east) {
+        return None;
+    }
+    let (top, bottom) = (y < CORNER_REACH, y >= h - CORNER_REACH);
+    let (left, right) = (x < CORNER_REACH, x >= w - CORNER_REACH);
+    Some(if top && left {
+        Direction::NorthWest
+    } else if top && right {
+        Direction::NorthEast
+    } else if bottom && left {
+        Direction::SouthWest
+    } else if bottom && right {
+        Direction::SouthEast
+    } else if north {
+        Direction::North
+    } else if south {
+        Direction::South
+    } else if west {
+        Direction::West
+    } else {
+        Direction::East
+    })
+}
+
+/// The pointer over an edge that resizes toward `direction`.
+fn resize_cursor(direction: Direction) -> mouse::Interaction {
+    match direction {
+        Direction::North | Direction::South => mouse::Interaction::ResizingVertically,
+        Direction::East | Direction::West => mouse::Interaction::ResizingHorizontally,
+        Direction::NorthEast | Direction::SouthWest => mouse::Interaction::ResizingDiagonallyUp,
+        Direction::NorthWest | Direction::SouthEast => mouse::Interaction::ResizingDiagonallyDown,
+    }
+}
+
+/// What the title bar asks of its window: a press in its empty part, a drawn control, or a
+/// press on a drawn window's edge.
+#[derive(Debug, Clone, Copy)]
 pub enum BarAction {
     /// Move the window with the pointer.
     Drag,
-    /// Zoom the window, or restore it.
+    /// Zoom (maximize) the window, or restore it.
     ToggleMaximize,
+    Minimize,
+    /// Close the window as its OS close button would (the app may ask first).
+    Close,
+    /// Resize the window from that edge or corner with the pointer.
+    ResizeFrom(Direction),
 }
 
+impl PartialEq for BarAction {
+    fn eq(&self, other: &Self) -> bool {
+        use std::mem::discriminant;
+        match (self, other) {
+            // `Direction` has no `PartialEq`; it has no fields either.
+            (Self::ResizeFrom(a), Self::ResizeFrom(b)) => discriminant(a) == discriminant(b),
+            _ => discriminant(self) == discriminant(other),
+        }
+    }
+}
+
+impl Eq for BarAction {}
+
 impl Chrome {
-    /// The strategy of the platform this build runs on.
-    pub const fn current() -> Self {
-        if cfg!(target_os = "macos") {
-            Self::Unified
-        } else {
-            Self::Native
+    /// The strategy of this run (see [`init`]).
+    pub fn current() -> Self {
+        setup().chrome
+    }
+
+    /// The default strategy of `platform`.
+    pub const fn for_platform(platform: Platform) -> Self {
+        match platform {
+            Platform::MacOs => Self::Unified,
+            Platform::Windows | Platform::Linux => Self::Drawn,
         }
     }
 
@@ -115,22 +476,29 @@ impl Chrome {
         match self {
             Self::Unified => MACOS_TITLEBAR_HEIGHT,
             Self::Native => NATIVE_BAR_HEIGHT,
+            Self::Drawn => DRAWN_BAR_HEIGHT,
         }
     }
 
     /// Space before the first tab: clear of the window buttons where they sit in the bar. In
-    /// full screen the OS hides them, so the tabs start at the edge.
+    /// full screen the OS hides them, so the tabs start at the edge. Drawn controls are laid
+    /// out beside the tabs, not over them.
     pub fn leading_inset(self, fullscreen: bool) -> f32 {
         match self {
             Self::Unified if !fullscreen => MACOS_TRAFFIC_LIGHTS_INSET,
-            Self::Unified | Self::Native => NATIVE_LEADING_INSET,
+            Self::Unified | Self::Native | Self::Drawn => NATIVE_LEADING_INSET,
         }
     }
 
     /// Whether this window has a bar of its own above the content (the editor's header): only
     /// where the OS title bar is gone.
     pub fn draws_title_bar(self) -> bool {
-        self == Self::Unified
+        matches!(self, Self::Unified | Self::Drawn)
+    }
+
+    /// Whether fbterm draws the window controls (and resizes from the edges) itself.
+    pub fn draws_controls(self) -> bool {
+        self == Self::Drawn
     }
 
     /// What a left press in the bar means. `captured` is whether a widget in the bar (a tab, a
@@ -160,6 +528,22 @@ impl Chrome {
                 ..base
             };
         }
+        if self == Self::Drawn {
+            #[cfg_attr(not(target_os = "windows"), allow(unused_mut))]
+            let mut settings = window::Settings {
+                decorations: false,
+                ..base
+            };
+            // Windows 11 keeps the shadow and rounded corners of an undecorated window only
+            // when asked.
+            #[cfg(target_os = "windows")]
+            {
+                settings.platform_specific.undecorated_shadow = true;
+                settings.platform_specific.corner_preference =
+                    window::settings::platform::CornerPreference::Round;
+            }
+            return settings;
+        }
         base
     }
 }
@@ -187,17 +571,23 @@ impl Chrome {
     }
 }
 
-/// The task for a bar action on window `id`.
+/// The task for a bar action on window `id`. [`BarAction::Close`] is the app's to handle (it
+/// may ask before closing), so it does nothing here.
 pub fn perform<T>(id: window::Id, action: BarAction) -> iced::Task<T> {
     match action {
         BarAction::Drag => window::drag(id),
         BarAction::ToggleMaximize => window::toggle_maximize(id),
+        BarAction::Minimize => window::minimize(id, true),
+        BarAction::ResizeFrom(direction) => window::drag_resize(id, direction),
+        BarAction::Close => iced::Task::none(),
     }
 }
 
-/// Wraps a title bar: left presses its children leave alone become [`BarAction`]s.
-/// `modal`: the palette or a dialog covers the window, so presses leave the window alone.
+/// Wraps a title bar drawn with `chrome`: left presses its children leave alone become
+/// [`BarAction`]s. `modal`: the palette or a dialog covers the window, so presses leave the
+/// window alone.
 pub fn title_bar<'a, Message: 'a>(
+    chrome: Chrome,
     content: impl Into<Element<'a, Message>>,
     modal: bool,
     on_action: impl Fn(BarAction) -> Message + 'a,
@@ -205,9 +595,167 @@ pub fn title_bar<'a, Message: 'a>(
     Element::new(TitleBar {
         content: content.into(),
         on_action: Box::new(on_action),
-        chrome: Chrome::current(),
+        chrome,
         modal,
     })
+}
+
+/// Wraps a whole drawn-chrome window: a left press in the [`EDGE_BAND`] along its edges
+/// becomes [`BarAction::ResizeFrom`] (and never reaches the content), and the pointer there
+/// shows the resize cursor. `maximized` (or full screen): the edges do nothing.
+pub fn edges<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    maximized: bool,
+    on_action: impl Fn(BarAction) -> Message + 'a,
+) -> Element<'a, Message> {
+    Element::new(Edges {
+        content: content.into(),
+        on_action: Box::new(on_action),
+        maximized,
+    })
+}
+
+struct Edges<'a, Message> {
+    content: Element<'a, Message>,
+    on_action: Box<dyn Fn(BarAction) -> Message + 'a>,
+    maximized: bool,
+}
+
+impl<Message> Edges<'_, Message> {
+    fn hit(&self, layout: Layout<'_>, cursor: mouse::Cursor) -> Option<Direction> {
+        let bounds = layout.bounds();
+        let p = cursor.position_over(bounds)?;
+        edge_hit(
+            bounds.size(),
+            Point::new(p.x - bounds.x, p.y - bounds.y),
+            self.maximized,
+        )
+    }
+}
+
+impl<Message> Widget<Message, iced::Theme, iced::Renderer> for Edges<'_, Message> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
+            && let Some(direction) = self.hit(layout, cursor)
+        {
+            shell.publish((self.on_action)(BarAction::ResizeFrom(direction)));
+            shell.capture_event();
+            return;
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        if let Some(direction) = self.hit(layout, cursor) {
+            return resize_cursor(direction);
+        }
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 struct TitleBar<'a, Message> {
@@ -427,7 +975,7 @@ mod tests {
         let expected = if cfg!(target_os = "macos") {
             Chrome::Unified
         } else {
-            Chrome::Native
+            Chrome::Drawn
         };
         assert_eq!(Chrome::current(), expected);
     }
@@ -469,6 +1017,169 @@ mod tests {
                 blur: false
             }
         );
+    }
+
+    #[test]
+    fn windows_controls_on_the_right() {
+        let expected = ControlsLayout {
+            side: Side::Right,
+            order: vec![Control::Minimize, Control::Maximize, Control::Close],
+        };
+        // Windows ignores any desktop layout string.
+        assert_eq!(controls_layout(Platform::Windows, None), expected);
+        assert_eq!(
+            controls_layout(Platform::Windows, Some("close,minimize,maximize:")),
+            expected
+        );
+    }
+
+    #[test]
+    fn gnome_layout_parsed() {
+        assert_eq!(
+            controls_layout(Platform::Linux, Some("close,minimize,maximize:")),
+            ControlsLayout {
+                side: Side::Left,
+                order: vec![Control::Close, Control::Minimize, Control::Maximize],
+            }
+        );
+        // As `gsettings get` prints it: quoted, with a newline; unknown names are skipped.
+        assert_eq!(
+            controls_layout(Platform::Linux, Some("'appmenu:minimize,close'\n")),
+            ControlsLayout {
+                side: Side::Right,
+                order: vec![Control::Minimize, Control::Close],
+            }
+        );
+        // A layout without close still gets one, at the outer end.
+        assert_eq!(
+            controls_layout(Platform::Linux, Some("maximize:")),
+            ControlsLayout {
+                side: Side::Left,
+                order: vec![Control::Close, Control::Maximize],
+            }
+        );
+        assert_eq!(
+            controls_layout(Platform::Linux, Some(":minimize")),
+            ControlsLayout {
+                side: Side::Right,
+                order: vec![Control::Minimize, Control::Close],
+            }
+        );
+    }
+
+    #[test]
+    fn kde_layout_becomes_a_desktop_layout() {
+        let rc =
+            "[Windows]\nFoo=1\n\n[org.kde.kdecoration2]\nButtonsOnLeft=XIA\nButtonsOnRight=H\n";
+        let layout = kde_layout(rc).expect("keys present");
+        assert_eq!(
+            controls_layout(Platform::Linux, Some(&layout)),
+            ControlsLayout {
+                side: Side::Left,
+                order: vec![Control::Close, Control::Minimize, Control::Maximize],
+            }
+        );
+        assert_eq!(kde_layout("[Windows]\nButtonsOnLeft=X\n"), None);
+    }
+
+    #[test]
+    fn unknown_layout_defaults_right() {
+        let default = ControlsLayout {
+            side: Side::Right,
+            order: vec![Control::Minimize, Control::Maximize, Control::Close],
+        };
+        for desktop in [
+            None,
+            Some(""),
+            Some("garbage"),
+            Some("appmenu:"),
+            Some("'menu:spacer'"),
+        ] {
+            assert_eq!(
+                controls_layout(Platform::Linux, desktop),
+                default,
+                "{desktop:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edge_hit_corners_and_edges() {
+        let size = Size::new(800.0, 600.0);
+        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false);
+        let is = |d: Option<Direction>, want: Direction| {
+            d.is_some_and(|d| std::mem::discriminant(&d) == std::mem::discriminant(&want))
+        };
+        // Inside the window, away from the edges: nothing.
+        assert!(hit(400.0, 300.0).is_none());
+        assert!(hit(EDGE_BAND, 300.0).is_none());
+        // The 8 px band on each edge.
+        assert!(is(hit(0.0, 300.0), Direction::West));
+        assert!(is(hit(EDGE_BAND - 0.5, 300.0), Direction::West));
+        assert!(is(hit(799.0, 300.0), Direction::East));
+        assert!(is(hit(400.0, 0.0), Direction::North));
+        assert!(is(hit(400.0, 595.0), Direction::South));
+        // Corners, reaching along both edges.
+        assert!(is(hit(1.0, 1.0), Direction::NorthWest));
+        assert!(is(hit(12.0, 2.0), Direction::NorthWest));
+        assert!(is(hit(798.0, 2.0), Direction::NorthEast));
+        assert!(is(hit(2.0, 590.0), Direction::SouthWest));
+        assert!(is(hit(795.0, 598.0), Direction::SouthEast));
+        // Outside the window: nothing.
+        assert!(hit(-1.0, 300.0).is_none());
+        assert!(hit(400.0, 600.5).is_none());
+    }
+
+    #[test]
+    fn maximized_disables_edge_resize() {
+        let size = Size::new(800.0, 600.0);
+        for p in [(0.0, 0.0), (0.0, 300.0), (799.0, 599.0), (400.0, 2.0)] {
+            assert!(edge_hit(size, Point::new(p.0, p.1), true).is_none());
+        }
+    }
+
+    #[test]
+    fn drawn_chrome_has_its_own_bar_without_os_decorations() {
+        let c = Chrome::Drawn;
+        assert!(c.draws_title_bar());
+        assert!(c.draws_controls());
+        assert!(!Chrome::Unified.draws_controls());
+        assert!(!Chrome::Native.draws_controls());
+        assert_eq!(
+            c.bar_press(false, false, click::Kind::Single),
+            Some(BarAction::Drag)
+        );
+        assert_eq!(
+            c.bar_press(false, false, click::Kind::Double),
+            Some(BarAction::ToggleMaximize)
+        );
+        assert_eq!(c.bar_press(true, false, click::Kind::Single), None);
+        let s = c.window_settings(window::Settings::default());
+        assert!(!s.decorations);
+        assert!(
+            Chrome::Native
+                .window_settings(window::Settings::default())
+                .decorations
+        );
+        assert_eq!(c.leading_inset(false), NATIVE_LEADING_INSET);
+        assert_eq!(c.backdrop(1.0, true), Chrome::Native.backdrop(1.0, true));
+    }
+
+    #[test]
+    fn macos_chrome_unchanged() {
+        let c = Chrome::Unified;
+        assert_eq!(c.bar_height(), MACOS_TITLEBAR_HEIGHT);
+        assert_eq!(c.leading_inset(false), MACOS_TRAFFIC_LIGHTS_INSET);
+        assert!(c.draws_title_bar());
+        assert!(!c.draws_controls());
+        let s = c.window_settings(window::Settings::default());
+        assert!(s.decorations, "the OS keeps drawing the window buttons");
+        assert_eq!(Chrome::for_platform(Platform::MacOs), Chrome::Unified);
+        assert_eq!(Chrome::for_platform(Platform::Windows), Chrome::Drawn);
+        assert_eq!(Chrome::for_platform(Platform::Linux), Chrome::Drawn);
+        if cfg!(target_os = "macos") {
+            assert_eq!(Chrome::current(), Chrome::Unified);
+        }
     }
 
     #[test]

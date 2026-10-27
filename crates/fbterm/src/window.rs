@@ -36,11 +36,18 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
     let content = window_view(app, id);
     // The main password dialog over a window other than a terminal window (those draw it
     // with their other dialogs).
-    match app.vault.dialog.as_ref().filter(|d| d.window == id) {
+    let content = match app.vault.dialog.as_ref().filter(|d| d.window == id) {
         Some(d) if !app.windows.contains_key(&id) => {
             stack![content, vault_layer(app, id, d)].into()
         }
         _ => content,
+    };
+    // Without OS decorations the window resizes from the band along its edges.
+    if Chrome::current().draws_controls() {
+        let fixed = app.maximized.contains(&id) || app.fullscreen.contains(&id);
+        chrome::edges(content, fixed, move |a| Message::TitleBar(id, a))
+    } else {
+        content
     }
 }
 
@@ -66,7 +73,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         let schemes = app.scheme_choices(true);
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id));
+            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
         let content = content.push(crate::editor::view::view(t, state, schemes, app.storage()));
         return Element::new(Shortcuts {
@@ -81,7 +88,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id));
+            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
         let notice = app.settings_notice.as_deref();
         let schemes = app.scheme_choices(false);
@@ -108,7 +115,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id));
+            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
         let content = content.push(crate::schemes_window::view::view(t, state, &app.style));
         return Element::new(Shortcuts {
@@ -129,7 +136,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id));
+            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
         let groups = crate::tunnels_window::groups(&app.profiles, &app.tunnels, &state.query);
         let any = crate::tunnels_window::any_defined(&app.profiles);
@@ -152,7 +159,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id));
+            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
         let content = content.push(crate::archive_window::view::view(
             t,
@@ -201,7 +208,9 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
             opacity,
         },
         scale: app.physical_scale(id),
+        chrome: Chrome::current(),
         fullscreen: app.fullscreen.contains(&id),
+        maximized: app.maximized.contains(&id),
         modal,
         demo_tip: app.demo_tip,
         bindings: &app.bindings,
@@ -745,8 +754,12 @@ struct TabBar<'b> {
     around: Surroundings,
     /// Physical pixels per logical pixel: tab corners are whole physical pixels.
     scale: f32,
+    /// How the bar is drawn.
+    chrome: Chrome,
     /// The window is in full screen: no room needed for the window buttons.
     fullscreen: bool,
+    /// The window is maximized: the drawn maximize control restores.
+    maximized: bool,
     /// The palette or a dialog covers the window.
     modal: bool,
     /// `FBTERM_DEMO_TOOLTIP` (debug aid): the button whose tooltip always shows.
@@ -768,7 +781,9 @@ fn tab_bar<'a>(
     let TabBar {
         window,
         bar_bg,
+        chrome,
         fullscreen,
+        maximized,
         modal,
         demo_tip,
         bindings,
@@ -776,7 +791,6 @@ fn tab_bar<'a>(
         ..
     } = bar;
     let tabs_bar = bar;
-    let chrome = Chrome::current();
     let height = chrome.bar_height();
     let msg = move |m| Message::TabBar(window, m);
     let mut bar = row![].spacing(2).align_y(Alignment::End);
@@ -878,7 +892,25 @@ fn tab_bar<'a>(
             .collect(),
         scale: tabs_bar.scale,
     });
-    chrome::title_bar(bar, modal, move |a| Message::TitleBar(window, a))
+    // Drawn controls sit beside the tabs' row, on a plate of the bar's color: beside the
+    // background, never under it (a translucent bar would show twice), and never in the row,
+    // whose first children `BarBackground` measures as the tabs.
+    let bar = if chrome.draws_controls() {
+        let plate = container(crate::ui::window_controls(t, window, maximized, height))
+            .height(height)
+            .align_y(Alignment::Center)
+            .style(move |_| container::Style {
+                background: Some(bar_bg.into()),
+                ..container::Style::default()
+            });
+        match chrome::setup().controls.side {
+            chrome::Side::Left => row![plate, bar].into(),
+            chrome::Side::Right => row![bar, plate].into(),
+        }
+    } else {
+        bar
+    };
+    chrome::title_bar(chrome, bar, modal, move |a| Message::TitleBar(window, a))
 }
 
 /// Top corner radius of a tab (the active one, a hovered one and a tinted one), and of the
@@ -1958,6 +1990,7 @@ mod tests {
         use iced::{Pixels, Point};
 
         use super::*;
+        use crate::chrome::BarAction;
         use crate::layout::PaneId;
         use crate::windows::{Carry, DragMsg};
 
@@ -1990,6 +2023,17 @@ mod tests {
             carry: Option<Carry>,
             steps: impl FnOnce(&[Rectangle]) -> Vec<(Event, Point)>,
         ) -> Vec<Message> {
+            drive_with(Chrome::Unified, tabs, carry, |b, _| steps(b))
+        }
+
+        /// [`drive`] with the bar drawn by `chrome`; `steps` also gets the drawn controls'
+        /// bounds (none without them).
+        fn drive_with(
+            chrome: Chrome,
+            tabs: &[Tab],
+            carry: Option<Carry>,
+            steps: impl FnOnce(&[Rectangle], &[Rectangle]) -> Vec<(Event, Point)>,
+        ) -> Vec<Message> {
             let bindings = Bindings::defaults(cfg!(target_os = "macos"));
             let t = &crate::theme::DARK;
             let bar = TabBar {
@@ -2001,7 +2045,9 @@ mod tests {
                     opacity: 1.0,
                 },
                 scale: 1.0,
+                chrome,
                 fullscreen: false,
+                maximized: false,
                 modal: false,
                 demo_tip: None,
                 bindings: &bindings,
@@ -2020,8 +2066,26 @@ mod tests {
                 &renderer,
                 &layout::Limits::new(Size::ZERO, SIZE),
             );
-            // title bar -> background -> container -> row -> tabs
-            let buttons: Vec<Rectangle> = Layout::new(&node)
+            // title bar -> background -> container -> row -> tabs; with drawn controls
+            // (on the right in tests) title bar -> row -> [background, plate -> controls].
+            let root = Layout::new(&node);
+            let (background, controls) = if chrome.draws_controls() {
+                let mut parts = root.children();
+                let background = parts.next().expect("the background");
+                let controls: Vec<Rectangle> = parts
+                    .next()
+                    .expect("the plate")
+                    .children()
+                    .next()
+                    .expect("the controls")
+                    .children()
+                    .map(|l| l.bounds())
+                    .collect();
+                (background, controls)
+            } else {
+                (root, Vec::new())
+            };
+            let buttons: Vec<Rectangle> = background
                 .children()
                 .next()
                 .expect("the row")
@@ -2031,7 +2095,7 @@ mod tests {
                 .collect();
             let viewport = Rectangle::with_size(SIZE);
             let mut messages = Vec::new();
-            for (event, at) in steps(&buttons) {
+            for (event, at) in steps(&buttons, &controls) {
                 let mut shell = Shell::new(&mut messages);
                 element.as_widget_mut().update(
                     &mut tree,
@@ -2131,6 +2195,59 @@ mod tests {
                 selects(&messages).is_empty(),
                 "dropping on a tab is not a click"
             );
+        }
+
+        fn bar_actions(messages: &[Message]) -> Vec<BarAction> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::TitleBar(_, a) => Some(*a),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn drawn_controls_act_on_the_window_and_tabs_still_work() {
+            let tabs = tabs();
+            let click = |p: Point| vec![(moved(p), p), (press(), p), (release(), p)];
+            // Each control, left to right: minimize, maximize, close.
+            let messages = drive_with(Chrome::Drawn, &tabs, None, |_, c| {
+                assert_eq!(c.len(), 3, "{c:?}");
+                c.iter().flat_map(|r| click(r.center())).collect()
+            });
+            assert_eq!(
+                bar_actions(&messages),
+                [
+                    BarAction::Minimize,
+                    BarAction::ToggleMaximize,
+                    BarAction::Close
+                ]
+            );
+            // The controls are at the bar's right end, clear of the tabs.
+            let messages = drive_with(Chrome::Drawn, &tabs, None, |b, c| {
+                assert!(c[0].x > b[2].x + b[2].width);
+                // Flush with the edge (Windows) or one gap from it (Linux).
+                let from_edge = SIZE.width - (c[2].x + c[2].width);
+                assert!((-0.5..=8.5).contains(&from_edge), "{c:?}");
+                click(b[1].center())
+            });
+            assert_eq!(selects(&messages), [1]);
+            assert!(bar_actions(&messages).is_empty());
+            // Empty bar space still moves the window.
+            let messages = drive_with(Chrome::Drawn, &tabs, None, |_, c| {
+                let gap = Point::new(c[0].x - 10.0, 20.0);
+                vec![(moved(gap), gap), (press(), gap)]
+            });
+            assert_eq!(bar_actions(&messages), [BarAction::Drag]);
+            // A tab drag works as without drawn controls.
+            let id = tabs[1].id;
+            let messages = drive_with(Chrome::Drawn, &tabs, None, |b, _| {
+                let at = b[1].center();
+                let far = Point::new(at.x, at.y + 6.0);
+                vec![(press(), at), (moved(far), far), (release(), at)]
+            });
+            assert_eq!(drags(&messages)[0], DragMsg::StartTab(id));
         }
 
         #[test]

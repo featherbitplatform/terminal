@@ -125,7 +125,8 @@ pub enum Message {
     WindowClosed(window::Id),
     /// A click in a window's tab bar; acts on that window whatever has focus.
     TabBar(window::Id, TabBarMsg),
-    /// A press on empty title-bar space (unified title bar): move or zoom that window.
+    /// A press on empty title-bar space, a drawn window control or a drawn window's edge:
+    /// move, zoom, minimize, close or resize that window.
     TitleBar(window::Id, BarAction),
     Shortcut(window::Id, Action),
     DismissNotices,
@@ -179,6 +180,8 @@ pub enum Message {
     WindowScale(window::Id, f32),
     /// A window's mode, asked after a resize (entering or leaving full screen resizes).
     WindowMode(window::Id, window::Mode),
+    /// Whether a window is maximized, asked after a resize where the chrome is drawn.
+    WindowMaximized(window::Id, bool),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
     SaveState(u64),
     /// `profiles.toml`, `settings.toml` and/or a file in `schemes/` changed on disk.
@@ -318,6 +321,9 @@ pub struct App {
     pub(crate) sizes: HashMap<window::Id, (f32, f32)>,
     /// Windows in full screen (terminal windows and the editor).
     pub fullscreen: std::collections::HashSet<window::Id>,
+    /// Maximized windows, where the chrome is drawn (their edges do not resize, and the
+    /// maximize control restores).
+    pub maximized: std::collections::HashSet<window::Id>,
     /// Counts resizes, so only the last one of a burst saves.
     pub(crate) resize_count: u64,
     /// The text of `profiles.toml` / `settings.toml` as last loaded or written by us: a change
@@ -452,7 +458,12 @@ fn query_mode(id: window::Id) -> Task<Message> {
     )
     .then(move |()| window::mode(id))
     .map(move |m| Message::WindowMode(id, m));
-    Task::batch([now, settled])
+    if !crate::chrome::Chrome::current().draws_controls() {
+        return Task::batch([now, settled]);
+    }
+    // Maximizing and restoring resize the window too.
+    let maximized = window::is_maximized(id).map(move |m| Message::WindowMaximized(id, m));
+    Task::batch([now, settled, maximized])
 }
 
 /// A debug-only environment variable (`FBTERM_SCREENSHOT`, `FBTERM_OPEN_TABS`, ...); release
@@ -602,6 +613,7 @@ impl App {
             closing: Default::default(),
             sizes: HashMap::new(),
             fullscreen: Default::default(),
+            maximized: Default::default(),
             resize_count: 0,
             profiles_seen,
             settings_seen,
@@ -909,6 +921,8 @@ impl App {
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }
+            // A drawn close control is the OS close button.
+            Message::TitleBar(wid, BarAction::Close) => self.close_requested(wid),
             Message::TitleBar(wid, action) => chrome::perform(wid, action),
             Message::WindowClosed(id) => {
                 if self.editor_window() == Some(id) {
@@ -962,6 +976,7 @@ impl App {
                 self.sizes.remove(&id);
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
+                self.maximized.remove(&id);
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
                 self.file_panels.ui.remove(&id);
@@ -1051,6 +1066,14 @@ impl App {
                     self.fullscreen.insert(id);
                 } else {
                     self.fullscreen.remove(&id);
+                }
+                Task::none()
+            }
+            Message::WindowMaximized(id, maximized) => {
+                if maximized {
+                    self.maximized.insert(id);
+                } else {
+                    self.maximized.remove(&id);
                 }
                 Task::none()
             }
