@@ -207,7 +207,8 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     let dialog = app.prompts.front(id);
     let vault = app.vault.dialog.as_ref().filter(|d| d.window == id);
     let asking = dialog.is_some() || vault.is_some();
-    let modal = palette.is_some() || find_box.is_some() || asking;
+    let menu = app.context_menu.as_ref().filter(|m| m.window == id);
+    let modal = palette.is_some() || find_box.is_some() || asking || menu.is_some();
     let carry = app.carry_in(id);
     let bar = TabBar {
         window: id,
@@ -314,7 +315,9 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
     // toggles still work, and not while a dialog waits for an answer.
-    let covered = Mode::Blocked { toggles: !asking };
+    let covered = Mode::Blocked {
+        toggles: !asking && menu.is_none(),
+    };
     // A carried tab follows the pointer over the whole window.
     let ghost = match carry {
         Some(Carry::Tab(source)) => win
@@ -374,6 +377,15 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     }
     if let Some(d) = vault {
         layers = layers.push(vault_layer(app, id, d));
+    }
+    if let Some(m) = menu {
+        let size = app.sizes.get(&id).map(|&(w, h)| Size::new(w, h));
+        layers = layers.push(Element::new(Shortcuts {
+            content: crate::context_menu::view(t, id, m, size),
+            window: id,
+            mode: Mode::Menu,
+            bindings: &app.bindings,
+        }));
     }
     layers.into()
 }

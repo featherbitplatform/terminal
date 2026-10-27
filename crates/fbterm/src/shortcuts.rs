@@ -34,6 +34,9 @@ pub(crate) enum Mode {
     Palette,
     /// The find-in-all-tabs box: like the palette.
     FindAll,
+    /// The terminal's right-click menu: Up/Down, Enter and Escape drive it; every other key
+    /// is dropped, so no shortcut acts and nothing reaches the terminal while it is open.
+    Menu,
     /// A window whose active tab has its find bar open: Enter / Shift+Enter and the find keys
     /// move between matches, Escape closes the bar, application shortcuts act, and typing goes
     /// to the bar's field, never to the terminal (the terminal is drawn unfocused).
@@ -170,6 +173,7 @@ fn key_message(
         // Other shortcuts fall through to the layer beneath, which handles them.
         Mode::Palette => palette_key(key, mods).map(|m| Some(Message::Palette(w, m))),
         Mode::FindAll => find_all_key(key, mods).map(|m| Some(Message::FindAll(w, m))),
+        Mode::Menu => Some(crate::context_menu::menu_key(key).map(|m| Message::ContextMenu(w, m))),
         Mode::Find => match find_bar_key(bindings, key, mods, text) {
             Some(m) => Some(Some(Message::Find(w, m))),
             None => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
@@ -647,6 +651,34 @@ mod tests {
             press(Mode::Normal, "w", false),
             Some(Some(Message::Shortcut(_, Action::CloseTab)))
         ));
+    }
+
+    #[test]
+    fn the_context_menu_takes_every_key() {
+        use crate::context_menu::MenuMsg;
+        use keyboard::key::Named;
+        let none = keyboard::Modifiers::empty();
+        let menu = |named| key(named, none, Mode::Menu);
+        assert!(matches!(
+            menu(Named::Escape),
+            Some(Some(Message::ContextMenu(_, MenuMsg::Close)))
+        ));
+        assert!(matches!(
+            menu(Named::Enter),
+            Some(Some(Message::ContextMenu(_, MenuMsg::Submit)))
+        ));
+        assert!(matches!(
+            menu(Named::ArrowUp),
+            Some(Some(Message::ContextMenu(_, MenuMsg::Up)))
+        ));
+        assert!(matches!(
+            menu(Named::ArrowDown),
+            Some(Some(Message::ContextMenu(_, MenuMsg::Down)))
+        ));
+        // No shortcut acts and no key reaches the terminal behind the menu.
+        assert!(matches!(press(Mode::Menu, "t", false), Some(None)));
+        assert!(matches!(press(Mode::Menu, "p", true), Some(None)));
+        assert!(matches!(menu(Named::F5), Some(None)));
     }
 
     #[test]
