@@ -842,6 +842,25 @@ fn over_limit_archives_are_refused() {
         .map(|i| archived_key(&format!("id_{i}"), KEY_BYTES, &[]))
         .collect();
     refused(&a);
+
+    // At most a password and a passphrase per profile.
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.secrets = (0..2001)
+        .map(|_| secret(ProfileId::new(), SecretKind::Password, PASSWORD))
+        .collect();
+    refused(&a);
+    a.secrets.pop();
+    assert!(plan(&ProfileStore::default(), &a, &no_schemes()).is_ok());
+
+    // A key's profile list: at most 1000 ids, none twice.
+    let ids: Vec<ProfileId> = many.iter().map(|p| p.id).collect();
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.keys = vec![archived_key("id_k", KEY_BYTES, &ids)];
+    refused(&a);
+    a.keys = vec![archived_key("id_k", KEY_BYTES, &ids[..1000])];
+    assert!(plan(&ProfileStore::default(), &a, &no_schemes()).is_ok());
+    a.keys = vec![archived_key("id_k", KEY_BYTES, &[ids[0], ids[0]])];
+    refused(&a);
 }
 
 #[test]
@@ -960,7 +979,7 @@ fn repeated_schemes_are_reported_once_each() {
     assert_eq!(p.schemes[0].scheme.name, "Ocean");
     assert_eq!(
         p.warnings,
-        vec!["The archive lists the color scheme Ocean again twice; only the first is used."]
+        vec!["The archive lists the color scheme Ocean twice; only the first is used."]
     );
 }
 

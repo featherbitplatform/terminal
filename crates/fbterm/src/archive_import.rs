@@ -46,6 +46,8 @@ const MAX_PROFILES: usize = 1000;
 const MAX_JUMPS: usize = 16;
 const MAX_SCHEMES: usize = 200;
 const MAX_KEYS: usize = 200;
+/// A password or a passphrase per profile.
+const MAX_SECRETS: usize = 2 * MAX_PROFILES;
 
 /// The name a key file gets when the archived name is not a plain, harmless file name.
 const FALLBACK_KEY_NAME: &str = "id_imported";
@@ -274,6 +276,11 @@ fn within_limits(archive: &Archive) -> bool {
     archive.profiles.len() <= MAX_PROFILES
         && archive.schemes.len() <= MAX_SCHEMES
         && archive.keys.len() <= MAX_KEYS
+        && archive.secrets.len() <= MAX_SECRETS
+        && archive.keys.iter().all(|k| {
+            let distinct: HashSet<&ProfileId> = k.profiles.iter().collect();
+            k.profiles.len() <= MAX_PROFILES && distinct.len() == k.profiles.len()
+        })
         && archive.profiles.iter().all(|p| match &p.kind {
             ProfileKind::Ssh(ssh) => {
                 let distinct: HashSet<&ProfileId> = ssh.jump.iter().collect();
@@ -321,16 +328,14 @@ pub(crate) fn apply(
 
     let mut secret_ops: Vec<SecretOp> = Vec::new();
     if full {
+        let at = positions(&store);
+        let mut stored: HashSet<(ProfileId, SecretKind)> = HashSet::new();
         for s in &archive.secrets {
             let Some(id) = index.get(&s.profile).and_then(|&i| resolved.finals[i]) else {
                 continue;
             };
-            let used = store.get(id).and_then(secret_kind);
-            if used == Some(s.kind)
-                && !secret_ops
-                    .iter()
-                    .any(|op| op.profile == id && op.kind == s.kind)
-            {
+            let used = at.get(&id).and_then(|&k| secret_kind(&store.profiles[k]));
+            if used == Some(s.kind) && stored.insert((id, s.kind)) {
                 secret_ops.push(SecretOp {
                     profile: id,
                     kind: s.kind,
@@ -410,16 +415,27 @@ fn first_entries(entries: &[ImportEntry]) -> HashMap<ProfileId, usize> {
 fn revalidate(plan: &mut ImportPlan) {
     let resolved = resolve(&plan.local, &plan.entries, plan.kind);
     let index = first_entries(&plan.entries);
+    let at = positions(&resolved.store);
     plan.has_keys = plan.key_users.iter().flatten().any(|id| {
         index
             .get(id)
             .and_then(|&i| resolved.finals[i])
-            .and_then(|id| resolved.store.get(id))
-            .is_some_and(uses_key)
+            .and_then(|id| at.get(&id))
+            .is_some_and(|&k| uses_key(&resolved.store.profiles[k]))
     });
     for (entry, error) in plan.entries.iter_mut().zip(resolved.errors) {
         entry.error = error;
     }
+}
+
+/// Where each profile is in the store, for lookups by id in linear time overall.
+fn positions(store: &ProfileStore) -> HashMap<ProfileId, usize> {
+    store
+        .profiles
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.id, i))
+        .collect()
 }
 
 /// Whether a profile signs in with a key.
@@ -804,7 +820,8 @@ fn plan_schemes(
 ) -> (Vec<SchemeEntry>, HashSet<String>) {
     let mut entries: Vec<SchemeEntry> = Vec::new();
     let mut dropped = HashSet::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    // The name of the first copy of each id.
+    let mut seen: HashMap<&str, &str> = HashMap::new();
     for s in &archive.schemes {
         // A built-in id is the built-in, whatever the archive's copy says.
         if BUILTIN_IDS.contains(&s.id.as_str()) {
@@ -815,13 +832,14 @@ fn plan_schemes(
         } else {
             &s.name
         };
-        if !seen.insert(s.id.as_str()) {
+        if let Some(first) = seen.get(s.id.as_str()) {
             warnings.push(format!(
                 "The archive lists the color scheme {} twice; only the first is used.",
-                shown(name)
+                shown(first)
             ));
             continue;
         }
+        seen.insert(s.id.as_str(), name.as_str());
         let entry = match local.get(&s.id) {
             Some(mine) if same_scheme(mine, s) => Some(SchemeEntry {
                 archived_id: s.id.clone(),
@@ -954,6 +972,8 @@ fn place_keys(
 ) -> Result<Vec<NewKeyFile>, String> {
     let mut writes: Vec<NewKeyFile> = Vec::new();
     let mut placed: HashSet<ProfileId> = HashSet::new();
+    // Placing keys only changes key paths, so positions stay valid.
+    let at = positions(store);
     for key in keys {
         if key.bytes.len() as u64 > MAX_KEY_BYTES {
             continue;
@@ -963,7 +983,7 @@ fn place_keys(
             .iter()
             .filter_map(|id| index.get(id).and_then(|&i| finals[i]))
             .filter(|id| !placed.contains(id))
-            .filter(|&id| store.get(id).is_some_and(uses_key))
+            .filter(|id| at.get(id).is_some_and(|&k| uses_key(&store.profiles[k])))
             .collect();
         if users.is_empty() {
             continue;
@@ -1016,8 +1036,8 @@ fn place_keys(
 
         for id in users {
             placed.insert(id);
-            if let Some(p) = store.profiles.iter_mut().find(|p| p.id == id)
-                && let ProfileKind::Ssh(ssh) = &mut p.kind
+            if let Some(&k) = at.get(&id)
+                && let ProfileKind::Ssh(ssh) = &mut store.profiles[k].kind
                 && let AuthMethod::Key { path: slot, .. } = &mut ssh.auth
             {
                 *slot = Some(path.clone());
