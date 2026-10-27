@@ -179,6 +179,19 @@ async fn shell_value(handle: &SessionHandle, tag: &str, command: &str) -> String
     .unwrap_or_else(|_| panic!("no <<{tag} ...>> in:\n{}", grid_text(handle)))
 }
 
+/// Remove a fixture (made under the home folder) through the test's shell, before the
+/// assertions run so a failing test leaves nothing behind either.
+async fn remove(handle: &SessionHandle, path: &str) {
+    assert!(path.starts_with(&format!("{HOME}/sftp-")), "{path}");
+    let gone = shell_value(
+        handle,
+        "RM",
+        &format!("rm -rf -- '{path}' && R=$(test -e '{path}' || echo gone)"),
+    )
+    .await;
+    assert_eq!(gone, "gone", "fixture {path} was not removed");
+}
+
 async fn list(sftp: &Sftp, path: &str) -> Result<Vec<Entry>, SftpError> {
     tokio::time::timeout(STEP, sftp.list(path))
         .await
@@ -222,9 +235,11 @@ async fn list_home_through_jump() {
     assert!(marker.starts_with("sftp-mark-"), "{marker:?}");
 
     let sftp = w.sftp(w.target2).await;
-    let home = sftp.home().await.unwrap();
-    assert_eq!(home, HOME);
-    let entries = list(&sftp, &home).await.unwrap();
+    let home = sftp.home().await;
+    let entries = list(&sftp, HOME).await;
+    remove(&shell, &format!("{HOME}/{marker}")).await;
+    assert_eq!(home.unwrap(), HOME);
+    let entries = entries.unwrap();
     assert_eq!(entry(&entries, &marker).kind, EntryKind::File);
     assert!(
         entries.iter().all(|e| e.name != "." && e.name != ".."),
@@ -251,7 +266,13 @@ async fn list_shows_links_and_kinds() {
     assert!(dir.starts_with(HOME), "{dir:?}");
 
     let sftp = w.sftp(w.bastion).await;
-    let entries = list(&sftp, &dir).await.unwrap();
+    let entries = list(&sftp, &dir).await;
+    let to_file = format!("{dir}/to-file");
+    let followed = sftp.stat(&to_file).await;
+    let link = sftp.lstat(&to_file).await;
+    let broken = sftp.stat(&format!("{dir}/broken")).await;
+    remove(&shell, &dir).await;
+    let entries = entries.unwrap();
 
     // Folders (and links to folders) first, then the rest, each by name.
     let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
@@ -294,17 +315,13 @@ async fn list_shows_links_and_kinds() {
     );
 
     // `stat` follows a link, `lstat` does not.
-    let to_file = format!("{dir}/to-file");
-    let followed = sftp.stat(&to_file).await.unwrap();
+    let followed = followed.unwrap();
     assert_eq!(followed.name, "to-file");
     assert_eq!(followed.kind, EntryKind::File);
     assert_eq!(followed.size, 5);
-    let link = sftp.lstat(&to_file).await.unwrap();
+    let link = link.unwrap();
     assert!(matches!(link.kind, EntryKind::Link { .. }), "{link:?}");
-    assert!(matches!(
-        sftp.stat(&format!("{dir}/broken")).await,
-        Err(SftpError::NotFound(_))
-    ));
+    assert!(matches!(broken, Err(SftpError::NotFound(_))), "{broken:?}");
     shell.close();
 }
 

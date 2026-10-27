@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fbterm_config::{ProfileId, ProfileStore};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use russh::ChannelMsg;
 use russh_sftp::client::error::Error as RawError;
 use russh_sftp::client::rawsession::Limits;
@@ -25,6 +25,12 @@ use super::{Connection, HOP_TIMEOUT, Prompter, SshError, SshPool};
 const POSIX_RENAME: &str = "posix-rename@openssh.com";
 /// How many symlinks of one listing are resolved at once.
 const LINK_LOOKUPS: usize = 16;
+/// The most entries one listing reads before giving up on the folder.
+const MAX_ENTRIES: usize = 100_000;
+/// How long one listing (reading the folder and resolving its links) may take in all.
+const LIST_DEADLINE: Duration = Duration::from_secs(60);
+/// How long closing a folder handle may take before the listing stops waiting for it.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
 
 /// An SFTP session on a profile's shared connection. Requests may run concurrently.
 pub struct Sftp {
@@ -33,8 +39,9 @@ pub struct Sftp {
     /// What the server allows per packet, read and write (`limits@openssh.com`), if it said.
     #[allow(dead_code)]
     limits: Option<Limits>,
-    /// Keeps the profile's connection (and its jump chain) open while the session lives.
-    _connection: Arc<Connection>,
+    /// Keeps the profile's connection (and its jump chain) open while the session lives
+    /// (`None` only in unit tests, which run the session over an in-memory stream).
+    _connection: Option<Arc<Connection>>,
 }
 
 /// One item of a folder, or the answer to [`Sftp::stat`] / [`Sftp::lstat`].
@@ -108,15 +115,15 @@ pub enum SortKey {
 /// Sort a listing: folders (see [`Entry::is_folder`]) always first, then everything else,
 /// each group by `key` (ties by name), `descending` reversing within the groups. Names
 /// compare without case, then with it; unknown modified times come before known ones.
-pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
-    entries.sort_by(|a, b| {
+pub fn sort_entries(entries: &mut Vec<Entry>, key: SortKey, descending: bool) {
+    // Lowercase names are computed once per entry, not on every comparison.
+    let mut keyed: Vec<(String, Entry)> = std::mem::take(entries)
+        .into_iter()
+        .map(|e| (e.name.to_lowercase(), e))
+        .collect();
+    keyed.sort_by(|(la, a), (lb, b)| {
         b.is_folder().cmp(&a.is_folder()).then_with(|| {
-            let by_name = || {
-                a.name
-                    .to_lowercase()
-                    .cmp(&b.name.to_lowercase())
-                    .then_with(|| a.name.cmp(&b.name))
-            };
+            let by_name = || la.cmp(lb).then_with(|| a.name.cmp(&b.name));
             let order = match key {
                 SortKey::Name => by_name(),
                 SortKey::Size => a.size.cmp(&b.size).then_with(by_name),
@@ -125,6 +132,7 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
             if descending { order.reverse() } else { order }
         })
     });
+    entries.extend(keyed.into_iter().map(|(_, e)| e));
 }
 
 /// The kind a mode's file type bits name; a link's target is filled in later.
@@ -241,11 +249,25 @@ impl Sftp {
                     Some(_) => {}
                 }
             }
-            let config = Config {
-                request_timeout_secs: HOP_TIMEOUT.as_secs(),
-                ..Config::default()
-            };
-            let mut session = RawSftpSession::new_with_config(channel.into_stream(), config);
+            Self::start(channel.into_stream(), Some(connection.clone())).await
+        };
+        tokio::time::timeout(HOP_TIMEOUT, start)
+            .await
+            .map_err(|_| unavailable("the server did not start the sftp session in time"))?
+    }
+
+    /// Start the SFTP protocol on `stream` (the subsystem channel) and read the server's
+    /// extensions.
+    async fn start<S>(stream: S, connection: Option<Arc<Connection>>) -> Result<Sftp, SshError>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let config = Config {
+            request_timeout_secs: HOP_TIMEOUT.as_secs(),
+            ..Config::default()
+        };
+        let mut session = RawSftpSession::new_with_config(stream, config);
+        {
             let version = session
                 .init()
                 .await
@@ -262,17 +284,13 @@ impl Sftp {
             } else {
                 None
             };
-            Ok::<_, SshError>((session, posix_rename, limits))
-        };
-        let (session, posix_rename, limits) = tokio::time::timeout(HOP_TIMEOUT, start)
-            .await
-            .map_err(|_| unavailable("the server did not start the sftp session in time"))??;
-        Ok(Sftp {
-            session,
-            posix_rename,
-            limits,
-            _connection: connection,
-        })
+            Ok(Sftp {
+                session,
+                posix_rename,
+                limits,
+                _connection: connection,
+            })
+        }
     }
 
     /// The home folder: the server's answer for `.` (`/` in some chroots).
@@ -297,31 +315,63 @@ impl Sftp {
     /// The folder `path`, without `.` and `..`, folders first then the rest by name. Links
     /// carry their target and what they end at.
     pub async fn list(&self, path: &str) -> Result<Vec<Entry>, SftpError> {
-        let err = |e| error_for(e, path);
-        let handle = self.session.opendir(path).await.map_err(err)?.handle;
-        let mut raw = Vec::new();
-        let read = loop {
-            match self.session.readdir(handle.as_str()).await {
-                Ok(name) => raw.extend(
-                    name.files
-                        .into_iter()
-                        .filter(|f| f.filename != "." && f.filename != "..")
-                        .map(|f| (f.filename, f.attrs)),
-                ),
-                Err(RawError::Status(s)) if s.status_code == StatusCode::Eof => break Ok(()),
-                Err(e) => break Err(err(e)),
+        self.list_within(path, MAX_ENTRIES, LIST_DEADLINE).await
+    }
+
+    /// [`Sftp::list`] with its limits as parameters, so tests can lower them.
+    async fn list_within(
+        &self,
+        path: &str,
+        max_entries: usize,
+        deadline: Duration,
+    ) -> Result<Vec<Entry>, SftpError> {
+        let deadline = tokio::time::Instant::now() + deadline;
+        let too_slow =
+            || SftpError::Unavailable(format!("The server took too long to list {path}."));
+        let handle = tokio::time::timeout_at(deadline, self.session.opendir(path))
+            .await
+            .map_err(|_| too_slow())?
+            .map_err(|e| error_for(e, path))?
+            .handle;
+        let read = async {
+            let mut raw = Vec::new();
+            loop {
+                match self.session.readdir(handle.as_str()).await {
+                    Ok(name) => {
+                        raw.extend(
+                            name.files
+                                .into_iter()
+                                .filter(|f| f.filename != "." && f.filename != "..")
+                                .map(|f| (f.filename, f.attrs)),
+                        );
+                        if raw.len() > max_entries {
+                            return Err(SftpError::Other(
+                                "This folder has too many entries to list.".into(),
+                            ));
+                        }
+                    }
+                    Err(RawError::Status(s)) if s.status_code == StatusCode::Eof => {
+                        return Ok(raw);
+                    }
+                    Err(e) => return Err(error_for(e, path)),
+                }
             }
         };
-        let _ = self.session.close(handle).await;
-        read?;
-        let mut entries: Vec<Entry> = futures_util::stream::iter(raw)
+        let raw = tokio::time::timeout_at(deadline, read).await;
+        // Every way out of the read closes the handle (best effort, bounded). A caller that
+        // drops the listing mid-read leaves it open on the server until the session ends.
+        let _ = tokio::time::timeout(CLOSE_WAIT, self.session.close(handle)).await;
+        let raw = raw.map_err(|_| too_slow())??;
+        let resolve = futures_util::stream::iter(raw)
             .map(|(name, attrs)| {
                 let full = join(path, &name);
                 async move { self.entry(name, &full, &attrs).await }
             })
             .buffered(LINK_LOOKUPS)
-            .collect()
-            .await;
+            .try_collect::<Vec<Entry>>();
+        let mut entries = tokio::time::timeout_at(deadline, resolve)
+            .await
+            .map_err(|_| too_slow())??;
         sort_entries(&mut entries, SortKey::Name, false);
         Ok(entries)
     }
@@ -334,7 +384,7 @@ impl Sftp {
             .await
             .map_err(|e| error_for(e, path))?
             .attrs;
-        Ok(self.entry(base_name(path), path, &attrs).await)
+        self.entry(base_name(path), path, &attrs).await
     }
 
     /// `path` itself: a link is reported as one, with its target.
@@ -345,7 +395,7 @@ impl Sftp {
             .await
             .map_err(|e| error_for(e, path))?
             .attrs;
-        Ok(self.entry(base_name(path), path, &attrs).await)
+        self.entry(base_name(path), path, &attrs).await
     }
 
     /// Whether the server can rename over an existing file atomically
@@ -355,29 +405,43 @@ impl Sftp {
     }
 
     /// The entry `name` at `full` with `attrs`; a link gets its target and what it ends at.
-    async fn entry(&self, name: String, full: &str, attrs: &FileAttributes) -> Entry {
+    /// A link whose target cannot be read or reached shows as broken; only a session that
+    /// ended (or stopped answering) fails.
+    async fn entry(
+        &self,
+        name: String,
+        full: &str,
+        attrs: &FileAttributes,
+    ) -> Result<Entry, SftpError> {
         let mut kind = kind_of_mode(attrs.permissions);
         if let EntryKind::Link { .. } = kind {
             let (target, end) =
                 futures_util::future::join(self.session.readlink(full), self.session.stat(full))
                     .await;
-            let target = target
-                .ok()
-                .and_then(|n| n.files.into_iter().next())
-                .map(|f| f.filename)
-                .unwrap_or_default();
-            let to = end
-                .ok()
-                .map(|a| Box::new(kind_of_mode(a.attrs.permissions)));
+            let target = match target.map_err(|e| error_for(e, full)) {
+                Ok(n) => n
+                    .files
+                    .into_iter()
+                    .next()
+                    .map(|f| f.filename)
+                    .unwrap_or_default(),
+                Err(e @ SftpError::Unavailable(_)) => return Err(e),
+                Err(_) => String::new(),
+            };
+            let to = match end.map_err(|e| error_for(e, full)) {
+                Ok(a) => Some(Box::new(kind_of_mode(a.attrs.permissions))),
+                Err(e @ SftpError::Unavailable(_)) => return Err(e),
+                Err(_) => None,
+            };
             kind = EntryKind::Link { target, to };
         }
-        Entry {
+        Ok(Entry {
             name,
             kind,
             size: attrs.size.unwrap_or(0),
             modified: modified_of(attrs),
             mode: attrs.permissions,
-        }
+        })
     }
 }
 
@@ -510,5 +574,231 @@ mod tests {
         assert_eq!(kind_of_mode(Some(0o010644)), EntryKind::Other);
         assert_eq!(kind_of_mode(Some(0o140755)), EntryKind::Other);
         assert_eq!(kind_of_mode(None), EntryKind::Other);
+    }
+
+    /// `fut`, failing the test instead of hanging when it never finishes.
+    async fn bounded<T>(fut: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(10), fut)
+            .await
+            .expect("the listing never finished")
+    }
+
+    fn link_kind(entry: &Entry) -> &EntryKind {
+        &entry.kind
+    }
+
+    #[tokio::test]
+    async fn unreachable_link_targets_show_as_broken() {
+        for code in [
+            StatusCode::NoSuchFile,
+            StatusCode::PermissionDenied,
+            StatusCode::Failure,
+        ] {
+            let sftp = fake::session(fake::Server::new(fake::Dir::OneLink, Some(code))).await;
+            let entries = sftp.list("/d").await.unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(
+                link_kind(&entries[0]),
+                &EntryKind::Link {
+                    target: "target".into(),
+                    to: None,
+                },
+                "{code:?}"
+            );
+        }
+        let sftp = fake::session(fake::Server::new(fake::Dir::OneLink, None)).await;
+        let entries = sftp.list("/d").await.unwrap();
+        assert_eq!(
+            link_kind(&entries[0]),
+            &EntryKind::Link {
+                target: "target".into(),
+                to: Some(Box::new(EntryKind::File)),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_connection_while_resolving_links_fails_the_listing() {
+        let server = fake::Server::new(fake::Dir::OneLink, Some(StatusCode::ConnectionLost));
+        let sftp = fake::session(server).await;
+        let err = sftp.list("/d").await.unwrap_err();
+        assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
+        let err = sftp.lstat("/d/link").await.unwrap_err();
+        assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn endless_folder_stops_at_the_entry_cap() {
+        let server = fake::Server::new(fake::Dir::Endless, None);
+        let sftp = fake::session(server.clone()).await;
+        let err = bounded(sftp.list_within("/d", 95, Duration::from_secs(60)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SftpError::Other("This folder has too many entries to list.".into())
+        );
+        assert_eq!(server.closes(), 1, "the folder handle is closed");
+    }
+
+    #[tokio::test]
+    async fn slow_folder_stops_at_the_deadline() {
+        let server = fake::Server::new(fake::Dir::Slow(Duration::from_millis(20)), None);
+        let sftp = fake::session(server.clone()).await;
+        let started = std::time::Instant::now();
+        let err = bounded(sftp.list_within("/d", MAX_ENTRIES, Duration::from_millis(300)))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(server.closes(), 1, "the folder handle is closed");
+    }
+
+    #[test]
+    fn default_listing_limits() {
+        assert_eq!(MAX_ENTRIES, 100_000);
+        assert_eq!(LIST_DEADLINE, Duration::from_secs(60));
+    }
+
+    /// An in-memory SFTP server that misbehaves on purpose.
+    mod fake {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        use russh_sftp::protocol::{Attrs, File, FileAttributes, Handle, Name, Status, StatusCode};
+        use russh_sftp::server::{Handler, StatusReply};
+
+        use super::super::Sftp;
+
+        #[derive(Clone, Copy)]
+        pub enum Dir {
+            /// One symlink, then the end of the folder.
+            OneLink,
+            /// A batch of files on every read, never the end.
+            Endless,
+            /// One file per read after `delay`, never the end.
+            Slow(Duration),
+        }
+
+        #[derive(Clone)]
+        pub struct Server {
+            pub dir: Dir,
+            /// What `stat` and `readlink` answer for the link.
+            pub link_status: Option<StatusCode>,
+            pub closes: Arc<AtomicUsize>,
+            pub reads: usize,
+        }
+
+        impl Server {
+            pub fn new(dir: Dir, link_status: Option<StatusCode>) -> Self {
+                Self {
+                    dir,
+                    link_status,
+                    closes: Arc::default(),
+                    reads: 0,
+                }
+            }
+
+            pub fn closes(&self) -> usize {
+                self.closes.load(Ordering::SeqCst)
+            }
+        }
+
+        fn mode_attrs(mode: u32) -> FileAttributes {
+            FileAttributes {
+                permissions: Some(mode),
+                size: Some(1),
+                ..FileAttributes::default()
+            }
+        }
+
+        impl Handler for Server {
+            type Error = StatusReply;
+
+            fn unimplemented(&self) -> Self::Error {
+                StatusCode::OpUnsupported.into()
+            }
+
+            async fn opendir(&mut self, id: u32, _path: String) -> Result<Handle, Self::Error> {
+                Ok(Handle {
+                    id,
+                    handle: "h".into(),
+                })
+            }
+
+            async fn readdir(&mut self, id: u32, _handle: String) -> Result<Name, Self::Error> {
+                match self.dir {
+                    Dir::OneLink => {
+                        self.reads += 1;
+                        if self.reads == 1 {
+                            Ok(Name {
+                                id,
+                                files: vec![File::new("link", mode_attrs(0o120777))],
+                            })
+                        } else {
+                            Err(StatusCode::Eof.into())
+                        }
+                    }
+                    Dir::Endless => Ok(Name {
+                        id,
+                        files: (0..10)
+                            .map(|i| File::new(format!("f{i}"), mode_attrs(0o100644)))
+                            .collect(),
+                    }),
+                    Dir::Slow(delay) => {
+                        tokio::time::sleep(delay).await;
+                        Ok(Name {
+                            id,
+                            files: vec![File::new("f", mode_attrs(0o100644))],
+                        })
+                    }
+                }
+            }
+
+            async fn close(&mut self, id: u32, _handle: String) -> Result<Status, Self::Error> {
+                self.closes.fetch_add(1, Ordering::SeqCst);
+                Ok(Status {
+                    id,
+                    status_code: StatusCode::Ok,
+                    error_message: "Ok".into(),
+                    language_tag: "en-US".into(),
+                })
+            }
+
+            async fn lstat(&mut self, id: u32, _path: String) -> Result<Attrs, Self::Error> {
+                Ok(Attrs {
+                    id,
+                    attrs: mode_attrs(0o120777),
+                })
+            }
+
+            async fn stat(&mut self, id: u32, _path: String) -> Result<Attrs, Self::Error> {
+                match self.link_status {
+                    Some(code) => Err(code.into()),
+                    None => Ok(Attrs {
+                        id,
+                        attrs: mode_attrs(0o100644),
+                    }),
+                }
+            }
+
+            async fn readlink(&mut self, id: u32, _path: String) -> Result<Name, Self::Error> {
+                match self.link_status {
+                    Some(StatusCode::ConnectionLost) => Err(StatusCode::ConnectionLost.into()),
+                    _ => Ok(Name {
+                        id,
+                        files: vec![File::dummy("target")],
+                    }),
+                }
+            }
+        }
+
+        /// A session talking to `server` over an in-memory pipe.
+        pub async fn session(server: Server) -> Sftp {
+            let (client, remote) = tokio::io::duplex(64 * 1024);
+            russh_sftp::server::run(remote, server).await;
+            Sftp::start(client, None).await.expect("fake sftp session")
+        }
     }
 }
