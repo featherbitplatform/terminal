@@ -1,0 +1,32 @@
+# gitleaks configuration: secrets scanning over the full git history (CI) and
+# the working tree. Extends the built-in default ruleset; the allowlists below
+# cover known test fixtures, not real secrets. gitleaks auto-loads this file
+# from the repo root.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Test-only SSH keys and key-parser fixtures, never real credentials"
+paths = [
+    # Throwaway keys for the live-test containers in dev/ssh-test/compose.yaml
+    # (see keys/README.md): public on purpose, authorized nowhere else.
+    '''dev/ssh-test/keys/''',
+    # Private-key parser fixtures for the RSA/ed25519 detection unit tests in
+    # crates/fbterm-session/src/ssh/mod.rs; they log in to nothing.
+    '''crates/fbterm-session/src/ssh/testdata/''',
+    # Archive import tests use a PEM header followed by a placeholder body as
+    # the bytes of an imported key file; no key material at all.
+    '''crates/fbterm/src/archive_import_tests\.rs''',
+]
+
+[[allowlists]]
+description = "Build outputs, dependency trees and scanner output"
+paths = [
+    '''target/''',
+    '''node_modules/''',
+    '''website/build/''',
+    '''website/\.docusaurus/''',
+    '''sast-out/''',
+    '''\.superpowers/''',
+]

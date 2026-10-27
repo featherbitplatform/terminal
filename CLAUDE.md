@@ -34,7 +34,7 @@ Binding design: `docs/superpowers/specs/2026-10-23-featherbit-terminal-design.md
 - **Conventional Commits** (`feat:`, `fix:`, `docs:`, `ci:`, `chore:`, `refactor:`, `test:`, optional scope). Do not add a `Co-Authored-By` trailer.
 - **Semantic versioning**, released like the gateway: `release/X.Y.Z` off `develop` (version bump in `Cargo.toml` there), merged into `main` with an annotated `vX.Y.Z` tag, then merged back into `develop`. The `v*` tag triggers the release workflow.
 - Docs website: Docusaurus in `website/`, deployed to `https://featherbitplatform.github.io/terminal/` by `.github/workflows/docs.yml` — same pattern as `../gateway/website`.
-- CI gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check`.
+- CI gates: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test`, `cargo deny check`, plus the security scans in `.github/workflows/security.yml` (semgrep, cargo-deny, grype, gitleaks over the full history, npm audit of `website/`; also weekly on `main`). Their configs live at the repo root (`.semgrepignore`, `.gitleaks.toml`, `.grype.yaml`, `deny.toml`, `website/audit-ci.jsonc`); every ignore carries a one-line reason. Releases attach CycloneDX SBOMs (`fbterm-<version>.cdx.json`, `fbterm-docs-<version>.cdx.json`, syft pinned in `release.yml` and `dev/sast.sh`).
 
 ## Commands
 
@@ -58,6 +58,7 @@ FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_sftp
 FBTERM_TEST_SSH=1 cargo test -p fbterm file_panel::live_tests
 docker compose -f dev/ssh-test/compose.yaml down
 
+bash dev/sast.sh [semgrep|deny|grype|gitleaks|npm-audit|sbom]   # security scans as CI runs them, via Docker (all by default; pwsh dev/sast.ps1 on Windows); SBOMs into sast-out/sbom/
 bash dev/perf/sessions.sh                # 20-tab memory/CPU measurement, about 25 min; see dev/perf/README.md
 bash dev/package-macos.sh <version>      # universal .app + .dmg into target/dist/ (macOS only)
 bash dev/make-icns.sh [mark.png]         # regenerate crates/fbterm/macos/fbterm.icns (needs Pillow)
