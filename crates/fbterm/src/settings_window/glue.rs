@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use fbterm_config::Settings;
+use fbterm_config::{Settings, WindowDecorations};
 use fbterm_term::{ColorScheme, TerminalStyle};
 use iced::{Font, Task, window};
 use parking_lot::Mutex;
@@ -12,11 +12,12 @@ use parking_lot::Mutex;
 use super::{SettingsMsg, SettingsState, WRITE_DEBOUNCE, Write, fonts, thousands};
 use crate::app::{App, Message, SettingsSource};
 use crate::chrome::Chrome;
+use crate::tabs::{Pane, Tab};
 use crate::theme;
 
 /// `name` as a `'static` str: iced wants font names that live for the whole process. Each
 /// distinct name is allocated once, however often the setting changes.
-fn intern(name: &str) -> &'static str {
+pub(crate) fn intern(name: &str) -> &'static str {
     static NAMES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
     let mut names = NAMES.get_or_init(Default::default).lock();
     if let Some(n) = names.get(name) {
@@ -27,7 +28,8 @@ fn intern(name: &str) -> &'static str {
     leaked
 }
 
-/// The look of terminals for `settings`.
+/// The look of terminals for `settings`, before a pane's color scheme applies (see
+/// [`App::pane_style`]).
 pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
     TerminalStyle {
         scheme: ColorScheme::graphite(),
@@ -42,6 +44,38 @@ pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
 }
 
 impl App {
+    /// The look of one pane: the colors of its scheme ([`App::scheme_for`]), the scheme's font
+    /// and size where it sets them (else the settings'), at the pane's own zoom; focused (keys
+    /// go to it, solid cursor) only for the focused pane of the focused window while its find
+    /// bar is closed. No accent border: the tiles draw the focus outline.
+    pub(crate) fn pane_style(&self, wid: window::Id, tab: &Tab, pane: &Pane) -> TerminalStyle {
+        let scheme = self.scheme_for(pane);
+        let (lo, hi) = fbterm_config::settings::FONT_SIZE_RANGE;
+        let base = scheme
+            .font_size
+            .map_or(self.settings.font_size, |s| s.clamp(lo, hi));
+        TerminalStyle {
+            scheme: ColorScheme::from(&scheme.colors),
+            font: match &scheme.font_family {
+                Some(family) => Font::with_name(intern(family)),
+                None => self.style.font,
+            },
+            // Unzoomed: the size as is (it may exceed the zoom range, up to 72).
+            font_size: if pane.zoom == 0 {
+                base
+            } else {
+                (base + f32::from(pane.zoom)).clamp(6.0, 48.0)
+            },
+            focused: self.app_active
+                && self.focused == Some(wid)
+                && tab.focused == pane.id
+                && pane.find.is_none()
+                && !self.file_panels.has_focus(wid),
+            accent: None,
+            ..self.style.clone()
+        }
+    }
+
     pub fn settings_window(&self) -> Option<window::Id> {
         self.settings_win.as_ref().map(|(id, _)| *id)
     }
@@ -63,6 +97,21 @@ impl App {
             SettingsMsg::RevealFolder => {
                 crate::config_files::reveal_config_folder(&self.paths);
                 Task::none()
+            }
+            SettingsMsg::EditSchemes => {
+                let current = self.settings.color_scheme.clone();
+                self.open_schemes(Some(current))
+            }
+            SettingsMsg::SecretStorage(choice) => self.choose_secret_storage(choice),
+            SettingsMsg::ResetVault => self.ask_reset_vault(),
+            // The row shows `System` after the desktop refused drawn chrome while the setting
+            // stays "fbterm": choosing fbterm tries drawn chrome again (nothing to write).
+            SettingsMsg::TitleBar(WindowDecorations::Fbterm)
+                if self.chrome_fell_back
+                    && self.settings.window_decorations == WindowDecorations::Fbterm =>
+            {
+                self.chrome_fell_back = false;
+                self.reapply_chrome()
             }
             other => {
                 // Locking every open terminal is only worth it for what reads the answer: a typed
@@ -102,12 +151,13 @@ impl App {
         }
     }
 
-    /// The most history lines any open tab holds: what a lowered scrollback would cut.
+    /// The most history lines any open pane holds: what a lowered scrollback would cut.
     fn max_open_history(&self) -> usize {
         self.windows
             .values()
             .flat_map(|w| w.tabs.iter())
-            .filter_map(|tab| tab.terminal())
+            .flat_map(|tab| &tab.panes)
+            .filter_map(|pane| pane.terminal())
             .map(|term| term.lock().history_len())
             .max()
             .unwrap_or(0)
@@ -118,12 +168,12 @@ impl App {
         if let Some(id) = self.settings_window() {
             return window::gain_focus(id);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(640.0, 720.0),
             min_size: Some(iced::Size::new(520.0, 420.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         let read_only = Settings::load(&self.paths.settings()).err();
         let mut state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
         state.display_hz = self.display_hz();
@@ -253,34 +303,41 @@ impl App {
     /// see [`SettingsSource`]).
     /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
     /// protocol flags programs have set, turning it on affects their requests from then on.
+    /// `color_scheme` recolors the open panes that follow it (those without a scheme of their
+    /// own, or whose own is not found).
     /// `background_opacity` is read each frame too; a window can only show through if it was
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
+    /// `window_decorations` (Linux) switches every open window's title bar at once.
     ///
     /// Returns the find refreshes a scrollback lowering asks for.
     pub(crate) fn apply_settings(
         &mut self,
-        new: Settings,
+        mut new: Settings,
         source: SettingsSource,
     ) -> Task<Message> {
+        // Saved secrets move only through the Settings window (which writes the key itself):
+        // a hand edit of `secret_storage` applies on the next launch.
+        new.secret_storage = self.settings.secret_storage;
         if new == self.settings {
             return Task::none();
         }
         if new.font_family != self.settings.font_family || new.font_size != self.settings.font_size
         {
             self.style = terminal_style(&new);
-            self.style_unfocused = TerminalStyle {
-                focused: false,
-                ..self.style.clone()
-            };
         }
         if new.theme != self.settings.theme {
             self.theme = theme::graphite_theme(new.theme);
             self.tokens = theme::tokens(new.theme);
         }
         if new.kitty_keyboard != self.settings.kitty_keyboard {
-            for tab in self.windows.values().flat_map(|w| w.tabs.iter()) {
-                if let Some(term) = tab.terminal() {
+            let panes = self
+                .windows
+                .values()
+                .flat_map(|w| &w.tabs)
+                .flat_map(|t| &t.panes);
+            for pane in panes {
+                if let Some(term) = pane.terminal() {
                     term.lock().set_kitty_keyboard(new.kitty_keyboard);
                 }
             }
@@ -307,30 +364,47 @@ impl App {
         if new.keys.map != self.settings.keys.map {
             self.bindings = crate::keys::Bindings::current(&new.keys.map);
         }
+        // Running tunnels read the limit at each reconnect attempt.
+        self.tunnel_retries
+            .store(new.tunnel_max_retries, std::sync::atomic::Ordering::Relaxed);
         let rate_changed = new.max_fps != self.settings.max_fps;
+        let decorations_changed = new.window_decorations != self.settings.window_decorations;
+        let scheme_changed = new.color_scheme != self.settings.color_scheme;
+        let before = scheme_changed.then(|| self.pane_colors());
         self.settings = new;
         if rate_changed {
             self.update_output_rate();
+        }
+        if let Some(before) = before {
+            self.schemes_moved(&before);
+        }
+        if decorations_changed {
+            let chrome = self.window_decorations_changed(self.settings.window_decorations);
+            return Task::batch([task, chrome]);
         }
         task
     }
 
     /// Set every open terminal's scrollback limit. If any lost lines, release the freed memory
-    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines. A tab
+    /// and, for a change from `settings.toml`, say how many tabs lost their oldest lines. A pane
     /// that lost lines and has a find bar open searches again, so the bar does not keep
     /// counting or stepping to matches that are gone.
     fn apply_scrollback(&mut self, lines: usize, source: SettingsSource) -> Task<Message> {
-        let mut trimmed_tabs = Vec::new();
-        for (wid, window) in &self.windows {
-            for (index, tab) in window.tabs.iter().enumerate() {
-                if let Some(term) = tab.terminal()
+        let mut trimmed_panes = Vec::new();
+        let mut trimmed = 0;
+        for tab in self.windows.values().flat_map(|w| &w.tabs) {
+            let before = trimmed_panes.len();
+            for pane in &tab.panes {
+                if let Some(term) = pane.terminal()
                     && term.lock().set_scrollback(lines) > 0
                 {
-                    trimmed_tabs.push((*wid, index));
+                    trimmed_panes.push(pane.id);
                 }
             }
+            if trimmed_panes.len() > before {
+                trimmed += 1;
+            }
         }
-        let trimmed = trimmed_tabs.len();
         if trimmed == 0 {
             return Task::none();
         }
@@ -352,11 +426,7 @@ impl App {
             };
             self.show_settings_notice(line);
         }
-        Task::batch(
-            trimmed_tabs
-                .into_iter()
-                .map(|(wid, index)| self.find_output(wid, index)),
-        )
+        Task::batch(trimmed_panes.into_iter().map(|pane| self.find_output(pane)))
     }
 
     /// The refresh rate `max_fps = "display"` follows: the fastest display a terminal window is

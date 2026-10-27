@@ -10,6 +10,7 @@ use crate::watch::Changed;
 const SETTINGS_CHANGED: Changed = Changed {
     profiles: false,
     settings: true,
+    schemes: false,
 };
 
 fn app() -> (App, Paths) {
@@ -419,9 +420,13 @@ fn a_lower_value_nothing_exceeds_applies_when_the_quiet_period_passes() {
 
 /// Run the search the open find bar of `wid`'s first tab is waiting for and deliver it.
 fn finish_search(app: &mut App, wid: iced::window::Id, term: &fbterm_term::SharedTerminal) {
-    let bar = app.windows[&wid].tabs[0].find.as_ref().unwrap();
+    let bar = app.windows[&wid].tabs[0]
+        .focused_pane()
+        .find
+        .as_ref()
+        .unwrap();
     let seq = bar.pending_seq().expect("a search is running");
-    let id = app.windows[&wid].tabs[0].id;
+    let id = app.windows[&wid].tabs[0].focused;
     let outcome = fbterm_term::search(
         term,
         &fbterm_term::SearchRequest {
@@ -436,7 +441,12 @@ fn finish_search(app: &mut App, wid: iced::window::Id, term: &fbterm_term::Share
 }
 
 fn matches_in(app: &App, wid: iced::window::Id) -> usize {
-    let counter = app.windows[&wid].tabs[0].find.as_ref().unwrap().counter();
+    let counter = app.windows[&wid].tabs[0]
+        .focused_pane()
+        .find
+        .as_ref()
+        .unwrap()
+        .counter();
     counter.rsplit(' ').next().unwrap().parse().unwrap()
 }
 
@@ -454,8 +464,9 @@ fn lowering_scrollback_refreshes_an_open_find_bar() {
     send(&mut app, SettingsMsg::ScrollbackApply);
     assert!(term.lock().history_len() <= 100);
     // The bar searches again, now or when its timer fires.
-    let id = app.windows[&wid].tabs[0].id;
+    let id = app.windows[&wid].tabs[0].focused;
     if app.windows[&wid].tabs[0]
+        .focused_pane()
         .find
         .as_ref()
         .unwrap()
@@ -466,4 +477,51 @@ fn lowering_scrollback_refreshes_an_open_find_bar() {
     finish_search(&mut app, wid, &term);
     let after = matches_in(&app, wid);
     assert!(after < before && after <= 100 + 24, "{before} -> {after}");
+}
+
+#[test]
+fn settings_scheme_choice_writes_and_applies() {
+    let (mut app, paths) = app();
+    send(&mut app, SettingsMsg::ColorScheme("ember".into()));
+    assert_eq!(app.settings.color_scheme, "ember");
+    assert_eq!(
+        Settings::load(&paths.settings()).unwrap().color_scheme,
+        "ember"
+    );
+    let (_, state) = app.settings_win.as_ref().unwrap();
+    assert_eq!(state.values.color_scheme, "ember");
+}
+
+#[test]
+fn settings_lists_builtins_first() {
+    let (app, _) = app();
+    let ids: Vec<_> = app
+        .scheme_choices(false)
+        .into_iter()
+        .map(|c| c.id.unwrap())
+        .collect();
+    assert_eq!(ids[..4], ["graphite", "graphite-light", "harbor", "ember"]);
+}
+
+#[test]
+fn lists_refresh_after_scheme_set_changes() {
+    let (mut app, paths) = app();
+    assert_eq!(app.scheme_choices(false).len(), 4);
+    let mut mine = fbterm_config::schemes::builtins().remove(0);
+    mine.id = fbterm_config::schemes::new_user_id();
+    mine.name = "Mine".into();
+    mine.builtin = false;
+    fbterm_config::schemes::save_user(&paths.schemes(), &mine).unwrap();
+    let _ = app.update(Message::ConfigChanged(Changed {
+        profiles: false,
+        settings: false,
+        schemes: true,
+    }));
+    let own = app.scheme_choices(false);
+    assert_eq!(own.len(), 5);
+    assert_eq!(own[4].name, "Mine");
+    let with_global = app.scheme_choices(true);
+    assert_eq!(with_global.len(), 6);
+    assert_eq!(with_global[0].id, None);
+    assert_eq!(with_global[0].to_string(), "Use global scheme");
 }

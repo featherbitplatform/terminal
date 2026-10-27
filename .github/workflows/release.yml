@@ -7,6 +7,19 @@ on:
     paths:
       - dev/package-macos.sh
       - crates/fbterm/macos/**
+      - dev/package-linux.sh
+      - dev/make-linux-icons.sh
+      - dev/smoke-linux.sh
+      - crates/fbterm/linux/**
+      - dev/package-windows.ps1
+      - dev/make-windows-icon.sh
+      - dev/smoke-windows.ps1
+      - crates/fbterm/windows/**
+      - crates/fbterm/wix/**
+      - crates/fbterm/build.rs
+      - crates/fbterm/Cargo.toml
+      - dev/release-version.sh
+      - dev/test-release-version.sh
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -24,6 +37,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
+  # The tag check every packaging job runs, tested with fake refs: the matching tag passes, a
+  # mismatched one is refused. Runs on pull requests too, where no real tag can be tried.
+  release-version-check:
+    name: release version check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            Cargo.toml
+            dev/release-version.sh
+            dev/test-release-version.sh
+          sparse-checkout-cone-mode: false
+      - name: Matching and mismatched tags
+        run: bash dev/test-release-version.sh
+
   package:
     name: unsigned universal macOS dmg
     runs-on: macos-14
@@ -31,23 +60,16 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: bash dev/release-version.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
-      - name: Resolve version
-        id: version
-        run: |
-          cargo_version="$(awk '/^\[workspace.package\]/{f=1;next} /^\[/{f=0} f && /^version *=/{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
-          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            tag_version="${GITHUB_REF_NAME#v}"
-            if [ "$tag_version" != "$cargo_version" ]; then
-              echo "::error::tag $GITHUB_REF_NAME does not match workspace version $cargo_version"
-              exit 1
-            fi
-          fi
-          echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
@@ -64,23 +86,233 @@ jobs:
             target/dist/fbterm-${{ steps.version.outputs.version }}-macos-universal.dmg
             target/dist/fbterm-${{ steps.version.outputs.version }}-macos-universal.dmg.sha256
 
+  linux:
+    name: linux-${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    # glibc 2.34 (RHEL 9's), the oldest of the supported systems, so the .deb and the .rpm
+    # run on all of them (see dev/package-linux.sh).
+    container: almalinux:9
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Install build tools
+        run: dnf install -y gcc make pkgconf-pkg-config git tar gawk binutils xz rpm desktop-file-utils
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+      - name: Install packaging tools
+        run: cargo install --locked cargo-deb@3.8.0 cargo-generate-rpm@0.21.1
+      - name: Package
+        run: bash dev/package-linux.sh "${{ steps.version.outputs.version }}" "${{ matrix.arch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fbterm-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            target/dist/fbterm-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb
+            target/dist/fbterm-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.deb.sha256
+            target/dist/fbterm-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm
+            target/dist/fbterm-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.rpm.sha256
+            target/dist/fbterm-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+            target/dist/fbterm-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
+
+  linux-smoke:
+    name: linux smoke ${{ matrix.arch }} ${{ matrix.target.format }} ${{ matrix.target.image }}
+    needs: linux
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        target:
+          - { image: "debian:12", format: deb }
+          - { image: "ubuntu:22.04", format: deb }
+          - { image: "fedora:39", format: rpm }
+          - { image: "rockylinux:9", format: rpm }
+          - { image: "ubuntu:22.04", format: tar.gz }
+          - { image: "fedora:39", format: tar.gz }
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    container: ${{ matrix.target.image }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: dev/smoke-linux.sh
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fbterm-linux-${{ matrix.arch }}
+          path: dist
+      - name: Install, run and remove
+        run: bash dev/smoke-linux.sh "${{ matrix.target.format }}" dist "${{ needs.linux.outputs.version }}"
+
+  windows:
+    name: windows-x86_64
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      # First, so a tag that is not v<workspace version> stops the job before any build.
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: bash dev/release-version.sh
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64
+      - name: Install packaging tools
+        run: cargo install --locked cargo-wix@0.3.9
+      # cargo-wix drives the WiX Toolset v3 (candle, light). The runner image ships 3.14; should
+      # a newer image drop it, install that same version.
+      - name: Check WiX Toolset
+        run: |
+          if (-not ($env:WIX -and (Test-Path (Join-Path $env:WIX 'bin\candle.exe')))) {
+            choco install wixtoolset --version 3.14.1 --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'installing the WiX Toolset failed' }
+            $env:WIX = Join-Path ${env:ProgramFiles(x86)} 'WiX Toolset v3.14\'
+            "WIX=$env:WIX" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          }
+          if (-not (Test-Path (Join-Path $env:WIX 'bin\light.exe'))) { throw "no WiX Toolset at '$env:WIX'" }
+          Write-Output "WiX Toolset: $env:WIX"
+      - name: Package
+        run: ./dev/package-windows.ps1 "${{ steps.version.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fbterm-windows-x86_64
+          if-no-files-found: error
+          path: |
+            target/dist/fbterm-${{ steps.version.outputs.version }}-windows-x86_64.msi
+            target/dist/fbterm-${{ steps.version.outputs.version }}-windows-x86_64.msi.sha256
+
+  windows-smoke:
+    name: windows smoke x86_64 msi
+    needs: windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: dev/smoke-windows.ps1
+          sparse-checkout-cone-mode: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: fbterm-windows-x86_64
+          path: dist
+      - name: Install, run, uninstall and reinstall
+        run: ./dev/smoke-windows.ps1 dist "${{ needs.windows.outputs.version }}" "${{ runner.temp }}/fbterm-msi-logs"
+      - name: Upload msiexec logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-smoke-msi-logs
+          path: ${{ runner.temp }}/fbterm-msi-logs
+
+  # One release with every system's files, published only when every build and every smoke
+  # test passed: any failing job skips this one, so nothing is published. Only a tag push
+  # publishes; a manual run on a tag builds and tests, never re-publishes. The release is
+  # made as a draft, gets all 16 files, and only then is published, so a failed upload never
+  # leaves a half-published release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [deny, package]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [deny, release-version-check, package, linux, linux-smoke, windows, windows-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VERSION: ${{ needs.package.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Put above the generated notes.
+      NOTES: >-
+        Downloads for macOS (universal `.dmg`), Linux (`.deb`, `.rpm` and `.tar.gz` for x86_64
+        and aarch64) and Windows (x86_64 `.msi`), each with its `.sha256` checksum. Install
+        steps: [macOS](https://featherbitplatform.github.io/terminal/install-macos),
+        [Linux](https://featherbitplatform.github.io/terminal/install-linux),
+        [Windows](https://featherbitplatform.github.io/terminal/install-windows).
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: fbterm-macos-universal
+          pattern: fbterm-*
+          merge-multiple: true
           path: dist
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/fbterm-${{ needs.package.outputs.version }}-macos-universal.dmg
-            dist/fbterm-${{ needs.package.outputs.version }}-macos-universal.dmg.sha256
-          generate_release_notes: true
-          prerelease: ${{ contains(needs.package.outputs.version, '-') }}
-          fail_on_unmatched_files: true
+      - name: Check every file is here
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cat > "$RUNNER_TEMP/release-files" <<EOF
+          dist/fbterm-$VERSION-macos-universal.dmg
+          dist/fbterm-$VERSION-macos-universal.dmg.sha256
+          dist/fbterm-$VERSION-linux-x86_64.deb
+          dist/fbterm-$VERSION-linux-x86_64.deb.sha256
+          dist/fbterm-$VERSION-linux-x86_64.rpm
+          dist/fbterm-$VERSION-linux-x86_64.rpm.sha256
+          dist/fbterm-$VERSION-linux-x86_64.tar.gz
+          dist/fbterm-$VERSION-linux-x86_64.tar.gz.sha256
+          dist/fbterm-$VERSION-linux-aarch64.deb
+          dist/fbterm-$VERSION-linux-aarch64.deb.sha256
+          dist/fbterm-$VERSION-linux-aarch64.rpm
+          dist/fbterm-$VERSION-linux-aarch64.rpm.sha256
+          dist/fbterm-$VERSION-linux-aarch64.tar.gz
+          dist/fbterm-$VERSION-linux-aarch64.tar.gz.sha256
+          dist/fbterm-$VERSION-windows-x86_64.msi
+          dist/fbterm-$VERSION-windows-x86_64.msi.sha256
+          EOF
+          missing=0
+          while read -r file; do
+            if [ ! -s "$file" ]; then
+              echo "::error::missing or empty: $file"
+              missing=1
+            fi
+          done < "$RUNNER_TEMP/release-files"
+          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 16 ]
+          exit "$missing"
+      - name: Remove a draft a failed run left
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.draft and .tag_name == env.TAG) | .id' |
+            while read -r id; do
+              echo "deleting the draft release $id for $TAG"
+              gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            done
+      - name: Create the release as a draft
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+            --notes "$NOTES" --generate-notes "${prerelease[@]}"
+      - name: Upload the files
+        run: |
+          set -euo pipefail
+          mapfile -t files < "$RUNNER_TEMP/release-files"
+          gh release upload "$TAG" "${files[@]}"
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false

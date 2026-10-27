@@ -3,7 +3,8 @@
 use std::path::PathBuf;
 
 use fbterm_config::{
-    LocalProfile, Paths, Profile, ProfileId, ProfileKind, ProfileStore, SavedState, SavedWindow,
+    LocalProfile, Paths, Profile, ProfileId, ProfileKind, ProfileStore, SavedAxis, SavedLayout,
+    SavedSplitTab, SavedState, SavedTab, SavedWindow,
 };
 
 use crate::app::{App, Message};
@@ -25,6 +26,7 @@ pub(crate) fn profile(name: &str) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             program: "/nonexistent/fbterm-test-shell".into(),
             args: vec![],
@@ -46,7 +48,7 @@ pub(crate) fn paths_with(profiles: &[Profile]) -> Paths {
 
 pub(crate) fn saved(tabs: &[&Profile], active: usize) -> SavedWindow {
     SavedWindow {
-        tabs: tabs.iter().map(|p| p.id).collect(),
+        tabs: tabs.iter().map(|p| SavedTab::Profile(p.id)).collect(),
         active,
         size: (900.0, 500.0),
     }
@@ -59,7 +61,7 @@ fn states(app: &App) -> Vec<Vec<bool>> {
         .map(|w| {
             w.tabs
                 .iter()
-                .map(|t| t.state != TabState::NotConnected)
+                .map(|t| t.state() != &TabState::NotConnected)
                 .collect()
         })
         .collect()
@@ -84,7 +86,7 @@ fn relaunch_restores_windows_and_connects_only_the_active_tabs() {
     );
     let first = app.windows.values().next().unwrap();
     assert_eq!(first.active, 1);
-    assert_eq!(first.tabs[0].profile, a.id);
+    assert_eq!(first.tabs[0].focused_pane().profile, a.id);
     assert_eq!(app.sizes.values().next(), Some(&(900.0, 500.0)));
 }
 
@@ -146,7 +148,10 @@ fn layout_changes_are_saved_and_debug_runs_do_not_save() {
         window: wid,
     });
     let on_disk = SavedState::load_or_default(&paths.state());
-    assert_eq!(on_disk.windows[0].tabs, vec![a.id, b.id]);
+    assert_eq!(
+        on_disk.windows[0].tabs,
+        vec![SavedTab::Profile(a.id), SavedTab::Profile(b.id)]
+    );
     assert_eq!(on_disk.windows[0].active, 1);
     assert!(on_disk.recency.contains_key(&b.id));
 
@@ -158,7 +163,7 @@ fn layout_changes_are_saved_and_debug_runs_do_not_save() {
     let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Close(1)));
     assert_eq!(
         SavedState::load_or_default(&paths.state()).windows[0].tabs,
-        vec![a.id]
+        vec![SavedTab::Profile(a.id)]
     );
 
     // A debug aid that opens tabs must not overwrite the real layout.
@@ -212,11 +217,12 @@ fn a_hand_edit_of_profiles_replaces_them_and_keeps_open_tabs() {
     let _ = app.update(Message::ConfigChanged(Changed {
         profiles: true,
         settings: false,
+        schemes: false,
     }));
     assert!(app.profiles.get(b.id).is_some());
     assert!(app.profiles_error.is_none());
     let tab = &app.windows.values().next().unwrap().tabs[0];
-    assert_eq!((tab.profile, tab.name.as_str()), (a.id, "a2"));
+    assert_eq!((tab.focused_pane().profile, tab.name()), (a.id, "a2"));
 }
 
 #[test]
@@ -227,6 +233,7 @@ fn a_broken_edit_keeps_the_previous_profiles_and_goes_read_only_until_fixed() {
     let changed = Changed {
         profiles: true,
         settings: false,
+        schemes: false,
     };
 
     let broken = "[[profiles]\nname = 1\n";
@@ -274,6 +281,7 @@ fn a_change_event_for_text_we_already_have_is_ignored() {
     let _ = app.update(Message::ConfigChanged(Changed {
         profiles: true,
         settings: false,
+        schemes: false,
     }));
     assert_eq!(
         app.profiles.profiles.len(),
@@ -289,6 +297,7 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
     std::fs::write(
         paths.settings(),
@@ -298,7 +307,6 @@ fn settings_reload_applies_or_keeps_the_previous_and_says_why() {
     let _ = app.update(Message::ConfigChanged(changed));
     assert_eq!(app.settings.font_size, 18.0);
     assert_eq!(app.style.font_size, 18.0);
-    assert_eq!(app.style_unfocused.font_size, 18.0);
     assert_eq!(
         app.tokens,
         crate::theme::tokens(fbterm_config::ThemeMode::Light)
@@ -339,6 +347,7 @@ fn kitty_keyboard_setting_reaches_open_and_new_terminals() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
     std::fs::write(paths.settings(), "kitty_keyboard = true\n").unwrap();
     let _ = app.update(Message::ConfigChanged(changed));
@@ -373,6 +382,7 @@ fn out_of_range_settings_apply_clamped_and_say_so() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
     std::fs::write(
         paths.settings(),
@@ -512,6 +522,7 @@ fn toml_lowering_trims_and_sets_notice() {
     let changed = Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     };
 
     // Raising applies at once and says nothing.
@@ -577,6 +588,7 @@ fn lowering_in_two_tabs_says_plural_with_separators() {
     let _ = app.update(Message::ConfigChanged(Changed {
         profiles: false,
         settings: true,
+        schemes: false,
     }));
     assert_eq!(
         app.settings_notice.as_deref(),
@@ -691,9 +703,11 @@ fn remote_history_clear_never_requests_release() {
     assert_eq!(term.lock().history_len(), 0);
     // The app handles output for the window of the tab whose history was cleared.
     let wid = *app.windows.keys().next().unwrap();
+    let pane = app.windows[&wid].tabs[0].focused;
     let size = term.lock().size();
     let _ = app.update(Message::Terminal(
         wid,
+        pane,
         fbterm_term::TerminalOutput::Resized(size),
     ));
     assert_eq!(
@@ -724,4 +738,244 @@ fn a_session_ending_without_a_user_close_requests_nothing() {
     }
     assert_eq!(crate::memory::requests(), before);
     assert!(app.pending_release.is_empty());
+}
+
+fn leaf(p: &Profile, zoom: i8) -> SavedLayout {
+    SavedLayout::Pane {
+        profile: p.id,
+        zoom,
+    }
+}
+
+fn split_tab(first: SavedLayout, second: SavedLayout, focused: usize) -> SavedTab {
+    SavedTab::Split(SavedSplitTab {
+        layout: SavedLayout::Split {
+            axis: SavedAxis::Row,
+            ratio: 0.3,
+            first: Box::new(first),
+            second: Box::new(second),
+        },
+        focused,
+    })
+}
+
+#[test]
+fn relaunch_restores_panes_and_starts_all_visible() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    let two = split_tab(leaf(&a, 2), leaf(&b, 0), 1);
+    SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![SavedTab::Profile(b.id), two.clone(), two],
+            active: 1,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (app, _) = App::build(paths, true);
+    let w = app.windows.values().next().unwrap();
+    assert_eq!(w.tabs.len(), 3);
+    let tab = &w.tabs[1];
+    assert_eq!(tab.panes.len(), 2);
+    assert!(
+        tab.panes.iter().all(|p| p.state != TabState::NotConnected),
+        "every pane of the active tab starts"
+    );
+    assert_eq!(tab.focused_pane().profile, b.id, "focus by reading order");
+    let order = tab.layout.panes();
+    assert_eq!(tab.pane(order[0]).unwrap().zoom, 2);
+    assert!(tab.maximized.is_none());
+    assert!(
+        w.tabs[2]
+            .panes
+            .iter()
+            .all(|p| p.state == TabState::NotConnected),
+        "a background tab's panes wait"
+    );
+}
+
+#[test]
+fn restored_arrangement_is_saved_back_unchanged() {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    let state = SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![
+                SavedTab::Profile(a.id),
+                split_tab(leaf(&a, 2), leaf(&b, 0), 1),
+            ],
+            active: 1,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    };
+    state.save(&paths.state()).unwrap();
+    let (app, _) = App::build(paths, true);
+    app.save_state();
+    let back = SavedState::load_or_default(&app.paths.state());
+    assert_eq!(back.windows[0].tabs, state.windows[0].tabs);
+}
+
+/// An app with one window: a plain tab `a`, then a split tab of `a` and `b`, both panes set to
+/// `states`. Returns the app, the window and the split tab's id.
+fn app_with_split_tab(states: [TabState; 2]) -> (App, iced::window::Id, crate::tabs::TabId) {
+    let (a, b) = (profile("a"), profile("b"));
+    let paths = paths_with(&[a.clone(), b.clone()]);
+    SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![
+                SavedTab::Profile(a.id),
+                split_tab(leaf(&a, 0), leaf(&b, 0), 0),
+            ],
+            active: 0,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths, true);
+    app.state_saving_enabled = false;
+    let wid = *app.windows.keys().next().unwrap();
+    let tab = &mut app.windows.get_mut(&wid).unwrap().tabs[1];
+    let order = tab.layout.panes();
+    for (id, state) in order.into_iter().zip(states) {
+        let pane = tab.pane_mut(id).unwrap();
+        pane.state = state;
+        // A started pane draws into a terminal; this one is held by the pane alone.
+        pane.placeholder.get_or_insert_with(|| {
+            std::sync::Arc::new(parking_lot::Mutex::new(fbterm_term::Terminal::new(
+                crate::app::DEFAULT_GRID,
+                100,
+            )))
+        });
+    }
+    let id = tab.id;
+    (app, wid, id)
+}
+
+fn click_close(app: &mut App, wid: iced::window::Id, index: usize) {
+    let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Close(index)));
+}
+
+#[test]
+fn closing_split_tab_asks_first() {
+    let (mut app, wid, id) = app_with_split_tab([TabState::Connected, TabState::Connecting]);
+    click_close(&mut app, wid, 1);
+    assert_eq!(app.windows[&wid].tabs.len(), 2, "nothing closed yet");
+    assert!(matches!(
+        app.prompts.front(wid),
+        Some(crate::prompts::Dialog::CloseTab { tab, panes: 2 }) if *tab == id
+    ));
+}
+
+#[test]
+fn cancel_keeps_the_tab() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    click_close(&mut app, wid, 1);
+    let before = crate::memory::requests();
+    let _ = app.update(Message::Prompt(crate::prompts::PromptMsg::Cancel(wid)));
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 2);
+    assert_eq!(crate::memory::requests(), before);
+}
+
+#[test]
+fn confirm_closes_all_panes_and_releases_once() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    click_close(&mut app, wid, 1);
+    let before = crate::memory::requests();
+    let _ = app.update(Message::Prompt(crate::prompts::PromptMsg::CloseTab(wid)));
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 1);
+    assert_eq!(
+        crate::memory::requests() + app.pending_release.len(),
+        before + 1,
+        "one release request for both panes, now or once they are let go"
+    );
+}
+
+#[test]
+fn single_pane_tab_closes_without_asking() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    click_close(&mut app, wid, 0);
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 1);
+}
+
+#[test]
+fn split_tab_with_one_live_pane_closes_without_asking() {
+    let (mut app, wid, _) =
+        app_with_split_tab([TabState::Connected, TabState::Disconnected("gone".into())]);
+    click_close(&mut app, wid, 1);
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs.len(), 1);
+}
+
+#[test]
+fn cmd_w_on_a_split_tab_closes_the_pane_without_asking() {
+    let (mut app, wid, _) = app_with_split_tab([TabState::Connected, TabState::Connected]);
+    let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Select(1)));
+    let _ = app.close_focused_pane(wid);
+    assert!(app.prompts.front(wid).is_none());
+    assert_eq!(app.windows[&wid].tabs[1].panes.len(), 1);
+}
+
+#[test]
+fn merged_layout_survives_save_and_reload() {
+    let (a, b, c) = (profile("a"), profile("b"), profile("c"));
+    let paths = paths_with(&[a.clone(), b.clone(), c.clone()]);
+    SavedState {
+        windows: vec![SavedWindow {
+            tabs: vec![
+                split_tab(leaf(&a, 0), leaf(&b, 1), 0),
+                SavedTab::Profile(c.id),
+            ],
+            active: 1,
+            size: (900.0, 500.0),
+        }],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let wid = *app.windows.keys().next().unwrap();
+    let w = &app.windows[&wid];
+    let (target, source) = (w.tabs[0].id, w.tabs[1].id);
+    let b_pane = w.tabs[0].layout.panes()[1];
+    let _ = app.merge_tab(
+        wid,
+        source,
+        target,
+        crate::layout::Drop::Tile(b_pane, crate::layout::Side::Bottom),
+    );
+    let merged = SavedTab::Split(fbterm_config::SavedSplitTab {
+        layout: SavedLayout::Split {
+            axis: SavedAxis::Row,
+            ratio: 0.3,
+            first: Box::new(leaf(&a, 0)),
+            second: Box::new(SavedLayout::Split {
+                axis: SavedAxis::Column,
+                ratio: 0.5,
+                first: Box::new(leaf(&b, 1)),
+                second: Box::new(leaf(&c, 0)),
+            }),
+        },
+        focused: 2,
+    });
+    let on_disk = SavedState::load_or_default(&paths.state());
+    assert_eq!(on_disk.windows[0].tabs, vec![merged.clone()]);
+    assert_eq!(on_disk.windows[0].active, 0);
+
+    // Relaunched: the same arrangement, ratios and focus, saved back unchanged.
+    drop(app);
+    let (relaunched, _) = App::build(paths.clone(), true);
+    let w = relaunched.windows.values().next().unwrap();
+    assert_eq!(w.tabs.len(), 1);
+    assert_eq!(w.tabs[0].panes.len(), 3);
+    relaunched.save_state();
+    let back = SavedState::load_or_default(&paths.state());
+    assert_eq!(back.windows[0].tabs, vec![merged]);
 }

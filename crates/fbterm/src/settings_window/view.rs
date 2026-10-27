@@ -1,9 +1,9 @@
 //! The Settings window: Appearance, Terminal and Keyboard cards of labelled controls, and a
 //! footer with the settings file actions.
 
-use fbterm_config::ThemeMode;
 use fbterm_config::keys::{Action, ActionGroup, Bindings, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
+use fbterm_config::{SecretStorage, ThemeMode, WindowDecorations};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, text, text_input, toggler,
 };
@@ -11,20 +11,31 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{RecordProblem, Recording, SettingsMsg, SettingsState};
 use crate::app::Message;
+use crate::chrome::{self, Platform};
+use crate::saved_secrets::{SectionInfo, choice_label, storage_note};
+use crate::schemes::SchemeChoice;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
 const CONTENT_WIDTH: f32 = 560.0;
+
+/// The `Saved secrets` section's line while secrets move.
+const MOVING: &str = "Moving saved secrets\u{2026}";
 
 fn msg(m: SettingsMsg) -> Message {
     Message::Settings(m)
 }
 
 /// `notice`: the banner line about `settings.toml` (a load error or clamped values), if any.
+/// `secrets`: what the `Saved secrets` section shows. `chrome_fell_back`: the desktop refused
+/// drawn chrome this session (the `Title bar` row then shows `System`).
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
+    schemes: Vec<SchemeChoice>,
     notice: Option<&'a str>,
+    secrets: SectionInfo,
+    chrome_fell_back: bool,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut body = column![
@@ -43,20 +54,31 @@ pub fn view<'a>(
         body = body.push(read_only_banner(t, err));
     }
     body = body
-        .push(section(t, "Appearance", appearance(t, state, editable)))
+        .push(section(
+            t,
+            "Appearance",
+            appearance(t, state, schemes, editable, chrome_fell_back),
+        ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
+        .push(section(t, "Tunnels", tunnels(t, state, editable)))
+        .push(section(
+            t,
+            "Saved secrets",
+            saved_secrets(t, secrets, editable),
+        ))
         .push(keyboard(t, state, editable));
     let page = scrollable(
         container(container(body).max_width(CONTENT_WIDTH))
             .padding(Padding::from([24.0, 32.0]))
             .center_x(Length::Fill),
     )
-    .direction(scrollable::Direction::Vertical(
-        scrollable::Scrollbar::new()
-            .width(6)
-            .scroller_width(6)
-            .margin(3),
-    ))
+    .id(state.page.clone())
+    .direction(scrollable::Direction::Vertical(crate::ui::edge_scrollbar(
+        crate::chrome::Chrome::current().draws_controls(),
+        6.0,
+        6.0,
+        3.0,
+    )))
     .style(move |theme, status| {
         let mut s = scrollable::default(theme, status);
         s.vertical_rail.background = None;
@@ -185,7 +207,9 @@ fn setting<'a>(
 fn appearance<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
+    schemes: Vec<SchemeChoice>,
     editable: bool,
+    chrome_fell_back: bool,
 ) -> Vec<Element<'a, Message>> {
     let v = &state.values;
     let theme = row![
@@ -193,15 +217,13 @@ fn appearance<'a>(
             t,
             "Dark",
             v.theme == ThemeMode::Dark,
-            editable,
-            ThemeMode::Dark
+            editable.then(|| msg(SettingsMsg::Theme(ThemeMode::Dark))),
         ),
         segment(
             t,
             "Light",
             v.theme == ThemeMode::Light,
-            editable,
-            ThemeMode::Light
+            editable.then(|| msg(SettingsMsg::Theme(ThemeMode::Light))),
         ),
     ]
     .spacing(2);
@@ -215,6 +237,34 @@ fn appearance<'a>(
     .width(240)
     .style(move |_, status| pick_style(t, status))
     .menu_style(move |_| menu_style(t));
+    let current = Some(v.color_scheme.as_str());
+    let picker: Element<'a, Message> = if editable {
+        let selected = crate::schemes::chosen(&schemes, current);
+        pick_list(schemes, selected, |c: SchemeChoice| {
+            msg(SettingsMsg::ColorScheme(c.id.unwrap_or_default()))
+        })
+        .placeholder(crate::schemes::NOT_FOUND)
+        .font(UI_FONT)
+        .text_size(12.5)
+        .padding(Padding::from([6.0, 10.0]))
+        .width(200)
+        .style(move |_, status| pick_style(t, status))
+        .menu_style(move |_| menu_style(t))
+        .into()
+    } else {
+        fixed_choice(t, crate::schemes::shown(&schemes, current), 200.0)
+    };
+    let scheme = row![
+        picker,
+        small_button(
+            t,
+            "Edit schemes\u{2026}",
+            msg(SettingsMsg::EditSchemes),
+            ui::secondary
+        ),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
     let size = row![
         slider(FONT_SIZE_RANGE.0..=FONT_SIZE_RANGE.1, v.font_size, |x| msg(
             SettingsMsg::FontSize(x)
@@ -255,10 +305,10 @@ fn appearance<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let (blur_hint, blur_inert) = blur_hint(cfg!(target_os = "macos"), v.background_opacity);
-    vec![
+    let mut rows = vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
+        setting(t, "Color scheme", None, false, scheme),
         setting(t, "Font size", None, false, size),
         setting(
             t,
@@ -267,20 +317,77 @@ fn appearance<'a>(
             false,
             opacity,
         ),
-        setting(
+        blur_setting(
             t,
-            "Background blur",
-            Some(blur_hint),
-            blur_inert,
-            switch(
-                t,
-                v.background_blur,
-                editable,
-                blur_inert,
-                SettingsMsg::Blur,
-            ),
+            v.background_blur,
+            editable,
+            chrome::blur_here(),
+            v.background_opacity,
         ),
-    ]
+    ];
+    if shows_title_bar_row(chrome::setup().look) {
+        let shown = title_bar_shown(v.window_decorations, chrome_fell_back);
+        let title_bar = row![
+            segment(
+                t,
+                "fbterm",
+                shown == WindowDecorations::Fbterm,
+                editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::Fbterm))),
+            ),
+            segment(
+                t,
+                "System",
+                shown == WindowDecorations::System,
+                editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::System))),
+            ),
+        ]
+        .spacing(2);
+        let title_bar = container(title_bar).padding(2).style(move |_| well(t));
+        rows.push(setting(t, "Title bar", None, false, title_bar));
+    }
+    rows
+}
+
+/// The `Background blur` row: the switch for `on`, usable only when `editable` and the system
+/// can blur (`supported`), with the hint for `opacity` (see [`blur_row`]).
+pub(super) fn blur_setting<'a>(
+    t: &'static Tokens,
+    on: bool,
+    editable: bool,
+    supported: bool,
+    opacity: f32,
+) -> Element<'a, Message> {
+    let blur = blur_row(supported, opacity);
+    setting(
+        t,
+        "Background blur",
+        Some(blur.hint),
+        blur.inert,
+        switch(
+            t,
+            on,
+            editable && blur.enabled,
+            blur.inert,
+            SettingsMsg::Blur,
+        ),
+    )
+}
+
+/// What the `Title bar` row shows as chosen: what is on screen. After the desktop refused
+/// drawn chrome that is `System` even though the setting stays `"fbterm"`, so one click on
+/// `fbterm` tries drawn chrome again.
+pub fn title_bar_shown(setting: WindowDecorations, fell_back: bool) -> WindowDecorations {
+    if fell_back {
+        WindowDecorations::System
+    } else {
+        setting
+    }
+}
+
+/// Whether the Settings window offers the `Title bar` choice: only where windows follow
+/// Linux's conventions (the `window_decorations` setting is ignored elsewhere).
+pub fn shows_title_bar_row(look: Platform) -> bool {
+    look == Platform::Linux
 }
 
 fn terminal<'a>(
@@ -328,6 +435,104 @@ fn terminal<'a>(
         ),
         setting(t, "Redraw rate", Some(state.rate_hint()), false, rate),
     ]
+}
+
+fn tunnels<'a>(
+    t: &'static Tokens,
+    state: &'a SettingsState,
+    editable: bool,
+) -> Vec<Element<'a, Message>> {
+    let retries = row![
+        text_input("10", &state.retries_text)
+            .on_input_maybe(editable.then_some(|s| msg(SettingsMsg::RetriesText(s))))
+            .on_submit_maybe(editable.then(|| msg(SettingsMsg::RetriesSubmit)))
+            .font(MONO)
+            .size(12.5)
+            .padding(Padding::from([6.0, 10.0]))
+            .width(110)
+            .align_x(Alignment::End)
+            .style(move |_, s| ui::input_style(t, s)),
+        unit(t, "attempts"),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    vec![setting(
+        t,
+        "Reconnect attempts",
+        Some("0 turns automatic reconnecting off"),
+        false,
+        retries,
+    )]
+}
+
+/// Where saved passwords and passphrases live, with a line for a move under way or its
+/// outcome, and `Reset vault` while a vault exists.
+fn saved_secrets<'a>(
+    t: &'static Tokens,
+    info: SectionInfo,
+    editable: bool,
+) -> Vec<Element<'a, Message>> {
+    let free = editable && !info.busy;
+    let mut choices = row![].spacing(2);
+    for choice in [
+        SecretStorage::Auto,
+        SecretStorage::Keychain,
+        SecretStorage::Vault,
+    ] {
+        choices = choices.push(segment(
+            t,
+            choice_label(choice),
+            info.choice == choice,
+            free.then(|| msg(SettingsMsg::SecretStorage(choice))),
+        ));
+    }
+    let choices = container(choices).padding(2).style(move |_| well(t));
+    let hint = format!("{}.", storage_note(info.active));
+    let mut storage = column![
+        row![
+            column![
+                text("Storage").font(UI_FONT).size(13).color(t.text),
+                text(hint).font(UI_FONT).size(12).color(t.text_muted),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+            choices,
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(8)
+    .padding(Padding::from([12.0, 16.0]));
+    let status = if info.busy {
+        Some((MOVING.to_owned(), t.text_secondary))
+    } else {
+        info.notice
+            .map(|n| (n.text, if n.error { t.danger } else { t.text_secondary }))
+    };
+    if let Some((line, color)) = status {
+        storage = storage.push(
+            text(line)
+                .font(UI_FONT)
+                .size(12)
+                .color(color)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        );
+    }
+    let mut rows = vec![storage.into()];
+    if info.vault_exists {
+        let reset = button(text("Reset vault").font(UI_FONT).size(12))
+            .on_press_maybe(free.then(|| msg(SettingsMsg::ResetVault)))
+            .padding(Padding::from([3.0, 10.0]))
+            .style(move |_, status| ui::danger_ghost(t, status));
+        rows.push(setting(
+            t,
+            "Encrypted vault",
+            Some("Forgot the main password? Reset deletes the saved secrets; profiles are kept."),
+            false,
+            reset,
+        ));
+    }
+    rows
 }
 
 /// The Scrollback row. While a lowered value waits, a warning with Apply and Cancel sits under
@@ -594,7 +799,7 @@ fn key_row<'a>(
             .into(),
         ),
         None if fixed => Some(
-            text("Fixed on macOS: the app menu owns it.")
+            text("Fixed on macOS. While transfers run it asks first.")
                 .font(UI_FONT)
                 .size(12)
                 .color(t.text_muted)
@@ -702,6 +907,34 @@ fn footer<'a>(
     .into()
 }
 
+/// A list drawn as its chosen value only, for a read-only window.
+pub(crate) fn fixed_choice<'a>(
+    t: &'static Tokens,
+    value: String,
+    width: f32,
+) -> Element<'a, Message> {
+    container(
+        text(value)
+            .font(UI_FONT)
+            .size(12.5)
+            .color(t.text_secondary)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding(Padding::from([6.0, 10.0]))
+    .width(width)
+    .clip(true)
+    .style(move |_| container::Style {
+        background: Some(t.surface.into()),
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
 fn unit<'a>(t: &'static Tokens, s: &'a str) -> Element<'a, Message> {
     container(text(s).font(UI_FONT).size(12).color(t.text_muted))
         .width(32)
@@ -728,15 +961,31 @@ fn number<'a>(
         .into()
 }
 
-/// The blur row's hint, and whether blur has no effect now (it is still saved): only macOS
-/// blurs for now, and only below full opacity.
-pub fn blur_hint(mac: bool, opacity: f32) -> (&'static str, bool) {
-    if !mac {
-        ("macOS only for now", true)
+/// How the blur row shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlurRow {
+    pub hint: &'static str,
+    /// Drawn muted: blur has no effect now (a switch that can be used is still saved).
+    pub inert: bool,
+    /// The switch can be used.
+    pub enabled: bool,
+}
+
+/// The blur row where the system can blur (`supported`, see [`chrome::blur_supported`]) at
+/// `opacity`: blur only shows below full opacity; where it is not supported the switch cannot
+/// be used at all.
+pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
+    let (hint, inert, enabled) = if !supported {
+        ("Not supported on this system", true, false)
     } else if opacity >= 1.0 {
-        ("Needs opacity below 100%", true)
+        ("Needs opacity below 100%", true, true)
     } else {
-        ("Applies to new windows", false)
+        ("Applies to new windows", false, true)
+    };
+    BlurRow {
+        hint,
+        inert,
+        enabled,
     }
 }
 
@@ -755,15 +1004,15 @@ fn switch<'a>(
         .into()
 }
 
+/// One button of a segmented control; `on_press`: `None` while it cannot change.
 fn segment<'a>(
     t: &'static Tokens,
     caption: &'a str,
     selected: bool,
-    editable: bool,
-    mode: ThemeMode,
+    on_press: Option<Message>,
 ) -> Element<'a, Message> {
     button(text(caption).font(UI_FONT).size(12.5))
-        .on_press_maybe(editable.then(|| msg(SettingsMsg::Theme(mode))))
+        .on_press_maybe(on_press)
         .padding(Padding::from([4.0, 14.0]))
         .style(move |_, status| {
             let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
@@ -802,7 +1051,7 @@ fn well(t: &Tokens) -> container::Style {
 }
 
 /// `editable` false: drawn muted (a slider has no disabled state of its own).
-fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -> slider::Style {
+pub(crate) fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -> slider::Style {
     let active = !matches!(status, slider::Status::Active);
     if !editable {
         return slider::Style {
@@ -840,7 +1089,7 @@ fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -> slider::S
     }
 }
 
-fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::Style {
+pub(crate) fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::Style {
     let (on, hovered, disabled) = match status {
         toggler::Status::Active { is_toggled } => (is_toggled, false, false),
         toggler::Status::Hovered { is_toggled } => (is_toggled, true, false),
@@ -873,7 +1122,7 @@ fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::S
     }
 }
 
-fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
+pub(crate) fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
     let border = match status {
         pick_list::Status::Opened { .. } => t.accent_edge,
         pick_list::Status::Hovered => t.text_muted,
@@ -892,7 +1141,7 @@ fn pick_style(t: &Tokens, status: pick_list::Status) -> pick_list::Style {
     }
 }
 
-fn menu_style(t: &Tokens) -> iced::overlay::menu::Style {
+pub(crate) fn menu_style(t: &Tokens) -> iced::overlay::menu::Style {
     iced::overlay::menu::Style {
         background: Background::Color(t.raised),
         border: Border {

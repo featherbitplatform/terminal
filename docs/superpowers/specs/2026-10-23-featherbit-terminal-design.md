@@ -92,6 +92,9 @@ Success: the owner uses it as their only terminal for full working days, startin
 - Docs site: Docusaurus in `website/`, deployed by a `.github/workflows/docs.yml` to
   `https://featherbitplatform.github.io/terminal/` (same pattern as `gateway/website`,
   `baseUrl: '/terminal/'`).
+- Secrets and archives use `age` with a passphrase recipient and never home-grown crypto; a shared
+  archive can never carry a password, passphrase, private key or key path. Done 2026-10-27
+  (milestone 5; see 5.4, 5.9 and `2026-10-27-export-vault-design.md`).
 
 ## 5. How it works
 
@@ -143,14 +146,15 @@ scrollback is complete) but never render. The UI thread only renders the visible
 **Connection model** *(builder's call made at design time)*: one SSH connection per profile,
 shared by everything using it, in the spirit of OpenSSH's ControlMaster. Each tab or pane on that
 profile is its own shell channel on the shared connection; the file panel and tunnels are further
-channels on it. Tunnels are owned by the connection, not by a tab, so `on-connect` tunnels start once
-when the connection is first established. Starting an on-demand tunnel with no tab open creates a
+channels on it. Tunnels are owned by the connection, not by a tab, so `with-shell` tunnels start once
+when the profile's first shell connects and stop when its last shell closes. Starting an on-demand tunnel with no tab open creates a
 background connection without a shell. The connection closes when its last channel (tab, file panel
 or tunnel) closes; closing a tab never drops a tunnel that is still running.
 
 **Windows and restore** *(builder's call)*: multi-window from the start (iced daemon/multi-window
 mode); the palette opens over the focused window. On relaunch the app restores windows, tabs and
-pane layout, reconnecting only the visible pane of each window and the rest on first focus.
+pane layout, reconnecting every pane of the visible tab of each window at once (they are all on
+screen) and the panes of other tabs when their tab is first shown.
 
 ### 5.4 Profiles and credentials
 
@@ -162,12 +166,16 @@ pane layout, reconnecting only the visible pane of each window and the rest on f
   are stored as **one** OS-keychain item (a serialized map keyed by profile id), not one item per
   profile: unsigned macOS builds change code identity on every release, so macOS re-asks for keychain
   access after each update, and one item keeps that to a single prompt instead of one per profile.
-- **Optional main password** *(later milestone)*: for machines where the OS keychain is not trusted,
-  secrets go into an `age`-encrypted vault file unlocked once per app start.
+- **Optional main password** *(done 2026-10-27, milestone 5)*: for machines where the OS keychain is
+  not trusted, secrets go into an `age`-encrypted vault file (`secrets.fbvault`) unlocked once per
+  app session. The `secret_storage` setting picks Automatic, the system storage (the OS keychain;
+  on Windows a DPAPI-encrypted file, `secrets.dpapi`) or the vault; switching moves every secret.
+  Key profiles may have no key file: connecting asks for one and remembers it. See
+  `2026-10-27-export-vault-design.md`.
 - **Jump chain:** an ordered list of references to other saved SSH profiles (so a bastion is defined
   once). The app connects to hop 1, opens a `direct-tcpip` channel to hop 2 through it, runs SSH over
   that channel, and so on. Each hop authenticates with its own profile's credentials. Up to at least
-  two hops; no hard limit.
+  two hops; at most 32 hops once expanded (done 2026-10-27, milestone 5).
 - **Host keys:** read and write `~/.ssh/known_hosts` (shared with OpenSSH). Unknown host: show the
   fingerprint and ask (trust-on-first-use). Changed key: refuse and explain; never auto-accept.
 - **Local shell discovery:** on first run, detect available shells (`$SHELL`, `/etc/shells` on
@@ -186,18 +194,33 @@ palette does; profiles rank above actions.
 
 - Tabs show profile name, connection state (connecting / connected / disconnected) and the profile
   accent color.
-- Tiling (milestone 2): split a tab into panes horizontally/vertically, resize, move focus by
-  keyboard, close a pane. Any pane can hold any profile.
+- Tiling *(milestone 2, done 2026-10-26; design and decisions in `2026-10-26-tiling-design.md`)*:
+  a tab is a tree of panes split side by side or top and bottom, to any depth; each pane is its own
+  session and holds any profile, local or SSH, in any mix. As built: the focused pane has a thin
+  accent outline and the others are dimmed (a tab with one pane has neither); dividers drag, and a
+  double-click on one shares its split equally; a split or drag never leaves a pane under 20
+  columns by 5 rows; focus moves by click or by direction (the nearest pane whose edge overlaps,
+  ties to the most recently focused); each pane zooms on its own; Maximize shows one pane alone
+  while the others keep running; closing a pane gives its space to its sibling, and closing a tab
+  with several live panes asks first. Tiles rearrange: a tab drags from the tab bar onto another
+  tab's content to merge as tiles, a tile moves by a hover handle (or a drag with Cmd, Ctrl+Shift
+  elsewhere) within its tab, onto another tile's edge or the tab's outer edge, and onto the tab
+  bar to become a tab; the palette offers the same as "Merge tab into...", "Move tile..." and
+  "Move tile to new tab". Sessions keep running through every rearrangement. Layout, ratios,
+  zoom and focus are saved in `state.toml` (an old file loads as single-pane tabs). Search covers
+  panes (see 5.12). A tab shows an indicator when any of its panes is disconnected or exited.
 - Disconnected SSH sessions keep their scrollback and show an inline "disconnected, press Enter to
   reconnect" notice *(builder's call)*.
 
 ### 5.7 Tunnels
 
 Defined per SSH profile: name, kind, bind address/port, target host/port, start mode
-(`on-connect` | `on-demand`). Kinds: **local forward** (the owner's use cases), plus *(builder's
+(`with-shell` | `on-demand`). Kinds: **local forward** (the owner's use cases), plus *(builder's
 call)* **remote forward** and **dynamic SOCKS**. All ride the profile's connection, therefore
 through its jump chain. Each tunnel shows state (listening, active connections, failed with reason
-such as "port in use"); on-demand tunnels toggle from the session UI and the palette.
+such as "port in use"); every tunnel toggles from the Tunnels window and the palette. A dropped connection under a
+running tunnel is retried with backoff and shown as reconnecting. Done 2026-10-27 (milestone 3);
+see `2026-10-27-tunnels-design.md`.
 
 ### 5.8 File panel
 
@@ -206,6 +229,8 @@ listing with size/mtime, navigate, download, upload, drag in from and out to Fin
 mkdir/rename/delete *(builder's call)*. Transfers run in a queue with progress at the bottom of the
 panel and do not block the terminal. Starting directory: the remote home *(builder's call; following
 the shell's cwd can come later)*.
+Done 2026-10-27 (milestone 4): SFTP browsing, downloads and uploads with a transfer queue; mkdir,
+rename, delete and drag out to Finder were left out; see `2026-10-27-file-panel-design.md`.
 
 ### 5.9 Export / import
 
@@ -219,6 +244,7 @@ Export picks profiles (all or a selection) and a mode:
 
 Import decrypts, previews, and merges by name with "skip / overwrite / keep both" on conflict.
 Jump-chain references are exported together with the profiles they point to.
+Done 2026-10-27 (milestone 5); see `2026-10-27-export-vault-design.md`.
 
 ### 5.10 Theming
 
@@ -226,8 +252,10 @@ Jump-chain references are exported together with the profiles they point to.
 - Terminal color scheme: built-in schemes (including a default derived from the Graphite palette)
   plus user-imported schemes *(builder's call: accept a simple TOML scheme format; supporting popular
   third-party formats is a nice-to-have)*.
-- Per-profile accent: shown on tab and pane border; a scheme override per profile is a
-  nice-to-have.
+- Per-profile accent: shown on tab and pane border (pane border in split tabs only). A scheme
+  override per profile is built too. *(Done 2026-10-27, milestone 2: built-in schemes Graphite,
+  Graphite Light, Harbor and Ember, user schemes as TOML files, the Color schemes window, global
+  and per-profile choice; see `2026-10-27-color-schemes-design.md`.)*
 - *(Owner's decision, 2026-10-23)* **Unified title bar on macOS.** The tab bar is the title bar:
   the OS title strip is transparent and hidden, the content runs under it, the native window
   buttons stay and sit vertically centered on the bar (32 px high, tabs start 78 px in, at the
@@ -270,8 +298,11 @@ Jump-chain references are exported together with the profiles they point to.
 ### 5.11 Keyboard defaults *(builder's call)*
 
 Cmd on macOS, Ctrl+Shift elsewhere: new tab (opens the palette), close, next/prev tab, tab 1..9,
-palette (Cmd+Shift+P), split right/down, focus pane by direction, toggle file panel, find in
-scrollback. All rebindable (see 5.11.1). *(Owner's decision, 2026-10-24)* Settings is Cmd+,
+palette (Cmd+Shift+P), split right (Cmd+D, Ctrl+Shift+D elsewhere) and down (Cmd+Shift+D,
+Ctrl+Shift+Alt+D), focus pane by direction (Cmd+Option+arrow, Ctrl+Alt+arrow), zoom the focused
+pane (Cmd+=, Cmd+-, Cmd+0; Ctrl+Shift+ the same keys elsewhere), maximize pane (Cmd+Shift+Enter,
+Ctrl+Shift+Enter), toggle file panel, find in scrollback. Find in this tab, Merge tab into,
+Move tile and Move tile to new tab have no default chord. All rebindable (see 5.11.1). *(Owner's decision, 2026-10-24)* Settings is Cmd+,
 on macOS and Ctrl+, elsewhere (the one Ctrl chord without Shift); the profile editor is
 Cmd+Shift+, (Ctrl+Shift+, elsewhere). Tab-bar buttons show their action and chord in a tooltip,
 derived from the same table.
@@ -322,7 +353,7 @@ derived from the same table.
 
 ### 5.12 Search *(owner's decisions, 2026-10-24; done)*
 
-- **Find in tab:** Cmd+F (Ctrl+Shift+F elsewhere) opens a slim bar at the top of the active tab's
+- **Find in pane:** Cmd+F (Ctrl+Shift+F elsewhere) opens a slim bar at the top of the focused pane's
   terminal (floating at the top right, so the grid and the pty keep their size). Incremental
   search over the whole scrollback and screen; all matches in view tinted violet, the current
   one in the accent; Enter / Shift+Enter and Cmd+G / Cmd+Shift+G (Ctrl+G / Ctrl+Shift+G
@@ -338,7 +369,9 @@ derived from the same table.
   and 500 overall with "more matches" notes, streaming in tab by tab. Enter focuses the window,
   selects the tab, closes the box and opens that tab's find bar on the same query with the chosen
   match current. Every tab of every window, hidden and disconnected ones included.
-- Both are palette actions ("Find in tab", "Find in all tabs").
+- Both are palette actions ("Find in pane", "Find in all tabs"); in a tab with panes each pane has
+  its own bar and results of find in all tabs name the pane, and "Find in this tab" limits that box
+  to the current tab's panes.
 - Builder's notes on the implementation: the search uses the `regex` crate over each logical line
   (rows joined across soft wraps), walking the scrollback newest first in 1000-row chunks with
   the terminal locked one chunk at a time (about 0.5 ms), on tokio's blocking pool, cancellable
@@ -428,15 +461,24 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    keychain password), jump hosts, host-key checks, profile editor, quick-launch palette, settings
    file, Graphite theme, CI (macOS + Linux + Windows build/test), unsigned macOS `.dmg` (Apple
    Silicon and Intel) on GitHub releases, docs site skeleton on GitHub Pages.
-2. Tiling, per-profile accent, color schemes, find in scrollback (find in scrollback done
-   2026-10-24, with a search over all tabs; see 5.12).
-3. Tunnels.
-4. File panel.
-5. Export/import, optional main-password vault.
-6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
-   (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
-   Windows and Linux: draw OS-styled window controls in the tab bar (no OS title bar),
-   drag/double-click/resize from edges; background blur where the platform supports it.
+2. Tiling, per-profile accent, color schemes, find in scrollback (milestone 2 done 2026-10-27; color schemes and pane accent borders: see 5.10 and `2026-10-27-color-schemes-design.md`; find in scrollback done
+   2026-10-24, with a search over all tabs; see 5.12; tiling done 2026-10-26, see 5.6 and
+   `2026-10-26-tiling-design.md`; measurements in `dev/perf/README.md`, scenario H).
+3. Tunnels (done 2026-10-27; see 5.7 and `2026-10-27-tunnels-design.md`).
+4. File panel (done 2026-10-27; see 5.8 and `2026-10-27-file-panel-design.md`).
+5. Export/import, optional main-password vault (done 2026-10-27; see 5.4, 5.9 and
+   `2026-10-27-export-vault-design.md`).
+6. Releases and later items.
+   - Windows and Linux release artifacts: done 2026-10-27 (design in
+     `2026-10-27-linux-windows-releases-design.md`): `.deb`, `.rpm` and `.tar.gz` for x86_64 and
+     aarch64, a Windows x86-64 `.msi`, one release workflow publishing them with the macOS `.dmg`;
+     drawn window controls in the tab bar (no OS title bar; the Linux `window_decorations`
+     setting with automatic fallback), drag, double-click and edge resize; background blur on
+     Windows 11 22H2+ and KDE Plasma under Wayland. Checks that need real machines are listed in
+     `CLAUDE.md` ("Hardware checks").
+   - Later: reading `~/.ssh/config` hosts into the palette; signing (when decided); deferred auth
+     methods (2FA, FIDO keys, certificates, agent forwarding); winget, apt and dnf repositories,
+     auto-update and Flatpak.
 
 Look-and-feel follow-up: Evaluate replacing window blur with Apple's public NSVisualEffectView
 (follows Reduce transparency, native vibrancy).
@@ -510,9 +552,13 @@ with full default scrollback at most 200 MB resident (scenario E), measured at 1
   session backends (pty, ssh), profiles/config/secrets, app/UI).
 - `cargo fmt`, `cargo clippy -D warnings`, `cargo test`, `cargo deny` in CI; security scanning in
   the spirit of the gateway's (gitleaks etc.) *(builder's call)*.
-- Release workflow on `v*` tags: build macOS universal (or per-arch) `.app` bundled into `.dmg`,
-  attach to the GitHub release with checksums. Docs explain the unsigned first-launch step
-  (right-click > Open, or `xattr -d com.apple.quarantine`).
+- Release workflow on `v*` tags: builds the macOS universal `.dmg`, the Linux `.deb`, `.rpm` and
+  `.tar.gz` (x86_64, aarch64) and the Windows x86-64 `.msi`, smoke-tests them, and attaches
+  everything to one GitHub release with a `.sha256` for each (done; the tag must match the
+  workspace version). Docs explain the unsigned first-launch step on each system (macOS: Open
+  Anyway or `xattr -d com.apple.quarantine`; Windows: SmartScreen `More info`, `Run anyway`) in
+  `website/docs/install-*.md`.
+- Not yet (later): winget, apt and dnf repositories, auto-update, Flatpak, code signing.
 - A `CLAUDE.md` for the repo is written once this design is approved.
 
 ## 9. Left to the builder

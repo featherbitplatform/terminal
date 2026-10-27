@@ -3,6 +3,9 @@ name = "fbterm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "featherbit terminal: an SSH-first terminal with saved profiles, tabs, split panes, tunnels and a file panel"
+homepage = "https://featherbitplatform.github.io/terminal/"
+repository = "https://github.com/featherbitplatform/terminal"
 
 [lints]
 workspace = true
@@ -20,6 +23,7 @@ async-trait = { workspace = true }
 directories = { workspace = true }
 rfd = { workspace = true }
 chrono = { workspace = true }
+zeroize = { workspace = true }
 notify = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -27,17 +31,109 @@ tracing-subscriber = { workspace = true }
 png = { workspace = true }
 
 [dev-dependencies]
+# The secrets crate with `test-support`, to search decrypted archives in tests.
+fbterm-secrets = { path = "../fbterm-secrets", features = ["test-support"] }
 feathercritty = { workspace = true }
 toml = { workspace = true }
 read-fonts = "=0.41.0"
+# Temporary folders that remove themselves (already in the lockfile through fbterm-session).
+tempfile = "3"
+# A headless renderer for driving widgets through `Widget::update` in tests (the version iced uses).
+iced_tiny_skia = "=0.14.1"
 
-# Window occlusion (see `visibility.rs`) and display refresh rate (`display_rate.rs`): the same versions iced's windowing already uses.
+# Window occlusion (see `visibility.rs`), display refresh rate (`display_rate.rs`) and the app menu's Quit key (`chrome.rs`): the same versions iced's windowing already uses.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSNotification", "NSOperation", "NSString"] }
-objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSNotification", "NSOperation", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSMenu", "NSMenuItem", "NSResponder", "NSScreen", "NSView", "NSWindow"] }
 
 # `malloc_trim` for `memory::release_freed` (glibc only; macOS declares its own call, other targets do nothing).
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"
+
+# Background blur on Windows 11 (`chrome::system_backdrop`): the acrylic system backdrop set on
+# the window's handle; the versions the rest of the workspace and iced's windowing use.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Graphics_Dwm"] }
+raw-window-handle = "0.6"
+
+# The icon and version information in fbterm.exe (build.rs); without the default `toml`
+# feature it reads nothing but cargo's environment and adds only `version_check`.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
+
+# Linux packages, built by dev/package-linux.sh (cargo-deb and cargo-generate-rpm) in an
+# almalinux:9 container: glibc 2.34, the oldest of the supported systems (RHEL 9; Ubuntu 22.04
+# has 2.35, Debian 12 2.36), so the binary asks for no newer glibc symbol than 2.34. It links
+# only glibc and libgcc (RPM finds those itself); everything else below is a library it opens
+# at run time (checked with `strings` on the release binary):
+# - windowing and keyboard: libxkbcommon(-x11), libwayland-client, libX11, libX11-xcb,
+#   libXcursor, libXi, libxcb; required, they are small and every desktop has them;
+# - file dialogs: libdbus-1 (the desktop portal); required;
+# - graphics: libvulkan, libEGL, libwayland-egl; only recommended (weak on RPM), so a
+#   minimal install still runs `fbterm --version`; the desktop's GPU stack provides them.
+# Saved secrets use the Secret Service over D-Bus in pure Rust: no library to declare.
+[package.metadata.deb]
+name = "fbterm"
+maintainer = "featherbit <featherbit-gw@outlook.com>"
+copyright = "featherbit"
+license-file = ["../../LICENSE", "0"]
+extended-description = """\
+featherbit terminal is a native terminal built for SSH: saved profiles with jump hosts, \
+tabs and split panes, named tunnels, an SFTP file panel and encrypted profile export. \
+It also runs local shells."""
+section = "x11"
+priority = "optional"
+depends = "libc6 (>= 2.34), libgcc-s1, libxkbcommon0, libxkbcommon-x11-0, libwayland-client0, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxcb1, libdbus-1-3"
+recommends = "libvulkan1, libegl1, libwayland-egl1"
+assets = [
+    ["target/release/fbterm", "usr/bin/", "755"],
+    ["linux/fbterm.desktop", "usr/share/applications/", "644"],
+    ["linux/icons/hicolor/32x32/apps/fbterm.png", "usr/share/icons/hicolor/32x32/apps/", "644"],
+    ["linux/icons/hicolor/64x64/apps/fbterm.png", "usr/share/icons/hicolor/64x64/apps/", "644"],
+    ["linux/icons/hicolor/128x128/apps/fbterm.png", "usr/share/icons/hicolor/128x128/apps/", "644"],
+    ["linux/icons/hicolor/256x256/apps/fbterm.png", "usr/share/icons/hicolor/256x256/apps/", "644"],
+    ["linux/icons/hicolor/512x512/apps/fbterm.png", "usr/share/icons/hicolor/512x512/apps/", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "fbterm"
+summary = "featherbit terminal: an SSH-first terminal"
+url = "https://featherbitplatform.github.io/terminal/"
+assets = [
+    { source = "target/release/fbterm", dest = "/usr/bin/fbterm", mode = "755" },
+    { source = "linux/fbterm.desktop", dest = "/usr/share/applications/fbterm.desktop", mode = "644" },
+    { source = "linux/icons/hicolor/32x32/apps/fbterm.png", dest = "/usr/share/icons/hicolor/32x32/apps/fbterm.png", mode = "644" },
+    { source = "linux/icons/hicolor/64x64/apps/fbterm.png", dest = "/usr/share/icons/hicolor/64x64/apps/fbterm.png", mode = "644" },
+    { source = "linux/icons/hicolor/128x128/apps/fbterm.png", dest = "/usr/share/icons/hicolor/128x128/apps/fbterm.png", mode = "644" },
+    { source = "linux/icons/hicolor/256x256/apps/fbterm.png", dest = "/usr/share/icons/hicolor/256x256/apps/fbterm.png", mode = "644" },
+    { source = "linux/icons/hicolor/512x512/apps/fbterm.png", dest = "/usr/share/icons/hicolor/512x512/apps/fbterm.png", mode = "644" },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/fbterm/LICENSE", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+libxkbcommon = "*"
+libxkbcommon-x11 = "*"
+libwayland-client = "*"
+libX11 = "*"
+libX11-xcb = "*"
+libXcursor = "*"
+libXi = "*"
+libxcb = "*"
+dbus-libs = "*"
+# Owns the /usr/share/icons/hicolor folders the icons go in, so removal leaves none behind.
+hicolor-icon-theme = "*"
+
+[package.metadata.generate-rpm.recommends]
+vulkan-loader = "*"
+mesa-libEGL = "*"
+libwayland-egl = "*"
+
+# Windows installer, built by dev/package-windows.ps1 with cargo-wix (the version pinned in
+# .github/workflows/release.yml) from wix/main.wxs. The upgrade code there is fixed forever
+# (every release shares it, so a newer one replaces an older one); it is recorded here too
+# for `cargo wix print wxs`. The installed exe carries its icon and version information
+# from build.rs.
+[package.metadata.wix]
+upgrade-guid = "D2F13F2B-68C8-4ED4-9953-D6E612A1FA8D"

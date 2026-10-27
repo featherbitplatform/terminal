@@ -9,15 +9,19 @@ use std::time::Duration;
 use fbterm_config::keys::{self as keymap, Action, Bindings, Chord};
 use fbterm_config::settings::{
     DEFAULT_MAX_FPS, FONT_SIZE_RANGE, OPACITY_RANGE, SCROLLBACK_RANGE, SCROLLBACK_WARN_ABOVE,
+    TUNNEL_RETRIES_RANGE,
 };
-use fbterm_config::{ConfigError, MaxFps, SettingChange, Settings, ThemeMode};
+use fbterm_config::{
+    ConfigError, MaxFps, SecretStorage, SettingChange, Settings, ThemeMode, WindowDecorations,
+};
 
 mod fonts;
 mod glue;
 pub mod view;
 
 pub use fonts::FontChoice;
-pub(crate) use glue::terminal_style;
+pub(crate) use fonts::{BUNDLED as BUNDLED_FONT, choices as font_choices, installed_monospace};
+pub(crate) use glue::{intern, terminal_style};
 
 /// Quiet period after the last slider or typing change before the file is written.
 pub const WRITE_DEBOUNCE: Duration = Duration::from_millis(300);
@@ -30,12 +34,16 @@ pub enum SettingsMsg {
     Close,
     OpenFile,
     RevealFolder,
+    /// Open the Color schemes window.
+    EditSchemes,
     /// The quiet period after change number `n` passed.
     Flush(u64),
     /// A slider was let go: write now.
     Release,
     Theme(ThemeMode),
     Font(FontChoice),
+    /// The id of the chosen global color scheme.
+    ColorScheme(String),
     FontSize(f32),
     FontSizeText(String),
     FontSizeSubmit,
@@ -45,12 +53,17 @@ pub enum SettingsMsg {
     OpacityText(String),
     OpacitySubmit,
     Blur(bool),
+    /// Who draws the title bar (Linux).
+    TitleBar(WindowDecorations),
     ScrollbackText(String),
     ScrollbackSubmit,
     /// Confirm lowering the scrollback below what an open tab holds: save and trim.
     ScrollbackApply,
     /// Drop the lowered value: the saved one comes back.
     ScrollbackCancel,
+    /// Reconnect attempts for tunnels, typed.
+    RetriesText(String),
+    RetriesSubmit,
     Kitty(bool),
     MaxFps(MaxFps),
     /// Record a new chord for an action (a click on its chord).
@@ -67,6 +80,11 @@ pub enum SettingsMsg {
     ClearKey(Action),
     /// Put every default chord back.
     ResetKeys,
+    /// A `Saved secrets` choice: the app moves the secrets (asking for the main password
+    /// when the vault needs it) and then writes it.
+    SecretStorage(SecretStorage),
+    /// `Reset vault`: the app asks first.
+    ResetVault,
 }
 
 /// A chord being recorded in the Keyboard section.
@@ -155,6 +173,8 @@ pub struct SettingsState {
     /// Background opacity in percent, as typed.
     pub opacity_text: String,
     pub scrollback_text: String,
+    /// Tunnel reconnect attempts, as typed.
+    pub retries_text: String,
     /// A lower scrollback typed but not saved, because an open tab holds more lines than it
     /// and applying it would cut them: the window asks (Apply / Cancel) first.
     pub pending_lower: Option<usize>,
@@ -178,9 +198,11 @@ pub struct SettingsState {
     pending: Vec<SettingChange>,
     /// Counts debounced changes, so only the last of a burst writes.
     generation: u64,
+    /// The scrolling page, for the `FBTERM_OPEN_SETTINGS=secrets` debug aid.
+    pub page: iced::widget::Id,
 }
 
-fn size_text(v: f32) -> String {
+pub(crate) fn size_text(v: f32) -> String {
     format!("{v}")
 }
 
@@ -201,6 +223,7 @@ impl SettingsState {
             font_size_text: String::new(),
             opacity_text: String::new(),
             scrollback_text: String::new(),
+            retries_text: String::new(),
             pending_lower: None,
             held_lower: None,
             max_open_history: 0,
@@ -211,6 +234,7 @@ impl SettingsState {
             recording: None,
             pending: Vec::new(),
             generation: 0,
+            page: iced::widget::Id::unique(),
         };
         state.sync(values);
         state
@@ -227,6 +251,7 @@ impl SettingsState {
         self.font_size_text = size_text(values.font_size);
         self.opacity_text = percent_text(values.background_opacity);
         self.scrollback_text = values.scrollback_lines.to_string();
+        self.retries_text = values.tunnel_max_retries.to_string();
         self.pending_lower = None;
         self.held_lower = None;
         if !self.fonts.iter().any(|f| f.family == values.font_family) {
@@ -385,7 +410,10 @@ impl SettingsState {
             SettingsMsg::Open
             | SettingsMsg::Close
             | SettingsMsg::OpenFile
-            | SettingsMsg::RevealFolder => Effect::NONE,
+            | SettingsMsg::RevealFolder
+            | SettingsMsg::EditSchemes
+            | SettingsMsg::SecretStorage(_)
+            | SettingsMsg::ResetVault => Effect::NONE,
             SettingsMsg::Flush(n) => match self.held_lower {
                 Some((v, at)) if at == n => {
                     self.held_lower = None;
@@ -411,7 +439,9 @@ impl SettingsState {
             },
             SettingsMsg::Theme(v) => self.change(SettingChange::Theme(v), false),
             SettingsMsg::Font(f) => self.change(SettingChange::FontFamily(f.family), false),
+            SettingsMsg::ColorScheme(id) => self.change(SettingChange::ColorScheme(id), false),
             SettingsMsg::Blur(v) => self.change(SettingChange::BackgroundBlur(v), false),
+            SettingsMsg::TitleBar(v) => self.change(SettingChange::WindowDecorations(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),
             SettingsMsg::Record(action)
@@ -570,6 +600,29 @@ impl SettingsState {
                     }
                 }
             }
+            SettingsMsg::RetriesText(s) => {
+                let parsed = s.trim().parse::<u32>().ok();
+                self.retries_text = s;
+                match parsed {
+                    Some(v) if (TUNNEL_RETRIES_RANGE.0..=TUNNEL_RETRIES_RANGE.1).contains(&v) => {
+                        self.change(SettingChange::TunnelMaxRetries(v), true)
+                    }
+                    _ => Effect::NONE,
+                }
+            }
+            SettingsMsg::RetriesSubmit => match self.retries_text.trim().parse::<u64>() {
+                Ok(v) => {
+                    let v = u32::try_from(v)
+                        .unwrap_or(u32::MAX)
+                        .clamp(TUNNEL_RETRIES_RANGE.0, TUNNEL_RETRIES_RANGE.1);
+                    self.retries_text = v.to_string();
+                    self.change(SettingChange::TunnelMaxRetries(v), false)
+                }
+                Err(_) => {
+                    self.retries_text = self.values.tunnel_max_retries.to_string();
+                    self.flush_now()
+                }
+            },
             SettingsMsg::ScrollbackApply => match self.pending_lower.take() {
                 Some(v) => {
                     self.scrollback_text = v.to_string();

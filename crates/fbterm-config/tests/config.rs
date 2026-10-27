@@ -16,12 +16,14 @@ fn ssh(name: &str, jump: Vec<ProfileId>) -> Profile {
         group: None,
         accent: None,
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Ssh(SshProfile {
             host: format!("{name}.example.com"),
             port: 22,
             user: "root".into(),
             auth: AuthMethod::Agent,
             jump,
+            tunnels: Vec::new(),
         }),
     }
 }
@@ -37,6 +39,7 @@ fn local(name: &str) -> Profile {
             b: 0xff,
         }),
         accent_style: Default::default(),
+        color_scheme: None,
         kind: ProfileKind::Local(LocalProfile {
             program: "/bin/zsh".into(),
             args: vec!["-l".into()],
@@ -52,7 +55,7 @@ fn round_trip_profiles_toml() {
     let mut key = ssh("key", vec![]);
     if let ProfileKind::Ssh(s) = &mut key.kind {
         s.auth = AuthMethod::Key {
-            path: "/k".into(),
+            path: Some("/k".into()),
             passphrase: true,
         };
     }
@@ -64,6 +67,69 @@ fn round_trip_profiles_toml() {
     assert!(!text.contains("password"));
     assert!(text.contains("#ab0cff"));
     assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn key_without_path_round_trips() {
+    let path = tmp("profiles.toml");
+    let mut key = ssh("shared", vec![]);
+    if let ProfileKind::Ssh(s) = &mut key.kind {
+        s.auth = AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        };
+    }
+    let store = ProfileStore {
+        profiles: vec![key],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("path"), "no path is written: {text}");
+    assert!(text.contains("type = \"key\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+    // Written again, the file is byte for byte the same.
+    store.save(&path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn old_key_profiles_load() {
+    let path = tmp("profiles.toml");
+    let old = "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nport = 22\nuser = \"u\"\njump = []\n\n[profiles.auth]\ntype = \"key\"\npath = \"~/.ssh/id_ed25519\"\npassphrase = true\n";
+    std::fs::write(&path, old).unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: Some("~/.ssh/id_ed25519".into()),
+            passphrase: true,
+        }
+    );
+    // Saved again, an old file keeps its path.
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("path = \"~/.ssh/id_ed25519\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+    // A key profile written by hand without a path loads with none.
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"key\" }\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        }
+    );
 }
 
 #[test]
@@ -632,4 +698,431 @@ fn a_key_override_on_a_reserved_chord_falls_back_with_a_notice() {
         w.message
     );
     assert_eq!(w.line, Some(2));
+}
+
+#[test]
+fn color_scheme_defaults_to_graphite() {
+    assert_eq!(Settings::default().color_scheme, "graphite");
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "").unwrap();
+    assert_eq!(Settings::load(&path).unwrap().color_scheme, "graphite");
+}
+
+#[test]
+fn color_scheme_write_field_round_trips() {
+    let path = tmp("settings.toml");
+    Settings::write_field(&path, &SettingChange::ColorScheme("harbor".into())).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("\ncolor_scheme = \"harbor\"\n"), "{text}");
+    assert!(
+        text.contains("# Terminal color scheme for every session"),
+        "{text}"
+    );
+    assert!(text.contains("# Color theme:"), "comments kept");
+    assert_eq!(Settings::load(&path).unwrap().color_scheme, "harbor");
+}
+
+#[test]
+fn profile_color_scheme_round_trips_and_is_omitted_when_none() {
+    let path = tmp("profiles.toml");
+    let mut themed = local("themed");
+    themed.color_scheme = Some("ember".into());
+    let store = ProfileStore {
+        profiles: vec![local("plain"), themed],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("color_scheme").count(), 1, "{text}");
+    assert!(text.contains("color_scheme = \"ember\""));
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn old_profiles_file_loads_without_color_scheme() {
+    let path = tmp("profiles.toml");
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"local\"\nprogram = \"/bin/sh\"\n",
+    )
+    .unwrap();
+    assert_eq!(
+        ProfileStore::load(&path).unwrap().profiles[0].color_scheme,
+        None
+    );
+}
+
+fn ssh_mut(p: &mut Profile) -> &mut SshProfile {
+    match &mut p.kind {
+        ProfileKind::Ssh(s) => s,
+        _ => panic!("expected ssh"),
+    }
+}
+
+fn local_tunnel(name: &str, port: u16) -> TunnelDef {
+    TunnelDef {
+        name: name.into(),
+        kind: TunnelKind::Local {
+            bind: "127.0.0.1".into(),
+            port,
+            host: "db.internal".into(),
+            host_port: 5432,
+        },
+        start: StartMode::OnDemand,
+    }
+}
+
+#[test]
+fn tunnels_round_trip_and_are_omitted_when_empty() {
+    let path = tmp("profiles.toml");
+    let mut with = ssh("with", vec![]);
+    ssh_mut(&mut with).tunnels = vec![
+        local_tunnel("db", 5432),
+        TunnelDef {
+            name: "web".into(),
+            kind: TunnelKind::Remote {
+                bind: "0.0.0.0".into(),
+                port: 8080,
+                host: "localhost".into(),
+                host_port: 3000,
+            },
+            start: StartMode::WithShell,
+        },
+        TunnelDef {
+            name: "proxy".into(),
+            kind: TunnelKind::Socks {
+                bind: "127.0.0.1".into(),
+                port: 1080,
+            },
+            start: StartMode::OnDemand,
+        },
+    ];
+    let store = ProfileStore {
+        profiles: vec![ssh("without", vec![]), with],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("tunnels").count(), 3, "{text}");
+    assert_eq!(text.matches("start = ").count(), 1, "{text}");
+    assert!(text.contains("start = \"with_shell\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn tunnel_defaults_bind_loopback_and_on_demand() {
+    let path = tmp("profiles.toml");
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"agent\" }\ntunnels = [\n  { name = \"db\", kind = \"local\", port = 5432, host = \"db.internal\", host_port = 5432 },\n  { name = \"s\", kind = \"socks\", port = 1080 },\n]\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("expected ssh")
+    };
+    assert_eq!(s.tunnels[0], local_tunnel("db", 5432));
+    assert_eq!(
+        s.tunnels[1].kind,
+        TunnelKind::Socks {
+            bind: "127.0.0.1".into(),
+            port: 1080
+        }
+    );
+    assert_eq!(s.tunnels[1].start, StartMode::OnDemand);
+    assert!(!s.tunnels[0].non_loopback());
+}
+
+#[test]
+fn old_profiles_load_without_tunnels() {
+    let path = tmp("profiles.toml");
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"agent\" }\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("expected ssh")
+    };
+    assert!(s.tunnels.is_empty());
+}
+
+#[test]
+fn duplicate_tunnel_name_is_invalid() {
+    let mut a = ssh("a", vec![]);
+    ssh_mut(&mut a).tunnels = vec![local_tunnel("db", 1), local_tunnel("db", 2)];
+    let errs = ProfileStore { profiles: vec![a] }.validate();
+    assert_eq!(
+        errs,
+        vec![ValidationError::DuplicateTunnel {
+            profile: "a".into(),
+            name: "db".into()
+        }]
+    );
+}
+
+#[test]
+fn empty_tunnel_name_is_invalid() {
+    let mut a = ssh("a", vec![]);
+    ssh_mut(&mut a).tunnels = vec![local_tunnel("  ", 1)];
+    let errs = ProfileStore { profiles: vec![a] }.validate();
+    assert_eq!(
+        errs,
+        vec![ValidationError::EmptyTunnelName {
+            profile: "a".into()
+        }]
+    );
+}
+
+#[test]
+fn local_port_zero_is_invalid() {
+    let mut a = ssh("a", vec![]);
+    ssh_mut(&mut a).tunnels = vec![
+        local_tunnel("db", 0),
+        TunnelDef {
+            name: "proxy".into(),
+            kind: TunnelKind::Socks {
+                bind: "127.0.0.1".into(),
+                port: 0,
+            },
+            start: StartMode::OnDemand,
+        },
+        TunnelDef {
+            name: "rev".into(),
+            kind: TunnelKind::Remote {
+                bind: "127.0.0.1".into(),
+                port: 0,
+                host: "localhost".into(),
+                host_port: 80,
+            },
+            start: StartMode::OnDemand,
+        },
+    ];
+    let errs = ProfileStore { profiles: vec![a] }.validate();
+    assert_eq!(
+        errs,
+        vec![
+            ValidationError::TunnelPort {
+                profile: "a".into(),
+                name: "db".into()
+            },
+            ValidationError::TunnelPort {
+                profile: "a".into(),
+                name: "proxy".into()
+            },
+        ]
+    );
+}
+
+#[test]
+fn tunnel_max_retries_defaults_clamps_and_writes() {
+    assert_eq!(Settings::default().tunnel_max_retries, 10);
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "tunnel_max_retries = 500\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.tunnel_max_retries, 100);
+    assert!(warning.unwrap().message.contains("tunnel_max_retries"));
+    std::fs::write(&path, "tunnel_max_retries = 0\n").unwrap();
+    let (s, warning) = Settings::load_checked(&path).unwrap();
+    assert_eq!(s.tunnel_max_retries, 0);
+    assert!(warning.is_none());
+    Settings::write_field(&path, &SettingChange::TunnelMaxRetries(7)).unwrap();
+    assert_eq!(Settings::load(&path).unwrap().tunnel_max_retries, 7);
+    assert!(SETTINGS_TEMPLATE.contains("#tunnel_max_retries = 10"));
+}
+
+#[test]
+fn blank_target_port_blocks_save() {
+    use fbterm_config::{StartMode, TunnelDef, TunnelKind, ValidationError};
+    let mut store = ProfileStore::default();
+    let mut p = Profile {
+        id: ProfileId::new(),
+        name: "web".into(),
+        group: None,
+        accent: None,
+        accent_style: Default::default(),
+        color_scheme: None,
+        kind: ProfileKind::Ssh(SshProfile {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: AuthMethod::Agent,
+            jump: vec![],
+            tunnels: vec![TunnelDef {
+                name: "db".into(),
+                kind: TunnelKind::Local {
+                    bind: "127.0.0.1".into(),
+                    port: 5432,
+                    host: "db".into(),
+                    host_port: 0,
+                },
+                start: StartMode::OnDemand,
+            }],
+        }),
+    };
+    store.profiles.push(p.clone());
+    assert_eq!(
+        store.validate(),
+        vec![ValidationError::TunnelTargetPort {
+            profile: "web".into(),
+            name: "db".into()
+        }]
+    );
+    if let ProfileKind::Ssh(s) = &mut p.kind
+        && let TunnelKind::Local { host_port, .. } = &mut s.tunnels[0].kind
+    {
+        *host_port = 5432;
+    }
+    store.profiles[0] = p;
+    assert!(store.validate().is_empty());
+}
+
+#[test]
+fn cycle_errors_name_each_profile_that_reaches_the_cycle() {
+    let mut a = ssh("a", vec![]);
+    let b = ssh("b", vec![a.id]);
+    if let ProfileKind::Ssh(s) = &mut a.kind {
+        s.jump = vec![b.id];
+    }
+    let c = ssh("c", vec![a.id]);
+    let mut selfish = ssh("self", vec![]);
+    if let ProfileKind::Ssh(s) = &mut selfish.kind {
+        s.jump = vec![selfish.id];
+    }
+    let fine = ssh("fine", vec![]);
+    let store = ProfileStore {
+        profiles: vec![c, a, b, selfish, fine],
+    };
+    let cycle = |n: &str| ValidationError::JumpCycle {
+        profile: n.to_string(),
+    };
+    assert_eq!(
+        store.validate(),
+        vec![cycle("c"), cycle("a"), cycle("b"), cycle("self")]
+    );
+    assert_eq!(cycle("a").to_string(), "profile \"a\" has a jump cycle");
+}
+
+#[test]
+fn validate_is_linear_for_diamonds_and_long_chains() {
+    use std::time::{Duration, Instant};
+    // Each level jumps through the previous one twice: a naive walk takes 2^40 steps.
+    let mut diamond = vec![ssh("d0", vec![])];
+    for i in 1..=40 {
+        let prev = diamond[i - 1].id;
+        diamond.push(ssh(&format!("d{i}"), vec![prev, prev]));
+    }
+    // A chain far deeper than the stack allows recursion for, ending in a cycle.
+    let mut chain = vec![ssh("c0", vec![])];
+    for i in 1..10_000 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), vec![prev]));
+    }
+    let last = chain[9_999].id;
+    if let ProfileKind::Ssh(s) = &mut chain[0].kind {
+        s.jump = vec![last];
+    }
+    for (profiles, cycles) in [(diamond, 0), (chain, 10_000)] {
+        let store = ProfileStore { profiles };
+        let start = Instant::now();
+        let errors = store.validate();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let found = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::JumpCycle { .. }))
+            .count();
+        assert_eq!(found, cycles);
+    }
+}
+
+/// Forty levels of two profiles, each jumping through both profiles of the level below: the
+/// expanded chain doubles per level.
+fn two_wide_diamond(levels: usize) -> Vec<Profile> {
+    let mut out: Vec<Profile> = vec![ssh("a0", vec![]), ssh("b0", vec![])];
+    for i in 1..levels {
+        let below = vec![out[2 * i - 2].id, out[2 * i - 1].id];
+        out.push(ssh(&format!("a{i}"), below.clone()));
+        out.push(ssh(&format!("b{i}"), below));
+    }
+    out
+}
+
+#[test]
+fn chains_longer_than_32_hops_are_refused() {
+    use std::time::{Duration, Instant};
+    // 32 hops are fine, 33 are not.
+    let mut chain = vec![ssh("c0", vec![])];
+    for i in 1..=33 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), vec![prev]));
+    }
+    let store = ProfileStore {
+        profiles: chain.clone(),
+    };
+    assert_eq!(store.jump_chain(chain[32].id).unwrap().len(), 32);
+    assert_eq!(
+        store.validate(),
+        vec![ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        }]
+    );
+    assert_eq!(
+        store.jump_chain(chain[33].id),
+        Err(ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        })
+    );
+    assert_eq!(
+        ValidationError::JumpChainTooLong {
+            profile: "c33".into()
+        }
+        .to_string(),
+        "profile \"c33\" goes through more than 32 jump hosts"
+    );
+
+    // A diamond: few profiles, but an exponentially long expanded chain.
+    let diamond = two_wide_diamond(40);
+    let top = diamond[79].id;
+    let store = ProfileStore { profiles: diamond };
+    let start = Instant::now();
+    let errors = store.validate();
+    // Levels 0 to 4 expand to 0, 2, 6, 14 and 30 hops; every level above is too long.
+    assert_eq!(errors.len(), 70, "{errors:?}");
+    assert!(
+        errors
+            .iter()
+            .all(|e| matches!(e, ValidationError::JumpChainTooLong { .. }))
+    );
+    assert!(matches!(
+        store.jump_chain(top),
+        Err(ValidationError::JumpChainTooLong { .. })
+    ));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A chain far deeper than recursion allows never overflows.
+    let mut deep = vec![ssh("d0", vec![])];
+    for i in 1..50_000 {
+        let prev = deep[i - 1].id;
+        deep.push(ssh(&format!("d{i}"), vec![prev]));
+    }
+    let last = deep[49_999].id;
+    let store = ProfileStore { profiles: deep };
+    let start = Instant::now();
+    assert!(matches!(
+        store.jump_chain(last),
+        Err(ValidationError::JumpChainTooLong { .. })
+    ));
+    assert_eq!(store.validate().len(), 49_999 - 32);
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
 }

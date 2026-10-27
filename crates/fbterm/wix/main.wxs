@@ -1,0 +1,134 @@
+<?xml version='1.0' encoding='windows-1252'?>
+<!--
+  featherbit terminal installer (WiX Toolset v3), built by `cargo wix` from
+  dev/package-windows.ps1. Based on the default template of cargo-wix 0.3.9
+  (Copyright (C) 2017 Christopher R. Field, Apache-2.0).
+
+  - Per machine, under "Program Files\featherbit terminal" (needs administrator rights).
+  - Start menu shortcut "featherbit terminal"; no desktop shortcut, no PATH change.
+  - Uninstalling removes only what was installed: the user's config folder
+    (%APPDATA%\featherbit\fbterm\config, with settings, profiles and secrets.dpapi)
+    is never part of the package and stays.
+  - The UpgradeCode below is fixed forever: every release shares it, so a newer
+    version replaces an older one (MajorUpgrade). Never change it.
+
+  Variables set by `cargo wix`: Version (X.Y.Z), CargoTargetBinDir (target\release).
+  sys.SOURCEFILEDIR is this folder, so the paths below do not depend on the working
+  directory.
+-->
+
+<?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
+    <?define PlatformProgramFilesFolder = "ProgramFiles64Folder" ?>
+<?else ?>
+    <?define PlatformProgramFilesFolder = "ProgramFilesFolder" ?>
+<?endif ?>
+
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+
+    <Product
+        Id='*'
+        Name='featherbit terminal'
+        UpgradeCode='D2F13F2B-68C8-4ED4-9953-D6E612A1FA8D'
+        Manufacturer='featherbit'
+        Language='1033'
+        Codepage='1252'
+        Version='$(var.Version)'>
+
+        <Package Id='*'
+            Keywords='Installer'
+            Description='featherbit terminal: an SSH-first terminal'
+            Manufacturer='featherbit'
+            InstallerVersion='450'
+            Languages='1033'
+            Compressed='yes'
+            InstallScope='perMachine'
+            SummaryCodepage='1252'
+            />
+
+        <!--
+          A newer version replaces an older one. Same-version upgrades are allowed so a
+          release replaces its own pre-release (MSI compares only X.Y.Z).
+          light reports warning ICE61 for AllowSameVersionUpgrades. It is expected: the same-version
+          upgrade is the point, so leave it.
+        -->
+        <MajorUpgrade
+            Schedule='afterInstallInitialize'
+            AllowSameVersionUpgrades='yes'
+            DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
+
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Property Id='DiskPrompt' Value='featherbit terminal Installation'/>
+
+        <Directory Id='TARGETDIR' Name='SourceDir'>
+            <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
+                <Directory Id='APPLICATIONFOLDER' Name='featherbit terminal'>
+                    <Component Id='License' Guid='*'>
+                        <File Id='LicenseFile'
+                            Name='LICENSE.txt'
+                            DiskId='1'
+                            Source='$(sys.SOURCEFILEDIR)..\..\..\LICENSE'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='binary0' Guid='*'>
+                        <File
+                            Id='exe0'
+                            Name='fbterm.exe'
+                            DiskId='1'
+                            Source='$(var.CargoTargetBinDir)\fbterm.exe'
+                            KeyPath='yes'>
+                            <!--
+                              Declared advertised and turned into a plain shortcut by
+                              DISABLEADVTSHORTCUTS below: a per-machine file stays the
+                              component's key path (no per-user registry value) and the
+                              shortcut takes its icon from fbterm.exe (build.rs embeds it).
+                            -->
+                            <Shortcut
+                                Id='StartMenuShortcut'
+                                Directory='ProgramMenuFolder'
+                                Name='featherbit terminal'
+                                Description='SSH-first terminal'
+                                WorkingDirectory='APPLICATIONFOLDER'
+                                Advertise='yes'/>
+                        </File>
+                    </Component>
+                </Directory>
+            </Directory>
+            <Directory Id='ProgramMenuFolder'/>
+        </Directory>
+
+        <Feature
+            Id='Binaries'
+            Title='Application'
+            Description='Installs featherbit terminal, its Start menu shortcut and the license.'
+            Level='1'
+            ConfigurableDirectory='APPLICATIONFOLDER'
+            AllowAdvertise='no'
+            Display='expand'
+            Absent='disallow'>
+            <ComponentRef Id='License'/>
+            <ComponentRef Id='binary0'/>
+        </Feature>
+
+        <Property Id='DISABLEADVTSHORTCUTS' Value='1'/>
+
+        <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
+
+        <!-- Apps and features (Add/Remove Programs): icon, links and publisher details. -->
+        <Icon Id='fbterm.ico' SourceFile='$(sys.SOURCEFILEDIR)..\windows\fbterm.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='fbterm.ico'/>
+        <Property Id='ARPHELPLINK' Value='https://featherbitplatform.github.io/terminal/'/>
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/featherbitplatform/terminal'/>
+        <Property Id='ARPURLUPDATEINFO' Value='https://github.com/featherbitplatform/terminal/releases'/>
+        <Property Id='ARPCOMMENTS' Value='SSH-first terminal with saved profiles, tabs, split panes, tunnels and a file panel.'/>
+        <Property Id='ARPNOMODIFY' Value='1'/>
+
+        <UI>
+            <UIRef Id='WixUI_FeatureTree'/>
+            <!-- No license agreement dialog: Welcome goes straight to the folder choice. -->
+            <Publish Dialog='WelcomeDlg' Control='Next' Event='NewDialog' Value='CustomizeDlg' Order='99'>1</Publish>
+            <Publish Dialog='CustomizeDlg' Control='Back' Event='NewDialog' Value='WelcomeDlg' Order='99'>1</Publish>
+        </UI>
+
+    </Product>
+
+</Wix>

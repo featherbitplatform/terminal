@@ -195,7 +195,7 @@ impl App {
             return Task::none();
         };
         let alt = terminal.lock().mode().contains(TermMode::ALT_SCREEN);
-        let name = default_file_name(&tab.title, chrono::Local::now().naive_local());
+        let name = default_file_name(tab.title(), chrono::Local::now().naive_local());
         self.exporting = Some(wid);
         let terminal = Delivered::new(terminal);
         let title = dialog_title(alt);
@@ -426,5 +426,28 @@ mod tests {
         let err = run(&shared, missing).unwrap_err();
         assert!(err.starts_with("Could not export out.txt:"), "{err}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn export_takes_focused_pane() {
+        use crate::tabs::{Pane, Tab};
+        let term = || -> SharedTerminal {
+            std::sync::Arc::new(parking_lot::Mutex::new(fbterm_term::Terminal::new(
+                crate::app::DEFAULT_GRID,
+                100,
+            )))
+        };
+        let mut first = Pane::new(fbterm_config::ProfileId::new(), String::from("a"), None);
+        first.placeholder = Some(term());
+        let mut second = Pane::new(first.profile, String::from("b"), None);
+        second.placeholder = Some(term());
+        let (a, b) = (first.id, second.id);
+        let want = second.placeholder.clone().unwrap();
+        let mut tab = Tab::single(first);
+        tab.layout.split(a, crate::layout::Side::Right, b);
+        tab.panes.push(second);
+        assert!(tab.focus(b));
+        assert!(std::sync::Arc::ptr_eq(tab.terminal().unwrap(), &want));
+        assert_eq!(tab.title(), tab.pane(b).unwrap().title);
     }
 }

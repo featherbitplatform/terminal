@@ -166,7 +166,7 @@ pub fn modifiers(chord: Chord) -> Modifiers {
 mod tests {
     use super::*;
 
-    const ALL: [Action; 25] = [
+    const ALL: [Action; 44] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -185,6 +185,11 @@ mod tests {
         Action::Quit,
         Action::EditProfiles,
         Action::Settings,
+        Action::EditSchemes,
+        Action::Tunnels,
+        Action::ExportProfiles,
+        Action::ImportProfiles,
+        Action::FilePanel,
         Action::OpenSettingsFile,
         Action::RevealConfigFolder,
         Action::ExportTab,
@@ -192,6 +197,20 @@ mod tests {
         Action::FindAll,
         Action::FindNext,
         Action::FindPrevious,
+        Action::SplitRight,
+        Action::SplitDown,
+        Action::FocusLeft,
+        Action::FocusRight,
+        Action::FocusUp,
+        Action::FocusDown,
+        Action::ZoomIn,
+        Action::ZoomOut,
+        Action::ZoomReset,
+        Action::MaximizePane,
+        Action::FindInTab,
+        Action::MergeTab,
+        Action::MoveTile,
+        Action::TileToTab,
     ];
 
     #[test]
@@ -201,10 +220,15 @@ mod tests {
                 let Some(c) = chord_for(mac, action) else {
                     continue;
                 };
-                let ChordKey::Char(ch) = c.key else {
-                    panic!("default chords are character keys");
+                let key = match c.key {
+                    ChordKey::Char(ch) => Key::Character(ch.to_string().into()),
+                    ChordKey::Enter => Key::Named(Named::Enter),
+                    ChordKey::Left => Key::Named(Named::ArrowLeft),
+                    ChordKey::Right => Key::Named(Named::ArrowRight),
+                    ChordKey::Up => Key::Named(Named::ArrowUp),
+                    ChordKey::Down => Key::Named(Named::ArrowDown),
+                    other => panic!("unexpected default key {other:?}"),
                 };
-                let key = Key::Character(ch.to_string().into());
                 let found = match action {
                     Action::FindNext | Action::FindPrevious => find_key(mac, &key, modifiers(c)),
                     _ => shortcut_for(mac, &key, modifiers(c)),
@@ -288,7 +312,9 @@ mod tests {
         assert_eq!(m("]", CMD), None, "next tab needs Shift");
         assert_eq!(m("t", CMD | Modifiers::ALT), None);
         assert_eq!(m("c", CMD), None, "copy belongs to the terminal");
-        assert_eq!(m("0", CMD), None);
+        assert_eq!(m("0", CMD), Some(Action::ZoomReset));
+        assert_eq!(m("0", cmd_shift()), None);
+        assert_eq!(m("d", CMD | Modifiers::ALT), None);
         assert_eq!(
             shortcut_for(true, &Key::Named(iced::keyboard::key::Named::Enter), CMD),
             None
@@ -463,13 +489,93 @@ mod tests {
     #[test]
     fn layout_symbols_are_their_own_keys() {
         // On AZERTY the digit row types & é " ' ( - è _ ç à unshifted: Ctrl+Shift+& is not
-        // tab 7 or tab 1, as before; and `!`, `$`, `*` (and German `#`) are not digits.
-        for sym in ["&", "(", "*", "!", "$", "#", "_", "+"] {
+        // tab 7 or tab 1, as before; and `!`, `$`, `*` (and German `#`) are not digits. (`+` is the
+        // exception: with Shift it is `=`, zoom in.)
+        for sym in ["&", "(", "*", "!", "$", "#", "_"] {
             assert_eq!(shortcut_for(false, &k(sym), ctrl_shift()), None, "{sym}");
             assert_eq!(shortcut_for(true, &k(sym), CMD), None, "{sym}");
         }
         // The F keys past 12 are keys too (with a modifier).
         let f13 = Key::Named(iced::keyboard::key::Named::F13);
         assert_eq!(press_chord(&f13, Modifiers::CTRL), Some(chord("ctrl+f13")));
+    }
+
+    #[test]
+    fn pane_chords_match_on_both_platforms() {
+        let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
+        let cmd_alt = Modifiers::LOGO | Modifiers::ALT;
+        let s = |mac, key: &Key, mods| shortcut_for(mac, key, mods);
+        assert_eq!(s(true, &k("d"), CMD), Some(Action::SplitRight));
+        assert_eq!(s(true, &k("d"), cmd_shift()), Some(Action::SplitDown));
+        assert_eq!(s(false, &k("d"), ctrl_shift()), Some(Action::SplitRight));
+        assert_eq!(
+            s(false, &k("d"), ctrl_shift() | Modifiers::ALT),
+            Some(Action::SplitDown)
+        );
+        assert_eq!(
+            s(true, &Key::Named(Named::ArrowLeft), cmd_alt),
+            Some(Action::FocusLeft)
+        );
+        assert_eq!(
+            s(false, &Key::Named(Named::ArrowDown), ctrl_alt),
+            Some(Action::FocusDown)
+        );
+        // Plain and Shift-only arrows belong to the program in the terminal.
+        assert_eq!(
+            s(false, &Key::Named(Named::ArrowLeft), Modifiers::CTRL),
+            None
+        );
+        assert_eq!(s(true, &Key::Named(Named::ArrowLeft), CMD), None);
+        // The plus key zooms in however it is typed.
+        for mods in [CMD, cmd_shift()] {
+            for key in ["=", "+"] {
+                assert_eq!(
+                    s(true, &k(key), mods),
+                    Some(Action::ZoomIn),
+                    "{key} {mods:?}"
+                );
+            }
+        }
+        // Off macOS: Shift+= (US), and a layout's own plus key with or without Shift.
+        for (key, mods) in [
+            ("=", ctrl_shift()),
+            ("+", ctrl_shift()),
+            ("+", Modifiers::CTRL),
+        ] {
+            assert_eq!(
+                s(false, &k(key), mods),
+                Some(Action::ZoomIn),
+                "{key} {mods:?}"
+            );
+        }
+        assert_eq!(
+            s(false, &k("="), Modifiers::CTRL),
+            None,
+            "Ctrl+= is the program's"
+        );
+        assert_eq!(s(true, &k("="), Modifiers::CTRL), None);
+        assert_eq!(s(true, &k("="), cmd_shift() | Modifiers::ALT), None);
+        // The label is the default chord's own.
+        assert_eq!(chord_for(true, Action::ZoomIn).unwrap().label(true), "⌘=");
+        assert_eq!(
+            chord_for(false, Action::ZoomIn).unwrap().label(false),
+            "Ctrl+Shift+="
+        );
+        // A rebound zoom in is only that chord: the plus key no longer zooms.
+        let mut o = fbterm_config::keys::Overrides::new();
+        o.insert(Action::ZoomIn, Chord::parse("cmd+alt+z").unwrap());
+        let b = Bindings::new(true, &o);
+        assert_eq!(shortcut(&b, &k("="), CMD, None), None);
+        assert_eq!(shortcut(&b, &k("z"), cmd_alt, None), Some(Action::ZoomIn));
+        assert_eq!(s(true, &k("-"), CMD), Some(Action::ZoomOut));
+        assert_eq!(s(false, &k("0"), ctrl_shift()), Some(Action::ZoomReset));
+        assert_eq!(
+            s(true, &Key::Named(Named::Enter), cmd_shift()),
+            Some(Action::MaximizePane)
+        );
+        assert_eq!(
+            s(false, &Key::Named(Named::Enter), ctrl_shift()),
+            Some(Action::MaximizePane)
+        );
     }
 }
