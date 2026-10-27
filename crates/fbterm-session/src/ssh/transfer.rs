@@ -176,8 +176,14 @@ pub fn upload(
 /// The first of `name`, `name (1).ext`, `name (2).ext`, … that is free in `dir`. The name is
 /// made safe first ([`safe_local_name`]), so the result is always directly inside `dir`.
 pub fn free_name(dir: &Path, name: &str) -> PathBuf {
+    free_name_avoiding(dir, name, |_| false)
+}
+
+/// [`free_name`], also skipping every path `reserved` claims: names that other downloads
+/// still running are about to write, though nothing is there yet.
+pub fn free_name_avoiding(dir: &Path, name: &str, reserved: impl Fn(&Path) -> bool) -> PathBuf {
     let name = safe_local_name(name);
-    let taken = |p: &Path| p.symlink_metadata().is_ok();
+    let taken = |p: &Path| reserved(p) || p.symlink_metadata().is_ok();
     let first = dir.join(&name);
     if !taken(&first) {
         return first;

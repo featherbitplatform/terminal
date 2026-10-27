@@ -75,6 +75,28 @@ fn free_name_counts_up() {
 }
 
 #[test]
+fn free_name_skips_reserved_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    // A name another download is about to write counts as taken, though nothing is there yet.
+    let reserved = [d.join("report.txt"), d.join("report (1).txt")];
+    let taken = |p: &Path| reserved.iter().any(|r| r == p);
+    assert_eq!(
+        free_name_avoiding(d, "report.txt", taken),
+        d.join("report (2).txt")
+    );
+    std::fs::write(d.join("report (2).txt"), "x").unwrap();
+    assert_eq!(
+        free_name_avoiding(d, "report.txt", taken),
+        d.join("report (3).txt")
+    );
+    assert_eq!(
+        free_name_avoiding(d, "other.txt", taken),
+        d.join("other.txt")
+    );
+}
+
+#[test]
 fn download_name_is_sanitized() {
     assert_eq!(safe_local_name("plain.txt"), "plain.txt");
     assert_eq!(safe_local_name(".hidden"), ".hidden");

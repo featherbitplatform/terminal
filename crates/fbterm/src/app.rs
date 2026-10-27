@@ -663,6 +663,13 @@ impl App {
                     event,
                 )))
             }),
+            Subscription::run_with(
+                self.file_panel_work.transfers.clone(),
+                crate::file_panel::transfer_stream,
+            )
+            .map(|(id, event)| {
+                Message::FilePanel(crate::file_panel::FilePanelMsg::Transfer(id, event))
+            }),
             Subscription::run_with(self.visibility.clone(), visibility::stream)
                 .map(|(id, visible)| Message::WindowVisible(id, visible)),
             Subscription::run_with(self.display.clone(), display_rate::stream)

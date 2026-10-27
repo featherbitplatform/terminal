@@ -2,10 +2,12 @@
 //! session, folder and listing, and the panel's width.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::ProfileId;
 use fbterm_session::ssh::sftp::{Entry, SortKey, sort_entries};
+use fbterm_session::ssh::transfer::TransferId;
 use iced::window;
 
 use super::Remote;
@@ -42,9 +44,107 @@ pub(crate) enum Listing {
     Unavailable(String),
 }
 
-/// One transfer in a profile's queue (filled by downloads and uploads).
-#[allow(dead_code, reason = "rows are added by downloads and uploads")]
+/// Which way a transfer goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Direction {
+    Download,
+}
+
+/// Where a transfer stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RowState {
+    Running,
+    /// Done; `local` is where a download was saved.
+    Finished {
+        local: Option<PathBuf>,
+    },
+    /// Stopped, with the reason shown in the row.
+    Failed(String),
+}
+
+/// Stops a running transfer.
+pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
+
+/// One transfer in a profile's queue. A cancelled transfer leaves the queue; finished and
+/// failed ones stay.
 pub(crate) struct TransferRow {
+    pub id: TransferId,
+    /// The remote name as plain text ([`super::plain_name`]).
+    pub name: String,
+    pub direction: Direction,
+    /// The local file a download writes: no other download may write it while this one runs.
+    pub local: Option<PathBuf>,
+    /// Bytes moved so far, of `total` when known.
+    pub done: u64,
+    pub total: Option<u64>,
+    pub state: RowState,
+    /// Stops the transfer while it runs.
+    pub(crate) cancel: Option<CancelFn>,
+}
+
+impl TransferRow {
+    /// A download that started writing `local`.
+    pub(crate) fn download(id: TransferId, name: String, local: PathBuf, cancel: CancelFn) -> Self {
+        Self {
+            id,
+            name,
+            direction: Direction::Download,
+            local: Some(local),
+            done: 0,
+            total: None,
+            state: RowState::Running,
+            cancel: Some(cancel),
+        }
+    }
+
+    /// A download that could not start, and why.
+    pub(crate) fn refused(name: String, reason: String) -> Self {
+        Self {
+            id: TransferId::next(),
+            name,
+            direction: Direction::Download,
+            local: None,
+            done: 0,
+            total: None,
+            state: RowState::Failed(reason),
+            cancel: None,
+        }
+    }
+
+    pub(crate) fn is_running(&self) -> bool {
+        self.state == RowState::Running
+    }
+
+    /// The saved file a finished download can show in the file manager.
+    pub(crate) fn revealable(&self) -> Option<&Path> {
+        match &self.state {
+            RowState::Finished { local } => local.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Why the transfer stopped, when it failed.
+    pub(crate) fn failed(&self) -> Option<&str> {
+        match &self.state {
+            RowState::Failed(reason) => Some(reason),
+            _ => None,
+        }
+    }
+
+    /// The local file this row is writing now, if it is a running download.
+    pub(crate) fn writing(&self) -> Option<&Path> {
+        match (self.direction, &self.state) {
+            (Direction::Download, RowState::Running) => self.local.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// What a `Download as…` dialog was opened for.
+pub(crate) struct PendingSave {
+    pub profile: ProfileId,
+    /// The remote file's path and its name as plain text.
+    pub remote: String,
     pub name: String,
 }
 
@@ -187,6 +287,16 @@ pub(crate) fn resolve_path(current: &str, home: &str, typed: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// The path of `name` inside `folder`.
+pub(crate) fn child(folder: &str, name: &str) -> String {
+    let folder = resolve_path(folder, "/", "");
+    if folder == "/" {
+        format!("/{name}")
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
 /// The folder above `folder` (`/` stays `/`).
 pub(crate) fn parent_of(folder: &str) -> String {
     resolve_path(folder, "/", "..")
@@ -254,6 +364,8 @@ pub(crate) struct FilePanels {
     pub width: f32,
     /// `FBTERM_DEMO_FILES` (debug aid): SSH panes count as connected.
     pub demo: bool,
+    /// The `Download as…` dialog open in each window (one at a time per window).
+    pub saving: HashMap<window::Id, PendingSave>,
 }
 
 impl FilePanels {
@@ -265,6 +377,7 @@ impl FilePanels {
             by_profile: HashMap::new(),
             width: width.map_or(DEFAULT_WIDTH, clamp_width),
             demo: false,
+            saving: HashMap::new(),
         }
     }
 

@@ -2,11 +2,13 @@
 //! profile's folder, the remembered width and the docked layout. A fake backend stands in for
 //! SFTP, so no network is needed: the tests answer its requests by hand.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use fbterm_config::{AuthMethod, Paths, Profile, ProfileId, ProfileKind, SavedState, SshProfile};
 use fbterm_session::SessionHandle;
 use fbterm_session::ssh::sftp::{Entry, EntryKind, Sftp, SftpError};
+use fbterm_session::ssh::transfer::{TransferEvent, TransferId, TransferSink};
 use iced::window;
 use parking_lot::Mutex;
 
@@ -26,6 +28,12 @@ struct Fake {
     lists: Mutex<Vec<(ProfileId, String, u64)>>,
     runtime: Option<tokio::runtime::Runtime>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Downloads started: the remote path, the destination and the transfer's id.
+    downloads: Mutex<Vec<(String, PathBuf, TransferId)>>,
+    /// Transfers cancelled.
+    cancels: Arc<Mutex<Vec<TransferId>>>,
+    /// Save dialogs opened: the window and the name offered.
+    saves: Mutex<Vec<(window::Id, String)>>,
 }
 
 impl Backend for Fake {
@@ -47,6 +55,30 @@ impl Backend for Fake {
         self.lists
             .lock()
             .push((request.profile, request.folder, request.token));
+    }
+
+    fn download(
+        &self,
+        request: super::DownloadRequest,
+        _sink: TransferSink,
+    ) -> Result<super::Started, String> {
+        let id = TransferId::next();
+        self.downloads.lock().push((request.path, request.dest, id));
+        let cancels = self.cancels.clone();
+        Ok(super::Started {
+            id,
+            cancel: Arc::new(move || cancels.lock().push(id)),
+        })
+    }
+
+    fn save_dialog(
+        &self,
+        window: window::Id,
+        name: String,
+        _folder: Option<PathBuf>,
+    ) -> iced::Task<Option<PathBuf>> {
+        self.saves.lock().push((window, name));
+        iced::Task::none()
     }
 }
 
@@ -1426,4 +1458,309 @@ fn navigating_while_the_session_opens_keeps_that_open() {
     assert_eq!(w.shows().as_deref(), Some("loading"));
     w.answer_open(&db, "/home/user");
     assert_eq!(w.last_list(&db).unwrap().0, "/var/log");
+}
+
+// ---- Downloads ----
+
+/// A fresh folder standing in for Downloads: tests never write to the real one.
+fn downloads_dir() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("fbterm-downloads-test-{}", ProfileId::new()));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+impl World {
+    /// [`World::browsing`] with Downloads at a fresh temporary folder.
+    fn downloading(entries: Vec<Entry>) -> (World, PathBuf) {
+        let mut w = World::browsing(entries);
+        let dir = downloads_dir();
+        w.app.file_panel_work.downloads = Some(dir.clone());
+        (w, dir)
+    }
+
+    fn select(&mut self, name: &str) {
+        let wid = self.wid;
+        let _ = self.msg(FilePanelMsg::Select(wid, name.into()));
+    }
+
+    fn download(&mut self) {
+        let wid = self.wid;
+        let _ = self.msg(FilePanelMsg::Download(wid));
+    }
+
+    fn download_as(&mut self) {
+        let wid = self.wid;
+        let _ = self.msg(FilePanelMsg::DownloadAs(wid));
+    }
+
+    /// The save dialog of `Download as…` closes with `path`.
+    fn choose(&mut self, path: Option<PathBuf>) {
+        let wid = self.wid;
+        let _ = self.msg(FilePanelMsg::SaveChosen(wid, path));
+    }
+
+    fn downloads(&self) -> Vec<(String, PathBuf, TransferId)> {
+        self.fake.downloads.lock().clone()
+    }
+
+    fn transfer(&mut self, id: TransferId, event: TransferEvent) {
+        let _ = self.msg(FilePanelMsg::Transfer(id, event));
+    }
+
+    fn rows(&self) -> &[super::state::TransferRow] {
+        &self.panel().transfers
+    }
+}
+
+#[test]
+fn download_goes_to_downloads_with_free_name() {
+    let (mut w, dir) = World::downloading(vec![file("app.log"), folder("logs")]);
+    std::fs::write(dir.join("app.log"), "already here").unwrap();
+    w.select("app.log");
+    assert!(w.app.can_download(w.wid));
+    w.download();
+    let started = w.downloads();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].0, "/home/user/app.log");
+    assert_eq!(
+        started[0].1,
+        dir.join("app (1).log"),
+        "a free name, never over a file"
+    );
+    // The row: the name, nothing done yet, running.
+    assert_eq!(w.rows().len(), 1);
+    assert_eq!(w.rows()[0].name, "app.log");
+    assert!(w.rows()[0].is_running());
+
+    // A second Download while the first runs: the first's name is taken though nothing is
+    // written there yet, so two transfers never write the same file.
+    w.download();
+    assert_eq!(w.downloads()[1].1, dir.join("app (2).log"));
+    assert!(!dir.join("app (1).log").exists() && !dir.join("app (2).log").exists());
+
+    // Progress updates the row as events come (no timer); finished, it offers the file.
+    let id = started[0].2;
+    w.transfer(
+        id,
+        TransferEvent::Progress {
+            done: 512,
+            total: Some(2048),
+        },
+    );
+    assert_eq!((w.rows()[0].done, w.rows()[0].total), (512, Some(2048)));
+    w.transfer(
+        id,
+        TransferEvent::Finished {
+            note: None,
+            local: Some(dir.join("app (1).log")),
+        },
+    );
+    assert!(!w.rows()[0].is_running());
+    assert_eq!(
+        w.rows()[0].revealable(),
+        Some(dir.join("app (1).log").as_path())
+    );
+    assert_eq!(
+        super::REVEAL_LABEL,
+        if cfg!(target_os = "macos") {
+            "Show in Finder"
+        } else {
+            "Show in folder"
+        }
+    );
+    // Its name is free again for a new Download only once a file is really there.
+    std::fs::write(dir.join("app (1).log"), "done").unwrap();
+    w.download();
+    assert_eq!(w.downloads()[2].1, dir.join("app (3).log"));
+
+    // Cancel stops the transfer; the cancelled row goes away when it reports so.
+    let second = w.downloads()[1].2;
+    let _ = w.msg(FilePanelMsg::CancelTransfer(second));
+    assert_eq!(*w.fake.cancels.lock(), [second]);
+    w.transfer(second, TransferEvent::Cancelled);
+    assert!(w.rows().iter().all(|r| r.id != second));
+    // A failed one shows why.
+    let third = w.downloads()[2].2;
+    w.transfer(third, TransferEvent::Failed("Permission denied.".into()));
+    let row = w.rows().iter().find(|r| r.id == third).unwrap();
+    assert_eq!(row.failed(), Some("Permission denied."));
+}
+
+#[test]
+fn download_as_uses_chosen_path() {
+    let (mut w, dir) = World::downloading(vec![file("app.log")]);
+    let wid = w.wid;
+    w.select("app.log");
+    w.download_as();
+    // The save dialog, over this window, offers the remote name.
+    assert_eq!(*w.fake.saves.lock(), [(wid, "app.log".to_owned())]);
+    assert!(
+        w.downloads().is_empty(),
+        "nothing starts before a path is chosen"
+    );
+    // A second click while the dialog is open opens no second one.
+    w.download_as();
+    assert_eq!(w.fake.saves.lock().len(), 1);
+    let chosen = dir.join("saved.log");
+    w.choose(Some(chosen.clone()));
+    assert_eq!(w.downloads().len(), 1);
+    assert_eq!(w.downloads()[0].0, "/home/user/app.log");
+    assert_eq!(w.downloads()[0].1, chosen, "exactly where the user chose");
+
+    // Cancelling the dialog starts nothing.
+    w.download_as();
+    w.choose(None);
+    assert_eq!(w.downloads().len(), 1);
+
+    // The same path while that download runs: refused inline, nothing started.
+    w.download_as();
+    w.choose(Some(chosen.clone()));
+    assert_eq!(w.downloads().len(), 1);
+    let refused = w.rows().last().unwrap();
+    assert_eq!(refused.failed(), Some("Already downloading to saved.log"));
+    // `Download` into the same folder skips the name too.
+    w.download_as();
+    w.choose(Some(dir.join("app.log")));
+    w.download();
+    assert_eq!(w.downloads()[2].1, dir.join("app (1).log"));
+
+    // Once the first one ended, its path can be chosen again.
+    let first = w.downloads()[0].2;
+    w.transfer(
+        first,
+        TransferEvent::Failed("The connection was lost.".into()),
+    );
+    w.download_as();
+    w.choose(Some(chosen.clone()));
+    assert_eq!(w.downloads().len(), 4);
+    assert_eq!(w.downloads()[3].1, chosen);
+}
+
+#[test]
+fn download_disabled_for_folders_and_special_files() {
+    let other = Entry {
+        kind: EntryKind::Other,
+        ..file("fifo")
+    };
+    let (mut w, _dir) = World::downloading(vec![
+        folder("logs"),
+        file("app.log"),
+        link("latest.log", "app.log", Some(EntryKind::File)),
+        link("current", "releases/42", Some(EntryKind::Dir)),
+        link("dangling", "gone", None),
+        other,
+    ]);
+    let wid = w.wid;
+    assert!(!w.app.can_download(wid), "nothing selected");
+    for name in ["..", "logs", "current", "dangling", "fifo"] {
+        w.select(name);
+        assert!(!w.app.can_download(wid), "{name}");
+        w.download();
+        w.download_as();
+        assert!(w.downloads().is_empty(), "{name}");
+        assert!(w.fake.saves.lock().is_empty(), "{name}");
+    }
+    // A file, and a link to a file (its target downloads).
+    for name in ["app.log", "latest.log"] {
+        w.select(name);
+        assert!(w.app.can_download(wid), "{name}");
+    }
+    w.download();
+    assert_eq!(w.downloads()[0].0, "/home/user/latest.log");
+    // Nothing the terminal shows can start one: only these panel messages do, and the panel
+    // of a local pane offers none.
+    let mut w = world();
+    let local = w.local.clone();
+    w.open_tab(&local);
+    w.toggle();
+    assert!(!w.app.can_download(w.wid));
+}
+
+#[test]
+fn download_uses_sanitized_name() {
+    let evil = "evil\u{1b}[2J\nname.txt";
+    let (mut w, dir) = World::downloading(vec![file(evil)]);
+    w.select(evil);
+    w.download();
+    let (remote, dest, _) = w.downloads()[0].clone();
+    assert_eq!(
+        remote,
+        format!("/home/user/{evil}"),
+        "the server's own name"
+    );
+    assert_eq!(dest, dir.join("evil_[2J_name.txt"));
+    assert_eq!(dest.parent(), Some(dir.as_path()));
+    // Shown plain in the row.
+    assert_eq!(w.rows()[0].name, "evil?[2J?name.txt");
+    // `Download as…` offers the same safe name.
+    w.download_as();
+    assert_eq!(w.fake.saves.lock()[0].1, "evil_[2J_name.txt");
+}
+
+#[test]
+fn running_downloads_keep_the_session_when_the_panel_hides() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log")]);
+    w.select("app.log");
+    w.download();
+    w.toggle();
+    assert!(
+        w.panel().sftp.is_some(),
+        "a running transfer keeps the session"
+    );
+    let id = w.downloads()[0].2;
+    w.transfer(
+        id,
+        TransferEvent::Finished {
+            note: None,
+            local: None,
+        },
+    );
+    // Any message runs the sync: nothing runs any more, so the session goes.
+    let _ = w.msg(FilePanelMsg::ResizeEnd);
+    assert!(w.panel().sftp.is_none());
+}
+
+#[test]
+fn transfer_rows_show_progress_and_their_actions() {
+    let size = iced::Size::new(300.0, 700.0);
+    let (mut w, dir) = World::downloading(vec![file("app.log"), file("db.dump")]);
+    let texts = drawn_texts(&w, size);
+    assert!(texts.iter().any(|t| t == "Download"));
+    assert!(texts.iter().any(|t| t == "Download as\u{2026}"));
+    w.select("app.log");
+    w.download();
+    w.select("db.dump");
+    w.download();
+    w.download();
+    let ids: Vec<TransferId> = w.downloads().iter().map(|d| d.2).collect();
+    w.transfer(
+        ids[0],
+        TransferEvent::Progress {
+            done: 512,
+            total: Some(2048),
+        },
+    );
+    w.transfer(
+        ids[1],
+        TransferEvent::Finished {
+            note: None,
+            local: Some(dir.join("db.dump")),
+        },
+    );
+    w.transfer(ids[2], TransferEvent::Failed("Disk full.".into()));
+    let texts = drawn_texts(&w, size);
+    for want in [
+        "app.log",
+        "512 B of 2.0 KB",
+        "Cancel",
+        super::REVEAL_LABEL,
+        "Disk full.",
+    ] {
+        assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+    }
+    assert_eq!(
+        texts.iter().filter(|t| *t == "Cancel").count(),
+        1,
+        "only the running row can be cancelled"
+    );
 }

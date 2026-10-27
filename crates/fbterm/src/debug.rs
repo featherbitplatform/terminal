@@ -174,18 +174,27 @@ impl App {
 
     /// `FBTERM_DEMO_FILES=<folder>:<item>,<item>,...` (debug aid): the first window's file
     /// panel open, serving this sample listing for every SSH pane (connected or not) and every
-    /// folder without touching the network; see [`crate::file_panel::Demo::parse`].
+    /// folder without touching the network, with a sample transfer queue (a running and a
+    /// finished download); see [`crate::file_panel::Demo::parse`].
     pub(crate) fn open_debug_files(&mut self) -> Task<Message> {
         let Some(spec) = debug_env("FBTERM_DEMO_FILES") else {
             return Task::none();
         };
         let demo = crate::file_panel::Demo::parse(&spec.to_string_lossy());
-        self.file_panel_work.backend = std::sync::Arc::new(demo);
+        let rows = || demo.sample_rows();
         self.file_panels.demo = true;
         if let Some(&wid) = self.windows.keys().next() {
             self.file_panels.show(wid);
         }
+        self.file_panel_work.backend = std::sync::Arc::new(crate::file_panel::Demo {
+            home: demo.home.clone(),
+            entries: demo.entries.clone(),
+        });
         self.sync_file_panels();
+        // Every session opened for the demo shows a sample transfer queue.
+        for panel in self.file_panels.by_profile.values_mut() {
+            panel.transfers.extend(rows());
+        }
         Task::none()
     }
 

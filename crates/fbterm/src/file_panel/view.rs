@@ -9,13 +9,13 @@ use chrono::Datelike;
 use fbterm_session::ssh::sftp::{Entry, EntryKind, SortKey};
 use iced::advanced::widget::{Id, Operation, operation::Focusable};
 use iced::widget::{
-    Space, button, column, container, mouse_area, responsive, row, scrollable, text, text_input,
-    toggler,
+    Space, button, column, container, mouse_area, progress_bar, responsive, row, scrollable, text,
+    text_input, toggler,
 };
 use iced::{Alignment, Border, Element, Length, Padding, Rectangle, Size, Task, window};
 
-use super::state::{self, PARENT, WindowPanel};
-use super::{Body, FilePanelMsg, ProfilePanel, plain_name};
+use super::state::{self, Direction, PARENT, RowState, TransferRow, WindowPanel};
+use super::{Body, FilePanelMsg, ProfilePanel, REVEAL_LABEL, plain_name};
 use crate::app::{App, Message};
 use crate::tabs::WindowState;
 use crate::theme::{Tokens, UI_FONT};
@@ -225,8 +225,9 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
             _ => "",
         };
         content = content.push(filter_bar(t, wid, filter, ui, app.file_panels.show_hidden));
+        content = content.push(toolbar(t, wid, app.can_download(wid)));
     }
-    content = content.push(match body {
+    let main = match body {
         Body::Note(line) => note(t, line),
         Body::Loading => note(t, "Loading\u{2026}".into()),
         Body::Error(line) => error(t, wid, line),
@@ -234,7 +235,14 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
             Some(ui) => listing(t, wid, panel, ui),
             None => note(t, String::new()),
         },
-    });
+    };
+    content = content.push(container(main).height(Length::Fill));
+    if let Some(rows) = app
+        .file_panel_transfers(wid)
+        .filter(|rows| !rows.is_empty())
+    {
+        content = content.push(transfers(t, rows));
+    }
     let rule = container(Space::new())
         .width(1)
         .height(Length::Fill)
@@ -392,6 +400,135 @@ fn filter_bar<'a>(
             left: PAD_X,
         })
         .into()
+}
+
+/// `Download` and `Download as…`, for the selected file (`Upload…` joins them later).
+fn toolbar<'a>(t: &'static Tokens, wid: window::Id, enabled: bool) -> Element<'a, Message> {
+    let action = |caption: &'static str, m: FilePanelMsg| {
+        button(text(caption).font(UI_FONT).size(12))
+            .on_press_maybe(enabled.then(|| msg(m)))
+            .padding(Padding::from([4.0, 10.0]))
+            .style(move |_, status| crate::ui::secondary(t, status))
+    };
+    row![
+        action("Download", FilePanelMsg::Download(wid)),
+        action("Download as\u{2026}", FilePanelMsg::DownloadAs(wid)),
+    ]
+    .spacing(8)
+    .padding(Padding {
+        top: 0.0,
+        right: PAD_X,
+        bottom: 6.0,
+        left: PAD_X,
+    })
+    .into()
+}
+
+/// The transfer queue under the listing: one row per transfer.
+fn transfers<'a>(t: &'static Tokens, rows: &'a [TransferRow]) -> Element<'a, Message> {
+    let rule = container(Space::new())
+        .width(Length::Fill)
+        .height(1)
+        .style(move |_| container::Style {
+            background: Some(t.border.into()),
+            ..container::Style::default()
+        });
+    let list = column(rows.iter().map(|r| transfer_row(t, r)))
+        .spacing(10)
+        .padding(Padding::from([8.0, PAD_X]));
+    // A long queue scrolls instead of pushing the listing away.
+    let list = scrollable(list)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new()
+                .width(6)
+                .scroller_width(4)
+                .margin(1),
+        ))
+        .style(move |theme, status| scroll_style(t, theme, status))
+        .height(Length::Shrink);
+    column![rule, container(list).max_height(TRANSFERS_MAX_HEIGHT)]
+        .width(Length::Fill)
+        .into()
+}
+
+/// The tallest the transfer queue grows.
+const TRANSFERS_MAX_HEIGHT: f32 = 180.0;
+
+/// `512 B of 2.0 KB`, or just the bytes while the size is not known.
+pub(crate) fn progress_text(done: u64, total: Option<u64>) -> String {
+    match total {
+        Some(total) => format!("{} of {}", human_size(done), human_size(total)),
+        None => human_size(done),
+    }
+}
+
+/// One transfer: direction and name with `Cancel` (running) or `Show in Finder` (finished),
+/// then its bar and bytes, or the reason it failed.
+fn transfer_row<'a>(t: &'static Tokens, r: &'a TransferRow) -> Element<'a, Message> {
+    let arrow = match r.direction {
+        Direction::Download => "\u{2193}",
+    };
+    let mut top = row![
+        mono(arrow, NAME_SIZE, t.text_muted),
+        container(mono(r.name.as_str(), NAME_SIZE, t.text))
+            .width(Length::Fill)
+            .clip(true),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    match &r.state {
+        RowState::Running => {
+            top = top.push(
+                button(text("Cancel").font(UI_FONT).size(11.5))
+                    .on_press(msg(FilePanelMsg::CancelTransfer(r.id)))
+                    .padding(Padding::from([2.0, 8.0]))
+                    .style(move |_, status| crate::ui::ghost(t, status)),
+            );
+        }
+        RowState::Finished { local: Some(_) } => {
+            top = top.push(
+                button(text(REVEAL_LABEL).font(UI_FONT).size(11.5))
+                    .on_press(msg(FilePanelMsg::Reveal(r.id)))
+                    .padding(Padding::from([2.0, 8.0]))
+                    .style(move |_, status| crate::ui::secondary(t, status)),
+            );
+        }
+        RowState::Finished { local: None } | RowState::Failed(_) => {}
+    }
+    let detail: Element<'a, Message> = match r.failed() {
+        Some(reason) => text(plain_name(reason))
+            .font(UI_FONT)
+            .size(11.5)
+            .color(t.danger)
+            .wrapping(text::Wrapping::WordOrGlyph)
+            .into(),
+        None => {
+            let finished = matches!(r.state, RowState::Finished { .. });
+            let fraction = match r.total {
+                _ if finished => 1.0,
+                Some(total) if total > 0 => (r.done as f64 / total as f64).min(1.0) as f32,
+                _ => 0.0,
+            };
+            let bar = progress_bar(0.0..=1.0, fraction)
+                .length(Length::Fill)
+                .girth(4)
+                .style(move |_| progress_bar::Style {
+                    background: t.raised.into(),
+                    bar: if finished { t.success } else { t.accent }.into(),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Border::default()
+                    },
+                });
+            column![
+                bar,
+                mono(progress_text(r.done, r.total), VALUE_SIZE, t.text_muted)
+            ]
+            .spacing(4)
+            .into()
+        }
+    };
+    column![top, detail].spacing(4).into()
 }
 
 fn note<'a>(t: &Tokens, line: String) -> Element<'a, Message> {
