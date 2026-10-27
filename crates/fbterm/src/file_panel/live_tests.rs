@@ -84,6 +84,31 @@ async fn outcome(
     }
 }
 
+/// Download `path` to `dest` through `backend` and return what arrived.
+async fn fetch(
+    backend: &PoolBackend,
+    remote: &Arc<dyn Remote>,
+    path: String,
+    dest: PathBuf,
+) -> String {
+    let (tx, mut rx) = unbounded_channel();
+    let Started { id, .. } = backend
+        .download(
+            DownloadRequest {
+                remote: remote.clone(),
+                path,
+                dest: dest.clone(),
+            },
+            tx,
+        )
+        .expect("the download starts");
+    assert!(matches!(
+        outcome(&mut rx, id).await,
+        TransferEvent::Finished { .. }
+    ));
+    std::fs::read_to_string(&dest).unwrap()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn pool_backend_uploads_and_downloads() {
     if !enabled() {
@@ -170,6 +195,12 @@ async fn pool_backend_uploads_and_downloads() {
         outcome(&mut rx, up).await,
         TransferEvent::Failed(format!("\"{name}\" already exists in {folder}."))
     );
+    // Nothing was replaced: the server still holds the first file.
+    let kept = dir.path().join("kept.conf");
+    assert_eq!(
+        fetch(&backend, &remote, format!("{folder}/{name}"), kept).await,
+        "first\n"
+    );
     // Replace.
     let up = upload(second.clone(), UploadMode::Replace);
     assert!(matches!(
@@ -197,4 +228,11 @@ async fn pool_backend_uploads_and_downloads() {
         }
     );
     assert_eq!(std::fs::read_to_string(&dest).unwrap(), "second version\n");
+
+    // Leave nothing behind on the server.
+    let sftp = remote.sftp().expect("a real session");
+    tokio::time::timeout(STEP, sftp.remove(&format!("{folder}/{name}")))
+        .await
+        .expect("removed in time")
+        .expect("removed");
 }

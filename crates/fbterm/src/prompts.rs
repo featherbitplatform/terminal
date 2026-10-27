@@ -450,6 +450,41 @@ impl PromptQueues {
         })
     }
 
+    /// Every close confirmation queued: its window and what it would close.
+    pub fn transfer_questions(&self) -> Vec<(window::Id, Closing)> {
+        self.0
+            .iter()
+            .flat_map(|(w, q)| {
+                q.iter().filter_map(move |p| match &p.dialog {
+                    Dialog::Transfers { then, .. } => Some((*w, *then)),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// Set the count of `window`'s close confirmation for `then`; at 0 there is nothing left
+    /// to ask about, and it goes.
+    pub fn set_transfers(&mut self, window: window::Id, then: Closing, count: usize) {
+        let Some(q) = self.0.get_mut(&window) else {
+            return;
+        };
+        if count == 0 {
+            q.retain(|p| !matches!(&p.dialog, Dialog::Transfers { then: t, .. } if *t == then));
+            if q.is_empty() {
+                self.0.remove(&window);
+            }
+            return;
+        }
+        for p in q.iter_mut() {
+            if let Dialog::Transfers { count: c, then: t } = &mut p.dialog
+                && *t == then
+            {
+                *c = count;
+            }
+        }
+    }
+
     /// Whether any window asks about quitting with transfers running.
     pub fn asks_quit(&self) -> bool {
         self.0.values().flatten().any(|p| {

@@ -87,6 +87,11 @@ pub(crate) fn remote_free_name(name: &str, taken: impl Fn(&str) -> bool) -> Stri
         .expect("some numbered name is free")
 }
 
+/// The queue note of a file skipped because the same name is being uploaded there.
+pub(crate) fn already_uploading(name: &str) -> String {
+    format!("Already uploading {name}")
+}
+
 /// Why a name typed in the clash dialog cannot be used, if it cannot.
 pub(crate) fn rename_problem(name: &str) -> Option<&'static str> {
     if name.trim().is_empty() {
@@ -212,42 +217,85 @@ impl App {
         };
         let listed = panel.folder == folder
             && matches!(&panel.listing, Listing::Loaded(entries) if entries.iter().any(|e| e.name == name));
-        listed
-            || panel
-                .transfers
-                .iter()
-                .any(|r| r.uploading_into(folder) == Some(name))
+        listed || self.uploading_same(profile, folder, name)
     }
 
-    /// Decide the files of `wid`'s batches in order until one needs the clash dialog.
+    /// Whether a running upload into `profile`'s `folder` writes `name` (ignoring case, as
+    /// [`same_destination`] does): a second upload there would share its part file.
+    fn uploading_same(&self, profile: ProfileId, folder: &str, name: &str) -> bool {
+        let name = name.to_lowercase();
+        self.file_panels.by_profile.get(&profile).is_some_and(|p| {
+            p.transfers
+                .iter()
+                .filter_map(|r| r.uploading_into(folder))
+                .any(|n| n.to_lowercase() == name)
+        })
+    }
+
+    /// Whether `profile`'s listing of `folder` is on its way: clashes are checked once it is
+    /// there.
+    fn listing_pending(&self, profile: ProfileId, folder: &str) -> bool {
+        self.file_panels.by_profile.get(&profile).is_some_and(|p| {
+            p.folder == folder && matches!(p.listing, Listing::Opening | Listing::Loading)
+        })
+    }
+
+    /// Go on with every window's uploads (a listing they wait for may have arrived).
+    pub(super) fn advance_all_uploads(&mut self) {
+        let windows: Vec<window::Id> = self.file_panels.batches.keys().copied().collect();
+        for wid in windows {
+            self.advance_uploads(wid);
+        }
+    }
+
+    /// Decide the files of `wid`'s batches in order until one needs the clash dialog (or
+    /// the folder's listing, still on its way).
     fn advance_uploads(&mut self, wid: window::Id) {
         loop {
             let Some(queue) = self.file_panels.batches.get_mut(&wid) else {
                 return;
             };
-            let Some(batch) = queue.front_mut() else {
+            let Some(batch) = queue.front() else {
                 self.file_panels.batches.remove(&wid);
                 return;
             };
             if batch.asking.is_some() {
                 return;
             }
+            let (profile, folder, all) = (batch.profile, batch.folder.clone(), batch.all);
+            if self.listing_pending(profile, &folder) {
+                return;
+            }
+            let Some(queue) = self.file_panels.batches.get_mut(&wid) else {
+                return;
+            };
+            let Some(batch) = queue.front_mut() else {
+                return;
+            };
             let Some((local, name)) = batch.items.pop_front() else {
                 queue.pop_front();
                 continue;
             };
-            let (profile, folder, all, more) = (
-                batch.profile,
-                batch.folder.clone(),
-                batch.all,
-                !batch.items.is_empty(),
-            );
+            let more = !batch.items.is_empty();
             let upload = |mode| Job::Upload {
                 local: local.clone(),
                 folder: folder.clone(),
                 name: name.clone(),
                 mode,
             };
+            // A second upload of a name being uploaded would share its part file: never.
+            if self.uploading_same(profile, &folder, &name) {
+                let shown = plain_name(&name);
+                self.add_row(
+                    profile,
+                    TransferRow::stopped(
+                        shown.clone(),
+                        Direction::Upload,
+                        RowState::Skipped(already_uploading(&shown)),
+                    ),
+                );
+                continue;
+            }
             if !self.remote_taken(profile, &folder, &name) {
                 self.start_job(profile, upload(UploadMode::New));
                 continue;
@@ -340,13 +388,23 @@ impl App {
             return Task::none();
         };
         let typed = rename.value.clone();
-        if let Some(problem) = rename_problem(&typed) {
+        // A name being uploaded there cannot be replaced either: it would share a part file.
+        let in_flight = self
+            .file_panels
+            .batches
+            .get(&wid)
+            .and_then(VecDeque::front)
+            .is_some_and(|b| self.uploading_same(b.profile, &b.folder, &typed));
+        let problem = rename_problem(&typed)
+            .map(str::to_owned)
+            .or_else(|| in_flight.then(|| already_uploading(&plain_name(&typed))));
+        if let Some(problem) = problem {
             if let Some(Dialog::Clash(Clash {
                 rename: Some(rename),
                 ..
             })) = self.prompts.front_mut(wid)
             {
-                rename.problem = Some(problem.into());
+                rename.problem = Some(problem);
             }
             return self.focus_prompt(wid);
         }
@@ -520,6 +578,13 @@ impl App {
                         writing.iter().any(|w| same_destination(w, p))
                     });
                 }
+            }
+            Job::Upload { folder, name, .. } if self.uploading_same(profile, folder, name) => {
+                let note = already_uploading(&plain_name(name));
+                if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                    panel.transfers[index].state = RowState::Failed(note);
+                }
+                return;
             }
             Job::Upload { .. } => {}
         }
@@ -704,6 +769,33 @@ impl App {
                 .push(wid, None, Dialog::Transfers { count, then });
         }
         true
+    }
+
+    /// What a close confirmation for `then` over `wid` counts now.
+    fn running_for(&self, wid: window::Id, then: Closing) -> usize {
+        match then {
+            Closing::Quit => self.running_total(),
+            Closing::Window => self.running_of(&self.ended_by(&self.window_panes(wid))),
+            Closing::Pane(pane) => self.running_of(&self.ended_by(&[pane])),
+            Closing::Tab(tab) => {
+                let panes: Vec<PaneId> = self
+                    .windows
+                    .get(&wid)
+                    .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+                    .map(|t| t.panes.iter().map(|p| p.id).collect())
+                    .unwrap_or_default();
+                self.running_of(&self.ended_by(&panes))
+            }
+        }
+    }
+
+    /// A transfer ended: the close confirmations say how many still run, and go once none
+    /// does (nothing is closed by itself: the user asks again).
+    pub(super) fn refresh_transfer_questions(&mut self) {
+        for (wid, then) in self.prompts.transfer_questions() {
+            let count = self.running_for(wid, then);
+            self.prompts.set_transfers(wid, then, count);
+        }
     }
 
     /// Whether closing `wid` must ask first; asks when it must.

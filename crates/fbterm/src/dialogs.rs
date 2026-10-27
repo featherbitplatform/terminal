@@ -251,6 +251,13 @@ impl App {
                 self.focus_prompt(w)
             }
             PromptMsg::Cancel(w) => {
+                // In the name field, `Back` (or Escape) returns to the choice.
+                if let Some(Dialog::Clash(clash)) = self.prompts.front_mut(w)
+                    && clash.rename.is_some()
+                {
+                    clash.rename = None;
+                    return Task::none();
+                }
                 // The clash dialog's `Cancel` (or Escape) skips that file and goes on.
                 if let Some(Dialog::Clash(clash)) = self.prompts.front(w) {
                     let all = clash.apply_all && clash.offer_all;
@@ -284,7 +291,8 @@ impl App {
                 let Some(Dialog::Clash(clash)) = self.prompts.front(w) else {
                     return Task::none();
                 };
-                if clash.rename.is_some() {
+                // One new name is for one file: not with `Apply to all`.
+                if clash.rename.is_some() || (clash.offer_all && clash.apply_all) {
                     return Task::none();
                 }
                 let value = self.clash_free_name(w, &clash.name.clone());

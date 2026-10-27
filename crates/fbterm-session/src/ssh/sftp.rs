@@ -79,6 +79,8 @@ pub struct Sftp {
     /// Keeps the profile's connection (and its jump chain) open while the session lives
     /// (`None` only in unit tests, which run the session over an in-memory stream).
     _connection: Option<Arc<Connection>>,
+    /// Set once a request found the session gone (or not answering): it is not used again.
+    ended: std::sync::atomic::AtomicBool,
 }
 
 /// One item of a folder, or the answer to [`Sftp::stat`] / [`Sftp::lstat`].
@@ -336,6 +338,7 @@ impl Sftp {
                 read_len,
                 write_len,
                 _connection: connection,
+                ended: std::sync::atomic::AtomicBool::new(false),
             })
         }
     }
@@ -351,7 +354,7 @@ impl Sftp {
             .session
             .realpath(path)
             .await
-            .map_err(|e| error_for(e, path))?;
+            .map_err(|e| self.error_for(e, path))?;
         name.files
             .into_iter()
             .next()
@@ -378,7 +381,7 @@ impl Sftp {
         let handle = tokio::time::timeout_at(deadline, self.session.opendir(path))
             .await
             .map_err(|_| too_slow())?
-            .map_err(|e| error_for(e, path))?
+            .map_err(|e| self.error_for(e, path))?
             .handle;
         let read = async {
             let mut raw = Vec::new();
@@ -400,7 +403,7 @@ impl Sftp {
                     Err(RawError::Status(s)) if s.status_code == StatusCode::Eof => {
                         return Ok(raw);
                     }
-                    Err(e) => return Err(error_for(e, path)),
+                    Err(e) => return Err(self.error_for(e, path)),
                 }
             }
         };
@@ -429,7 +432,7 @@ impl Sftp {
             .session
             .stat(path)
             .await
-            .map_err(|e| error_for(e, path))?
+            .map_err(|e| self.error_for(e, path))?
             .attrs;
         self.entry(base_name(path), path, &attrs).await
     }
@@ -440,7 +443,7 @@ impl Sftp {
             .session
             .lstat(path)
             .await
-            .map_err(|e| error_for(e, path))?
+            .map_err(|e| self.error_for(e, path))?
             .attrs;
         self.entry(base_name(path), path, &attrs).await
     }
@@ -451,10 +454,20 @@ impl Sftp {
         self.posix_rename
     }
 
-    /// Whether the connection under the session is still up: a session on a dropped
-    /// connection answers nothing again, so it is opened anew instead.
+    /// Whether the session can still be used: no request found it gone, and the connection
+    /// under it is up. A session that is not alive is opened anew instead.
     pub fn is_alive(&self) -> bool {
-        self._connection.as_ref().is_none_or(|c| c.is_alive())
+        !self.ended.load(std::sync::atomic::Ordering::Acquire)
+            && self._connection.as_ref().is_none_or(|c| c.is_alive())
+    }
+
+    /// [`error_for`], remembering a session that is gone.
+    fn error_for(&self, error: RawError, path: &str) -> SftpError {
+        let e = error_for(error, path);
+        if matches!(e, SftpError::Unavailable(_)) {
+            self.ended.store(true, std::sync::atomic::Ordering::Release);
+        }
+        e
     }
 
     /// Data length of one read request.
@@ -473,7 +486,7 @@ impl Sftp {
             .session
             .lstat(path)
             .await
-            .map_err(|e| error_for(e, path))?
+            .map_err(|e| self.error_for(e, path))?
             .attrs)
     }
 
@@ -483,7 +496,7 @@ impl Sftp {
             .session
             .stat(path)
             .await
-            .map_err(|e| error_for(e, path))?
+            .map_err(|e| self.error_for(e, path))?
             .attrs)
     }
 
@@ -492,7 +505,7 @@ impl Sftp {
             .session
             .open(path, flags, FileAttributes::empty())
             .await
-            .map_err(|e| error_for(e, path))?
+            .map_err(|e| self.error_for(e, path))?
             .handle)
     }
 
@@ -529,7 +542,7 @@ impl Sftp {
         match self.session.read(handle, offset, len).await {
             Ok(data) => Ok(Some(data.data)),
             Err(RawError::Status(s)) if s.status_code == StatusCode::Eof => Ok(None),
-            Err(e) => Err(error_for(e, path)),
+            Err(e) => Err(self.error_for(e, path)),
         }
     }
 
@@ -545,7 +558,7 @@ impl Sftp {
             .write(handle, offset, data)
             .await
             .map(drop)
-            .map_err(|e| error_for(e, path))
+            .map_err(|e| self.error_for(e, path))
     }
 
     /// Close `handle` (opened on `path`); a failure can mean written data was lost.
@@ -554,7 +567,7 @@ impl Sftp {
             .close(handle)
             .await
             .map(drop)
-            .map_err(|e| error_for(e, path))
+            .map_err(|e| self.error_for(e, path))
     }
 
     /// Set `attrs` on the open `handle` (opened on `path`).
@@ -568,16 +581,16 @@ impl Sftp {
             .fsetstat(handle, attrs)
             .await
             .map(drop)
-            .map_err(|e| error_for(e, path))
+            .map_err(|e| self.error_for(e, path))
     }
 
     /// Remove the file (or link) `path`.
-    pub(crate) async fn remove(&self, path: &str) -> Result<(), SftpError> {
+    pub async fn remove(&self, path: &str) -> Result<(), SftpError> {
         self.session
             .remove(path)
             .await
             .map(drop)
-            .map_err(|e| error_for(e, path))
+            .map_err(|e| self.error_for(e, path))
     }
 
     /// Rename `from` to `to`; fails when `to` exists (the server never replaces it).
@@ -586,7 +599,7 @@ impl Sftp {
             .rename(from, to)
             .await
             .map(drop)
-            .map_err(|e| error_for(e, to))
+            .map_err(|e| self.error_for(e, to))
     }
 
     /// Rename `from` over `to` atomically (`posix-rename@openssh.com`); only when
@@ -601,9 +614,9 @@ impl Sftp {
         }
         match self.session.extended(POSIX_RENAME, data).await {
             Ok(Packet::Status(s)) if s.status_code == StatusCode::Ok => Ok(()),
-            Ok(Packet::Status(s)) => Err(error_for(RawError::Status(s), to)),
-            Ok(_) => Err(error_for(RawError::UnexpectedPacket, to)),
-            Err(e) => Err(error_for(e, to)),
+            Ok(Packet::Status(s)) => Err(self.error_for(RawError::Status(s), to)),
+            Ok(_) => Err(self.error_for(RawError::UnexpectedPacket, to)),
+            Err(e) => Err(self.error_for(e, to)),
         }
     }
 
@@ -621,7 +634,7 @@ impl Sftp {
             let (target, end) =
                 futures_util::future::join(self.session.readlink(full), self.session.stat(full))
                     .await;
-            let target = match target.map_err(|e| error_for(e, full)) {
+            let target = match target.map_err(|e| self.error_for(e, full)) {
                 Ok(n) => n
                     .files
                     .into_iter()
@@ -631,7 +644,7 @@ impl Sftp {
                 Err(e @ SftpError::Unavailable(_)) => return Err(e),
                 Err(_) => String::new(),
             };
-            let to = match end.map_err(|e| error_for(e, full)) {
+            let to = match end.map_err(|e| self.error_for(e, full)) {
                 Ok(a) => Some(Box::new(kind_of_mode(a.attrs.permissions))),
                 Err(e @ SftpError::Unavailable(_)) => return Err(e),
                 Err(_) => None,
@@ -824,8 +837,11 @@ mod tests {
     async fn lost_connection_while_resolving_links_fails_the_listing() {
         let server = fake::Server::new(fake::Dir::OneLink, Some(StatusCode::ConnectionLost));
         let sftp = fake::session(server).await;
+        assert!(sftp.is_alive());
         let err = sftp.list("/d").await.unwrap_err();
         assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
+        // A session found gone is not used again: the panel opens a new one.
+        assert!(!sftp.is_alive());
         let err = sftp.lstat("/d/link").await.unwrap_err();
         assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
     }

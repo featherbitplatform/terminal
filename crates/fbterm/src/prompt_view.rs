@@ -267,7 +267,7 @@ fn clash_view<'a>(
             body = body.push(field_col).push(buttons(vec![
                 ui::text_button(
                     t,
-                    "Cancel",
+                    "Back",
                     Some(msg(PromptMsg::Cancel(window))),
                     ui::secondary,
                 )

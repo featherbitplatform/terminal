@@ -1902,6 +1902,27 @@ impl World {
         self.fake.uploads.lock().clone()
     }
 
+    /// Every running upload finishes; the folder is read again and lists `entries`.
+    fn finish_uploads(&mut self, entries: Vec<Entry>) {
+        let running: Vec<TransferId> = self
+            .rows()
+            .iter()
+            .filter(|r| r.is_running() && r.direction == super::state::Direction::Upload)
+            .map(|r| r.id)
+            .collect();
+        for id in running {
+            self.transfer(
+                id,
+                TransferEvent::Finished {
+                    note: None,
+                    local: None,
+                },
+            );
+        }
+        let db = self.db.clone();
+        self.answer_list(&db, entries);
+    }
+
     fn prompt(&mut self, m: PromptMsg) {
         let _ = self.app.update(Message::Prompt(m));
     }
@@ -2053,6 +2074,7 @@ fn clash_asks_replace_rename_cancel() {
         summary(&w.uploads()),
         [uploaded(&local, "app.conf", UploadMode::Replace)]
     );
+    w.finish_uploads(vec![file("app.conf"), file("other")]);
 
     // Cancel (Escape answers the same): nothing uploaded, no row.
     let rows = w.rows().len();
@@ -2080,6 +2102,11 @@ fn clash_asks_replace_rename_cancel() {
         assert_eq!(w.rename_problem().as_deref(), Some(problem), "{typed:?}");
         assert_eq!(w.uploads().len(), 1, "{typed:?}");
     }
+    // Escape (`Back`) in the name field returns to the choice; nothing is decided.
+    w.prompt(PromptMsg::Cancel(wid));
+    assert_eq!(w.clash(), Some(("app.conf".into(), false, None)));
+    assert_eq!(w.uploads().len(), 1);
+    w.prompt(PromptMsg::ClashRename(wid));
     w.prompt(PromptMsg::ClashName(wid, "app-new.conf".into()));
     w.prompt(PromptMsg::Submit(wid));
     assert!(w.dialog().is_none());
@@ -2105,19 +2132,22 @@ fn clash_asks_replace_rename_cancel() {
 fn apply_to_all_covers_remaining() {
     let (mut w, dir) = World::uploading(
         vec![file("a.conf"), file("b.conf"), file("c.conf")],
-        &["a.conf", "b.conf", "c.conf", "d.conf"],
+        &["a.conf", "b.conf", "c.conf", "d.conf", "e.conf"],
     );
     let wid = w.wid;
-    let all: Vec<PathBuf> = ["a.conf", "b.conf", "c.conf", "d.conf"]
+    let all: Vec<PathBuf> = ["a.conf", "b.conf", "c.conf", "d.conf", "e.conf"]
         .iter()
         .map(|n| dir.join(n))
         .collect();
-    w.pick(all.clone());
+    w.pick(all[..4].to_vec());
     assert_eq!(w.clash(), Some(("a.conf".into(), true, None)));
     // Without `Apply to all` each clash is asked about.
     w.prompt(PromptMsg::ClashReplace(wid));
     assert_eq!(w.clash(), Some(("b.conf".into(), true, None)));
     w.prompt(PromptMsg::ClashApplyAll(wid, true));
+    // One new name is for one file: `Rename` does nothing with `Apply to all`.
+    w.prompt(PromptMsg::ClashRename(wid));
+    assert_eq!(w.clash(), Some(("b.conf".into(), true, None)));
     w.prompt(PromptMsg::ClashReplace(wid));
     assert!(w.dialog().is_none());
     assert_eq!(
@@ -2130,9 +2160,11 @@ fn apply_to_all_covers_remaining() {
         ]
     );
 
+    w.finish_uploads(["a.conf", "b.conf", "c.conf", "d.conf"].map(file).to_vec());
+
     // Cancel for all: only the file without a clash goes.
     let before = w.uploads().len();
-    w.pick(vec![all[0].clone(), all[1].clone(), all[3].clone()]);
+    w.pick(vec![all[0].clone(), all[1].clone(), all[4].clone()]);
     w.prompt(PromptMsg::ClashApplyAll(wid, true));
     w.prompt(PromptMsg::Cancel(wid));
     assert!(w.dialog().is_none());
@@ -2140,8 +2172,7 @@ fn apply_to_all_covers_remaining() {
         .iter()
         .map(|u| u.name.clone())
         .collect();
-    // d.conf is uploading (from the first batch), so it clashes too and is cancelled.
-    assert!(names.is_empty(), "{names:?}");
+    assert_eq!(names, ["e.conf"]);
 
     // The last clash of a batch offers no `Apply to all`: nothing is left to apply it to.
     w.pick(vec![dir.join("d.conf"), all[0].clone()]);
@@ -2175,6 +2206,8 @@ fn rename_prefills_free_name() {
     );
     // `app (2).conf` is uploading now: the next free name skips it.
     w.prompt(PromptMsg::Cancel(wid));
+    w.prompt(PromptMsg::Cancel(wid));
+    assert!(w.dialog().is_none());
     w.pick(vec![dir.join("app.conf")]);
     w.prompt(PromptMsg::ClashRename(wid));
     assert_eq!(w.clash().and_then(|c| c.2).as_deref(), Some("app (3).conf"));
@@ -2464,4 +2497,155 @@ fn transfers_do_not_block_terminal_input() {
     type_in(&mut w, "pwd\r");
     assert_eq!(input.inputs(), [b"ls\r".to_vec(), b"pwd\r".to_vec()]);
     assert!(w.rows()[0].is_running());
+}
+
+#[test]
+fn same_name_uploading_is_skipped_with_note() {
+    let (mut w, dir) = World::uploading(vec![file("b.conf")], &["a.conf", "b.conf", "other/"]);
+    let wid = w.wid;
+    std::fs::write(dir.join("other").join("A.CONF"), "x").unwrap();
+    w.pick(vec![dir.join("a.conf")]);
+    assert_eq!(w.uploads().len(), 1);
+    // The same name while that upload runs (in any case): never a second upload, never
+    // Replace offered, a note in the queue.
+    w.pick(vec![dir.join("a.conf"), dir.join("other").join("A.CONF")]);
+    assert!(w.dialog().is_none());
+    assert_eq!(w.uploads().len(), 1);
+    let notes: Vec<_> = w.rows().iter().filter_map(|r| r.note()).collect();
+    assert_eq!(
+        notes,
+        ["Already uploading a.conf", "Already uploading A.CONF"]
+    );
+    // Not even with `Apply to all` Replace.
+    w.pick(vec![dir.join("b.conf"), dir.join("a.conf")]);
+    w.prompt(PromptMsg::ClashApplyAll(wid, true));
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert!(w.dialog().is_none());
+    assert_eq!(
+        summary(&w.uploads()),
+        [
+            uploaded(&dir.join("a.conf"), "a.conf", UploadMode::New),
+            uploaded(&dir.join("b.conf"), "b.conf", UploadMode::Replace),
+        ]
+    );
+    assert_eq!(
+        w.rows().last().unwrap().note(),
+        Some("Already uploading a.conf")
+    );
+    // Nor by renaming to it.
+    w.finish_uploads(vec![file("b.conf")]);
+    w.pick(vec![dir.join("a.conf")]);
+    w.pick(vec![dir.join("b.conf")]);
+    w.prompt(PromptMsg::ClashRename(wid));
+    w.prompt(PromptMsg::ClashName(wid, "A.conf".into()));
+    w.prompt(PromptMsg::Submit(wid));
+    assert_eq!(
+        w.rename_problem().as_deref(),
+        Some("Already uploading A.conf")
+    );
+    assert_eq!(w.uploads().len(), 3);
+}
+
+#[test]
+fn drops_wait_for_the_listing() {
+    let mut w = world();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.toggle();
+    w.answer_open(&db, "/home/user");
+    // The folder is still being read.
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("app.conf"), "x").unwrap();
+    let wid = w.wid;
+    let _ = w.msg(FilePanelMsg::Dropped(wid, temp.path().join("app.conf")));
+    let _ = w.msg(FilePanelMsg::DropsSettled(wid));
+    assert!(w.uploads().is_empty(), "not before the listing is there");
+    assert!(w.dialog().is_none());
+    // It lists the name: asked, not uploaded blindly.
+    w.answer_list(&db, vec![file("app.conf")]);
+    assert_eq!(w.clash(), Some(("app.conf".into(), false, None)));
+    w.prompt(PromptMsg::Cancel(wid));
+    assert!(w.uploads().is_empty());
+}
+
+/// A session that answers until told it is gone.
+struct FlakyRemote(std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl Remote for FlakyRemote {
+    async fn list(&self, _path: &str) -> Result<Vec<Entry>, SftpError> {
+        Ok(Vec::new())
+    }
+
+    fn sftp(&self) -> Option<Arc<Sftp>> {
+        None
+    }
+
+    fn is_alive(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[test]
+fn a_transfer_finding_the_session_gone_lets_it_go() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log"), file("db.dump")]);
+    let wid = w.wid;
+    let db = w.db.clone();
+    let flaky = Arc::new(FlakyRemote(true.into()));
+    w.app.file_panels.by_profile.get_mut(&db.id).unwrap().sftp = Some(flaky.clone());
+    w.select("app.log");
+    w.download();
+    let id = w.downloads()[0].2;
+    // A file failing on a session that still answers keeps the session.
+    w.select("db.dump");
+    w.download();
+    let other = w.downloads()[1].2;
+    w.transfer(other, TransferEvent::Failed("Permission denied.".into()));
+    assert!(w.panel().sftp.is_some());
+    // The session itself went away (its channel closed, the connection may be fine).
+    flaky.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    w.transfer(
+        id,
+        TransferEvent::Failed("The SFTP session has ended.".into()),
+    );
+    assert!(w.panel().sftp.is_none());
+    assert_eq!(
+        w.shows().as_deref(),
+        Some("error: The SFTP session has ended.")
+    );
+    // Retry opens a new one.
+    let opens = w.opens(&db);
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, id));
+    assert_eq!(w.opens(&db), opens + 1);
+}
+
+#[test]
+fn close_question_stays_current_and_quit_falls_back() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log"), file("db.dump")]);
+    let wid = w.wid;
+    w.select("app.log");
+    w.download();
+    w.select("db.dump");
+    w.download();
+    let ids: Vec<TransferId> = w.downloads().iter().map(|d| d.2).collect();
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    assert_eq!(w.running_asked(), Some(2));
+    let done = || TransferEvent::Finished {
+        note: None,
+        local: None,
+    };
+    w.transfer(ids[0], done());
+    assert_eq!(w.running_asked(), Some(1), "the count follows");
+    w.transfer(ids[1], done());
+    assert!(w.dialog().is_none(), "nothing runs: nothing to ask about");
+    assert!(!w.app.quitting, "nothing closes by itself");
+
+    // A cancelled transfer that never reports: the quit goes ahead after the wait.
+    w.select("app.log");
+    w.download();
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    w.prompt(PromptMsg::StopTransfers(wid));
+    assert!(!w.app.quitting);
+    let _ = w.msg(FilePanelMsg::QuitWaited);
+    assert!(w.app.quitting);
 }

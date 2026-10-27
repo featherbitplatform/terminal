@@ -1051,8 +1051,15 @@ impl App {
                     row.cancel = None;
                 }
                 TransferEvent::Failed(reason) => {
-                    row.state = state::RowState::Failed(reason);
+                    row.state = state::RowState::Failed(reason.clone());
                     row.cancel = None;
+                    // The session is gone (not just this file): let it go, so browsing and
+                    // `Retry` open a new one.
+                    if panel.sftp.as_ref().is_some_and(|s| !s.is_alive()) {
+                        panel.sftp = None;
+                        panel.listing = Listing::Failed(reason);
+                        panel.shown.clear();
+                    }
                 }
                 TransferEvent::Cancelled => {
                     panel.transfers.remove(i);
@@ -1063,6 +1070,7 @@ impl App {
         if let Some((profile, folder)) = ended_upload {
             self.uploads_ended(profile, &folder);
         }
+        self.refresh_transfer_questions();
         self.quit_if_stopped(false)
     }
 
@@ -1372,6 +1380,13 @@ impl App {
     }
 
     fn file_panel_event(&mut self, event: PanelEvent) -> Task<Message> {
+        let task = self.file_panel_event_inner(event);
+        // Uploads waiting for a listing go on once it is there (or could not be read).
+        self.advance_all_uploads();
+        task
+    }
+
+    fn file_panel_event_inner(&mut self, event: PanelEvent) -> Task<Message> {
         match event {
             PanelEvent::Opened {
                 profile,
