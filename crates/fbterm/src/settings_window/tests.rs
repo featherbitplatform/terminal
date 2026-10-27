@@ -409,7 +409,7 @@ fn chords_the_terminal_or_the_system_owns_are_refused() {
     assert!(why.ends_with("is used by Copy"), "{why}");
     assert!(s.values.keys.map.is_empty());
     if mac {
-        // Cmd+Q belongs to the app menu even for another action, and Quit itself is fixed.
+        // Cmd+Q is Quit's even for another action, and Quit itself is fixed.
         s.update(SettingsMsg::Pressed(Some(chord("cmd+q"))));
         assert!(matches!(
             s.recording.as_ref().unwrap().problem,

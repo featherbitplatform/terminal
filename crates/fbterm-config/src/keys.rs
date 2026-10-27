@@ -289,7 +289,8 @@ impl Action {
     }
 
     /// Whether the action's chord cannot be changed on this platform: on macOS Quit stays Cmd+Q,
-    /// which the app menu owns (it acts before any window sees the key).
+    /// the key every Mac app quits with (the app takes it from its menu's Quit item, so it
+    /// reaches this binding and Quit can ask first).
     pub fn is_fixed(self, mac: bool) -> bool {
         mac && self == Self::Quit
     }
@@ -627,8 +628,8 @@ fn arrow_chord(mac: bool, key: ChordKey) -> Chord {
 }
 
 /// What already owns `chord` outside the binding table, so it cannot be bound: the terminal's
-/// copy, paste and scroll keys, Save in the profile editor, and on macOS the app menu's Quit,
-/// Hide and Hide Others (which act before any window sees the key).
+/// copy, paste and scroll keys, Save in the profile editor, and on macOS Quit (fixed on Cmd+Q)
+/// and the app menu's Hide and Hide Others (which act before any window sees the key).
 pub fn reserved(mac: bool, chord: Chord) -> Option<&'static str> {
     let Chord {
         key,

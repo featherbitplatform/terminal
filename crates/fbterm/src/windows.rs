@@ -261,7 +261,9 @@ impl App {
     /// - The close button on the last terminal window is Quit. On any other terminal window it
     ///   drops that window from the layout. Closing the last tab of the last window leaves no
     ///   tabs to save, so the next launch opens the default window.
-    /// - macOS Cmd+Q from the app menu is `terminate:`: winit closes the windows without a
+    /// - macOS: `Cmd+Q` is taken from the app menu at launch (`chrome::release_quit_key`), so
+    ///   the key reaches `quit_asking` like any shortcut and asks while transfers run. Choosing Quit in
+    ///   the app menu with the mouse is still `terminate:`: winit closes the windows without a
     ///   close request and the process ends; windows closing unasked count as a quit, and
     ///   state.toml is already current because it is saved on every layout change.
     pub(crate) fn quit(&mut self) -> Task<Message> {

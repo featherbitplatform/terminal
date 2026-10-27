@@ -285,6 +285,9 @@ pub struct App {
     /// The app is quitting: windows closing from now on are not the user dropping them, so
     /// the layout saved at quit must stay as it is.
     pub(crate) quitting: bool,
+    /// macOS: `Cmd+Q` was taken from the app menu's Quit, so it reaches the app's own Quit
+    /// (see [`crate::chrome::release_quit_key`]); tried as windows open until it is.
+    pub(crate) quit_key_free: bool,
     /// Windows we asked to close. A window that closes without being asked is the OS tearing
     /// the app down (macOS Cmd+Q from the menu): that is a quit too.
     pub(crate) closing: std::collections::HashSet<window::Id>,
@@ -525,6 +528,7 @@ impl App {
                 && debug_env("FBTERM_SCREENSHOT").is_none()
                 && crate::perf::opts().is_none(),
             quitting: false,
+            quit_key_free: false,
             closing: Default::default(),
             sizes: HashMap::new(),
             fullscreen: Default::default(),
@@ -763,6 +767,10 @@ impl App {
             Message::NewWindow => self.action(None, Action::NewWindow),
             Message::WindowOpened(id) => {
                 self.focused.get_or_insert(id);
+                // The app menu exists once the app has launched, before any window opens.
+                if !self.quit_key_free {
+                    self.quit_key_free = crate::chrome::release_quit_key();
+                }
                 if self.windows.contains_key(&id) {
                     Task::batch([
                         visibility::watch(id, &self.visibility),

@@ -15,6 +15,55 @@ use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector, window};
 
+/// Whether a menu item with `action` and `key` (its key equivalent) is the app menu's Quit on
+/// `Cmd+Q`: the item [`release_quit_key`] takes the key from.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn is_quit_key_item(action: Option<&str>, key: &str) -> bool {
+    action == Some("terminate:") && key.eq_ignore_ascii_case("q")
+}
+
+/// Take `Cmd+Q` from the macOS app menu's Quit, so the key reaches the window and goes
+/// through the app's own Quit (which asks first while transfers run). The menu item stays;
+/// choosing it with the mouse still ends the app at once. Returns whether the key was found
+/// and freed (the menu exists only once the app has launched); does nothing elsewhere.
+#[cfg(target_os = "macos")]
+pub(crate) fn release_quit_key() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    use objc2_foundation::NSString;
+    // AppKit's menus belong to the main thread, where iced runs `update`.
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    let Some(menu) = NSApplication::sharedApplication(mtm).mainMenu() else {
+        return false;
+    };
+    let mut freed = false;
+    for top in menu.itemArray().iter() {
+        let Some(submenu) = top.submenu() else {
+            continue;
+        };
+        for item in submenu.itemArray().iter() {
+            let action = item
+                .action()
+                .map(|sel| sel.name().to_string_lossy().into_owned());
+            if is_quit_key_item(action.as_deref(), &item.keyEquivalent().to_string()) {
+                item.setKeyEquivalent(&NSString::from_str(""));
+                freed = true;
+            }
+        }
+    }
+    if freed {
+        tracing::info!("Cmd+Q now goes through the app's Quit");
+    }
+    freed
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn release_quit_key() -> bool {
+    true
+}
+
 /// Height of the macOS title bar area in logical pixels (measured on macOS 27: the window
 /// buttons are 14 px tall, centered 16 px from the top).
 pub const MACOS_TITLEBAR_HEIGHT: f32 = 32.0;
@@ -415,6 +464,16 @@ mod tests {
                 blur: false
             }
         );
+    }
+
+    #[test]
+    fn only_the_menus_quit_on_cmd_q_is_picked() {
+        assert!(is_quit_key_item(Some("terminate:"), "q"));
+        assert!(is_quit_key_item(Some("terminate:"), "Q"));
+        assert!(!is_quit_key_item(Some("terminate:"), ""));
+        assert!(!is_quit_key_item(Some("hide:"), "h"));
+        assert!(!is_quit_key_item(Some("performClose:"), "q"));
+        assert!(!is_quit_key_item(None, "q"));
     }
 
     #[cfg(target_os = "macos")]
