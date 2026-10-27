@@ -25,6 +25,13 @@ sha1 = "0.11"
 data-encoding = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+[features]
+# Raw remote-forward calls on `Connection` for the live tests (`tests/ssh_live.rs`); the app
+# never enables it.
+test-support = []
+
 [dev-dependencies]
+# The crate itself with `test-support`, for its integration tests.
+fbterm-session = { path = ".", features = ["test-support"] }
 tempfile = "3"
 feathercritty = { workspace = true }

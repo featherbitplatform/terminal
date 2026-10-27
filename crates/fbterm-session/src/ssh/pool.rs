@@ -290,6 +290,27 @@ impl Connection {
         }
     }
 
+    /// Claim the forwarded channels for `address:port` (the address as requested, the port
+    /// the server listens on): from now on they are accepted and arrive on the returned
+    /// receiver. Refused (`None`) while another claim on the same forward is live, so one
+    /// tunnel can never take over or remove another's routing. The claim ends when the
+    /// returned guard is dropped, and only if it is still the registered one. The guard does
+    /// not keep the connection open.
+    pub(crate) fn claim_forward(
+        &self,
+        address: &str,
+        port: u32,
+    ) -> Option<(ForwardClaim, mpsc::UnboundedReceiver<Channel<Msg>>)> {
+        claim_in(&self.forwards, address, port)
+    }
+}
+
+/// Raw remote-forward calls, for the live tests only (feature `test-support`, which only the
+/// crate's own tests enable). Registering here replaces a live claim instead of being refused,
+/// so these are not part of the API the app builds against.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+impl Connection {
     /// Ask the server to listen on `address:port` (port 0: a port of its choosing) and send
     /// its connections back as `forwarded-tcpip` channels. Returns the port it listens on.
     /// Those channels are refused until [`Connection::register_forward`] claims the port.
@@ -320,18 +341,6 @@ impl Connection {
     /// Stop accepting forwarded channels for `address:port`.
     pub fn unregister_forward(&self, address: &str, port: u32) {
         self.forwards.lock().remove(&(address.to_owned(), port));
-    }
-
-    /// Like [`Connection::register_forward`], but refused (`None`) while another claim on
-    /// the same forward is live, so one tunnel can never take over or remove another's
-    /// routing. The claim ends when the returned guard is dropped, and only if it is still the
-    /// registered one. The guard does not keep the connection open.
-    pub(crate) fn claim_forward(
-        &self,
-        address: &str,
-        port: u32,
-    ) -> Option<(ForwardClaim, mpsc::UnboundedReceiver<Channel<Msg>>)> {
-        claim_in(&self.forwards, address, port)
     }
 }
 

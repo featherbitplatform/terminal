@@ -12,7 +12,7 @@
 //!   client; the tunnel stays up.
 //! - **Remote**: asks the server to listen on `bind:port`; each `forwarded-tcpip` channel for
 //!   it becomes a TCP connection to `host:host_port` from here. Only forwards this tunnel
-//!   requested are accepted (see [`super::Connection::register_forward`]).
+//!   requested are accepted (see `Connection::claim_forward`).
 //! - **SOCKS**: SOCKS5 with no authentication and CONNECT only; host names go to the server
 //!   as typed and are resolved there, never here. BIND and UDP ASSOCIATE are refused.
 //!
