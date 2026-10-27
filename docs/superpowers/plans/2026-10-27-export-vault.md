@@ -25,7 +25,7 @@
 - Vault: `<config>/secrets.fbvault`, `age`-encrypted TOML; unlocked once per app session on first need with `Unlock saved secrets` (main password); setting it asks twice (`Set a main password`); `Reset vault` deletes saved secrets after confirmation (`Delete all saved passwords and passphrases? Profiles are kept.`) and keeps profiles; cancelling unlock makes that connection ask for its secret as if none were saved.
 - Copy: palette actions `Export profiles…`, `Import profiles…`; editor footer buttons `Export…`, `Import…`; export kinds `Full (for your own machines)` and `Shared (no secrets, for teammates)`; Settings section `Saved secrets` with choices `Automatic`, `System keychain`, `Encrypted vault` and button `Reset vault`.
 - Users who never use these features see no change.
-- Cross-platform; no new `unsafe`; no emoji or em-dashes; never name another terminal application; Conventional Commits with no attribution of any kind; `cargo deny` passes with the new dependencies (record them in `LICENSES.md`).
+- Cross-platform; no new `unsafe` outside the DPAPI calls (Task 6b); no emoji or em-dashes; never name another terminal application; Conventional Commits with no attribution of any kind; `cargo deny` passes with the new dependencies (record them in `LICENSES.md`).
 - Gates per task: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`; `cd website && npm run build` when docs change.
 
 ## Review Focus
