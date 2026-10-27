@@ -420,11 +420,31 @@ pub(crate) enum Body<'a> {
     Entries(&'a ProfilePanel),
 }
 
-/// A remote name as plain text: control characters (escape sequences, new lines) become `?`.
+/// A remote name (or a server's message) as plain text: control characters (escape
+/// sequences, new lines), bidirectional controls (which could reorder what is shown, e.g. a
+/// `.exe` shown as `.pdf`), line and paragraph separators and invisible zero-width characters
+/// become `?`. The joiners U+200C and U+200D stay: names in many scripts need them.
 pub(crate) fn plain_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
+        .map(|c| if is_unsafe_char(c) { '?' } else { c })
         .collect()
+}
+
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{061C}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{200B}'
+                | '\u{2060}'
+                | '\u{FEFF}'
+        )
 }
 
 impl App {
@@ -471,7 +491,7 @@ impl App {
         match msg {
             FilePanelMsg::Event(event) => {
                 if let Some(event) = event.take() {
-                    self.file_panel_event(event);
+                    return self.file_panel_event(event);
                 }
             }
             FilePanelMsg::Resize(width) => self.file_panels.width = state::clamp_width(width),
@@ -486,6 +506,7 @@ impl App {
                     panel.refresh(on);
                 }
                 self.save_state();
+                return self.list_to_top(None);
             }
             FilePanelMsg::Focus(wid, focused) => return self.focus_file_panel(wid, focused),
             FilePanelMsg::Select(wid, name) => {
@@ -504,7 +525,7 @@ impl App {
                 }
             }
             FilePanelMsg::PathSubmit(wid) => return self.submit_path(wid),
-            FilePanelMsg::Filter(wid, text) => self.set_filter(wid, text),
+            FilePanelMsg::Filter(wid, text) => return self.set_filter(wid, text),
             FilePanelMsg::Sort(wid, key) => {
                 let show_hidden = self.file_panels.show_hidden;
                 if let Some(panel) = self.shown_panel_mut(wid) {
@@ -517,7 +538,7 @@ impl App {
                     panel.sort_and_refresh(show_hidden);
                 }
             }
-            FilePanelMsg::Retry(wid) => self.retry(wid),
+            FilePanelMsg::Retry(wid) => return self.retry(wid),
             FilePanelMsg::Scrolled(wid, offset, height) => {
                 if let Some(ui) = self.file_panels.ui.get_mut(&wid) {
                     ui.offset = offset;
@@ -576,19 +597,33 @@ impl App {
         panel.filter.clear();
         panel.selected = select;
         panel.shown.clear();
-        self.read_folder(profile);
-        // Every panel showing this profile starts the new folder at the top.
+        let has_session = panel.sftp.is_some();
+        if has_session {
+            self.read_folder(profile);
+        } else {
+            // The session is gone (the folder's error said so): open it again, over this
+            // window, for the new folder rather than leave the old error under the new path.
+            self.reopen(profile, wid);
+        }
+        for ui in self.file_panels.ui.values_mut() {
+            ui.editing = None;
+        }
+        self.list_to_top(Some(profile))
+    }
+
+    /// Scroll the list back to the top in every panel showing `profile` (every open panel
+    /// with `None`): its rows changed, and an offset past their end would show none.
+    fn list_to_top(&mut self, profile: Option<ProfileId>) -> Task<Message> {
         let showing: Vec<window::Id> = self
             .file_panels
             .open
             .iter()
             .copied()
-            .filter(|&w| self.shown_profile(w) == Some(profile))
+            .filter(|&w| profile.is_none() || self.shown_profile(w) == profile)
             .collect();
         let mut tasks = Vec::new();
         for w in showing {
             if let Some(ui) = self.file_panels.ui.get_mut(&w) {
-                ui.editing = None;
                 ui.offset = 0.0;
                 tasks.push(iced::widget::operation::snap_to(
                     ui.list_id.clone(),
@@ -676,19 +711,23 @@ impl App {
         self.go_to(wid, path, None)
     }
 
-    fn set_filter(&mut self, wid: window::Id, text: String) {
+    fn set_filter(&mut self, wid: window::Id, text: String) -> Task<Message> {
         let show_hidden = self.file_panels.show_hidden;
-        if let Some(panel) = self.shown_panel_mut(wid) {
+        let Some(profile) = self.shown_profile(wid) else {
+            return Task::none();
+        };
+        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
             panel.filter = text;
             panel.refresh(show_hidden);
         }
+        self.list_to_top(Some(profile))
     }
 
     /// `Retry` in `wid`'s panel: a session that is gone (or never opened) is opened again,
     /// asking over this window; otherwise the folder is read again.
-    fn retry(&mut self, wid: window::Id) {
+    fn retry(&mut self, wid: window::Id) -> Task<Message> {
         let Some(profile) = self.shown_profile(wid) else {
-            return;
+            return Task::none();
         };
         let has_session = self
             .file_panels
@@ -698,11 +737,17 @@ impl App {
         if has_session {
             self.read_folder(profile);
         } else {
-            if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
-                panel.release();
-            }
-            self.open_sftp(profile, wid);
+            self.reopen(profile, wid);
         }
+        self.list_to_top(Some(profile))
+    }
+
+    /// Open `profile`'s session again (it is gone), asking over `wid`; its folder is kept.
+    fn reopen(&mut self, profile: ProfileId, wid: window::Id) {
+        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+            panel.release();
+        }
+        self.open_sftp(profile, wid);
     }
 
     /// A key for `wid`'s panel, which has the keyboard.
@@ -735,8 +780,7 @@ impl App {
                     .shown_panel_mut(wid)
                     .is_some_and(|p| !p.filter.is_empty());
                 if filtered {
-                    self.set_filter(wid, String::new());
-                    Task::none()
+                    self.set_filter(wid, String::new())
                 } else {
                     self.focus_file_panel(wid, false)
                 }
@@ -749,13 +793,14 @@ impl App {
                     Some(panel) => format!("{}{text}", panel.filter),
                     None => return Task::none(),
                 };
-                self.set_filter(wid, filter);
+                let top = self.set_filter(wid, filter);
                 match self.file_panels.ui.get(&wid) {
                     Some(ui) => Task::batch([
+                        top,
                         iced::widget::operation::focus(ui.filter_id.clone()),
                         iced::widget::operation::move_cursor_to_end(ui.filter_id.clone()),
                     ]),
-                    None => Task::none(),
+                    None => top,
                 }
             }
             PanelKey::Up
@@ -818,7 +863,7 @@ impl App {
         }
     }
 
-    fn file_panel_event(&mut self, event: PanelEvent) {
+    fn file_panel_event(&mut self, event: PanelEvent) -> Task<Message> {
         match event {
             PanelEvent::Opened {
                 profile,
@@ -826,10 +871,10 @@ impl App {
                 result,
             } => {
                 let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
-                    return;
+                    return Task::none();
                 };
                 if panel.token != token || panel.listing != Listing::Opening {
-                    return;
+                    return Task::none();
                 }
                 panel.opening = None;
                 match result {
@@ -844,13 +889,14 @@ impl App {
                                 Ok(home) => panel.folder = home,
                                 Err(e) => {
                                     panel.listing = Listing::Failed(e);
-                                    return;
+                                    return Task::none();
                                 }
                             }
                         }
                         self.read_folder(profile);
                     }
                 }
+                Task::none()
             }
             PanelEvent::Listed {
                 profile,
@@ -859,10 +905,10 @@ impl App {
                 result,
             } => {
                 let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
-                    return;
+                    return Task::none();
                 };
                 if panel.token != token || panel.folder != folder {
-                    return;
+                    return Task::none();
                 }
                 panel.listing = match result {
                     Ok(mut entries) => {
@@ -878,6 +924,8 @@ impl App {
                     }
                 };
                 panel.refresh(self.file_panels.show_hidden);
+                // New rows: from the top, as a shorter listing may end above the offset.
+                self.list_to_top(Some(profile))
             }
         }
     }
@@ -945,12 +993,25 @@ impl App {
                 .get(&wid)
                 .and_then(WindowState::active_tab)
                 .map(|tab| tab.focused);
-            let remote = matches!(self.panel_shows(wid), Some(Shown::Remote(_)));
+            let shown = match self.panel_shows(wid) {
+                Some(Shown::Remote(p)) => Some(p),
+                _ => None,
+            };
+            let remote = shown.is_some();
             let Some(ui) = self.file_panels.ui.get_mut(&wid) else {
                 continue;
             };
             let moved = ui.pane.is_some() && ui.pane != pane;
             ui.pane = pane;
+            // Another profile's folder: its list starts at the top.
+            if ui.profile != shown {
+                ui.profile = shown;
+                ui.offset = 0.0;
+                tasks.push(iced::widget::operation::snap_to(
+                    ui.list_id.clone(),
+                    iced::widget::operation::RelativeOffset::START,
+                ));
+            }
             if ui.focused && (moved || !remote) {
                 ui.focused = false;
                 ui.editing = None;
@@ -1019,9 +1080,9 @@ impl App {
             Shown::Remote(p) => match self.file_panels.by_profile.get(&p).map(|p| &p.listing) {
                 None | Some(Listing::Closed | Listing::Opening | Listing::Loading) => Body::Loading,
                 Some(Listing::Loaded(_)) => Body::Entries(&self.file_panels.by_profile[&p]),
-                Some(Listing::Failed(e)) => Body::Error(e.clone()),
+                Some(Listing::Failed(e)) => Body::Error(plain_name(e)),
                 Some(Listing::Unavailable(reason)) => {
-                    Body::Error(format!("SFTP is not available: {reason}"))
+                    Body::Error(format!("SFTP is not available: {}", plain_name(reason)))
                 }
             },
         })

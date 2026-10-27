@@ -465,7 +465,10 @@ fn listing<'a>(
             - if wide { GAP + MODIFIED_WIDTH } else { 0.0 };
         let room = (name_width / (NAME_SIZE * MONO_ADVANCE)).floor().max(1.0) as usize;
         let list_height = size.height - HEADER_HEIGHT;
-        let range = visible_rows(rows, offset, list_height);
+        // The offset may be older than the rows (they shrank, and a list that fits reports no
+        // scroll): never past the end, or no row would be built.
+        let end = (rows as f32 * ROW_HEIGHT - list_height).max(0.0);
+        let range = visible_rows(rows, offset.clamp(0.0, end), list_height);
         let mut list = column![Space::new().height(range.start as f32 * ROW_HEIGHT)];
         for index in range.clone() {
             let item = if parent && index == 0 {

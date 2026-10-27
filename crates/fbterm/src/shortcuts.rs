@@ -273,7 +273,7 @@ fn panel_key(event: &Event) -> Option<PanelKey> {
         return None;
     };
     if modifiers.command() || modifiers.control() || modifiers.alt() || modifiers.logo() {
-        return typed_text(event).map(PanelKey::Type);
+        return panel_text(event).map(PanelKey::Type);
     }
     Some(match key {
         keyboard::Key::Named(Named::ArrowUp) => PanelKey::Up,
@@ -285,8 +285,30 @@ fn panel_key(event: &Event) -> Option<PanelKey> {
         keyboard::Key::Named(Named::Enter) => PanelKey::Enter,
         keyboard::Key::Named(Named::Backspace) => PanelKey::Backspace,
         keyboard::Key::Named(Named::Escape) => PanelKey::Escape,
-        _ => return typed_text(event).map(PanelKey::Type),
+        _ => return panel_text(event).map(PanelKey::Type),
     })
+}
+
+/// Text a key press types for the panel: as [`typed_text`], and on macOS also what Option
+/// types (`~` is Option+5 on some layouts). Chords bound to app shortcuts never get here:
+/// [`Mode::Panel`] acts on them before the panel's fields.
+fn panel_text(event: &Event) -> Option<String> {
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        text: Some(text),
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if !(cfg!(target_os = "macos") && modifiers.alt()) {
+        return typed_text(event);
+    }
+    if modifiers.command() || modifiers.control() || modifiers.logo() {
+        return None;
+    }
+    let text = text.to_string();
+    (!text.is_empty() && text.chars().all(|c| !c.is_control())).then_some(text)
 }
 
 /// Printable text a key press types (no Cmd, Ctrl or Alt held).
@@ -994,6 +1016,67 @@ mod tests {
             Some(Some(Message::Shortcut(_, Action::Settings)))
         ));
         assert!(save(&b, M::COMMAND));
+    }
+
+    #[test]
+    fn option_typed_text_reaches_the_panel_unless_it_is_a_shortcut() {
+        let alt = keyboard::Modifiers::ALT;
+        let five = keyboard::Key::Character("5".into());
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: five.clone(),
+            modified_key: keyboard::Key::Character("~".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit5),
+            location: keyboard::Location::Standard,
+            modifiers: alt,
+            text: Some("~".into()),
+            repeat: false,
+        });
+        // Option+5 types `~` on some macOS layouts: the panel takes it as text.
+        let expected = cfg!(target_os = "macos").then(|| PanelKey::Type("~".into()));
+        assert_eq!(panel_key(&event), expected);
+        // Option with Cmd or Ctrl is never text.
+        let with = |mods| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: five.clone(),
+                modified_key: five.clone(),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit5),
+                location: keyboard::Location::Standard,
+                modifiers: mods,
+                text: Some("~".into()),
+                repeat: false,
+            })
+        };
+        assert_eq!(panel_key(&with(alt | keyboard::Modifiers::CTRL)), None);
+        assert_eq!(panel_key(&with(alt | keyboard::Modifiers::LOGO)), None);
+        // A chord bound to an app shortcut acts as the shortcut before the panel sees it.
+        let mut overrides = fbterm_config::keys::Overrides::new();
+        overrides.insert(Action::NewTab, Some(parse_chord("alt+5")));
+        let b = Bindings::current(&overrides);
+        assert!(matches!(
+            key_message(
+                &b,
+                Mode::Panel { editing: false },
+                window::Id::unique(),
+                &five,
+                alt,
+                false,
+                Some("~")
+            ),
+            Some(Some(Message::Shortcut(_, Action::NewTab)))
+        ));
+        // Unbound, it goes on to the panel.
+        assert!(
+            key_message(
+                &defaults(),
+                Mode::Panel { editing: false },
+                window::Id::unique(),
+                &five,
+                alt,
+                false,
+                Some("~")
+            )
+            .is_none()
+        );
     }
 
     fn parse_chord(s: &str) -> keys::Chord {

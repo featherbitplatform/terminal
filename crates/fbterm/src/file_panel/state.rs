@@ -128,7 +128,10 @@ impl ProfilePanel {
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| show_hidden || !e.name.starts_with('.'))
-                .filter(|(_, e)| filter.is_empty() || e.name.to_lowercase().contains(&filter))
+                // Against the name as shown, so `?` matches a control character.
+                .filter(|(_, e)| {
+                    filter.is_empty() || super::plain_name(&e.name).to_lowercase().contains(&filter)
+                })
                 .map(|(i, _)| i),
         );
     }
@@ -209,6 +212,8 @@ pub(crate) struct WindowPanel {
     /// The focused pane the panel last followed: when another pane or tab takes focus, the
     /// keyboard goes back to the terminal.
     pub pane: Option<crate::layout::PaneId>,
+    /// The profile the panel last showed.
+    pub profile: Option<ProfileId>,
     /// The path bar as a text field, with what is typed so far.
     pub editing: Option<String>,
     /// The list's scroll offset and visible height, in logical pixels (height 0 until the
@@ -225,6 +230,7 @@ impl WindowPanel {
         Self {
             focused: false,
             pane: None,
+            profile: None,
             editing: None,
             offset: 0.0,
             height: 0.0,

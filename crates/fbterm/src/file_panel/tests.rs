@@ -943,6 +943,11 @@ fn filter_is_substring_case_insensitive() {
     // A new folder starts unfiltered.
     let _ = w.msg(FilePanelMsg::Activate(wid, "Logs".into()));
     assert_eq!(w.panel().filter, "");
+    // The filter matches what is shown: control characters as `?`.
+    let db = w.db.clone();
+    w.answer_list(&db, vec![file("a\u{1b}b"), file("ab")]);
+    let _ = w.msg(FilePanelMsg::Filter(wid, "a?b".into()));
+    assert_eq!(w.shows().as_deref(), Some(".. a\u{1b}b"));
 }
 
 #[test]
@@ -1158,6 +1163,58 @@ fn control_chars_in_names_are_neutralized() {
     // The path bar too.
     let segments = super::view::path_labels("/srv/a\u{1b}b");
     assert_eq!(segments, ["/", "srv", "a?b"]);
+    // Bidi overrides and line separators cannot reorder or break a name.
+    assert_eq!(
+        super::plain_name("invoice\u{202E}fdp.exe"),
+        "invoice?fdp.exe"
+    );
+    assert_eq!(super::plain_name("a\u{2028}b\u{2029}c"), "a?b?c");
+    assert_eq!(
+        super::plain_name(
+            "\u{202A}\u{2066}\u{2069}\u{200E}\u{200F}\u{061C}\u{200B}\u{2060}\u{FEFF}"
+        ),
+        "?????????"
+    );
+    // Joiners stay: names need them.
+    assert_eq!(
+        super::plain_name("a\u{200C}b\u{200D}c"),
+        "a\u{200C}b\u{200D}c"
+    );
+
+    // The inline error: paths and server text are shown plain too.
+    let mut w = World::browsing(vec![]);
+    let (wid, db) = (w.wid, w.db.clone());
+    let _ = w.msg(FilePanelMsg::Navigate(
+        wid,
+        "/srv/x\u{1b}[2J\u{202E}y".into(),
+    ));
+    let (folder, token) = w.last_list(&db).unwrap();
+    w.event(PanelEvent::Listed {
+        profile: db.id,
+        token,
+        folder,
+        result: Err(SftpError::Denied(
+            "Permission denied for /srv/x\u{1b}[2J\u{202E}y.\nsecond line".into(),
+        )),
+    });
+    assert_eq!(
+        w.shows().as_deref(),
+        Some("error: Permission denied for /srv/x?[2J?y.?second line")
+    );
+    let mut w = world();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.toggle();
+    let (_, token) = w.last_open(&db).unwrap();
+    w.event(PanelEvent::Opened {
+        profile: db.id,
+        token,
+        result: Err("refused\u{1b}]0;x\u{7}".into()),
+    });
+    assert_eq!(
+        w.shows().as_deref(),
+        Some("error: SFTP is not available: refused?]0;x?")
+    );
 }
 
 use super::Listing;
@@ -1229,4 +1286,121 @@ fn the_keyboard_goes_back_when_focus_moves_or_nothing_is_browsed() {
     let wid = w.wid;
     let _ = w.msg(FilePanelMsg::Focus(wid, true));
     assert!(!w.app.file_panels.has_focus(w.wid));
+}
+
+/// Every text `wid`'s panel draws, laid out in a `size` panel.
+fn drawn_texts(w: &World, size: iced::Size) -> Vec<String> {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::{Id, Operation, Tree};
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn text(&mut self, _id: Option<&Id>, _bounds: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+    }
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        iced::Pixels(16.0),
+    ));
+    let (mut element, _) = super::view::panel(&w.app, w.wid).expect("the panel is open");
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(iced::Size::ZERO, size));
+    let mut texts = Texts(Vec::new());
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    texts.0
+}
+
+#[test]
+fn shrinking_rows_never_blank_the_list() {
+    let size = iced::Size::new(300.0, 700.0);
+    let entries: Vec<Entry> = (0..5000).map(|i| file(&format!("f{i:06}"))).collect();
+    let mut w = World::browsing(entries);
+    let (wid, db) = (w.wid, w.db.clone());
+    let scroll_far = |w: &mut World| {
+        let _ = w.msg(FilePanelMsg::Scrolled(
+            wid,
+            4000.0 * super::view::ROW_HEIGHT,
+            500.0,
+        ));
+    };
+    scroll_far(&mut w);
+    let texts = drawn_texts(&w, size);
+    assert!(
+        texts.iter().any(|t| t == "f003999"),
+        "rows near the offset are built"
+    );
+    assert!(!texts.iter().any(|t| t == "f000001"));
+
+    // A filter that leaves a few rows: they are drawn, from the top.
+    let _ = w.msg(FilePanelMsg::Filter(wid, "f00000".into()));
+    assert_eq!(w.app.file_panels.ui[&wid].offset, 0.0);
+    assert!(drawn_texts(&w, size).iter().any(|t| t == "f000003"));
+
+    // A stale offset alone (no reset) still draws the rows: the list clamps it.
+    w.app.file_panels.ui.get_mut(&wid).unwrap().offset = 4000.0 * super::view::ROW_HEIGHT;
+    assert!(drawn_texts(&w, size).iter().any(|t| t == "f000003"));
+
+    // Hidden files off, a shorter re-list: back at the top each time.
+    let _ = w.msg(FilePanelMsg::Filter(wid, String::new()));
+    scroll_far(&mut w);
+    let _ = w.msg(FilePanelMsg::ShowHidden(false));
+    assert_eq!(w.app.file_panels.ui[&wid].offset, 0.0);
+    scroll_far(&mut w);
+    let _ = w.msg(FilePanelMsg::Retry(wid));
+    assert_eq!(w.app.file_panels.ui[&wid].offset, 0.0);
+    scroll_far(&mut w);
+    w.answer_list(&db, vec![file("a.log"), file("b.log")]);
+    assert_eq!(w.app.file_panels.ui[&wid].offset, 0.0);
+    assert!(drawn_texts(&w, size).iter().any(|t| t == "b.log"));
+}
+
+#[test]
+fn the_list_starts_at_the_top_when_another_profile_is_shown() {
+    let mut w = world();
+    let (db, web) = (w.db.clone(), w.web.clone());
+    let (_, right) = w.open_split(&db, &web);
+    w.toggle();
+    w.answer_open(&db, "/home/user");
+    w.answer_list(&db, (0..500).map(|i| file(&format!("f{i}"))).collect());
+    let wid = w.wid;
+    let _ = w.msg(FilePanelMsg::Scrolled(
+        wid,
+        400.0 * super::view::ROW_HEIGHT,
+        500.0,
+    ));
+    w.focus(right);
+    assert_eq!(w.app.file_panels.ui[&wid].offset, 0.0);
+}
+
+#[test]
+fn navigating_without_a_session_reopens_it() {
+    let mut w = World::browsing(vec![folder("logs")]);
+    let (wid, db) = (w.wid, w.db.clone());
+    let (folder, token) = w.last_list(&db).unwrap();
+    w.event(PanelEvent::Listed {
+        profile: db.id,
+        token,
+        folder,
+        result: Err(SftpError::Unavailable("The connection was lost.".into())),
+    });
+    assert_eq!(
+        w.shows().as_deref(),
+        Some("error: The connection was lost.")
+    );
+    // Going elsewhere does not leave the old error under the new path: the session is
+    // opened again, over this window, for the new folder.
+    let _ = w.msg(FilePanelMsg::Navigate(wid, "/var/log".into()));
+    assert_eq!(w.shows().as_deref(), Some("loading"));
+    assert_eq!(w.opens(&db), 2);
+    assert_eq!(w.last_open(&db).unwrap().0, wid);
+    w.answer_open(&db, "/home/user");
+    assert_eq!(w.last_list(&db).unwrap().0, "/var/log");
 }
