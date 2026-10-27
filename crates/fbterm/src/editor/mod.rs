@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use fbterm_config::{
     AccentStyle, AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind,
-    ProfileStore, Rgb, SshProfile, ValidationError,
+    ProfileStore, Rgb, SshProfile, StartMode, TunnelDef, TunnelKind, ValidationError,
 };
 use fbterm_secrets::{SecretKind, SecretStore};
 
@@ -89,6 +89,181 @@ pub enum EditorMsg {
     Program(String),
     Args(String),
     Cwd(String),
+    TunnelAdd,
+    TunnelRemove(usize),
+    TunnelName(usize, String),
+    TunnelKind(usize, KindChoice),
+    TunnelBind(usize, String),
+    TunnelPort(usize, String),
+    TunnelHost(usize, String),
+    TunnelHostPort(usize, String),
+    TunnelStart(usize, StartMode),
+}
+
+/// Which kind of tunnel a row is, without the details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindChoice {
+    Local,
+    Remote,
+    Socks,
+}
+
+impl KindChoice {
+    pub(super) fn of(kind: &TunnelKind) -> Self {
+        match kind {
+            TunnelKind::Local { .. } => Self::Local,
+            TunnelKind::Remote { .. } => Self::Remote,
+            TunnelKind::Socks { .. } => Self::Socks,
+        }
+    }
+}
+
+/// The warning under a tunnel that listens beyond this machine, if it does.
+pub fn tunnel_warning(t: &TunnelDef) -> Option<String> {
+    t.non_loopback().then(|| {
+        format!(
+            "Listens on {}: other machines can reach this tunnel.",
+            t.bind().trim()
+        )
+    })
+}
+
+/// Parse a typed port: empty is 0 (not set), otherwise a valid port; `None` rejects the input.
+fn typed_port(v: &str, allow_zero: bool) -> Option<u16> {
+    if v.is_empty() {
+        return Some(0);
+    }
+    if !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<u16>().ok().filter(|&p| allow_zero || p > 0)
+}
+
+/// Edit one tunnel; returns whether anything changed.
+fn edit_tunnel(draft: &mut SshDraft, msg: EditorMsg) -> bool {
+    let SshDraft {
+        tunnels, parked, ..
+    } = draft;
+    parked.resize(tunnels.len(), (String::new(), 0));
+    match msg {
+        EditorMsg::TunnelAdd => {
+            let name = (1..)
+                .map(|i| format!("Tunnel {i}"))
+                .find(|n| tunnels.iter().all(|t| t.name != *n))
+                .expect("an unused name exists");
+            parked.push((String::new(), 0));
+            tunnels.push(TunnelDef {
+                name,
+                kind: TunnelKind::Local {
+                    bind: "127.0.0.1".into(),
+                    port: 0,
+                    host: String::new(),
+                    host_port: 0,
+                },
+                start: StartMode::default(),
+            });
+            return true;
+        }
+        EditorMsg::TunnelRemove(i) if i < tunnels.len() => {
+            tunnels.remove(i);
+            parked.remove(i);
+            return true;
+        }
+        _ => {}
+    }
+    let (EditorMsg::TunnelName(i, _)
+    | EditorMsg::TunnelKind(i, _)
+    | EditorMsg::TunnelBind(i, _)
+    | EditorMsg::TunnelPort(i, _)
+    | EditorMsg::TunnelHost(i, _)
+    | EditorMsg::TunnelHostPort(i, _)
+    | EditorMsg::TunnelStart(i, _)) = msg
+    else {
+        return false;
+    };
+    let (Some(t), Some(park)) = (tunnels.get_mut(i), parked.get_mut(i)) else {
+        return false;
+    };
+    match msg {
+        EditorMsg::TunnelName(_, v) => t.name = v,
+        EditorMsg::TunnelStart(_, v) => t.start = v,
+        EditorMsg::TunnelKind(_, choice) => {
+            if KindChoice::of(&t.kind) == choice {
+                return false;
+            }
+            let (bind, port, host, host_port) = match std::mem::replace(
+                &mut t.kind,
+                TunnelKind::Socks {
+                    bind: String::new(),
+                    port: 0,
+                },
+            ) {
+                TunnelKind::Local {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                }
+                | TunnelKind::Remote {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                } => (bind, port, host, host_port),
+                TunnelKind::Socks { bind, port } => (bind, port, park.0.clone(), park.1),
+            };
+            if choice == KindChoice::Socks {
+                *park = (host.clone(), host_port);
+            }
+            t.kind = match choice {
+                KindChoice::Local => TunnelKind::Local {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                },
+                KindChoice::Remote => TunnelKind::Remote {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                },
+                KindChoice::Socks => TunnelKind::Socks { bind, port },
+            };
+        }
+        EditorMsg::TunnelBind(_, v) => match &mut t.kind {
+            TunnelKind::Local { bind, .. }
+            | TunnelKind::Remote { bind, .. }
+            | TunnelKind::Socks { bind, .. } => *bind = v,
+        },
+        EditorMsg::TunnelPort(_, v) => {
+            // A remote bind may use 0: the server picks the port.
+            let allow_zero = matches!(t.kind, TunnelKind::Remote { .. });
+            let Some(new) = typed_port(&v, allow_zero) else {
+                return false;
+            };
+            match &mut t.kind {
+                TunnelKind::Local { port, .. }
+                | TunnelKind::Remote { port, .. }
+                | TunnelKind::Socks { port, .. } => *port = new,
+            }
+        }
+        EditorMsg::TunnelHost(_, v) => match &mut t.kind {
+            TunnelKind::Local { host, .. } | TunnelKind::Remote { host, .. } => *host = v,
+            TunnelKind::Socks { .. } => return false,
+        },
+        EditorMsg::TunnelHostPort(_, v) => match &mut t.kind {
+            TunnelKind::Local { host_port, .. } | TunnelKind::Remote { host_port, .. } => {
+                let Some(new) = typed_port(&v, false) else {
+                    return false;
+                };
+                *host_port = new;
+            }
+            TunnelKind::Socks { .. } => return false,
+        },
+        _ => return false,
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +285,9 @@ pub struct SshDraft {
     pub key_path: String,
     pub key_passphrase: bool,
     pub jump: Vec<ProfileId>,
+    pub tunnels: Vec<TunnelDef>,
+    /// Per tunnel, the target a SOCKS switch set aside, so Local, SOCKS, Local keeps it.
+    parked: Vec<(String, u16)>,
     /// Typed secret for the chosen auth; empty keeps whatever the keychain has.
     pub secret: String,
 }
@@ -176,6 +354,8 @@ impl Draft {
                     key_path,
                     key_passphrase,
                     jump: s.jump.clone(),
+                    tunnels: s.tunnels.clone(),
+                    parked: Vec::new(),
                     secret: String::new(),
                 })
             }
@@ -215,6 +395,7 @@ impl Draft {
                     AuthChoice::Agent => AuthMethod::Agent,
                 },
                 jump: s.jump.clone(),
+                tunnels: s.tunnels.clone(),
             }),
         };
         Profile {
@@ -477,6 +658,8 @@ impl EditorState {
                 key_path: String::new(),
                 key_passphrase: false,
                 jump: Vec::new(),
+                tunnels: Vec::new(),
+                parked: Vec::new(),
                 secret: String::new(),
             }),
         )
@@ -769,6 +952,18 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::JumpDown(i), DraftKind::Ssh(s)) if i + 1 < s.jump.len() => {
             s.jump.swap(i, i + 1);
         }
+        (
+            m @ (EditorMsg::TunnelAdd
+            | EditorMsg::TunnelRemove(_)
+            | EditorMsg::TunnelName(..)
+            | EditorMsg::TunnelKind(..)
+            | EditorMsg::TunnelBind(..)
+            | EditorMsg::TunnelPort(..)
+            | EditorMsg::TunnelHost(..)
+            | EditorMsg::TunnelHostPort(..)
+            | EditorMsg::TunnelStart(..)),
+            DraftKind::Ssh(s),
+        ) => return edit_tunnel(s, m),
         (EditorMsg::Program(v), DraftKind::Local(l)) => l.program = v,
         (EditorMsg::Args(v), DraftKind::Local(l)) => {
             l.args = v.split_whitespace().map(str::to_owned).collect();

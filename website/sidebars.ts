@@ -7,6 +7,7 @@ const sidebars: SidebarsConfig = {
     'profiles',
     'tiling',
     'color-schemes',
+    'tunnels',
     'keyboard-shortcuts',
     'files',
   ],

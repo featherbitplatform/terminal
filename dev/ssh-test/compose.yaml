@@ -1,8 +1,10 @@
-# Throwaway sshd servers for the live SSH tests (crates/fbterm-session/tests/ssh_live.rs).
+# Throwaway sshd servers for the live SSH tests (crates/fbterm-session/tests/ssh_live.rs and
+# ssh_tunnels.rs).
 #
 #   docker compose -f dev/ssh-test/compose.yaml up -d
 #   dev/ssh-test/wait-ready.sh
 #   FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_live
+#   FBTERM_TEST_SSH=1 cargo test -p fbterm-session --test ssh_tunnels
 #   docker compose -f dev/ssh-test/compose.yaml down
 #
 # Topology (every server: user `fb`, password `fb-pass`, all keys in keys/pub authorized):

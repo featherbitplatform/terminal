@@ -56,6 +56,7 @@ Without an accent, both look the same: a plain tab. The tint follows the backgro
 | `user` | string | required | User to log in as. |
 | `auth` | table | required | How to authenticate; see below. |
 | `jump` | array of profile ids | `[]` | Profiles to hop through before this one. |
+| `tunnels` | array of tables | `[]` | Named port forwards and SOCKS proxies that ride this profile's connection, written as `[[profiles.tunnels]]` tables right after the profile. See [Tunnels](tunnels#in-profilestoml). |
 
 ### Authentication
 
@@ -87,7 +88,7 @@ You can chain in two ways, and they combine:
 - **Several ids in one `jump`.** `jump = [a, b]` connects to `a`, then `b`, then the target.
 - **A hop that has its own `jump`.** In the example, `db-1` jumps through `api-1`, which itself jumps through `bastion`. Opening `db-1` connects `bastion`, then `api-1`, then `db-1`. A hop's own jumps are expanded first.
 
-Each hop authenticates with its own profile, so every hop needs a working `auth`. Tabs that share a hop reuse its connection, so opening a second host behind `bastion` does not log in to `bastion` again.
+Each hop authenticates with its own profile, so every hop needs a working `auth`. Tabs that share a hop reuse its connection, so opening a second host behind `bastion` does not log in to `bastion` again. [Tunnels](tunnels) ride the same connection and its jump chain.
 
 ## Validation
 
@@ -100,5 +101,7 @@ The app validates `profiles.toml` when it loads it. Each problem is shown as a n
 | `jump` names a local profile | `profile "<name>" jumps through a non-SSH profile` |
 | Profiles jump through each other in a loop | `profile "<name>" has a jump cycle` |
 | `host` is empty or blank | `profile "<name>" has an empty host` |
+| A tunnel has no name, or two tunnels of a profile share one | `profile "<name>" has a tunnel without a name`, `profile "<name>" has two tunnels named "<tunnel>"` |
+| A `local` or `socks` tunnel has port `0`, a tunnel has no target port, or an empty bind address or host | `tunnel "<tunnel>" of profile "<name>" needs a port above 0` and similar |
 
 A file that is not valid TOML, or has a bad value (for example `accent = "red"`, which must be `"#rrggbb"`), is reported with its path and line number, for example `profiles.toml:12: invalid colour "red": expected "#rrggbb"`. A malformed file is never modified or overwritten, and profiles are read-only until you fix it.

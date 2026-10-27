@@ -52,6 +52,7 @@ fn profile(auth: AuthMethod) -> Profile {
             user: USER.into(),
             auth,
             jump: vec![],
+            tunnels: Vec::new(),
         }),
     }
 }
@@ -608,6 +609,7 @@ mod pool {
                     passphrase: false,
                 },
                 jump,
+                tunnels: Vec::new(),
             }),
         }
     }
@@ -1143,5 +1145,421 @@ mod pool {
             w.fx.known_hosts_lines()
         );
         assert!(pool.connected_profiles().is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared connection access for tunnels: acquire, the disconnect signal, the forwarded-channel
+// guard and the no-prompt prompter of automatic reconnects.
+
+mod access {
+    use super::*;
+
+    use fbterm_config::ProfileStore;
+    use fbterm_session::ssh::{Connection, NoPrompt, SshPool};
+    use fbterm_session::{EventSink, SessionEvent, SessionHandle};
+    use fbterm_term::GridSize;
+    use feathercritty::index::{Column, Line};
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    const SIZE: GridSize = GridSize {
+        cols: 160,
+        rows: 30,
+        cell_width: 8.0,
+        cell_height: 16.0,
+    };
+
+    fn key_profile(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
+        Profile {
+            id: ProfileId::new(),
+            name: name.into(),
+            group: None,
+            accent: None,
+            accent_style: Default::default(),
+            color_scheme: None,
+            kind: ProfileKind::Ssh(SshProfile {
+                host: host.into(),
+                port: PORT,
+                user: USER.into(),
+                auth: AuthMethod::Key {
+                    path: keys_dir().join("fb_test_ed25519"),
+                    passphrase: false,
+                },
+                jump,
+                tunnels: Vec::new(),
+            }),
+        }
+    }
+
+    /// A password profile without a saved password: every dial asks for it exactly once (the
+    /// script answers without remembering), so the number of questions counts the dials.
+    fn password_profile() -> Profile {
+        let mut p = key_profile("bastion-pw", HOST, vec![]);
+        if let ProfileKind::Ssh(s) = &mut p.kind {
+            s.auth = AuthMethod::Password;
+        }
+        p
+    }
+
+    async fn acquire(
+        pool: &SshPool,
+        store: &ProfileStore,
+        id: ProfileId,
+        prompter: Arc<dyn Prompter>,
+    ) -> Result<Arc<Connection>, SshError> {
+        tokio::time::timeout(STEP, pool.acquire(store, &id, prompter))
+            .await
+            .expect("acquire timed out")
+    }
+
+    async fn open_with(
+        pool: &SshPool,
+        store: &ProfileStore,
+        id: ProfileId,
+        prompter: Arc<dyn Prompter>,
+    ) -> (
+        SessionHandle,
+        tokio::sync::mpsc::UnboundedReceiver<(fbterm_session::SessionId, SessionEvent)>,
+    ) {
+        let (tx, rx): (EventSink, _) = unbounded_channel();
+        let terminal = Arc::new(parking_lot::Mutex::new(fbterm_term::Terminal::new(
+            SIZE, 1000,
+        )));
+        let h = tokio::time::timeout(
+            STEP,
+            pool.open_shell_prompting(store, &id, terminal, tx, prompter),
+        )
+        .await
+        .expect("open_shell timed out")
+        .expect("open_shell");
+        (h, rx)
+    }
+
+    fn grid_text(handle: &SessionHandle) -> String {
+        let t = handle.terminal.lock();
+        let g = t.term().grid();
+        let size = t.size();
+        let mut out = String::new();
+        for row in 0..size.rows as i32 {
+            for col in 0..size.cols as usize {
+                out.push(g.screen()[Line(row)][Column(col)].c);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn run(handle: &SessionHandle, line: &str) {
+        handle.send(format!("{line}\r").into_bytes());
+    }
+
+    /// The value printed by the shell as `<<TAG value>>` (the echoed command line has a `$`
+    /// right after the tag, so `pick` rejects it).
+    async fn printed(handle: &SessionHandle, tag: &str, pick: fn(&str) -> bool) -> String {
+        let open = format!("<<{tag} ");
+        tokio::time::timeout(STEP, async {
+            loop {
+                let text = grid_text(handle);
+                if let Some(v) = text.split(open.as_str()).skip(1).find_map(|s| {
+                    let v = s.split(">>").next()?;
+                    pick(v).then(|| v.to_owned())
+                }) {
+                    return v;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no <<{tag} ...>> in:\n{}", grid_text(handle)))
+    }
+
+    async fn ssh_connection(handle: &SessionHandle) -> String {
+        run(handle, "echo \"<<C $SSH_CONNECTION>>\"");
+        printed(handle, "C", |v| v.starts_with(|c: char| c.is_ascii_digit())).await
+    }
+
+    /// Trusts every host (of any hop) and never expects a secret question.
+    struct TrustAny;
+
+    #[async_trait]
+    impl Prompter for TrustAny {
+        async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
+            true
+        }
+        async fn ask_secret(
+            &self,
+            name: &str,
+            kind: SecretKind,
+            _retry: bool,
+        ) -> Option<SecretAnswer> {
+            panic!("unexpected {kind:?} prompt for {name}");
+        }
+    }
+
+    fn secret_calls(s: &Script) -> usize {
+        s.secret_calls.lock().len()
+    }
+
+    #[tokio::test]
+    async fn acquire_shares_the_shell_connection() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let p = password_profile();
+        let id = p.id;
+        let store = ProfileStore { profiles: vec![p] };
+        let script = Script::new(true, vec![answer(PASSWORD, false), answer(PASSWORD, false)]);
+        let pool = SshPool::new(fx.ctx(script.clone()));
+
+        let (a, _ra) = open_with(&pool, &store, id, script.clone()).await;
+        let conn = ssh_connection(&a).await;
+        let c = acquire(&pool, &store, id, script.clone()).await.unwrap();
+        assert_eq!(secret_calls(&script), 1, "acquire dialled again");
+        assert!(c.is_alive());
+        // A second acquire hands out the same connection.
+        let c2 = acquire(&pool, &store, id, script.clone()).await.unwrap();
+        assert!(Arc::ptr_eq(&c, &c2));
+        drop(c2);
+
+        // The acquired connection is the shell's: with the shell gone it stays, and the next
+        // shell rides the same TCP connection without dialling.
+        a.close();
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let (b, _rb) = open_with(&pool, &store, id, script.clone()).await;
+        assert_eq!(ssh_connection(&b).await, conn);
+        assert_eq!(secret_calls(&script), 1);
+        assert_eq!(pool.connected_profiles(), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn acquire_keeps_connection_open_without_shell() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let p = password_profile();
+        let id = p.id;
+        let store = ProfileStore { profiles: vec![p] };
+        let script = Script::new(true, vec![answer(PASSWORD, false), answer(PASSWORD, false)]);
+        let pool = SshPool::new(fx.ctx(script.clone()));
+
+        // No shell at all: the acquired connection alone keeps the profile connected.
+        let c = acquire(&pool, &store, id, script.clone()).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(c.is_alive());
+        assert_eq!(pool.connected_profiles(), vec![id]);
+
+        // A shell opened now joins it, and closing that shell leaves it up.
+        let (a, _ra) = open_with(&pool, &store, id, script.clone()).await;
+        let conn = ssh_connection(&a).await;
+        assert_eq!(secret_calls(&script), 1, "the shell dialled again");
+        a.close();
+        drop(a);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(c.is_alive());
+        assert_eq!(pool.connected_profiles(), vec![id]);
+
+        // Releasing the last user closes it, on the server too.
+        drop(c);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !pool.connected_profiles().is_empty() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("connection still listed after its last user let go");
+        let client_port = conn.split_whitespace().nth(1).unwrap().to_owned();
+        let port_hex = format!("{:04X}", client_port.parse::<u16>().unwrap());
+        let probe = key_profile("probe", HOST, vec![]);
+        let handle = connect(&probe, &fx.ctx(Script::new(true, vec![])))
+            .await
+            .unwrap();
+        tokio::time::timeout(STEP, async {
+            loop {
+                let tables = exec(&handle, "cat /proc/net/tcp /proc/net/tcp6").await;
+                let open = tables.lines().any(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    f.len() > 3 && f[2].ends_with(&format!(":{port_hex}")) && f[3] == "01"
+                });
+                if !open {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .expect("server still has the connection");
+    }
+
+    #[tokio::test]
+    async fn closed_resolves_on_server_drop() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let bastion = key_profile("bastion", HOST, vec![]);
+        let target = key_profile("target", "target", vec![bastion.id]);
+        let id = target.id;
+        let store = ProfileStore {
+            profiles: vec![bastion, target],
+        };
+        let trust: Arc<dyn Prompter> = Arc::new(TrustAny);
+        let pool = SshPool::new(fx.ctx(trust.clone()));
+        let c = acquire(&pool, &store, id, trust.clone()).await.unwrap();
+        let closed = tokio::spawn(c.closed());
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !closed.is_finished(),
+            "closed() resolved on a live connection"
+        );
+
+        let (a, _ra) = open_with(&pool, &store, id, trust.clone()).await;
+        ssh_connection(&a).await;
+        // Kills this connection's server process on the target (not the bastion hop).
+        run(&a, "kill -9 $PPID");
+        let reason = tokio::time::timeout(STEP, closed)
+            .await
+            .expect("closed() did not resolve after the server dropped")
+            .unwrap();
+        assert!(!reason.is_empty());
+        assert!(!c.is_alive());
+        // Already closed: resolves at once.
+        let again = tokio::time::timeout(Duration::from_secs(1), c.closed())
+            .await
+            .expect("closed() on a closed connection must resolve at once");
+        assert_eq!(again, reason);
+    }
+
+    #[tokio::test]
+    async fn unsolicited_forwarded_channel_is_rejected() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let p = key_profile("bastion", HOST, vec![]);
+        let id = p.id;
+        let store = ProfileStore { profiles: vec![p] };
+        let trust: Arc<dyn Prompter> = Script::new(true, vec![]);
+        let pool = SshPool::new(fx.ctx(trust.clone()));
+        let c = acquire(&pool, &store, id, trust.clone()).await.unwrap();
+
+        // Two remote listeners on the server; only the first is registered as ours.
+        let ours = tokio::time::timeout(STEP, c.request_remote_forward("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .expect("forward");
+        let mut channels = c.register_forward("127.0.0.1", ours);
+        let stray = tokio::time::timeout(STEP, c.request_remote_forward("127.0.0.1", 0))
+            .await
+            .unwrap()
+            .expect("forward");
+        assert_ne!(ours, stray);
+        let served = tokio::spawn(async move {
+            let mut n = 0;
+            while let Some(channel) = channels.recv().await {
+                n += 1;
+                let mut stream = channel.into_stream();
+                let _ = stream.write_all(b"routed-ok\n").await;
+                let _ = stream.shutdown().await;
+            }
+            n
+        });
+
+        let (h, _rx) = open_with(&pool, &store, id, trust.clone()).await;
+        // The registered port reaches us.
+        run(
+            &h,
+            &format!("R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{ours}); echo \"<<A $R>>\""),
+        );
+        assert_eq!(printed(&h, "A", |v| !v.starts_with('$')).await, "routed-ok");
+        // The other one is refused at once: the server closes its client without data. A
+        // channel accepted and left alone would hold it open until `timeout` gives up (124).
+        run(
+            &h,
+            &format!(
+                "R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{stray}; echo rc=$?); echo \"<<B $R>>\""
+            ),
+        );
+        assert_eq!(printed(&h, "B", |v| !v.starts_with('$')).await, "rc=0");
+
+        // Unregistered, our own port is refused too.
+        c.unregister_forward("127.0.0.1", ours);
+        run(
+            &h,
+            &format!(
+                "R=$(timeout 5 cat < /dev/tcp/127.0.0.1/{ours}; echo rc=$?); echo \"<<D $R>>\""
+            ),
+        );
+        assert_eq!(printed(&h, "D", |v| !v.starts_with('$')).await, "rc=0");
+        assert_eq!(
+            tokio::time::timeout(STEP, served).await.unwrap().unwrap(),
+            1,
+            "exactly one channel was routed"
+        );
+        let _ = c.cancel_remote_forward("127.0.0.1", ours).await;
+        let _ = c.cancel_remote_forward("127.0.0.1", stray).await;
+    }
+
+    #[tokio::test]
+    async fn no_prompt_reconnect_needs_input() {
+        if !enabled() {
+            return;
+        }
+        let fx = Fixture::new();
+        let key = key_profile("bastion", HOST, vec![]);
+        let pw = password_profile();
+        let (key_id, pw_id) = (key.id, pw.id);
+        let store = ProfileStore {
+            profiles: vec![key, pw],
+        };
+        let none: Arc<dyn Prompter> = Arc::new(NoPrompt);
+        let pool = SshPool::new(fx.ctx(none.clone()));
+
+        // Unknown host key: the question cannot be asked.
+        let err = acquire(&pool, &store, key_id, none.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SshError::NeedsInput), "{err:?}");
+        assert_eq!(err.to_string(), "needs your input");
+        assert!(fx.known_hosts_lines().is_empty());
+
+        // Once the host is known, a key profile reconnects without asking anything ...
+        let trusted = connect(
+            store.get(key_id).unwrap(),
+            &fx.ctx(Script::new(true, vec![])),
+        )
+        .await
+        .unwrap();
+        drop(trusted);
+        let c = acquire(&pool, &store, key_id, none.clone()).await.unwrap();
+        assert!(c.is_alive());
+
+        // ... but a password nobody saved needs the user.
+        let err = acquire(&pool, &store, pw_id, none.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SshError::NeedsInput), "{err:?}");
+
+        // So does a saved password the server rejects (asking for another is a question), and
+        // the saved one is left alone.
+        fx.store.set(&pw_id, SecretKind::Password, "wrong").unwrap();
+        let err = acquire(&pool, &store, pw_id, none.clone())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err, SshError::NeedsInput), "{err:?}");
+        assert_eq!(
+            fx.store
+                .get(&pw_id, SecretKind::Password)
+                .unwrap()
+                .as_deref(),
+            Some("wrong")
+        );
+        assert_eq!(pool.connected_profiles(), vec![key_id]);
     }
 }

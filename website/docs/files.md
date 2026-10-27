@@ -18,7 +18,7 @@ The directory is created the first time the app writes a file. All files are TOM
 
 | File | Written by | Purpose |
 | --- | --- | --- |
-| `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles. See [Profiles and jump hosts](profiles). |
+| `profiles.toml` | you (and the profile editor) | Saved local and SSH profiles, with their tunnels. See [Profiles and jump hosts](profiles) and [Tunnels](tunnels). |
 | `settings.toml` | you (and the Settings window) | Font, scrollback, theme, background, keyboard protocol and changed keyboard shortcuts. |
 | `schemes/` | you (and the Color schemes window) | One `<id>.toml` file per color scheme of yours. See [Color schemes](color-schemes#files-and-sharing). |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
@@ -43,6 +43,7 @@ kitty_keyboard = false
 background_opacity = 1.0
 background_blur = false
 max_fps = 60
+tunnel_max_retries = 10
 ```
 
 | Field | Type | Default | Meaning |
@@ -56,6 +57,7 @@ max_fps = 60
 | `background_opacity` | number, `0.05` to `1.0` | `1.0` | Opacity of the terminal's background and of the tab bar, from `0.05` (nearly see-through) to `1.0` (opaque). Text, the cursor, the selection and cells a program gives their own background color stay opaque. On macOS a change applies to open windows at once; on Linux and Windows a window can only become see-through if it was opened while the value was below `1.0`, so open a new window after lowering it. |
 | `background_blur` | `true` or `false` | `false` | Blur what shows through a see-through background. Takes effect only for windows opened while `background_opacity` is below `1.0`, so open a new window after changing it. macOS only for now. |
 | `max_fps` | integer, `30` to `240`, or `"display"` | `60` | Most redraws per second caused by program output. Typing, scrolling, selecting and resizing always redraw at once. `"display"` follows the refresh rate of the screen your windows are on (the fastest one, if they are on several screens); where the rate cannot be detected (Linux and Windows for now) it means `60`. Higher values use more CPU while output streams. Applies at once. |
+| `tunnel_max_retries` | integer, `0` to `100` | `10` | How many times a [tunnel](tunnels#reconnecting) tries to reconnect on its own after its connection drops. `0` turns automatic reconnecting off. In the Settings window this is **Reconnect attempts** under Tunnels. Applies at once. |
 
 ### Redraw rate
 

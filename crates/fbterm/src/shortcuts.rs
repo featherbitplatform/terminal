@@ -15,6 +15,7 @@ use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
 use crate::schemes_window::{ImportChoice, SchemesMsg};
 use crate::settings_window::SettingsMsg;
+use crate::tunnels_window::TunnelsMsg;
 
 /// How a [`Shortcuts`] wrapper treats keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,6 +53,9 @@ pub(crate) enum Mode {
     /// Enter keeps both, Escape cancels, and no other key reaches a field behind the question
     /// or acts as a shortcut.
     SchemesImport,
+    /// The Tunnels window: Cmd+W closes it, Settings, the profile editor, Color schemes and
+    /// Quit work; other shortcuts do nothing (typing goes to the search bar).
+    Tunnels,
     /// The Settings window recording a new chord: every key press goes to the recorder (plain
     /// Escape cancels), none reaches a field or acts as a shortcut.
     Recording,
@@ -170,7 +174,9 @@ fn key_message(
             }
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
-                Action::Quit | Action::Settings | Action::EditSchemes if !repeat => {
+                Action::Quit | Action::Settings | Action::EditSchemes | Action::Tunnels
+                    if !repeat =>
+                {
                     Some(Message::Shortcut(w, action))
                 }
                 _ => None,
@@ -178,7 +184,9 @@ fn key_message(
         }
         Mode::Settings => shortcut.map(|action| match action {
             Action::CloseTab if !repeat => Some(Message::Settings(SettingsMsg::Close)),
-            Action::Quit | Action::EditProfiles | Action::EditSchemes if !repeat => {
+            Action::Quit | Action::EditProfiles | Action::EditSchemes | Action::Tunnels
+                if !repeat =>
+            {
                 Some(Message::Shortcut(w, action))
             }
             _ => None,
@@ -191,12 +199,23 @@ fn key_message(
             }
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Schemes(SchemesMsg::Close)),
-                Action::Quit | Action::Settings | Action::EditProfiles if !repeat => {
+                Action::Quit | Action::Settings | Action::EditProfiles | Action::Tunnels
+                    if !repeat =>
+                {
                     Some(Message::Shortcut(w, action))
                 }
                 _ => None,
             })
         }
+        Mode::Tunnels => shortcut.map(|action| match action {
+            Action::CloseTab if !repeat => Some(Message::Tunnels(TunnelsMsg::Close)),
+            Action::Quit | Action::Settings | Action::EditProfiles | Action::EditSchemes
+                if !repeat =>
+            {
+                Some(Message::Shortcut(w, action))
+            }
+            _ => None,
+        }),
         Mode::SchemesConfirm => Some(match key {
             keyboard::Key::Named(Named::Escape) if !repeat => {
                 Some(Message::Schemes(SchemesMsg::CancelDelete))
@@ -757,6 +776,19 @@ mod tests {
             Some(None)
         ));
         assert!(matches!(press(Mode::SchemesImport, "w", false), Some(None)));
+    }
+
+    #[test]
+    fn the_tunnels_window_closes_and_reaches_the_others() {
+        assert!(matches!(
+            press(Mode::Tunnels, "w", false),
+            Some(Some(Message::Tunnels(TunnelsMsg::Close)))
+        ));
+        assert!(matches!(
+            press(Mode::Tunnels, ",", true),
+            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
+        ));
+        assert!(matches!(press(Mode::Tunnels, "t", false), Some(None)));
     }
 
     #[test]

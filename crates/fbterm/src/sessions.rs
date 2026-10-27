@@ -255,6 +255,7 @@ impl App {
             handle.resize(current);
         }
         let pane = &mut window.tabs[t].panes[p];
+        let profile = pane.profile;
         let warnings = handle.auth_warnings().to_vec();
         if let Some(text) = tabs::install_session(pane, handle) {
             write_notice(pane, &text, false);
@@ -272,6 +273,8 @@ impl App {
         if !self.occluded.contains(&wid) {
             tabs::on_dirty(window, id);
         }
+        // The profile's first connected shell starts its "with the shell" tunnels.
+        self.sync_shell_tunnels(profile);
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {
@@ -306,8 +309,16 @@ impl App {
             return Task::none();
         };
         let pane = &mut window.tabs[t].panes[p];
+        let profile = pane.profile;
         if let Some(text) = tabs::apply_event(pane, &event) {
             write_notice(pane, &text, false);
+        }
+        if matches!(
+            event,
+            SessionEvent::Exited(_) | SessionEvent::Disconnected(_)
+        ) {
+            // The profile's last shell ending stops its "with the shell" tunnels.
+            self.sync_shell_tunnels(profile);
         }
         Task::none()
     }
@@ -335,8 +346,11 @@ impl App {
                         Task::none()
                     }
                     InputRoute::Reconnect | InputRoute::Respawn => {
-                        let id = pane.id;
-                        self.start(wid, id)
+                        let (id, profile) = (pane.id, pane.profile);
+                        let task = self.start(wid, id);
+                        // Its tunnels come back once it connects (`connected`).
+                        self.sync_shell_tunnels(profile);
+                        task
                     }
                     InputRoute::Ignore => Task::none(),
                 }

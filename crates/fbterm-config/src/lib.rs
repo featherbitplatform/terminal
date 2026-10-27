@@ -13,6 +13,7 @@ pub mod store;
 pub use paths::Paths;
 pub use profile::{
     AccentStyle, AuthMethod, LocalProfile, Profile, ProfileId, ProfileKind, Rgb, SshProfile,
+    StartMode, TunnelDef, TunnelKind,
 };
 pub use settings::{MaxFps, SETTINGS_TEMPLATE, Settings, ThemeMode};
 pub use settings_edit::SettingChange;

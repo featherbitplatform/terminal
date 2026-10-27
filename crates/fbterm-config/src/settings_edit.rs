@@ -21,6 +21,7 @@ pub enum SettingChange {
     BackgroundOpacity(f32),
     BackgroundBlur(bool),
     MaxFps(MaxFps),
+    TunnelMaxRetries(u32),
     /// Every keyboard shortcut override (the whole `[keys]` table as the app sees it). Only
     /// the actions whose chord differs from what the file gives are written, so entries the
     /// app could not take (and other text in the table) stay as they are unless that action
@@ -41,6 +42,7 @@ impl SettingChange {
             Self::BackgroundOpacity(_) => "background_opacity",
             Self::BackgroundBlur(_) => "background_blur",
             Self::MaxFps(_) => "max_fps",
+            Self::TunnelMaxRetries(_) => "tunnel_max_retries",
             Self::Keys(_) => "keys",
         }
     }
@@ -57,6 +59,7 @@ impl SettingChange {
             Self::BackgroundOpacity(v) => settings.background_opacity = *v,
             Self::BackgroundBlur(v) => settings.background_blur = *v,
             Self::MaxFps(v) => settings.max_fps.clone_from(v),
+            Self::TunnelMaxRetries(v) => settings.tunnel_max_retries = *v,
             Self::Keys(v) => {
                 settings.keys.map.clone_from(v);
                 settings.keys.invalid.clear();
@@ -76,6 +79,7 @@ impl SettingChange {
             Self::MaxFps(MaxFps::Fixed(n)) => Value::from(i64::from(*n)),
             Self::MaxFps(MaxFps::Display) => Value::from("display"),
             Self::MaxFps(MaxFps::Invalid(_)) => Value::from(i64::from(DEFAULT_MAX_FPS)),
+            Self::TunnelMaxRetries(v) => Value::from(i64::from(*v)),
             // Written per action by `edit_keys`.
             Self::Keys(_) => Value::from(""),
         }
@@ -349,6 +353,7 @@ mod tests {
             SettingChange::BackgroundBlur(true),
             SettingChange::MaxFps(MaxFps::Fixed(120)),
             SettingChange::MaxFps(MaxFps::Display),
+            SettingChange::TunnelMaxRetries(3),
             keys(&[(Action::Palette, "ctrl+alt+p")]),
         ]
     }

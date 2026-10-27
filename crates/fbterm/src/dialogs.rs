@@ -5,8 +5,8 @@ use iced::{Task, window};
 use crate::app::{App, Message, load_profiles};
 use crate::chrome::Chrome;
 use crate::editor::{EditorMsg, EditorState, SaveError};
-use crate::palette;
 use crate::prompts::{Dialog, PromptEvent, PromptMsg};
+use crate::tunnels::NO_WINDOW;
 
 impl App {
     pub fn editor_window(&self) -> Option<window::Id> {
@@ -176,14 +176,10 @@ impl App {
         }
     }
 
-    /// The profile store changed: open palettes list the new names, panes take new names,
-    /// accents and color schemes (they keep their sessions; they refer to profiles by id), and
-    /// the panes whose scheme changed are recolored.
+    /// The profile store changed: open palettes list the new names and tunnels, panes take new
+    /// names, accents and color schemes (they keep their sessions; they refer to profiles by id),
+    /// and the panes whose scheme changed are recolored.
     pub(crate) fn profiles_changed(&mut self) {
-        let items = palette::items(&self.profiles);
-        for state in self.palettes.values_mut() {
-            state.set_items(items.clone(), &self.recency);
-        }
         let before = self.pane_colors();
         for w in self.windows.values_mut() {
             for pane in w.tabs.iter_mut().flat_map(|t| &mut t.panes) {
@@ -199,19 +195,48 @@ impl App {
             }
         }
         self.schemes_moved(&before);
+        self.tunnels_profiles_changed();
+        self.refresh_palettes();
     }
 
     pub(crate) fn prompt_msg(&mut self, msg: PromptMsg) -> Task<Message> {
         match msg {
             PromptMsg::Event(delivered) => match delivered.take() {
-                Some(PromptEvent::Ask { id, window, ask }) => {
+                Some(PromptEvent::Ask {
+                    id,
+                    window,
+                    tunnel,
+                    ask,
+                }) => {
                     let target = window
                         .filter(|w| self.windows.contains_key(w))
                         .or_else(|| self.focused_window());
-                    // No window to ask in: dropping `ask` answers "no".
-                    match target {
-                        Some(w) if self.prompts.ask(w, id, ask) => self.focus_prompt(w),
-                        _ => Task::none(),
+                    match (target, tunnel) {
+                        (Some(w), tunnel) => {
+                            if !self.prompts.ask(w, id, ask) {
+                                return Task::none();
+                            }
+                            // A tunnel switched on from the Tunnels window asks over the
+                            // terminal window used last, which may be behind it: bring that
+                            // one forward.
+                            let raise = if tunnel.is_some() && self.focused != Some(w) {
+                                window::gain_focus(w)
+                            } else {
+                                Task::none()
+                            };
+                            Task::batch([raise, self.focus_prompt(w)])
+                        }
+                        // No terminal window to ask in: the tunnel cannot go on (dropping
+                        // `ask` answers "no").
+                        (None, Some(key)) => {
+                            let key = self.tunnels.resolve(&key);
+                            if self.tunnels.running(&key) {
+                                self.tunnel_failed(&key, NO_WINDOW.into());
+                            }
+                            Task::none()
+                        }
+                        // Dropping `ask` answers "no".
+                        (None, None) => Task::none(),
                     }
                 }
                 Some(PromptEvent::Withdraw(id)) => match self.prompts.withdraw(id) {

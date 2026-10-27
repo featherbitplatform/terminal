@@ -341,7 +341,7 @@ fn window_opens_from_settings_palette_and_editor() {
     assert_eq!(win(&app).selected, "graphite");
     close(&mut app);
     // The palette's `Color schemes` action.
-    let listed = crate::palette::items(&app.profiles).into_iter().any(|i| {
+    let listed = crate::palette::items(&app.profiles, Vec::new()).into_iter().any(|i| {
         matches!(i, crate::palette::PaletteItem::Action { action: Action::EditSchemes, ref label } if label == "Color schemes")
     });
     assert!(listed);
