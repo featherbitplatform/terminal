@@ -158,15 +158,17 @@ impl Reporter {
 }
 
 /// Start the tunnel `def` of `key.profile` (the definition is a snapshot: later edits do not
-/// reach a running tunnel). The connection is first acquired from `pool` with `prompter`, so a
-/// tunnel switched on by hand may ask the user.
+/// reach a running tunnel). A local or SOCKS tunnel binds its port first, so a port in use
+/// fails it before anything is asked; then the connection is acquired from `pool` with
+/// `prompter`, so a tunnel switched on by hand may ask the user.
 ///
 /// When the connection is lost the tunnel reconnects on its own: it reports
 /// `Reconnecting { attempt, max }`, waits the backoff (1, 2, 4, 8, 16 s, then 30 s), acquires
 /// the connection again without prompts ([`NoPrompt`]), and once it has one serves again and
 /// reports `Up`. `max` is read from `retries` at each attempt; when the attempts run out (at
 /// once with `0`) it reports `Failed("connection lost: {reason}")` with the last reason, and a
-/// reconnect that would need the user fails at once with `needs your input`. A local or SOCKS
+/// reconnect that would need the user (an unknown or changed host key, a secret that is not
+/// saved) fails at once with `needs your input`. A local or SOCKS
 /// listener stays bound meanwhile (clients that connect are closed), so the port stays ours; a
 /// remote forward is requested again on the new connection.
 /// Must be called within a tokio runtime.
@@ -294,6 +296,11 @@ enum Attempt {
 impl Tunnel {
     async fn run(self) {
         let mut stop = self.stop.clone();
+        // The port first: a port in use fails the tunnel before any login or question.
+        let front = match self.front().await {
+            Ok(front) => front,
+            Err(reason) => return self.reporter.send(TunnelState::Failed(reason)),
+        };
         let prompter = self.prompter.clone();
         let first = tokio::select! {
             biased;
@@ -303,10 +310,6 @@ impl Tunnel {
         let connection = match first {
             Ok(c) => c,
             Err(e) => return self.reporter.send(TunnelState::Failed(e.to_string())),
-        };
-        let front = match self.front().await {
-            Ok(front) => front,
-            Err(reason) => return self.reporter.send(TunnelState::Failed(reason)),
         };
         // On the first start a refused forward fails the tunnel at once; only a lost
         // connection is worth reconnecting.
@@ -426,10 +429,7 @@ impl Tunnel {
                 let connection = tokio::select! {
                     biased;
                     () = stopped(&mut stop) => return Err(Attempt::Stopped),
-                    c = self.connect(Arc::new(NoPrompt)) => c.map_err(|e| match e {
-                        SshError::NeedsInput => Attempt::NeedsInput,
-                        e => Attempt::Failed(e.to_string()),
-                    })?,
+                    c = self.connect(Arc::new(NoPrompt)) => c.map_err(no_prompt_attempt)?,
                 };
                 self.prepare(front, connection)
                     .await
@@ -668,6 +668,16 @@ impl Tunnel {
         }
         drop(connection);
         result
+    }
+}
+
+/// What a reconnect's failed no-prompt connect means for the tunnel. Anything that needs the
+/// user ends the reconnecting at once: an unanswered question, and a changed host key (a
+/// security stop that only the user can clear, never worth retrying).
+fn no_prompt_attempt(e: SshError) -> Attempt {
+    match e {
+        SshError::NeedsInput | SshError::HostKeyChanged { .. } => Attempt::NeedsInput,
+        e => Attempt::Failed(e.to_string()),
     }
 }
 
@@ -1284,6 +1294,122 @@ mod tests {
             OpenFailure::Prohibited
         );
         assert_eq!(open_failure(&russh::Error::Disconnect), OpenFailure::Other);
+    }
+
+    /// A prompter that records whether it was asked anything and always says no.
+    #[derive(Default)]
+    struct Asked(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl Prompter for Asked {
+        async fn confirm_host_key(&self, _: &str, _: u16, _: &str) -> bool {
+            self.0.store(true, Ordering::SeqCst);
+            false
+        }
+
+        async fn ask_secret(
+            &self,
+            _: &str,
+            _: fbterm_secrets::SecretKind,
+            _: bool,
+        ) -> Option<super::super::SecretAnswer> {
+            self.0.store(true, Ordering::SeqCst);
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn taken_local_port_fails_before_connecting() {
+        use fbterm_config::{AuthMethod, Profile, ProfileKind, SshProfile, StartMode};
+        // The server accepts TCP and never answers: connecting would take the whole connect
+        // timeout (and could ask questions) before the port was ever tried.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let def = TunnelDef {
+            name: "db".into(),
+            kind: TunnelKind::Local {
+                bind: "127.0.0.1".into(),
+                port,
+                host: "db.internal".into(),
+                host_port: 5432,
+            },
+            start: StartMode::OnDemand,
+        };
+        let profile = Profile {
+            kind: ProfileKind::Ssh(SshProfile {
+                host: "127.0.0.1".into(),
+                port: silent.local_addr().unwrap().port(),
+                user: "user".into(),
+                auth: AuthMethod::Password,
+                jump: vec![],
+                tunnels: vec![def.clone()],
+            }),
+            id: ProfileId::new(),
+            name: "srv".into(),
+            group: None,
+            accent: None,
+            accent_style: Default::default(),
+            color_scheme: None,
+        };
+        let asked = Arc::new(Asked::default());
+        let pool = Arc::new(SshPool::new(super::super::SshContext {
+            known_hosts: std::env::temp_dir().join("fbterm-unused-known-hosts"),
+            secrets: Arc::new(fbterm_secrets::MemoryStore::new()),
+            prompter: asked.clone(),
+        }));
+        let key = TunnelKey {
+            profile: profile.id,
+            name: "db".into(),
+        };
+        let (sink, mut rx) = mpsc::unbounded_channel();
+        let store = ProfileStore {
+            profiles: vec![profile],
+        };
+        let handle = start_tunnel(
+            pool,
+            store,
+            key,
+            def,
+            asked.clone(),
+            Arc::new(AtomicU32::new(0)),
+            sink,
+        );
+        let mut last = None;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some((_, state)) = rx.recv().await {
+                last = Some(state);
+                if matches!(last, Some(TunnelState::Failed(_))) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the taken port fails the tunnel at once, without connecting");
+        assert_eq!(
+            last,
+            Some(TunnelState::Failed(format!("port {port} already in use")))
+        );
+        assert!(!asked.0.load(Ordering::SeqCst), "nothing was asked");
+        handle.stopped().await;
+    }
+
+    #[test]
+    fn reconnect_needing_the_user_fails_at_once() {
+        let needs = |e: SshError| matches!(no_prompt_attempt(e), Attempt::NeedsInput);
+        assert!(needs(SshError::NeedsInput));
+        // A changed host key is a security stop, never retried.
+        assert!(needs(SshError::HostKeyChanged {
+            host: "db.internal".into(),
+            port: 22,
+        }));
+        assert!(!needs(SshError::Connect(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused",
+        ))));
+        assert!(!needs(SshError::AuthFailed {
+            profile: "srv".into()
+        }));
     }
 
     #[tokio::test]
