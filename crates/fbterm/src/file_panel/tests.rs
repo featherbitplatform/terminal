@@ -769,7 +769,7 @@ mod dock {
             content: docked,
             window: wid,
             mode: if panel_focused {
-                crate::shortcuts::Mode::Panel { editing: false }
+                crate::shortcuts::Mode::Panel
             } else {
                 crate::shortcuts::Mode::Normal
             },

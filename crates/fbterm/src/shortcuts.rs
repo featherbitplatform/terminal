@@ -39,9 +39,10 @@ pub(crate) enum Mode {
     /// A window whose file panel has the keyboard: application shortcuts act, keys go to the
     /// panel's fields first, and what they leave (arrows, Enter, Backspace, Escape, typing)
     /// drives the panel. Nothing reaches the terminal (the dock sends key presses to the panel
-    /// only). With `editing`, the path field is open and Escape leaves it before the field
-    /// sees it.
-    Panel { editing: bool },
+    /// only). Escape is the panel's before any field sees it (a focused field would only let
+    /// go of the keyboard): it leaves the path field, else clears the filter, else gives the
+    /// keyboard back.
+    Panel,
     /// A connection dialog: Escape cancels, Enter submits; other keys go to its field.
     Prompt,
     /// The profile editor window: Cmd+W closes it, Cmd+S saves, Settings and Quit work; other
@@ -164,10 +165,10 @@ fn key_message(
             Some(m) => Some(Some(Message::Find(w, m))),
             None => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
         },
-        Mode::Panel { editing } => match key {
-            keyboard::Key::Named(Named::Escape) if editing && !repeat => Some(Some(
-                Message::FilePanel(FilePanelMsg::Key(w, PanelKey::Escape)),
-            )),
+        Mode::Panel => match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => Some(Some(Message::FilePanel(
+                FilePanelMsg::Key(w, PanelKey::Escape),
+            ))),
             _ => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
         },
         Mode::Prompt => match key {
@@ -416,7 +417,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
             viewport,
         );
         // The panel's fields did not take the key: the panel acts on it.
-        if let Mode::Panel { .. } = self.mode
+        if self.mode == Mode::Panel
             && !shell.is_event_captured()
             && let Some(key) = panel_key(event)
         {
@@ -512,7 +513,7 @@ mod tests {
     #[test]
     fn panel_mode_keeps_shortcuts_and_hands_other_keys_to_the_panel() {
         use keyboard::key::Named;
-        let panel = Mode::Panel { editing: false };
+        let panel = Mode::Panel;
         assert!(matches!(
             press(panel, "t", false),
             Some(Some(Message::Shortcut(_, Action::NewTab)))
@@ -530,14 +531,28 @@ mod tests {
         };
         // Plain keys go on to the panel's fields first.
         assert!(named(panel, Named::Backspace).is_none());
-        assert!(named(panel, Named::Escape).is_none());
-        // While a path is typed, Escape leaves the field before the field sees it.
+        // Escape is the panel's before any field sees it (a focused field would only let go
+        // of the keyboard): it leaves the path field, clears the filter, or gives the
+        // keyboard back.
         assert!(matches!(
-            named(Mode::Panel { editing: true }, Named::Escape),
+            named(panel, Named::Escape),
             Some(Some(Message::FilePanel(FilePanelMsg::Key(
                 _,
                 PanelKey::Escape
             ))))
+        ));
+        // A held Escape does nothing more.
+        assert!(!matches!(
+            key_message(
+                &defaults(),
+                panel,
+                window::Id::unique(),
+                &keyboard::Key::Named(Named::Escape),
+                keyboard::Modifiers::empty(),
+                true,
+                None,
+            ),
+            Some(Some(Message::FilePanel(_)))
         ));
         let event = |key: keyboard::Key, text: Option<&str>| {
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -1055,7 +1070,7 @@ mod tests {
         assert!(matches!(
             key_message(
                 &b,
-                Mode::Panel { editing: false },
+                Mode::Panel,
                 window::Id::unique(),
                 &five,
                 alt,
@@ -1068,7 +1083,7 @@ mod tests {
         assert!(
             key_message(
                 &defaults(),
-                Mode::Panel { editing: false },
+                Mode::Panel,
                 window::Id::unique(),
                 &five,
                 alt,

@@ -241,11 +241,6 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             focused: app.file_panels.has_focus(id),
         });
     let panel_focused = panel.as_ref().is_some_and(|p| p.focused);
-    let editing_path = app
-        .file_panels
-        .ui
-        .get(&id)
-        .is_some_and(|ui| ui.editing.is_some());
     body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
     // toggles still work, and not while a dialog waits for an answer.
@@ -272,9 +267,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         mode: if modal {
             covered
         } else if panel_focused {
-            Mode::Panel {
-                editing: editing_path,
-            }
+            Mode::Panel
         } else if find.is_some() {
             Mode::Find
         } else {
