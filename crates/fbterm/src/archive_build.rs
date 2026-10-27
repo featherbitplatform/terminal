@@ -77,6 +77,19 @@ pub(crate) fn build(
 
     if kind == ArchiveKind::Full {
         archive.secrets = saved_secrets(&archive.profiles, secrets)?;
+        // A carried passphrase means the key has one, whatever the profile said.
+        for s in archive
+            .secrets
+            .iter()
+            .filter(|s| s.kind == SecretKind::KeyPassphrase)
+        {
+            if let Some(p) = archive.profiles.iter_mut().find(|p| p.id == s.profile)
+                && let ProfileKind::Ssh(ssh) = &mut p.kind
+                && let AuthMethod::Key { passphrase, .. } = &mut ssh.auth
+            {
+                *passphrase = true;
+            }
+        }
         if include_keys {
             archive.keys = key_files(&archive.profiles, &mut warnings);
         }
@@ -217,8 +230,8 @@ fn shared_tunnel(tunnel: &TunnelDef) -> TunnelDef {
 }
 
 /// The saved secret each SSH profile's method uses: the password of a password profile, the
-/// passphrase of a key profile whose key has one. A store that cannot be read stops the export rather than
-/// silently making an archive without secrets.
+/// passphrase of a key profile (whatever its passphrase flag says). A store that cannot be
+/// read stops the export rather than silently making an archive without secrets.
 fn saved_secrets(
     profiles: &[Profile],
     secrets: &dyn SecretStore,
@@ -230,13 +243,10 @@ fn saved_secrets(
         };
         let kind = match ssh.auth {
             AuthMethod::Password => SecretKind::Password,
-            AuthMethod::Key {
-                passphrase: true, ..
-            } => SecretKind::KeyPassphrase,
-            AuthMethod::Key {
-                passphrase: false, ..
-            }
-            | AuthMethod::Agent => continue,
+            // Whatever the flag says: a passphrase remembered while connecting is saved for
+            // a key the profile never marked.
+            AuthMethod::Key { .. } => SecretKind::KeyPassphrase,
+            AuthMethod::Agent => continue,
         };
         let value = secrets
             .get(&p.id, kind)

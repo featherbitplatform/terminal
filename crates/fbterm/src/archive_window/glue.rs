@@ -10,10 +10,10 @@ use iced::{Task, window};
 use zeroize::Zeroizing;
 
 use super::{
-    ArchiveMode, ArchiveMsg, ArchiveState, Busy, EDITOR_DIRTY, EXTENSION, ExportJob, FILTER_LABEL,
-    ImportSummary, NO_FILE, NO_IMPORT_PASSWORD, NOTHING_TO_IMPORT, Notice, Opened, SCHEMES_STALE,
-    anything_to_import, default_file_name, default_key_dir, ensure_key_dir, exported_text,
-    imported_text, run_export, run_open, set_row_choice, shown_dir, write_key_files,
+    ArchiveMode, ArchiveMsg, ArchiveState, Busy, EDITOR_DIRTY, EDITOR_SAVING, EXTENSION, ExportJob,
+    FILTER_LABEL, ImportSummary, NO_FILE, NO_IMPORT_PASSWORD, NOTHING_TO_IMPORT, Notice, Opened,
+    SCHEMES_STALE, anything_to_import, default_file_name, default_key_dir, ensure_key_dir,
+    exported_text, imported_text, run_export, run_open, set_row_choice, shown_dir, write_key_files,
     written_before,
 };
 use crate::app::{App, Delivered, Message};
@@ -154,6 +154,10 @@ impl App {
                 if state.export.kind == ArchiveKind::Full
                     && self.backend.needs_main_password() == Some(MainPassword::Unlock)
                 {
+                    if let Some(text) = self.vault.dialog_open() {
+                        state.export.problem = Some(text.into());
+                        return Task::none();
+                    }
                     return self.ask_main_password(
                         wid,
                         MainPassword::Unlock,
@@ -321,6 +325,15 @@ impl App {
                 }
             }
             ArchiveMsg::Import => return self.import_opened(),
+            ArchiveMsg::Probed(seq) => {
+                if state.busy.map(|(s, _)| s) != Some(seq) {
+                    return Task::none();
+                }
+                state.busy = None;
+                // A move to the vault is written and said now, before the import goes on.
+                self.storage_auto_switched();
+                return self.import_opened();
+            }
             ArchiveMsg::SecretsStored(seq, result) => {
                 if state.busy.map(|(s, _)| s) != Some(seq) {
                     return Task::none();
@@ -348,8 +361,11 @@ impl App {
     /// in that order, then store the saved secrets in one batch on the blocking pool. A vault
     /// that must be unlocked or made first is asked for before anything is written.
     fn import_opened(&mut self) -> Task<Message> {
-        let editor_dirty = self.editor.as_ref().is_some_and(|(_, ed)| ed.dirty);
-        let need = self.backend.needs_main_password();
+        let editor = self
+            .editor
+            .as_ref()
+            .map(|(_, ed)| (ed.dirty, ed.saving.is_some()));
+        let probe = self.backend.probe_pending();
         let Some((wid, state)) = &mut self.archive_win else {
             return Task::none();
         };
@@ -357,17 +373,46 @@ impl App {
         if state.busy.is_some() {
             return Task::none();
         }
+        // Automatic storage has not checked the system storage yet: check now, off the UI
+        // thread, so the main password question below is the one the secrets will meet (a
+        // move to the vault found while storing them would come after profiles.toml).
+        if probe
+            && state
+                .import
+                .opened
+                .as_ref()
+                .is_some_and(|o| o.plan.has_secrets)
+        {
+            let seq = self.next_job();
+            if let Some((_, state)) = &mut self.archive_win {
+                state.busy = Some((seq, Busy::Checking));
+            }
+            let backend = self.backend.clone();
+            return self.blocking(
+                move || backend.probe(),
+                |_| (),
+                move |()| ArchiveMsg::Probed(seq),
+            );
+        }
+        let need = self.backend.needs_main_password();
+        let Some((_, state)) = &mut self.archive_win else {
+            return Task::none();
+        };
         let Some(opened) = state.import.opened.take() else {
             return Task::none();
         };
         let key_dir = state.import.key_dir.clone().or_else(default_key_dir);
-        let result = self.write_import(&opened, key_dir.as_deref(), editor_dirty, need);
+        let result = self.write_import(&opened, key_dir.as_deref(), editor, need);
         let Some((_, state)) = &mut self.archive_win else {
             return Task::none();
         };
         match result {
             Ok(Written::Ask(need)) => {
                 state.import.opened = Some(opened);
+                if let Some(text) = self.vault.dialog_open() {
+                    state.import.problem = Some(text.into());
+                    return Task::none();
+                }
                 self.ask_main_password(wid, need, Message::Archive(ArchiveMsg::Import), None)
             }
             Ok(Written::Files {
@@ -433,7 +478,7 @@ impl App {
         &mut self,
         opened: &Opened,
         key_dir: Option<&Path>,
-        editor_dirty: bool,
+        editor: Option<(bool, bool)>,
         need: Option<MainPassword>,
     ) -> Result<Written, String> {
         let plan = &opened.plan;
@@ -449,8 +494,11 @@ impl App {
             &key_dir,
             self.profiles_error.is_some(),
         )?;
-        if editor_dirty {
-            return Err(EDITOR_DIRTY.into());
+        // The profile editor (unsaved changes, saving) would overwrite or lose the import.
+        match editor {
+            Some((true, _)) => return Err(EDITOR_DIRTY.into()),
+            Some((_, true)) => return Err(EDITOR_SAVING.into()),
+            _ => {}
         }
         if !anything_to_import(plan) {
             return Err(NOTHING_TO_IMPORT.into());

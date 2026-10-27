@@ -407,6 +407,114 @@ fn full_overwrite_replaces_carried_secrets() {
 }
 
 #[test]
+fn a_carried_passphrase_is_stored_and_flagged_whatever_the_flag_says() {
+    // An archive from a version that gated on the flag, or a key whose flag was never
+    // set: the passphrase it carries is stored, and the profile says its key has one.
+    let db = ssh("db", key(Some("/home/me/.ssh/id_db"), false), Vec::new());
+    let mut a = archive(ArchiveKind::Full, &[&db]);
+    a.secrets = vec![secret(db.id, SecretKind::KeyPassphrase, PASSPHRASE)];
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    let dir = key_dir();
+    let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
+    assert_eq!(applied.secret_ops.len(), 1);
+    assert_eq!(applied.secret_ops[0].kind, SecretKind::KeyPassphrase);
+    assert_eq!(applied.secret_ops[0].value.as_str(), PASSPHRASE);
+    assert_eq!(
+        auth(by_name(&applied.store, "db")),
+        &key(Some("/home/me/.ssh/id_db"), true)
+    );
+    // Without a carried passphrase the flag stays as the archive has it.
+    let a = archive(ArchiveKind::Full, &[&db]);
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
+    assert!(applied.secret_ops.is_empty());
+    assert_eq!(
+        auth(by_name(&applied.store, "db")),
+        &key(Some("/home/me/.ssh/id_db"), false)
+    );
+}
+
+#[test]
+fn only_local_key_paths_are_taken_from_an_archive() {
+    use crate::archive_import::archive_key_path_ok as ok;
+    use std::path::Path;
+    assert!(ok(Path::new("~/.ssh/id_ed25519")));
+    assert!(ok(Path::new("/home/me/.ssh/id_ed25519")));
+    #[cfg(windows)]
+    assert!(ok(Path::new("C:\\Users\\me\\.ssh\\id_ed25519")));
+    for hostile in [
+        "\\\\host\\share\\id",
+        "//host/share/id",
+        "\\\\.\\pipe\\id",
+        "\\\\?\\C:\\id",
+        "/dev/zero",
+        "/dev",
+        "/home/me/../../dev/zero",
+        "~/../../dev/zero",
+        "id_ed25519",
+        ".ssh/id_ed25519",
+        "~user/.ssh/id",
+        "~",
+        "",
+    ] {
+        assert!(!ok(Path::new(hostile)), "{hostile}");
+    }
+}
+
+#[test]
+fn hostile_key_paths_are_dropped_on_import() {
+    let unc = ssh("unc", key(Some("\\\\host\\share\\id"), false), Vec::new());
+    let dev = ssh("dev", key(Some("/dev/zero"), false), Vec::new());
+    let relative = ssh("relative", key(Some("keys/id"), false), Vec::new());
+    let home = ssh("home", key(Some("~/.ssh/id_home"), false), Vec::new());
+    let local_dev = ssh("dev", key(None, false), Vec::new());
+    let local_store = store(&[&local_dev]);
+    let a = archive(ArchiveKind::Full, &[&unc, &dev, &relative, &home]);
+    // `dev` matches a local profile with no key path: Overwrite takes the archive's.
+    let dev_id = dev.id;
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
+    let i = p
+        .entries
+        .iter()
+        .position(|e| e.incoming.id == dev_id)
+        .unwrap();
+    set_choice(&mut p, i, Choice::Overwrite);
+    let dir = key_dir();
+    let applied = apply(&p, &a, &local_store, dir.path(), false).unwrap();
+    // Dropped: the profile asks for a key file on its first connect.
+    for name in ["unc", "dev", "relative"] {
+        assert_eq!(
+            auth(by_name(&applied.store, name)),
+            &key(None, false),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        auth(by_name(&applied.store, "home")),
+        &key(Some("~/.ssh/id_home"), false)
+    );
+    // The preview shows the path that is kept, and only that one.
+    let shown: Vec<Option<PathBuf>> = (0..p.entries.len())
+        .map(|i| p.kept_key_path(i).map(PathBuf::from))
+        .collect();
+    let home_at = p
+        .entries
+        .iter()
+        .position(|e| e.incoming.name == "home")
+        .unwrap();
+    for (i, path) in shown.iter().enumerate() {
+        if i == home_at {
+            assert_eq!(
+                path.as_deref(),
+                Some(std::path::Path::new("~/.ssh/id_home"))
+            );
+        } else {
+            assert_eq!(path, &None, "{}", p.entries[i].incoming.name);
+        }
+    }
+}
+
+#[test]
 fn shared_overwrite_keeps_local_secrets_and_key_path() {
     let db = ssh("db", key(Some("/home/me/.ssh/id_db"), true), Vec::new());
     let local_store = store(&[&db]);

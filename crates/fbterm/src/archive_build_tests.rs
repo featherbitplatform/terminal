@@ -207,37 +207,42 @@ fn broken_jump_chains_still_export() {
 }
 
 #[test]
-fn passphrase_read_only_when_the_key_has_one() {
+fn a_saved_passphrase_travels_whatever_the_flag_says() {
+    // A passphrase remembered while connecting is saved even when the profile never said
+    // its key has one: a full archive carries it, and its copy of the profile says so.
     let dir = tempfile::tempdir().unwrap();
     let key_path = write_key(dir.path(), "id_plain", KEY_BYTES);
-    let plain = ssh("plain", key(&key_path, false), Vec::new());
+    let unflagged = ssh("unflagged", key(&key_path, false), Vec::new());
+    let nothing = ssh("nothing", key(&key_path, false), Vec::new());
     let store = ProfileStore {
-        profiles: vec![plain.clone()],
+        profiles: vec![unflagged.clone(), nothing.clone()],
     };
     let secrets = MemoryStore::new();
     secrets
-        .set(&plain.id, SecretKind::KeyPassphrase, "pp-stale-0c2f")
+        .set(&unflagged.id, SecretKind::KeyPassphrase, "pp-typed-0c2f")
         .unwrap();
     let (full, _) = build(
         &store,
-        &[plain.id],
+        &[unflagged.id, nothing.id],
         ArchiveKind::Full,
         false,
         &secrets,
         &no_schemes(),
     )
     .unwrap();
-    assert!(full.secrets.is_empty());
-    // Not even read: a store that fails every read does not stop the export.
-    build(
-        &store,
-        &[plain.id],
-        ArchiveKind::Full,
-        false,
-        &Unreadable,
-        &no_schemes(),
-    )
-    .unwrap();
+    assert_eq!(full.secrets.len(), 1);
+    assert_eq!(full.secrets[0].profile, unflagged.id);
+    assert_eq!(full.secrets[0].kind, SecretKind::KeyPassphrase);
+    assert_eq!(full.secrets[0].value.as_str(), "pp-typed-0c2f");
+    let flag = |id: ProfileId| match &full.profiles.iter().find(|p| p.id == id).unwrap().kind {
+        ProfileKind::Ssh(SshProfile {
+            auth: AuthMethod::Key { passphrase, .. },
+            ..
+        }) => *passphrase,
+        _ => panic!("key profile"),
+    };
+    assert!(flag(unflagged.id), "the archived copy says the key has one");
+    assert!(!flag(nothing.id), "nothing saved: unchanged");
 }
 
 #[test]

@@ -438,6 +438,8 @@ fn import_preview_lists_entries_and_clashes() {
             ),
         ]
     );
+    // app-box's key file is in the archive and takes the place of its path: no path shown.
+    assert!(rows.iter().all(|r| r.key_path.is_none()));
     assert_eq!(
         super::archive_summary(&opened.plan, ArchiveKind::Full),
         "Full archive. Includes saved secrets and private key files."
@@ -931,4 +933,115 @@ fn import_into_a_locked_vault_unlocks_first() {
         fresh.get(&db.id, SecretKind::Password).unwrap().as_deref(),
         Some(SAVED)
     );
+}
+
+/// A system storage that is not there at all (no Secret Service).
+struct NoService;
+impl fbterm_secrets::SecretStore for NoService {
+    fn get(
+        &self,
+        _: &ProfileId,
+        _: SecretKind,
+    ) -> Result<Option<String>, fbterm_secrets::SecretError> {
+        Err(fbterm_secrets::SecretError::Unavailable(
+            "no service".into(),
+        ))
+    }
+    fn set(
+        &self,
+        _: &ProfileId,
+        _: SecretKind,
+        _: &str,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        Err(fbterm_secrets::SecretError::Unavailable(
+            "no service".into(),
+        ))
+    }
+    fn remove(&self, _: &ProfileId) -> Result<(), fbterm_secrets::SecretError> {
+        Err(fbterm_secrets::SecretError::Unavailable(
+            "no service".into(),
+        ))
+    }
+    fn remove_kind(&self, _: &ProfileId, _: SecretKind) -> Result<(), fbterm_secrets::SecretError> {
+        Err(fbterm_secrets::SecretError::Unavailable(
+            "no service".into(),
+        ))
+    }
+}
+
+#[test]
+fn an_import_checks_automatic_storage_before_writing() {
+    // Automatic, nothing checked yet, and no system storage: the import is the first thing
+    // to need secrets. It must find out first (the vault, with no main password yet) and
+    // ask for one before writing anything, not fail its secrets after profiles.toml.
+    use fbterm_secrets::SecretStore;
+    let db = ssh("db-host", AuthMethod::Password, Vec::new());
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let dir = temp();
+    let vault = dir.path().join("secrets.fbvault");
+    let backend = std::sync::Arc::new(
+        fbterm_secrets::SecretBackend::with_system(
+            fbterm_config::SecretStorage::Auto,
+            Box::new(NoService),
+            vault.clone(),
+        )
+        .with_probe_retry_delay(std::time::Duration::ZERO),
+    );
+    app.use_secret_backend(backend.clone());
+    let keys = ready_import(&mut app, dir.path(), &sample_archive());
+    let before = std::fs::read_to_string(paths.profiles()).unwrap();
+
+    send(&mut app, ArchiveMsg::Import);
+    assert_eq!(backend.active(), fbterm_secrets::Storage::Vault);
+    assert_eq!(
+        app.settings.secret_storage,
+        fbterm_config::SecretStorage::Vault
+    );
+    let d = app.vault.dialog.as_ref().expect("a main password first");
+    assert_eq!(d.kind, crate::saved_secrets::Kind::Set);
+    assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    assert!(!keys.exists(), "nothing written before the vault is made");
+
+    for m in [
+        crate::saved_secrets::VaultMsg::Password(Redacted("main-pw-auto".into())),
+        crate::saved_secrets::VaultMsg::Confirm(Redacted("main-pw-auto".into())),
+        crate::saved_secrets::VaultMsg::Submit,
+    ] {
+        let _ = app.update(Message::Vault(m));
+    }
+    assert_eq!(
+        state(&app).import.notice.as_ref().map(|n| n.text.as_str()),
+        Some("Imported 3 profiles (1 replaced), 1 key file and 1 saved secret.")
+    );
+    assert_eq!(
+        backend
+            .get(&db.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some(SAVED)
+    );
+}
+
+#[test]
+fn import_refused_while_the_editor_is_saving() {
+    let db = ssh("db-host", AuthMethod::Password, Vec::new());
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let dir = temp();
+    let keys = ready_import(&mut app, dir.path(), &sample_archive());
+    let _ = app.update(Message::Editor(crate::editor::EditorMsg::Open));
+    // An editor save whose secret changes are still running.
+    app.editor.as_mut().unwrap().1.saving = Some(7);
+    let before = std::fs::read_to_string(paths.profiles()).unwrap();
+
+    send(&mut app, ArchiveMsg::Import);
+    assert_eq!(
+        state(&app).import.problem.as_deref(),
+        Some(super::EDITOR_SAVING)
+    );
+    assert!(state(&app).import.opened.is_some(), "kept to import later");
+    assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    assert!(!keys.exists());
+    assert_eq!(app.editor.as_ref().unwrap().1.saving, Some(7));
 }

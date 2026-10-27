@@ -45,12 +45,15 @@ pub const READ_ONLY: &str =
     "profiles.toml could not be read, so nothing can be imported until it is fixed.";
 pub const EDITOR_DIRTY: &str =
     "The profile editor has unsaved changes. Save or discard them before importing.";
+pub const EDITOR_SAVING: &str =
+    "The profile editor is still saving. Wait for it to finish before importing.";
 pub const NOTHING_TO_IMPORT: &str = "Nothing to import: every profile is skipped or blocked.";
 pub const SCHEMES_STALE: &str =
     "The color schemes changed since the archive was opened. Open it again to import.";
 pub const SEALING: &str = "Encrypting the archive\u{2026}";
 pub const OPENING: &str = "Opening the archive\u{2026}";
 pub const STORING: &str = "Storing saved secrets\u{2026}";
+pub const CHECKING: &str = "Checking where saved secrets are kept\u{2026}";
 /// What an unmatched profile's row says in the match column.
 pub const NEW: &str = "New";
 
@@ -131,6 +134,8 @@ pub enum ArchiveMsg {
     Import,
     /// The imported saved secrets were stored (how many), or why not.
     SecretsStored(u64, Result<usize, String>),
+    /// Automatic storage made its check before an import (see `App::import_opened`).
+    Probed(u64),
 }
 
 /// What the window is waiting for in the background.
@@ -140,6 +145,8 @@ pub enum Busy {
     Opening,
     /// Storing the imported saved secrets.
     Storing,
+    /// Automatic storage checks the system storage before an import's secrets.
+    Checking,
 }
 
 /// A line under the form: the outcome of the last export or import.
@@ -500,6 +507,9 @@ pub struct PreviewRow {
     pub choices: Vec<RowChoice>,
     pub choice: RowChoice,
     pub error: Option<String>,
+    /// The key path the profile takes from the archive, when it keeps one (no key file in
+    /// the archive takes its place and Overwrite keeps no local path).
+    pub key_path: Option<String>,
 }
 
 /// The preview rows of `plan` against the local profiles.
@@ -514,7 +524,8 @@ pub fn preview_rows(plan: &ImportPlan, local: &ProfileStore) -> Vec<PreviewRow> 
     };
     plan.entries
         .iter()
-        .map(|e| {
+        .enumerate()
+        .map(|(i, e)| {
             let (jumps, tunnels) = match &e.incoming.kind {
                 ProfileKind::Ssh(s) => (
                     s.jump
@@ -554,6 +565,7 @@ pub fn preview_rows(plan: &ImportPlan, local: &ProfileStore) -> Vec<PreviewRow> 
                 choices,
                 choice,
                 error: e.error.clone(),
+                key_path: plan.kept_key_path(i).map(|p| p.display().to_string()),
             }
         })
         .collect()

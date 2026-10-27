@@ -7,8 +7,8 @@ use iced::widget::{Space, button, checkbox, column, container, row, scrollable, 
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
 use super::{
-    ArchiveMode, ArchiveMsg, ArchiveState, Busy, INCLUDE_KEYS, INCLUDED_FOR_JUMPS, KIND_FULL,
-    KIND_SHARED, NEW, OPENING, PreviewRow, READ_ONLY, SEALING, STORING, archive_summary,
+    ArchiveMode, ArchiveMsg, ArchiveState, Busy, CHECKING, INCLUDE_KEYS, INCLUDED_FOR_JUMPS,
+    KIND_FULL, KIND_SHARED, NEW, OPENING, PreviewRow, READ_ONLY, SEALING, STORING, archive_summary,
     default_key_dir, export_groups, preview_rows, scheme_lines, shown_dir,
 };
 use crate::app::Message;
@@ -590,6 +590,19 @@ fn preview_row<'a>(
     ]
     .spacing(3)
     .width(Length::Fill);
+    if let Some(path) = r.key_path {
+        words = words.push(
+            row![
+                text("Key file").font(UI_FONT).size(12).color(t.text_muted),
+                text(path)
+                    .font(MONO)
+                    .size(12)
+                    .color(t.text_secondary)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+            ]
+            .spacing(6),
+        );
+    }
     if !meta.is_empty() {
         words = words.push(
             text(meta.join(" \u{b7} "))
@@ -637,6 +650,7 @@ fn footer<'a>(
             Busy::Sealing => SEALING,
             Busy::Opening => OPENING,
             Busy::Storing => STORING,
+            Busy::Checking => CHECKING,
         };
         note = note.push(line(s.into(), t.text_secondary));
     } else if let Some(p) = problem {

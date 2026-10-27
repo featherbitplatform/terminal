@@ -287,6 +287,44 @@ fn within_limits(archive: &Archive) -> bool {
         })
 }
 
+impl ImportPlan {
+    /// The key path entry `i` keeps from the archive, for the preview: none when the archive
+    /// gives none (or one [`archive_key_path_ok`] refused), when a key file in the archive
+    /// takes its place, or when Overwrite keeps the local profile's own path.
+    pub(crate) fn kept_key_path(&self, i: usize) -> Option<&Path> {
+        if self.kind != ArchiveKind::Full {
+            return None;
+        }
+        let e = self.entries.get(i)?;
+        let ProfileKind::Ssh(ssh) = &e.incoming.kind else {
+            return None;
+        };
+        let AuthMethod::Key {
+            path: Some(path), ..
+        } = &ssh.auth
+        else {
+            return None;
+        };
+        if self
+            .key_users
+            .iter()
+            .any(|users| users.contains(&e.incoming.id))
+        {
+            return None;
+        }
+        let local_path = e.matched.and_then(|m| self.local.get(m)).is_some_and(|p| {
+            matches!(
+                &p.kind,
+                ProfileKind::Ssh(s) if matches!(s.auth, AuthMethod::Key { path: Some(_), .. })
+            )
+        });
+        if e.choice == Choice::Overwrite && local_path {
+            return None;
+        }
+        Some(path)
+    }
+}
+
 /// Change one entry's choice and check every entry again (references follow the choice).
 pub(crate) fn set_choice(plan: &mut ImportPlan, i: usize, c: Choice) {
     if let Some(entry) = plan.entries.get_mut(i) {
@@ -331,8 +369,13 @@ pub(crate) fn apply(
             let Some(id) = index.get(&s.profile).and_then(|&i| resolved.finals[i]) else {
                 continue;
             };
-            let used = at.get(&id).and_then(|&k| secret_kind(&store.profiles[k]));
-            if used == Some(s.kind) && stored.insert((id, s.kind)) {
+            let Some(&k) = at.get(&id) else {
+                continue;
+            };
+            if secret_kind(&store.profiles[k]) == Some(s.kind) && stored.insert((id, s.kind)) {
+                if s.kind == SecretKind::KeyPassphrase {
+                    flag_passphrase(&mut store.profiles[k]);
+                }
                 secret_ops.push(SecretOp {
                     profile: id,
                     kind: s.kind,
@@ -366,9 +409,18 @@ pub(crate) fn apply(
 }
 
 /// What an archived profile may claim. A shared archive carries SSH profiles without key
-/// paths only, whatever the file says: local profiles are dropped, key paths cleared.
+/// paths only, whatever the file says: local profiles are dropped, key paths cleared. A full
+/// archive's key path is kept only when [`archive_key_path_ok`] (else the profile asks for a
+/// key file on its first connect).
 fn claimed(profile: &Profile, kind: ArchiveKind) -> Option<Profile> {
     let mut p = profile.clone();
+    if kind == ArchiveKind::Full
+        && let ProfileKind::Ssh(ssh) = &mut p.kind
+        && let AuthMethod::Key { path, .. } = &mut ssh.auth
+        && path.as_deref().is_some_and(|k| !archive_key_path_ok(k))
+    {
+        *path = None;
+    }
     if kind == ArchiveKind::Shared {
         let ProfileKind::Ssh(ssh) = &mut p.kind else {
             return None;
@@ -383,20 +435,47 @@ fn claimed(profile: &Profile, kind: ArchiveKind) -> Option<Profile> {
     Some(p)
 }
 
-/// The secret a profile's method uses, if any.
+/// Whether a key path from an archive may be used as it is: a local absolute path or one
+/// under the home folder (`~/`), never a network share (`\\host\share`, `//host/share`), a
+/// device (`/dev/...`, `\\.\...`), a path that climbs out with `..`, or a relative path
+/// (which would depend on the folder fbterm runs in). Reading a key from such a path on the
+/// first connect could leak credentials (Windows sends them to a share) or hang.
+pub(crate) fn archive_key_path_ok(path: &Path) -> bool {
+    use std::path::Component;
+    let text = path.to_string_lossy();
+    let slashed = text.replace('\\', "/");
+    if slashed.starts_with("//") {
+        return false;
+    }
+    if slashed == "/dev" || slashed.starts_with("/dev/") {
+        return false;
+    }
+    if path.components().any(|c| c == Component::ParentDir) || slashed.contains("/../") {
+        return false;
+    }
+    slashed.starts_with("~/") || path.has_root()
+}
+
+/// The secret a profile's method uses, if any: the password of a password profile, the
+/// passphrase of any key profile (a passphrase remembered while connecting is saved whatever
+/// the profile's flag says).
 fn secret_kind(p: &Profile) -> Option<SecretKind> {
     let ProfileKind::Ssh(ssh) = &p.kind else {
         return None;
     };
     match ssh.auth {
         AuthMethod::Password => Some(SecretKind::Password),
-        AuthMethod::Key {
-            passphrase: true, ..
-        } => Some(SecretKind::KeyPassphrase),
-        AuthMethod::Key {
-            passphrase: false, ..
-        }
-        | AuthMethod::Agent => None,
+        AuthMethod::Key { .. } => Some(SecretKind::KeyPassphrase),
+        AuthMethod::Agent => None,
+    }
+}
+
+/// Mark key profile `p`'s key as having a passphrase (one is stored for it).
+fn flag_passphrase(p: &mut Profile) {
+    if let ProfileKind::Ssh(ssh) = &mut p.kind
+        && let AuthMethod::Key { passphrase, .. } = &mut ssh.auth
+    {
+        *passphrase = true;
     }
 }
 
