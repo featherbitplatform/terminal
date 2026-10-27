@@ -36,6 +36,9 @@
 
 mod actions;
 mod app;
+mod archive_build;
+#[cfg(test)]
+mod archive_build_tests;
 mod chrome;
 mod config_files;
 mod debug;

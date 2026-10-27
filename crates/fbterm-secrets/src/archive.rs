@@ -27,6 +27,10 @@ pub const FORMAT: u32 = 1;
 /// 1 MB each); the cap keeps a huge file from exhausting memory.
 pub const MAX_ARCHIVE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The largest private key file an archive carries or an import writes: anything bigger is
+/// not a key.
+pub const MAX_KEY_BYTES: u64 = 1024 * 1024;
+
 /// What an archive carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +163,34 @@ pub fn seal(archive: &Archive, password: &str) -> Result<Vec<u8>, ArchiveError> 
 /// [`ArchiveError::WrongPassword`]; a damaged or cut-off payload, or contents that do not
 /// parse, are [`ArchiveError::Corrupt`].
 pub fn open(bytes: &[u8], password: &str) -> Result<Archive, ArchiveError> {
+    let plain = decrypt(bytes, password)?;
+    let text = std::str::from_utf8(&plain).map_err(|_| ArchiveError::Corrupt(UNREADABLE.into()))?;
+
+    // The version first, so a newer layout is reported as such rather than as unreadable.
+    #[derive(Deserialize)]
+    struct Version {
+        format: Option<u32>,
+    }
+    let version: Version =
+        toml::from_str(text).map_err(|_| ArchiveError::Corrupt(UNREADABLE.into()))?;
+    match version.format {
+        Some(f) if f > FORMAT => return Err(ArchiveError::Newer),
+        Some(f) if f >= 1 => {}
+        _ => return Err(ArchiveError::Corrupt(UNREADABLE.into())),
+    }
+    // Parser messages quote the offending line, which may hold a secret: never pass them on.
+    toml::from_str(text).map_err(|_| ArchiveError::Corrupt(UNREADABLE.into()))
+}
+
+/// The decrypted bytes of an archive, unparsed: for tests that search everything an archive
+/// carries (the app never needs them).
+#[cfg(any(test, feature = "test-support"))]
+pub fn open_plaintext(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, ArchiveError> {
+    decrypt(bytes, password)
+}
+
+/// Decrypt an archive file into a wiped buffer.
+fn decrypt(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, ArchiveError> {
     if bytes.len() > MAX_ARCHIVE_BYTES {
         return Err(ArchiveError::Corrupt(TOO_LARGE.into()));
     }
@@ -178,22 +210,7 @@ pub fn open(bytes: &[u8], password: &str) -> Result<Archive, ArchiveError> {
     reader
         .read_to_end(&mut plain)
         .map_err(|_| ArchiveError::Corrupt(DAMAGED.into()))?;
-    let text = std::str::from_utf8(&plain).map_err(|_| ArchiveError::Corrupt(UNREADABLE.into()))?;
-
-    // The version first, so a newer layout is reported as such rather than as unreadable.
-    #[derive(Deserialize)]
-    struct Version {
-        format: Option<u32>,
-    }
-    let version: Version =
-        toml::from_str(text).map_err(|_| ArchiveError::Corrupt(UNREADABLE.into()))?;
-    match version.format {
-        Some(f) if f > FORMAT => return Err(ArchiveError::Newer),
-        Some(f) if f >= 1 => {}
-        _ => return Err(ArchiveError::Corrupt(UNREADABLE.into())),
-    }
-    // Parser messages quote the offending line, which may hold a secret: never pass them on.
-    toml::from_str(text).map_err(|_| ArchiveError::Corrupt(UNREADABLE.into()))
+    Ok(plain)
 }
 
 /// Key file bytes as base64 text, through wiped buffers.
