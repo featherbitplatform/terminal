@@ -6,7 +6,7 @@ sidebar_label: File panel
 
 The file panel browses the server of an SSH session beside the terminal and moves files to and from it over SFTP. It is docked at the right edge of the window; the terminal stays visible and keeps running. Use it to fetch a log, drop a config file onto a host or look around a folder without typing `ls`.
 
-![The file panel beside a terminal: a folder listing, the Download toolbar and a transfer queue](/img/file-panel.png)
+![The file panel: a folder listing, the Download toolbar and a transfer queue](/img/file-panel.png)
 
 ## Opening the panel
 
@@ -25,7 +25,7 @@ The panel uses the profile's shared connection (and its [jump hosts](profiles#ju
 
 A profile's panel starts in the server's home folder. The folder you were in is kept for each profile until you quit the app, so switching between panes and tabs of different servers returns to where you were.
 
-When you open the panel, the keyboard goes to it. `Escape`, a click in the terminal or moving to another pane gives it back; a click in the panel takes it again. While the panel has the keyboard, keys go to the panel only and never to the terminal.
+When you open the panel, the keyboard goes to it. A click in the terminal or moving to another pane gives it back, and so does `Escape` (when the filter has text, the first `Escape` clears the filter and the next one gives the keyboard back); a click in the panel takes it again. While the panel has the keyboard, keys go to the panel only and never to the terminal.
 
 ## Browsing
 
@@ -42,7 +42,7 @@ File names are shown as plain text. A name that contains control characters or i
 
 Select a file and use the toolbar:
 
-- **Download** saves into your Downloads folder. If the name is taken it picks a free one: `report.pdf`, then `report (1).pdf`, `report (2).pdf` and so on. It never replaces anything.
+- **Download** saves into your Downloads folder (your home folder when there is no Downloads folder; with neither, the row says `No Downloads folder was found.`). If the name is taken it picks a free one: `report.pdf`, then `report (1).pdf`, `report (2).pdf` and so on. It never replaces anything.
 - **Download as…** opens the system's save dialog, offering the remote name, so you pick the folder and name.
 
 A link to a file downloads the file it points to. Folders, special files (devices, sockets) and links that point nowhere cannot be downloaded. A file that grows or shrinks while it downloads is not an error; you get what the server sent until the end of the file.
@@ -78,10 +78,10 @@ Transfers appear at the bottom of the panel, one row each, with a progress bar:
 | --- | --- |
 | Running | **Cancel** |
 | Finished download | **Show in Finder** (**Show in folder**) |
-| Failed | The reason in red and **Retry**. If the connection dropped, Retry reconnects first (asking again if it needs to) and then repeats the transfer. |
+| Failed | The reason in red and **Retry**. If the connection dropped, Retry reconnects first (asking again if it needs to) and then repeats the transfer. A transfer that was refused before it started (for example `Already downloading to <name>`) shows only the reason and the dismiss button. |
 | Finished, failed or skipped | A dismiss button that removes the row. |
 
-Cancelled rows disappear by themselves. Finished and skipped rows are cleared when the panel is closed; failed rows stay until you retry or dismiss them.
+Cancelled rows disappear by themselves. Finished and skipped rows are cleared once no panel in any window shows that profile; failed rows stay until you retry (when they can be retried) or dismiss them.
 
 Transfers belong to the connection, not to the panel: hiding the panel, switching tabs or moving focus never stops them, and they appear again in the profile's queue when you reopen the panel.
 
@@ -97,7 +97,7 @@ The panel acts only on your clicks and keys. A program running in the terminal, 
 
 ## Limits
 
-- File names that are not valid UTF-8 appear with replacement characters and cannot be opened or downloaded.
+- File names that are not valid UTF-8 appear with replacement characters, and may not be openable.
 - Only SFTP is used. A server without an SFTP subsystem has no file panel.
 - The panel lists, downloads and uploads. It does not create, rename or delete remote files.
 
