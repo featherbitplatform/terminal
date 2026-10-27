@@ -15,6 +15,7 @@ struct Recording {
     /// Every call in order: "set", "remove_kind", "remove".
     log: Mutex<Vec<&'static str>>,
     fail_set: AtomicBool,
+    fail_remove_kind: AtomicBool,
 }
 
 impl SecretStore for Recording {
@@ -35,6 +36,9 @@ impl SecretStore for Recording {
     }
     fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
         self.log.lock().push("remove_kind");
+        if self.fail_remove_kind.load(Ordering::SeqCst) {
+            return Err(SecretError::Backend("denied".into()));
+        }
         self.removed_kinds.lock().push((*id, kind));
         self.inner.remove_kind(id, kind)
     }
@@ -459,6 +463,64 @@ fn secrets_of_an_auth_no_longer_used_are_removed() {
     ed.update(EditorMsg::Name("web2".into()));
     ed.save(&mut store, &file()).unwrap();
     assert!(secrets.removed_kinds.lock().is_empty());
+}
+
+#[test]
+fn failed_kind_removals_are_retried_on_the_next_save() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let db = ssh_with("db", AuthMethod::Password);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone(), db.clone()],
+    };
+    let (mut ed, secrets) = editor(&store);
+    // web stops using a password; db gets a new one, which the store refuses: the batch
+    // fails, so web's old password was not removed either.
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Auth(AuthChoice::Agent));
+    ed.update(EditorMsg::Select(db.id));
+    ed.update(EditorMsg::Secret(Redacted("db-pw".into())));
+    secrets.fail_set.store(true, Ordering::SeqCst);
+    assert!(ed.save(&mut store, &file()).is_err());
+    assert!(secrets.removed_kinds.lock().is_empty());
+    // The next save retries it (the profiles on disk no longer say web had a password).
+    secrets.fail_set.store(false, Ordering::SeqCst);
+    ed.save(&mut store, &file()).unwrap();
+    assert_eq!(
+        *secrets.removed_kinds.lock(),
+        vec![(web.id, SecretKind::Password)]
+    );
+    secrets.removed_kinds.lock().clear();
+    ed.update(EditorMsg::Select(db.id));
+    ed.update(EditorMsg::Name("db2".into()));
+    ed.save(&mut store, &file()).unwrap();
+    assert!(secrets.removed_kinds.lock().is_empty(), "retried once");
+}
+
+#[test]
+fn a_retried_kind_removal_is_dropped_once_the_kind_is_used_again() {
+    let web = ssh_with("web", AuthMethod::Password);
+    let mut store = ProfileStore {
+        profiles: vec![web.clone()],
+    };
+    let (mut ed, secrets) = editor(&store);
+    ed.update(EditorMsg::Select(web.id));
+    ed.update(EditorMsg::Auth(AuthChoice::Agent));
+    secrets.fail_remove_kind.store(true, Ordering::SeqCst);
+    assert!(ed.save(&mut store, &file()).is_err());
+    secrets.fail_remove_kind.store(false, Ordering::SeqCst);
+    // Back to a password with a new one typed: the queued removal would delete it.
+    ed.update(EditorMsg::Auth(AuthChoice::Password));
+    ed.update(EditorMsg::Secret(Redacted("new-pw".into())));
+    secrets.removed_kinds.lock().clear();
+    ed.save(&mut store, &file()).unwrap();
+    assert!(secrets.removed_kinds.lock().is_empty());
+    assert_eq!(
+        secrets
+            .get(&web.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("new-pw")
+    );
 }
 
 #[test]

@@ -435,6 +435,17 @@ impl Draft {
         matches!(self.kind, DraftKind::Ssh(_))
     }
 
+    /// Whether this draft's authentication uses a saved secret of `kind`.
+    fn uses_kind(&self, kind: SecretKind) -> bool {
+        match &self.kind {
+            DraftKind::Ssh(s) => match kind {
+                SecretKind::Password => s.auth == AuthChoice::Password,
+                SecretKind::KeyPassphrase => s.auth == AuthChoice::Key && s.key_passphrase,
+            },
+            DraftKind::Local(_) => false,
+        }
+    }
+
     /// The secret typed for this draft and the kind it is stored as, if any.
     fn typed_secret(&self) -> Option<(SecretKind, &str)> {
         let DraftKind::Ssh(s) = &self.kind else {
@@ -457,6 +468,9 @@ pub struct EditorState {
     pub selected: Option<ProfileId>,
     /// Saved profiles deleted in the editor; their secrets go on the next save.
     removed: Vec<ProfileId>,
+    /// Kinds of secret a saved profile no longer uses whose removal failed; retried on the
+    /// next save unless the profile uses that kind again by then.
+    removed_kinds: Vec<(ProfileId, SecretKind)>,
     /// Problems found by the last save attempt.
     pub errors: Vec<ValidationError>,
     /// A one-line message: a refused delete, a failed write, "Saved".
@@ -509,6 +523,7 @@ impl EditorState {
             selected: drafts.first().map(|d| d.id),
             drafts,
             removed: Vec::new(),
+            removed_kinds: Vec::new(),
             errors: Vec::new(),
             notice: None,
             read_only,
@@ -830,6 +845,13 @@ impl EditorState {
                 });
             }
         }
+        for &(id, kind) in &self.removed_kinds {
+            let retry = SecretOp::RemoveKind { id, kind };
+            let still_unused = self.draft(id).is_some_and(|d| !d.uses_kind(kind));
+            if still_unused && !removes.contains(&retry) {
+                removes.push(retry);
+            }
+        }
         removes.extend(self.removed.iter().map(|&id| SecretOp::Remove(id)));
         sets.extend(removes);
         Ok(Prepared { store, ops: sets })
@@ -864,6 +886,7 @@ impl EditorState {
         *store = prepared.store;
         self.errors.clear();
         self.removed.clear();
+        self.removed_kinds.clear();
         Ok(prepared.ops)
     }
 
@@ -904,6 +927,9 @@ impl EditorState {
                     if let SecretOp::Remove(id) = op {
                         // Retried on the next save.
                         self.removed.push(id);
+                    }
+                    if let SecretOp::RemoveKind { id, kind } = op {
+                        self.removed_kinds.push((id, kind));
                     }
                     failures.push(format!("could not {what}: {e}"));
                 }
