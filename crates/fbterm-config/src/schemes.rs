@@ -373,6 +373,22 @@ fn check_user_id(dir: &Path, id: &str) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
+/// Whether a user scheme from elsewhere (an imported archive) could be a scheme file: a plain,
+/// non-built-in id, at most [`MAX_FILE_BYTES`] once written, and loading back unchanged
+/// through the scheme file checks.
+pub fn is_valid_user(scheme: &Scheme) -> bool {
+    if scheme.builtin || check_user_id(Path::new(""), &scheme.id).is_err() {
+        return false;
+    }
+    let Ok(text) = toml::to_string_pretty(scheme) else {
+        return false;
+    };
+    if text.len() as u64 > MAX_FILE_BYTES {
+        return false;
+    }
+    toml::from_str::<Scheme>(&text).is_ok_and(|back| back == *scheme)
+}
+
 /// Save a user scheme as `<dir>/<id>.toml`. Built-ins are refused.
 pub fn save_user(dir: &Path, scheme: &Scheme) -> Result<PathBuf, ConfigError> {
     let path = check_user_id(dir, &scheme.id)?;
@@ -483,6 +499,44 @@ mod tests {
 
         let bad = text.replace("font_size = 13.5", "font_size = -1.0");
         assert!(toml::from_str::<Scheme>(&bad).is_err());
+    }
+
+    #[test]
+    fn valid_user_schemes_follow_the_file_rules() {
+        let mut ok = builtins().remove(1);
+        ok.builtin = false;
+        ok.id = "user-1".into();
+        assert!(is_valid_user(&ok));
+
+        let builtin = builtins().remove(0);
+        assert!(!is_valid_user(&builtin));
+        let builtin_id = Scheme {
+            id: "graphite".into(),
+            ..ok.clone()
+        };
+        assert!(!is_valid_user(&builtin_id));
+        for id in ["", "../x", "User-1", "a/b", &"x".repeat(101)] {
+            let bad = Scheme {
+                id: id.into(),
+                ..ok.clone()
+            };
+            assert!(!is_valid_user(&bad), "{id:?}");
+        }
+        let nameless = Scheme {
+            name: " ".into(),
+            ..ok.clone()
+        };
+        assert!(!is_valid_user(&nameless));
+        let bad_size = Scheme {
+            font_size: Some(f32::NAN),
+            ..ok.clone()
+        };
+        assert!(!is_valid_user(&bad_size));
+        let huge = Scheme {
+            font_family: Some("f".repeat(MAX_FILE_BYTES as usize)),
+            ..ok
+        };
+        assert!(!is_valid_user(&huge));
     }
 
     #[test]
