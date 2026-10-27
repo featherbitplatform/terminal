@@ -208,6 +208,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ForceHover<'_> {
 pub enum DemoTip {
     New,
     Profiles,
+    Tunnels,
     Settings,
     /// The first tab's close button.
     Close,
@@ -218,6 +219,7 @@ impl DemoTip {
         match s {
             "new" => Some(Self::New),
             "profiles" => Some(Self::Profiles),
+            "tunnels" => Some(Self::Tunnels),
             "settings" => Some(Self::Settings),
             "close" => Some(Self::Close),
             _ => None,
@@ -287,6 +289,7 @@ mod tests {
         assert_eq!(DemoTip::parse("close"), Some(DemoTip::Close));
         assert_eq!(DemoTip::parse("profiles"), Some(DemoTip::Profiles));
         assert_eq!(DemoTip::parse("settings"), Some(DemoTip::Settings));
+        assert_eq!(DemoTip::parse("tunnels"), Some(DemoTip::Tunnels));
         assert_eq!(DemoTip::parse("x"), None);
     }
 }

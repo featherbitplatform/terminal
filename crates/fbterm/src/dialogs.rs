@@ -5,7 +5,6 @@ use iced::{Task, window};
 use crate::app::{App, Message, load_profiles};
 use crate::chrome::Chrome;
 use crate::editor::{EditorMsg, EditorState, SaveError};
-use crate::palette;
 use crate::prompts::{Dialog, PromptEvent, PromptMsg};
 
 impl App {
@@ -176,14 +175,10 @@ impl App {
         }
     }
 
-    /// The profile store changed: open palettes list the new names, panes take new names,
+    /// The profile store changed: open palettes list the new names and tunnels, panes take new names,
     /// accents and color schemes (they keep their sessions; they refer to profiles by id), and
     /// the panes whose scheme changed are recolored.
     pub(crate) fn profiles_changed(&mut self) {
-        let items = palette::items(&self.profiles);
-        for state in self.palettes.values_mut() {
-            state.set_items(items.clone(), &self.recency);
-        }
         let before = self.pane_colors();
         for w in self.windows.values_mut() {
             for pane in w.tabs.iter_mut().flat_map(|t| &mut t.panes) {
@@ -200,6 +195,7 @@ impl App {
         }
         self.schemes_moved(&before);
         self.tunnels_profiles_changed();
+        self.refresh_palettes();
     }
 
     pub(crate) fn prompt_msg(&mut self, msg: PromptMsg) -> Task<Message> {

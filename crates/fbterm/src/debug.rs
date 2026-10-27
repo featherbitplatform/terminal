@@ -164,6 +164,14 @@ impl App {
         self.open_schemes(select)
     }
 
+    /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the Tunnels window at startup.
+    pub(crate) fn open_debug_tunnels(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_OPEN_TUNNELS").is_none() {
+            return Task::none();
+        }
+        self.open_tunnels()
+    }
+
     /// `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (debug aids): the find bar of the first
     /// window's active tab, or the find-in-all-tabs box, open with that query once the tabs
     /// have had a second to print something.

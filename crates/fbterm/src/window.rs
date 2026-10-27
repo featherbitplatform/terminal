@@ -23,7 +23,7 @@ use crate::tab_look::{Surroundings, look};
 use crate::tabs::{Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
-use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_USERS, ICON_X, icon};
+use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_TUNNELS, ICON_USERS, ICON_X, icon};
 use crate::windows::{Carry, DragMsg};
 
 /// Gap between the top of the tab bar and the top of a tab.
@@ -94,6 +94,29 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             bindings: &app.bindings,
         });
     }
+    if let Some((tid, state)) = &app.tunnels_win
+        && *tid == id
+    {
+        let mut content = column![];
+        if Chrome::current().draws_title_bar() {
+            content = content.push(crate::ui::window_header(t, id));
+        }
+        let groups = crate::tunnels_window::groups(&app.profiles, &app.tunnels, &state.query);
+        let any = crate::tunnels_window::any_defined(&app.profiles);
+        let content = content.push(crate::tunnels_window::view::view(
+            t,
+            &state.query,
+            &state.input,
+            groups,
+            any,
+        ));
+        return Element::new(Shortcuts {
+            content: content.into(),
+            window: id,
+            mode: Mode::Tunnels,
+            bindings: &app.bindings,
+        });
+    }
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };
@@ -131,6 +154,7 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
         demo_tip: app.demo_tip,
         bindings: &app.bindings,
         carry,
+        tunnels_up: app.tunnels.up_count(),
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -354,6 +378,8 @@ struct TabBar<'b> {
     bindings: &'b Bindings,
     /// A tab or tile being dragged in this window.
     carry: Option<Carry>,
+    /// How many tunnels are up (the indicator's count).
+    tunnels_up: usize,
 }
 
 fn tab_bar<'a>(
@@ -369,6 +395,7 @@ fn tab_bar<'a>(
         modal,
         demo_tip,
         bindings,
+        tunnels_up,
         ..
     } = bar;
     let tabs_bar = bar;
@@ -394,6 +421,22 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::Profiles))
         .padding(7)
         .style(move |_, status| ghost(t, status));
+    let mut indicator = row![icon(ICON_TUNNELS, 14.0, t.text_muted)]
+        .spacing(5)
+        .align_y(Alignment::Center);
+    if let Some(n) = crate::tunnels_window::indicator_count(tunnels_up) {
+        indicator = indicator.push(
+            text(n)
+                .font(UI_FONT)
+                .size(12)
+                .line_height(text::LineHeight::Absolute(14.0.into()))
+                .color(t.success),
+        );
+    }
+    let tunnels = button(indicator)
+        .on_press(msg(TabBarMsg::Tunnels))
+        .padding(7)
+        .style(move |_, status| ghost(t, status));
     let settings = button(icon(ICON_SETTINGS, 14.0, t.text_muted))
         .on_press(msg(TabBarMsg::Settings))
         .padding(7)
@@ -410,6 +453,12 @@ fn tab_bar<'a>(
         tooltip_text("Edit profiles", Action::EditProfiles, bindings),
         demo_tip == Some(DemoTip::Profiles),
     );
+    let tunnels = tip(
+        t,
+        tunnels,
+        tooltip_text("Tunnels", Action::Tunnels, bindings),
+        demo_tip == Some(DemoTip::Tunnels),
+    );
     let settings = tip(
         t,
         settings,
@@ -422,6 +471,9 @@ fn tab_bar<'a>(
             .center_y(height),
     );
     bar = bar.push(container(profiles).center_y(height));
+    // After the tab buttons, like every trailing button: `BarBackground` measures the tabs as
+    // the row's first children.
+    bar = bar.push(container(tunnels).center_y(height));
     bar = bar.push(container(settings).center_y(height));
     let bar = container(bar)
         .padding(Padding {
@@ -1577,6 +1629,8 @@ mod tests {
                 demo_tip: None,
                 bindings: &bindings,
                 carry,
+                // The indicator with a count sits after the tabs; tabs are measured as before.
+                tunnels_up: 3,
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(

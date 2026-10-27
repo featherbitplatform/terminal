@@ -904,7 +904,7 @@ pub(crate) fn slider_style(t: &Tokens, status: slider::Status, editable: bool) -
     }
 }
 
-fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::Style {
+pub(crate) fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) -> toggler::Style {
     let (on, hovered, disabled) = match status {
         toggler::Status::Active { is_toggled } => (is_toggled, false, false),
         toggler::Status::Hovered { is_toggled } => (is_toggled, true, false),

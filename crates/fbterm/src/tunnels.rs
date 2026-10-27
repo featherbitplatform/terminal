@@ -207,11 +207,25 @@ impl Tunnels {
     }
 
     /// The state of `key`; `Off` for a tunnel that never ran.
-    #[allow(dead_code, reason = "called by the tunnels panel and the palette")]
     pub(crate) fn state(&self, key: &TunnelKey) -> TunnelState {
         self.entries
             .get(key)
             .map_or(TunnelState::Off, |e| e.state.clone())
+    }
+
+    /// How many tunnels are up (the tab bar's indicator).
+    pub(crate) fn up_count(&self) -> usize {
+        self.entries
+            .values()
+            .filter(|e| e.handle.is_some() && matches!(e.state, TunnelState::Up { .. }))
+            .count()
+    }
+
+    /// Whether `key`, defined as `def` and off, will start with its profile's next shell: a
+    /// `with_shell` tunnel, unless the user switched it off by hand while a shell is open.
+    pub(crate) fn waits_for_shell(&self, key: &TunnelKey, def: &TunnelDef) -> bool {
+        def.start == StartMode::WithShell
+            && !(self.off_by_hand.contains(key) && self.shells_up.contains(&key.profile))
     }
 
     /// Stop `key` now: it is `Off` at once; its task releases what it held right after.
@@ -255,7 +269,6 @@ fn failure_prefix(name: &str, profile: &str) -> String {
 impl App {
     /// Switch `key` on or off. Switching on a `with_shell` tunnel with no shell of its profile
     /// connected makes that run on-demand (`manual`): it outlives the shells.
-    #[allow(dead_code, reason = "called by the tunnels panel and the palette")]
     pub(crate) fn tunnel_toggle(&mut self, key: &TunnelKey) -> Task<Message> {
         if self.tunnels.running(key) {
             self.tunnels.stop(key);
@@ -264,12 +277,12 @@ impl App {
             let manual = def.start == StartMode::OnDemand || self.shell_count(key.profile) == 0;
             self.launch(key, self.focused_window(), manual);
         }
+        self.refresh_palettes();
         Task::none()
     }
 
     /// Start `key` again with its current definition (Retry, or restart to apply): the old
     /// instance, if any, is stopped and released first.
-    #[allow(dead_code, reason = "called by the tunnels panel and the palette")]
     pub(crate) fn tunnel_retry(&mut self, key: &TunnelKey) -> Task<Message> {
         let Some(def) = definition(&self.profiles, key) else {
             return Task::none();
@@ -279,6 +292,7 @@ impl App {
             || self.shell_count(key.profile) == 0;
         self.tunnels.stop(key);
         self.launch(key, self.focused_window(), manual);
+        self.refresh_palettes();
         Task::none()
     }
 
@@ -355,6 +369,7 @@ impl App {
             }
             state => entry.state = state,
         }
+        self.refresh_palettes();
         Task::none()
     }
 
@@ -435,6 +450,7 @@ impl App {
                 self.tunnels.stop(key);
             }
         }
+        self.refresh_palettes();
     }
 
     /// [`App::sync_shell_tunnels`] for every profile that had or has a connected shell (after

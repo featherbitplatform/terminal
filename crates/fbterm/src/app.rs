@@ -37,6 +37,7 @@ use crate::settings_window::{SettingsMsg, SettingsState};
 use crate::tabs::{Pane, TabState, WindowState};
 use crate::theme;
 use crate::tunnels::{Tunnels, tunnel_stream};
+use crate::tunnels_window::{TunnelsMsg, TunnelsState};
 use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
 
@@ -47,6 +48,8 @@ pub enum TabBarMsg {
     Close(usize),
     New,
     Profiles,
+    /// The tunnels indicator: opens the Tunnels window.
+    Tunnels,
     Settings,
 }
 
@@ -154,6 +157,8 @@ pub enum Message {
     Settings(SettingsMsg),
     /// The Color schemes window.
     Schemes(SchemesMsg),
+    /// The Tunnels window.
+    Tunnels(TunnelsMsg),
     /// Exporting a tab to a file.
     Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
@@ -200,6 +205,7 @@ pub(crate) enum ShotWindow {
     Editor,
     Settings,
     Schemes,
+    Tunnels,
 }
 
 pub struct App {
@@ -256,6 +262,8 @@ pub struct App {
     pub settings_win: Option<(window::Id, SettingsState)>,
     /// The Color schemes window, when open.
     pub schemes_win: Option<(window::Id, SchemesState)>,
+    /// The Tunnels window, when open.
+    pub tunnels_win: Option<(window::Id, TunnelsState)>,
     /// Connection dialogs waiting per window.
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
@@ -298,11 +306,12 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes` (debug aid): capture that window instead.
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels` (debug aid): capture that
+    /// window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
-    /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
-    /// shows.
+    /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close` (debug aid): that tab-bar
+    /// button's tooltip always shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
     /// `FBTERM_SCALE` (debug aid): extra UI scale on top of the OS's, e.g. 0.625 on a 2x
     /// screen for a fractional 1.25 physical scale. 1.0 otherwise.
@@ -491,6 +500,7 @@ impl App {
             editor: None,
             settings_win: None,
             schemes_win: None,
+            tunnels_win: None,
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
@@ -518,6 +528,7 @@ impl App {
                 Some(w) if w == "editor" => ShotWindow::Editor,
                 Some(w) if w == "settings" => ShotWindow::Settings,
                 Some(w) if w == "schemes" => ShotWindow::Schemes,
+                Some(w) if w == "tunnels" => ShotWindow::Tunnels,
                 _ => ShotWindow::Terminal,
             },
             shooting: false,
@@ -543,6 +554,7 @@ impl App {
         task = task.chain(app.open_debug_editor());
         task = task.chain(app.open_debug_settings());
         task = task.chain(app.open_debug_schemes());
+        task = task.chain(app.open_debug_tunnels());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
         (app, task)
@@ -587,6 +599,9 @@ impl App {
         }
         if self.schemes_window() == Some(id) {
             return "Color schemes · fbterm".into();
+        }
+        if self.tunnels_window() == Some(id) {
+            return "Tunnels · fbterm".into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title()),
@@ -648,6 +663,7 @@ impl App {
             ShotWindow::Editor if self.editor.is_none() => return false,
             ShotWindow::Settings if self.settings_win.is_none() => return false,
             ShotWindow::Schemes if self.schemes_win.is_none() => return false,
+            ShotWindow::Tunnels if self.tunnels_win.is_none() => return false,
             _ => {}
         }
         self.windows
@@ -760,6 +776,7 @@ impl App {
                     TabBarMsg::Close(i) => self.close_tab_asking(wid, i),
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
+                    TabBarMsg::Tunnels => self.action(Some(wid), Action::Tunnels),
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }
@@ -775,6 +792,9 @@ impl App {
                 }
                 if self.schemes_window() == Some(id) {
                     self.schemes_win = None;
+                }
+                if self.tunnels_window() == Some(id) {
+                    self.tunnels_win = None;
                 }
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
@@ -837,6 +857,7 @@ impl App {
                     && self.editor.is_none()
                     && self.settings_win.is_none()
                     && self.schemes_win.is_none()
+                    && self.tunnels_win.is_none()
                 {
                     iced::exit()
                 } else if self.quitting {
@@ -865,6 +886,7 @@ impl App {
             Message::Export(msg) => self.export_msg(msg),
             Message::Settings(msg) => self.settings_msg(msg),
             Message::Schemes(msg) => self.schemes_msg(msg),
+            Message::Tunnels(msg) => self.tunnels_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
@@ -982,6 +1004,7 @@ impl App {
             ShotWindow::Editor => self.editor_window(),
             ShotWindow::Settings => self.settings_window(),
             ShotWindow::Schemes => self.schemes_window(),
+            ShotWindow::Tunnels => self.tunnels_window(),
             ShotWindow::Terminal => self.windows.keys().next().copied(),
         };
         let Some(wid) = target else {

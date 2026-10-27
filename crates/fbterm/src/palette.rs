@@ -1,8 +1,9 @@
-//! Quick-launch palette: fuzzy search over profiles and actions, per window.
+//! Quick-launch palette: fuzzy search over profiles, tunnels and actions, per window.
 
 use std::collections::{BTreeMap, HashMap};
 
 use fbterm_config::{ProfileId, ProfileKind, ProfileStore};
+use fbterm_session::ssh::tunnel::TunnelKey;
 use iced::widget::{
     button, column, container, mouse_area, opaque, row, scrollable, text, text_input,
 };
@@ -46,6 +47,14 @@ pub enum PaletteItem {
         name: String,
         /// `user@host` (plus ` via <hops>`) for SSH, the program path for local shells.
         detail: String,
+    },
+    /// A tunnel: choosing it switches it on or off.
+    Tunnel {
+        key: TunnelKey,
+        /// `Tunnel: {profile} / {name}`.
+        label: String,
+        /// Its state, shown on the right of the row.
+        state: String,
     },
     Action {
         action: Action,
@@ -93,13 +102,53 @@ impl PaletteItem {
     fn label(&self) -> &str {
         match self {
             Self::Profile { name, .. } => name,
-            Self::Action { label, .. } | Self::Choice { label, .. } => label,
+            Self::Tunnel { label, .. }
+            | Self::Action { label, .. }
+            | Self::Choice { label, .. } => label,
         }
     }
 
-    /// Listed in a fixed order after the profiles (actions and choices).
+    /// Where the item is listed: profiles, then tunnels, then actions (and choices). Within
+    /// the last two groups the listed order holds while the query is empty.
+    fn group(&self) -> u8 {
+        match self {
+            Self::Profile { .. } => 0,
+            Self::Tunnel { .. } => 1,
+            Self::Action { .. } | Self::Choice { .. } => 2,
+        }
+    }
+
     fn is_action(&self) -> bool {
-        !matches!(self, Self::Profile { .. })
+        self.group() > 0
+    }
+}
+
+/// Fuzzy matching as the palette does it: every whitespace-separated word of the query is a
+/// literal fuzzy atom (no `!`, `^`, `'` or `$` syntax), smart case and normalization.
+pub struct Fuzzy {
+    pattern: Pattern,
+    matcher: Matcher,
+    buf: Vec<char>,
+}
+
+impl Fuzzy {
+    pub fn new(query: &str) -> Self {
+        Self {
+            pattern: Pattern::new(
+                query,
+                CaseMatching::Smart,
+                Normalization::Smart,
+                AtomKind::Fuzzy,
+            ),
+            matcher: Matcher::new(Config::DEFAULT),
+            buf: Vec::new(),
+        }
+    }
+
+    /// The score of `haystack`, `None` when it does not match.
+    pub fn score(&mut self, haystack: &str) -> Option<u32> {
+        self.pattern
+            .score(Utf32Str::new(haystack, &mut self.buf), &mut self.matcher)
     }
 }
 
@@ -208,6 +257,7 @@ fn actions() -> Vec<PaletteItem> {
         (Action::EditProfiles, "Edit profiles"),
         (Action::Settings, "Settings"),
         (Action::EditSchemes, "Color schemes"),
+        (Action::Tunnels, "Tunnels"),
         (Action::OpenSettingsFile, "Open settings file"),
         (Action::RevealConfigFolder, "Reveal config folder"),
         (Action::Quit, "Quit"),
@@ -225,8 +275,9 @@ pub fn action_hint(action: Action, bindings: &Bindings) -> Option<String> {
     bindings.label(action)
 }
 
-/// Every profile of the store, then the actions.
-pub fn items(store: &ProfileStore) -> Vec<PaletteItem> {
+/// Every profile of the store, then `tunnels` (the [`PaletteItem::Tunnel`] rows), then the
+/// actions.
+pub fn items(store: &ProfileStore, tunnels: Vec<PaletteItem>) -> Vec<PaletteItem> {
     let mut out: Vec<PaletteItem> = store
         .profiles
         .iter()
@@ -252,17 +303,20 @@ pub fn items(store: &ProfileStore) -> Vec<PaletteItem> {
             }
         })
         .collect();
+    out.extend(tunnels);
     out.extend(actions());
     out
 }
 
 /// Indices into `items`, best first. Empty query: recent profiles (latest first), the other
-/// profiles alphabetically, then the actions in their listed order. Otherwise only matches:
-/// profiles before actions, each by score, then recency, then name.
+/// profiles alphabetically, then the tunnels and the actions in their listed order. Otherwise
+/// only matches: profiles, then tunnels, then actions, each by score, then recency, then name.
 pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize> {
     let recent = |item: &PaletteItem| match item {
         PaletteItem::Profile { id, .. } => recency.get(*id),
-        PaletteItem::Action { .. } | PaletteItem::Choice { .. } => None,
+        PaletteItem::Tunnel { .. } | PaletteItem::Action { .. } | PaletteItem::Choice { .. } => {
+            None
+        }
     };
     let name_key = |i: usize| items[i].label().to_lowercase();
 
@@ -270,7 +324,7 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
         let mut order: Vec<usize> = (0..items.len()).collect();
         order.sort_by(|&a, &b| {
             let (ia, ib) = (&items[a], &items[b]);
-            ia.is_action().cmp(&ib.is_action()).then_with(|| {
+            ia.group().cmp(&ib.group()).then_with(|| {
                 if ia.is_action() {
                     a.cmp(&b)
                 } else {
@@ -284,17 +338,9 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
         return order;
     }
 
-    // Every whitespace-separated word is a literal fuzzy atom (no `!`, `^`, `'` or `$` syntax),
-    // matched against name and detail together so one query can span both.
-    let pattern = Pattern::new(
-        query,
-        CaseMatching::Smart,
-        Normalization::Smart,
-        AtomKind::Fuzzy,
-    );
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut buf = Vec::new();
-    let mut score = |s: &str| pattern.score(Utf32Str::new(s, &mut buf), &mut matcher);
+    // A profile's name and detail are matched together so one query can span both.
+    let mut fuzzy = Fuzzy::new(query);
+    let mut score = |s: &str| fuzzy.score(s);
 
     let mut scored: Vec<(usize, u32)> = items
         .iter()
@@ -302,17 +348,17 @@ pub fn rank(query: &str, items: &[PaletteItem], recency: &Recency) -> Vec<usize>
         .filter_map(|(i, item)| {
             let best = match item {
                 PaletteItem::Profile { name, detail, .. } => score(&format!("{name} {detail}")),
-                PaletteItem::Action { label, .. } | PaletteItem::Choice { label, .. } => {
-                    score(label)
-                }
+                PaletteItem::Tunnel { label, .. }
+                | PaletteItem::Action { label, .. }
+                | PaletteItem::Choice { label, .. } => score(label),
             };
             best.map(|s| (i, s))
         })
         .collect();
     scored.sort_by(|&(a, sa), &(b, sb)| {
         items[a]
-            .is_action()
-            .cmp(&items[b].is_action())
+            .group()
+            .cmp(&items[b].group())
             .then(sb.cmp(&sa))
             .then_with(|| recent(&items[b]).cmp(&recent(&items[a])))
             .then_with(|| name_key(a).cmp(&name_key(b)))
@@ -403,6 +449,12 @@ impl PaletteState {
     #[cfg(test)]
     pub fn ranked_len(&self) -> usize {
         self.ranked.len()
+    }
+
+    /// The listed items, best first.
+    #[cfg(test)]
+    pub fn ranked_items(&self) -> Vec<&PaletteItem> {
+        self.ranked.iter().map(|&i| &self.items[i]).collect()
     }
 }
 
@@ -546,9 +598,9 @@ fn item_row<'a>(
         });
     let (label, detail) = match item {
         PaletteItem::Profile { name, detail, .. } => (name.as_str(), Some(detail.as_str())),
-        PaletteItem::Action { label, .. } | PaletteItem::Choice { label, .. } => {
-            (label.as_str(), None)
-        }
+        PaletteItem::Tunnel { label, .. }
+        | PaletteItem::Action { label, .. }
+        | PaletteItem::Choice { label, .. } => (label.as_str(), None),
     };
     let mut content = row![
         text(label)
@@ -559,8 +611,22 @@ fn item_row<'a>(
     ]
     .spacing(12)
     .align_y(Alignment::Center);
-    match detail {
-        Some(d) => {
+    match (detail, item) {
+        (_, PaletteItem::Tunnel { state, .. }) => {
+            content = content.push(
+                container(
+                    text(state.as_str())
+                        .font(UI_FONT)
+                        .size(12)
+                        .wrapping(text::Wrapping::None)
+                        .color(t.text_secondary),
+                )
+                .width(Length::Fill)
+                .align_x(Alignment::End)
+                .clip(true),
+            );
+        }
+        (Some(d), _) => {
             content = content.push(
                 container(
                     text(d)
@@ -574,11 +640,13 @@ fn item_row<'a>(
                 .clip(true),
             );
         }
-        None => {
+        (None, _) => {
             // An action shows its current chord, or just that it is an action.
             let hint = match item {
                 PaletteItem::Action { action, .. } => action_hint(*action, bindings),
-                PaletteItem::Profile { .. } | PaletteItem::Choice { .. } => None,
+                PaletteItem::Profile { .. }
+                | PaletteItem::Tunnel { .. }
+                | PaletteItem::Choice { .. } => None,
             };
             let hint: Element<'a, Message> = match hint {
                 Some(chord) => text(chord)
@@ -642,7 +710,7 @@ mod tests {
     fn id(item: &PaletteItem) -> ProfileId {
         match item {
             PaletteItem::Profile { id, .. } => *id,
-            PaletteItem::Action { .. } | PaletteItem::Choice { .. } => panic!("not a profile"),
+            _ => panic!("not a profile"),
         }
     }
 
@@ -692,6 +760,7 @@ mod tests {
                 "Edit profiles",
                 "Settings",
                 "Color schemes",
+                "Tunnels",
                 "Open settings file",
                 "Reveal config folder",
                 "Quit"
@@ -830,7 +899,7 @@ mod tests {
         let store = ProfileStore {
             profiles: vec![bastion, web],
         };
-        let list = items(&store);
+        let list = items(&store, Vec::new());
         let detail = |n: &str| {
             list.iter().find_map(|i| match i {
                 PaletteItem::Profile { name, detail, .. } if name == n => Some(detail.clone()),
@@ -839,7 +908,7 @@ mod tests {
         };
         assert_eq!(detail("bastion").as_deref(), Some("root@b.example.com"));
         assert_eq!(detail("web").as_deref(), Some("root@10.0.0.5 via bastion"));
-        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 19);
+        assert_eq!(list.iter().filter(|i| i.is_action()).count(), 20);
     }
 
     #[test]
