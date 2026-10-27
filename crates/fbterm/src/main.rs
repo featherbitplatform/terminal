@@ -66,6 +66,7 @@ mod archive_import_tests;
 mod archive_window;
 mod chrome;
 mod config_files;
+mod context_menu;
 mod debug;
 mod dialogs;
 mod display_rate;

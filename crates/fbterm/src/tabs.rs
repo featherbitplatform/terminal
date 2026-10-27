@@ -384,6 +384,9 @@ pub fn apply_event(pane: &mut Pane, event: &SessionEvent) -> Option<String> {
 pub struct WindowState {
     pub tabs: Vec<Tab>,
     pub active: usize,
+    /// The window was created transparent (see [`crate::chrome::Backdrop`]), so it can show a
+    /// background opacity below 1. Fixed when the window opens.
+    pub transparent: bool,
 }
 
 /// A tab taken out of its window.

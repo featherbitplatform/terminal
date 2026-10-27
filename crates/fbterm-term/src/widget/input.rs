@@ -27,6 +27,9 @@ pub struct Context<'a> {
     pub bounds: Rectangle,
     pub grid: GridSize,
     pub cursor: mouse::Cursor,
+    /// A right-click copies the selection, or asks for the context menu without one (Windows
+    /// and Linux; see [`super::RIGHT_CLICK_MENU`]).
+    pub right_click_menu: bool,
 }
 
 /// What the widget should do after handling an event.
@@ -173,6 +176,15 @@ fn keyboard_scroll(term: &mut Terminal, key: &Key, m: Modifiers, is_macos: bool)
     true
 }
 
+/// The bytes a paste of `text` sends to the program in `term`: bracketed when the program
+/// asked for it. Like typing, it drops the selection and shows the newest output. Every paste
+/// goes through here (the paste chord and the context menu's `Paste`).
+pub fn paste_input(term: &mut Terminal, text: &str) -> Vec<u8> {
+    let bytes = encode_paste(text, term.mode());
+    reset_view(term);
+    bytes
+}
+
 /// Typing or pasting: drop the selection and show the newest output.
 fn reset_view(term: &mut Terminal) {
     if term.selection().is_some() {
@@ -301,7 +313,9 @@ impl InputState {
                     None => Effect::NONE,
                 }
             }
-            Event::Mouse(mouse::Event::ButtonPressed(button)) => self.press(ctx, *button, out),
+            Event::Mouse(mouse::Event::ButtonPressed(button)) => {
+                self.press(ctx, *button, clipboard, out)
+            }
             Event::Mouse(mouse::Event::ButtonReleased(button)) => self.release(ctx, *button, out),
             Event::Mouse(mouse::Event::CursorMoved { .. }) => self.moved(ctx, out),
             Event::Mouse(mouse::Event::CursorLeft) => {
@@ -357,9 +371,7 @@ impl InputState {
             }
             Chord::Paste => {
                 if let Some(text) = clipboard.read(Kind::Standard).filter(|t| !t.is_empty()) {
-                    let mut term = ctx.term.lock();
-                    let bytes = encode_paste(&text, term.mode());
-                    reset_view(&mut term);
+                    let bytes = paste_input(&mut ctx.term.lock(), &text);
                     out.push(TerminalOutput::Input(bytes));
                 }
                 Effect::REDRAW
@@ -396,6 +408,7 @@ impl InputState {
         &mut self,
         ctx: &Context<'_>,
         button: mouse::Button,
+        clipboard: &mut dyn Clipboard,
         out: &mut Vec<TerminalOutput>,
     ) -> Effect {
         let Some(pos) = ctx.cursor.position_in(ctx.bounds) else {
@@ -424,6 +437,9 @@ impl InputState {
             self.reported = Some((b, cell));
             self.report(b, MouseKind::Press, cell, mode, out);
             return Effect::CAPTURE;
+        }
+        if button == mouse::Button::Right && ctx.right_click_menu {
+            return self.right_click(&mut term, ctx, clipboard, out);
         }
         if button != mouse::Button::Left {
             return Effect::NONE;
@@ -470,6 +486,33 @@ impl InputState {
             }
         }
         Effect::REDRAW
+    }
+
+    /// A right-click the program does not get: copy the selection to the clipboard (as the
+    /// Copy chord does) and clear it; without one, ask the host for the context menu at the
+    /// pointer. Only a press of the user's mouse gets here, never anything a program sends.
+    fn right_click(
+        &mut self,
+        term: &mut Terminal,
+        ctx: &Context<'_>,
+        clipboard: &mut dyn Clipboard,
+        out: &mut Vec<TerminalOutput>,
+    ) -> Effect {
+        self.drag = None;
+        let text = term
+            .selection()
+            .map(|s| s.text(term))
+            .filter(|t| !t.is_empty());
+        if let Some(text) = text {
+            clipboard.write(Kind::Standard, text.clone());
+            out.push(TerminalOutput::Copy(text));
+            term.set_selection(None);
+            return Effect::REDRAW;
+        }
+        if let Some(at) = ctx.cursor.position() {
+            out.push(TerminalOutput::ContextMenu(at));
+        }
+        Effect::CAPTURE
     }
 
     fn release(
@@ -749,6 +792,176 @@ mod tests {
         );
     }
 
+    /// A clipboard that remembers what was written and hands out `text` when read.
+    #[derive(Default)]
+    struct TestClipboard {
+        text: Option<String>,
+        written: Vec<String>,
+    }
+
+    impl Clipboard for TestClipboard {
+        fn read(&self, _kind: Kind) -> Option<String> {
+            self.text.clone()
+        }
+        fn write(&mut self, _kind: Kind, contents: String) {
+            self.written.push(contents);
+        }
+    }
+
+    fn shared(t: Terminal) -> SharedTerminal {
+        std::sync::Arc::new(parking_lot::Mutex::new(t))
+    }
+
+    /// A context over a 40x24 terminal at (10, 20) in the window, the pointer at `at`.
+    fn ctx_at(term: &SharedTerminal, at: iced::Point, menu: bool) -> Context<'_> {
+        let grid = term.lock().size();
+        Context {
+            term,
+            focused: true,
+            bounds: Rectangle::new(iced::Point::new(10.0, 20.0), iced::Size::new(320.0, 384.0)),
+            grid,
+            cursor: mouse::Cursor::Available(at),
+            right_click_menu: menu,
+        }
+    }
+
+    fn right_press() -> Event {
+        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right))
+    }
+
+    fn select_first_word(term: &SharedTerminal) {
+        let mut t = term.lock();
+        let line = feathercritty::index::Line(0);
+        let mut sel = Selection::start(Point::new(line, Column(0)));
+        sel.update(Point::new(line, Column(3)));
+        t.set_selection(Some(sel));
+    }
+
+    #[test]
+    fn right_click_on_a_selection_copies_it_and_clears_it() {
+        let mut t = filled(24);
+        t.feed(b"\x1b[H\x1b[2Jword two\r\n");
+        let term = shared(t);
+        select_first_word(&term);
+        let at = iced::Point::new(50.0, 40.0);
+        let mut st = InputState::default();
+        let mut clip = TestClipboard::default();
+        let mut out = Vec::new();
+        let effect = st.handle(
+            &ctx_at(&term, at, true),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(clip.written, vec!["word".to_owned()]);
+        assert_eq!(out, vec![TerminalOutput::Copy("word".into())]);
+        assert!(
+            term.lock().selection().is_none(),
+            "the selection is cleared"
+        );
+        assert!(effect.redraw && effect.capture);
+    }
+
+    #[test]
+    fn right_click_without_a_selection_asks_for_the_menu_at_the_pointer() {
+        let term = shared(filled(24));
+        let at = iced::Point::new(50.0, 40.0);
+        let mut st = InputState::default();
+        let mut clip = TestClipboard::default();
+        let mut out = Vec::new();
+        let effect = st.handle(
+            &ctx_at(&term, at, true),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(out, vec![TerminalOutput::ContextMenu(at)]);
+        assert!(clip.written.is_empty());
+        assert!(effect.capture);
+        // Releasing the button does nothing more.
+        let mut out = Vec::new();
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
+        st.handle(&ctx_at(&term, at, true), &release, &mut clip, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn right_click_does_nothing_where_the_menu_is_off() {
+        let term = shared(filled(24));
+        select_first_word(&term);
+        let at = iced::Point::new(50.0, 40.0);
+        let mut st = InputState::default();
+        let mut clip = TestClipboard::default();
+        let mut out = Vec::new();
+        st.handle(
+            &ctx_at(&term, at, false),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert!(out.is_empty() && clip.written.is_empty());
+        assert!(term.lock().selection().is_some());
+    }
+
+    #[test]
+    fn under_mouse_reporting_right_click_is_the_programs_and_shift_right_click_is_ours() {
+        let mut t = filled(24);
+        t.feed(b"\x1b[?1000h\x1b[?1006h");
+        let term = shared(t);
+        let at = iced::Point::new(50.0, 40.0);
+        let mut st = InputState::default();
+        let mut clip = TestClipboard::default();
+        let mut out = Vec::new();
+        st.handle(
+            &ctx_at(&term, at, true),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
+        st.handle(&ctx_at(&term, at, true), &release, &mut clip, &mut out);
+        assert_eq!(
+            inputs(out),
+            vec![b"\x1b[<2;6;2M".to_vec(), b"\x1b[<2;6;2m".to_vec()]
+        );
+        // With Shift held: the menu, and nothing reaches the program.
+        let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::SHIFT));
+        let mut out = Vec::new();
+        st.handle(&ctx_at(&term, at, true), &shift, &mut clip, &mut out);
+        st.handle(
+            &ctx_at(&term, at, true),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(out, vec![TerminalOutput::ContextMenu(at)]);
+        // ...and with a selection, the copy.
+        select_first_word(&term);
+        let mut out = Vec::new();
+        st.handle(
+            &ctx_at(&term, at, true),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert!(matches!(out.as_slice(), [TerminalOutput::Copy(_)]));
+        assert!(term.lock().selection().is_none());
+    }
+
+    #[test]
+    fn paste_input_brackets_when_asked_and_resets_the_view() {
+        let mut t = filled(24);
+        t.scroll(5);
+        assert_eq!(offset(&t), 5);
+        assert_eq!(paste_input(&mut t, "ls\n"), b"ls\r".to_vec());
+        assert_eq!(offset(&t), 0, "a paste shows the newest output");
+        t.feed(b"\x1b[?2004h");
+        let line = feathercritty::index::Line(0);
+        t.set_selection(Some(Selection::start(Point::new(line, Column(0)))));
+        assert_eq!(paste_input(&mut t, "ls"), b"\x1b[200~ls\x1b[201~".to_vec());
+        assert!(t.selection().is_none());
+    }
+
     fn key_event(pressed: bool, named: keyboard::key::Named, code: keyboard::key::Code) -> Event {
         let key = Key::Named(named);
         let physical_key = keyboard::key::Physical::Code(code);
@@ -797,6 +1010,7 @@ mod tests {
             bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(320.0, 384.0)),
             grid,
             cursor: mouse::Cursor::Unavailable,
+            right_click_menu: false,
         };
         let mut st = InputState::default();
         let mut clip = iced::advanced::clipboard::Null;
@@ -841,6 +1055,7 @@ mod tests {
             bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(320.0, 384.0)),
             grid,
             cursor: mouse::Cursor::Unavailable,
+            right_click_menu: false,
         };
         let mut clip = iced::advanced::clipboard::Null;
         let mut out = Vec::new();

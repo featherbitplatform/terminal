@@ -12,7 +12,7 @@ Full documentation: [featherbitplatform.github.io/terminal](https://featherbitpl
 
 ## Install
 
-Download from the [latest release](https://github.com/featherbitplatform/terminal/releases/latest); each file comes with a `.sha256` checksum. Builds are not signed yet, so each system asks you to confirm the first launch.
+Download from the [latest release](https://github.com/featherbitplatform/terminal/releases/latest); each file comes with a `.sha256` checksum, and releases from 0.3.0 on also carry CycloneDX SBOMs of the app and the docs site. Builds are not signed yet, so each system asks you to confirm the first launch.
 
 - **macOS:** the universal `.dmg` for Apple Silicon and Intel Macs. See [Install on macOS](https://featherbitplatform.github.io/terminal/install-macos).
 - **Linux:** `.deb` (Debian 12 and Ubuntu 22.04 and newer), `.rpm` (Fedora 39 and RHEL 9 and newer) or `.tar.gz`, for x86_64 and aarch64. See [Install on Linux](https://featherbitplatform.github.io/terminal/install-linux).
@@ -38,16 +38,16 @@ Requires a recent stable Rust toolchain (edition 2024).
 ```bash
 cargo run -p fbterm            # build and run
 cargo test --workspace         # tests
-bash dev/package-macos.sh 0.2.0  # universal .app and .dmg into target/dist/ (macOS only)
-bash dev/package-linux.sh 0.2.0 x86_64  # .deb, .rpm, .tar.gz (Linux; see the script)
-pwsh dev/package-windows.ps1 0.2.0      # .msi (Windows)
+bash dev/package-macos.sh 0.3.0  # universal .app and .dmg into target/dist/ (macOS only)
+bash dev/package-linux.sh 0.3.0 x86_64  # .deb, .rpm, .tar.gz (Linux; see the script)
+pwsh dev/package-windows.ps1 0.3.0      # .msi (Windows)
 ```
 
 The code builds and tests on macOS, Linux and Windows, and releases ship for all three. Terminal emulation comes from [feathercritty](https://github.com/featherbitplatform/feathercritty), our fork of the `alacritty_terminal` crate.
 
 ## Contributing
 
-Work happens on `feature/*` branches off `develop` with [Conventional Commits](https://www.conventionalcommits.org/); `main` holds tagged releases only. CI runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo deny check` and live SSH tests.
+Work happens on `feature/*` branches off `develop` with [Conventional Commits](https://www.conventionalcommits.org/); `main` holds tagged releases only. CI runs `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`, `cargo deny check` and live SSH tests; security scans (semgrep, grype, gitleaks, npm audit) run on every pull request and weekly, and `bash dev/sast.sh` runs them locally.
 
 ## License
 

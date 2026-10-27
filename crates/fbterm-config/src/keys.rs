@@ -27,6 +27,9 @@ pub enum Action {
     Quit,
     /// The profile editor: Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere.
     EditProfiles,
+    /// Copy a profile (the one selected in the profile editor, or the focused pane's) and
+    /// open the copy in the editor (no chord by default).
+    DuplicateProfile,
     /// The Settings window: Cmd+, on macOS, Ctrl+, elsewhere.
     Settings,
     /// The Color schemes window (no chord by default).
@@ -118,7 +121,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 44] = [
+    pub const ALL: [Action; 45] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -148,6 +151,7 @@ impl Action {
         Action::TileToTab,
         Action::NewWindow,
         Action::EditProfiles,
+        Action::DuplicateProfile,
         Action::ExportProfiles,
         Action::ImportProfiles,
         Action::Settings,
@@ -185,6 +189,7 @@ impl Action {
             Self::NewWindow => "new_window",
             Self::Quit => "quit",
             Self::EditProfiles => "edit_profiles",
+            Self::DuplicateProfile => "duplicate_profile",
             Self::Settings => "settings",
             Self::EditSchemes => "edit_schemes",
             Self::Tunnels => "tunnels",
@@ -232,6 +237,7 @@ impl Action {
             Self::NewWindow => "New window".into(),
             Self::Quit => "Quit".into(),
             Self::EditProfiles => "Edit profiles".into(),
+            Self::DuplicateProfile => "Duplicate profile".into(),
             Self::Settings => "Settings".into(),
             Self::EditSchemes => "Color schemes".into(),
             Self::Tunnels => "Tunnels".into(),
@@ -285,6 +291,7 @@ impl Action {
             | Self::TileToTab => ActionGroup::Panes,
             Self::NewWindow
             | Self::EditProfiles
+            | Self::DuplicateProfile
             | Self::Settings
             | Self::EditSchemes
             | Self::Tunnels
@@ -693,6 +700,83 @@ pub fn reserved(mac: bool, chord: Chord) -> Option<&'static str> {
     None
 }
 
+/// A shortcut outside the binding table, shown read-only in the Settings window: its chord is
+/// one [`reserved`] keeps, so it can neither be changed nor taken by an action. (Quit on macOS
+/// is an action of its own, listed with the others as fixed, see [`Action::is_fixed`].)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FixedShortcut {
+    pub title: &'static str,
+    pub chord: Chord,
+    /// A second chord doing the same.
+    pub also: Option<Chord>,
+    /// A line under the row.
+    pub note: Option<&'static str>,
+}
+
+/// The fixed shortcuts on macOS (`mac`) or the other platforms, in the order shown.
+pub fn fixed_shortcuts(mac: bool) -> Vec<FixedShortcut> {
+    let key = |key: ChordKey, shift: bool, cmd: bool| Chord {
+        key,
+        ctrl: false,
+        alt: false,
+        shift,
+        cmd,
+    };
+    let clipboard = |c: char| {
+        if mac {
+            mac_chord(c, false)
+        } else {
+            ctrl_chord(c, true, false)
+        }
+    };
+    let save = if mac {
+        mac_chord('s', false)
+    } else {
+        ctrl_chord('s', false, false)
+    };
+    let row = |title, chord| FixedShortcut {
+        title,
+        chord,
+        also: None,
+        note: None,
+    };
+    let mut list = vec![
+        FixedShortcut {
+            note: (!mac).then_some("Ctrl+C goes to the program. Right-click copies a selection."),
+            ..row("Copy", clipboard('c'))
+        },
+        FixedShortcut {
+            note: (!mac).then_some("Right-click with nothing selected offers Paste."),
+            ..row("Paste", clipboard('v'))
+        },
+        row("Scroll up a page", key(ChordKey::PageUp, true, false)),
+        row("Scroll down a page", key(ChordKey::PageDown, true, false)),
+        FixedShortcut {
+            also: mac.then(|| key(ChordKey::Home, false, true)),
+            ..row("Scroll to top", key(ChordKey::Home, true, false))
+        },
+        FixedShortcut {
+            also: mac.then(|| key(ChordKey::End, false, true)),
+            ..row("Scroll to bottom", key(ChordKey::End, true, false))
+        },
+        FixedShortcut {
+            note: Some("In the profile editor and the Color schemes window."),
+            ..row("Save", save)
+        },
+    ];
+    if mac {
+        list.push(row("Hide fbterm", mac_chord('h', false)));
+        list.push(row(
+            "Hide others",
+            Chord {
+                alt: true,
+                ..mac_chord('h', false)
+            },
+        ));
+    }
+    list
+}
+
 /// The built-in chord for `action` on macOS (`mac`) or the other platforms, if it has one.
 ///
 /// macOS chords use Cmd (with Shift where noted) and never Ctrl; Option only with the arrows
@@ -752,6 +836,7 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
         | Action::Tunnels
         | Action::ExportProfiles
         | Action::ImportProfiles
+        | Action::DuplicateProfile
         | Action::ExportTab
         | Action::FindInTab
         | Action::MergeTab
@@ -1360,6 +1445,85 @@ mod tests {
                         "{}",
                         a.name()
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_shortcuts_list_the_reserved_chords() {
+        for mac in [true, false] {
+            let list = fixed_shortcuts(mac);
+            let titles: Vec<&str> = list.iter().map(|f| f.title).collect();
+            let mut expected = vec![
+                "Copy",
+                "Paste",
+                "Scroll up a page",
+                "Scroll down a page",
+                "Scroll to top",
+                "Scroll to bottom",
+                "Save",
+            ];
+            if mac {
+                expected.extend(["Hide fbterm", "Hide others"]);
+            }
+            assert_eq!(titles, expected);
+            // Every chord shown is one `reserved` keeps, under the matching name.
+            for f in &list {
+                for chord in std::iter::once(f.chord).chain(f.also) {
+                    let what = reserved(mac, chord).unwrap_or_else(|| panic!("{}", f.title));
+                    let first = f.title.split(' ').next().unwrap();
+                    assert!(what.starts_with(first), "{} is {what}", f.title);
+                }
+            }
+        }
+        let label = |mac, i: usize| fixed_shortcuts(mac)[i].chord.label(mac);
+        assert_eq!(label(false, 0), "Ctrl+Shift+C");
+        assert_eq!(label(false, 1), "Ctrl+Shift+V");
+        assert_eq!(label(true, 0), "\u{2318}C");
+        assert_eq!(label(true, 1), "\u{2318}V");
+        assert_eq!(label(false, 2), "Shift+PageUp");
+        assert_eq!(fixed_shortcuts(true)[4].also, Some(c("cmd+home")));
+        assert_eq!(fixed_shortcuts(false)[4].also, None);
+        // Elsewhere the copy row says where Ctrl+C goes and that right-click copies.
+        assert!(
+            fixed_shortcuts(false)[0]
+                .note
+                .unwrap()
+                .contains("Right-click")
+        );
+        assert_eq!(fixed_shortcuts(true)[0].note, None);
+    }
+
+    #[test]
+    fn every_reserved_chord_but_quit_is_a_fixed_shortcut() {
+        // Probe every key with every modifier set: each thing `reserved` names (Quit aside,
+        // a fixed action row of its own) is named by some chord of the fixed list.
+        let keys = ('a'..='z')
+            .map(ChordKey::Char)
+            .chain(NAMED.iter().map(|(k, _)| *k))
+            .chain((1..=12).map(ChordKey::F));
+        let keys: Vec<ChordKey> = keys.collect();
+        for mac in [true, false] {
+            let listed: std::collections::HashSet<&str> = fixed_shortcuts(mac)
+                .iter()
+                .flat_map(|f| std::iter::once(f.chord).chain(f.also))
+                .filter_map(|c| reserved(mac, c))
+                .collect();
+            for &key in &keys {
+                for bits in 0..16u8 {
+                    let chord = Chord {
+                        key,
+                        ctrl: bits & 1 != 0,
+                        alt: bits & 2 != 0,
+                        shift: bits & 4 != 0,
+                        cmd: bits & 8 != 0,
+                    };
+                    if let Some(what) = reserved(mac, chord)
+                        && what != "Quit (system)"
+                    {
+                        assert!(listed.contains(what), "{what} is not listed (mac: {mac})");
+                    }
                 }
             }
         }

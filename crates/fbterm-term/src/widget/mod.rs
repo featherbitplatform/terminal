@@ -27,6 +27,7 @@ use crate::{GridSize, SearchMatch, SearchPattern, SharedTerminal};
 pub use colors::cell_colors;
 pub use draw::{DrawList, build as build_draw_list};
 pub use geometry::{grid_size_from_bounds, pixel_to_cell, pixel_to_point};
+pub use input::paste_input;
 
 /// How a terminal is drawn.
 #[derive(Debug, Clone, PartialEq)]
@@ -78,7 +79,14 @@ pub enum TerminalOutput {
     Copy(String),
     /// An OSC 8 hyperlink was activated (Cmd+click on macOS, Ctrl+click elsewhere).
     OpenUrl(String),
+    /// The user right-clicked with nothing selected (Windows and Linux, see
+    /// [`RIGHT_CLICK_MENU`]): show the context menu at this point of the window.
+    ContextMenu(iced::Point),
 }
+
+/// Whether a right-click the program does not take copies the selection, or opens the
+/// context menu when nothing is selected: on Windows and Linux. macOS keeps right-click as is.
+pub const RIGHT_CLICK_MENU: bool = !cfg!(target_os = "macos");
 
 /// A terminal view. Locks `term` only while drawing or handling an event.
 pub fn terminal_view<'a, Message: 'a>(
@@ -253,6 +261,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
             bounds,
             grid,
             cursor,
+            right_click_menu: RIGHT_CLICK_MENU,
         };
         let effect = state.input.handle(&ctx, event, clipboard, &mut out);
         for o in out {

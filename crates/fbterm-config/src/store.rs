@@ -210,6 +210,33 @@ impl ProfileStore {
         self.profiles.iter().find(|p| p.id == id)
     }
 
+    /// Add a copy of profile `id` right after it: a new id, every other field the same but the
+    /// name, which is the first of `{name} copy`, `{name} copy 2`, `{name} copy 3`, ... no
+    /// profile has (names are unique). Returns the copy's id; `None` (nothing changed) when
+    /// there is no profile `id`. Saved secrets are not part of a profile: the caller copies
+    /// them.
+    pub fn duplicate(&mut self, id: ProfileId) -> Option<ProfileId> {
+        let pos = self.profiles.iter().position(|p| p.id == id)?;
+        let base = format!("{} copy", self.profiles[pos].name.trim());
+        let taken = |n: &str| self.profiles.iter().any(|p| p.name == n);
+        let name = if taken(&base) {
+            (2..)
+                .map(|i| format!("{base} {i}"))
+                .find(|n| !taken(n))
+                .expect("an unused name exists")
+        } else {
+            base
+        };
+        let copy = Profile {
+            id: ProfileId::new(),
+            name,
+            ..self.profiles[pos].clone()
+        };
+        let new_id = copy.id;
+        self.profiles.insert(pos + 1, copy);
+        Some(new_id)
+    }
+
     pub fn validate(&self) -> Vec<ValidationError> {
         let index: HashMap<ProfileId, &Profile> = self.profiles.iter().map(|p| (p.id, p)).collect();
         let (cycles, too_long) = self.chain_facts(&index);
