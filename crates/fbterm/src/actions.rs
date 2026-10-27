@@ -72,6 +72,8 @@ impl App {
             Action::Settings => self.settings_msg(SettingsMsg::Open),
             Action::EditSchemes => self.open_schemes(None),
             Action::Tunnels => self.open_tunnels(),
+            Action::ExportProfiles => self.open_archive(crate::archive_window::ArchiveMode::Export),
+            Action::ImportProfiles => self.open_archive(crate::archive_window::ArchiveMode::Import),
             Action::FilePanel => self.on_window(wid, App::toggle_file_panel),
             Action::OpenSettingsFile => {
                 crate::config_files::open_settings_file(&self.paths);

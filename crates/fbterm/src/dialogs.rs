@@ -36,6 +36,8 @@ impl App {
                     .and_then(|d| d.color_scheme.clone());
                 self.open_schemes(current)
             }
+            EditorMsg::Export => self.open_archive(crate::archive_window::ArchiveMode::Export),
+            EditorMsg::Import => self.open_archive(crate::archive_window::ArchiveMode::Import),
             EditorMsg::Reload => {
                 self.reload_profiles(true);
                 Task::none()
@@ -201,6 +203,7 @@ impl App {
         self.schemes_moved(&before);
         self.tunnels_profiles_changed();
         self.refresh_palettes();
+        self.refresh_export_preview();
     }
 
     pub(crate) fn prompt_msg(&mut self, msg: PromptMsg) -> Task<Message> {

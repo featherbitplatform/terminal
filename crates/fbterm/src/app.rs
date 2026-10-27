@@ -19,6 +19,7 @@ use iced::{Event, Subscription, Task, Theme};
 use parking_lot::Mutex;
 use tokio::sync::mpsc::unbounded_channel;
 
+use crate::archive_window::{ArchiveMsg, ArchiveState};
 use crate::chrome::{self, BarAction};
 use crate::display_rate;
 use crate::editor::{EditorMsg, EditorState};
@@ -159,6 +160,8 @@ pub enum Message {
     Schemes(SchemesMsg),
     /// The Tunnels window.
     Tunnels(TunnelsMsg),
+    /// The export and import window.
+    Archive(ArchiveMsg),
     /// Exporting a tab to a file.
     Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
@@ -208,6 +211,7 @@ pub(crate) enum ShotWindow {
     Settings,
     Schemes,
     Tunnels,
+    Archive,
 }
 
 pub struct App {
@@ -273,6 +277,14 @@ pub struct App {
     pub schemes_win: Option<(window::Id, SchemesState)>,
     /// The Tunnels window, when open.
     pub tunnels_win: Option<(window::Id, TunnelsState)>,
+    /// The export and import window, when open.
+    pub archive_win: Option<(window::Id, ArchiveState)>,
+    /// Numbers the archive window's dialogs and background jobs, so a late answer for one it
+    /// no longer waits for (even from a window since closed) is dropped.
+    pub(crate) archive_seq: u64,
+    /// Tests: run the archive window's background work at once instead of on the blocking
+    /// pool (the app's tasks never run in tests).
+    pub(crate) blocking_inline: bool,
     /// Connection dialogs waiting per window.
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
@@ -318,8 +330,8 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels` (debug aid): capture that
-    /// window instead.
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels|archive` (debug aid): capture
+    /// that window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
     /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close` (debug aid): that tab-bar
@@ -519,6 +531,9 @@ impl App {
             settings_win: None,
             schemes_win: None,
             tunnels_win: None,
+            archive_win: None,
+            archive_seq: 0,
+            blocking_inline: false,
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
@@ -548,6 +563,7 @@ impl App {
                 Some(w) if w == "settings" => ShotWindow::Settings,
                 Some(w) if w == "schemes" => ShotWindow::Schemes,
                 Some(w) if w == "tunnels" => ShotWindow::Tunnels,
+                Some(w) if w == "archive" => ShotWindow::Archive,
                 _ => ShotWindow::Terminal,
             },
             shooting: false,
@@ -574,6 +590,7 @@ impl App {
         task = task.chain(app.open_debug_settings());
         task = task.chain(app.open_debug_schemes());
         task = task.chain(app.open_debug_tunnels());
+        task = task.chain(app.open_debug_archive());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
         task = task.chain(app.open_debug_files());
@@ -622,6 +639,9 @@ impl App {
         }
         if self.tunnels_window() == Some(id) {
             return "Tunnels · fbterm".into();
+        }
+        if self.archive_window() == Some(id) {
+            return self.archive_title().into();
         }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title()),
@@ -704,6 +724,7 @@ impl App {
             ShotWindow::Settings if self.settings_win.is_none() => return false,
             ShotWindow::Schemes if self.schemes_win.is_none() => return false,
             ShotWindow::Tunnels if self.tunnels_win.is_none() => return false,
+            ShotWindow::Archive if self.archive_win.is_none() => return false,
             _ => {}
         }
         self.windows
@@ -851,6 +872,10 @@ impl App {
                 if self.tunnels_window() == Some(id) {
                     self.tunnels_win = None;
                 }
+                // Dropping the state wipes typed passwords and an opened archive.
+                if self.archive_window() == Some(id) {
+                    self.archive_win = None;
+                }
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
                 // stop saving.
@@ -921,6 +946,7 @@ impl App {
                     && self.settings_win.is_none()
                     && self.schemes_win.is_none()
                     && self.tunnels_win.is_none()
+                    && self.archive_win.is_none()
                 {
                     iced::exit()
                 } else if self.quitting {
@@ -950,6 +976,7 @@ impl App {
             Message::Settings(msg) => self.settings_msg(msg),
             Message::Schemes(msg) => self.schemes_msg(msg),
             Message::Tunnels(msg) => self.tunnels_msg(msg),
+            Message::Archive(msg) => self.archive_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
@@ -1073,6 +1100,7 @@ impl App {
             ShotWindow::Settings => self.settings_window(),
             ShotWindow::Schemes => self.schemes_window(),
             ShotWindow::Tunnels => self.tunnels_window(),
+            ShotWindow::Archive => self.archive_window(),
             ShotWindow::Terminal => self.windows.keys().next().copied(),
         };
         let Some(wid) = target else {

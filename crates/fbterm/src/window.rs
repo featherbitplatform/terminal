@@ -118,6 +118,26 @@ pub fn view(app: &App, id: window::Id) -> Element<'_, Message> {
             bindings: &app.bindings,
         });
     }
+    if let Some((aid, state)) = &app.archive_win
+        && *aid == id
+    {
+        let mut content = column![];
+        if Chrome::current().draws_title_bar() {
+            content = content.push(crate::ui::window_header(t, id));
+        }
+        let content = content.push(crate::archive_window::view::view(
+            t,
+            state,
+            &app.profiles,
+            app.profiles_error.is_some(),
+        ));
+        return Element::new(Shortcuts {
+            content: content.into(),
+            window: id,
+            mode: Mode::Archive,
+            bindings: &app.bindings,
+        });
+    }
     let Some(win) = app.windows.get(&id) else {
         return container(text("")).into();
     };

@@ -33,6 +33,10 @@ pub enum Action {
     EditSchemes,
     /// The Tunnels window (no chord by default).
     Tunnels,
+    /// The archive window in its Export mode (no chord by default).
+    ExportProfiles,
+    /// The archive window in its Import mode (no chord by default).
+    ImportProfiles,
     /// Show or hide the file panel of the active tab: Cmd+Shift+E on macOS, Ctrl+Shift+E
     /// elsewhere.
     FilePanel,
@@ -114,7 +118,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 42] = [
+    pub const ALL: [Action; 44] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -144,6 +148,8 @@ impl Action {
         Action::TileToTab,
         Action::NewWindow,
         Action::EditProfiles,
+        Action::ExportProfiles,
+        Action::ImportProfiles,
         Action::Settings,
         Action::EditSchemes,
         Action::Tunnels,
@@ -182,6 +188,8 @@ impl Action {
             Self::Settings => "settings",
             Self::EditSchemes => "edit_schemes",
             Self::Tunnels => "tunnels",
+            Self::ExportProfiles => "export_profiles",
+            Self::ImportProfiles => "import_profiles",
             Self::FilePanel => "file_panel",
             Self::OpenSettingsFile => "open_settings_file",
             Self::RevealConfigFolder => "reveal_config_folder",
@@ -227,6 +235,8 @@ impl Action {
             Self::Settings => "Settings".into(),
             Self::EditSchemes => "Color schemes".into(),
             Self::Tunnels => "Tunnels".into(),
+            Self::ExportProfiles => "Export profiles\u{2026}".into(),
+            Self::ImportProfiles => "Import profiles\u{2026}".into(),
             Self::FilePanel => "File panel".into(),
             Self::OpenSettingsFile => "Open settings file".into(),
             Self::RevealConfigFolder => "Reveal config folder".into(),
@@ -278,6 +288,8 @@ impl Action {
             | Self::Settings
             | Self::EditSchemes
             | Self::Tunnels
+            | Self::ExportProfiles
+            | Self::ImportProfiles
             | Self::FilePanel => ActionGroup::Windows,
             Self::Find | Self::FindAll | Self::FindNext | Self::FindPrevious | Self::FindInTab => {
                 ActionGroup::Search
@@ -738,6 +750,8 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
         | Action::RevealConfigFolder
         | Action::EditSchemes
         | Action::Tunnels
+        | Action::ExportProfiles
+        | Action::ImportProfiles
         | Action::ExportTab
         | Action::FindInTab
         | Action::MergeTab
@@ -1438,6 +1452,30 @@ mod tests {
         assert_eq!(a.group(), ActionGroup::Windows);
         assert_eq!(default_chord(true, a), None);
         assert_eq!(default_chord(false, a), None);
+    }
+
+    #[test]
+    fn export_and_import_are_listed_without_a_chord() {
+        for (a, name, title) in [
+            (
+                Action::ExportProfiles,
+                "export_profiles",
+                "Export profiles\u{2026}",
+            ),
+            (
+                Action::ImportProfiles,
+                "import_profiles",
+                "Import profiles\u{2026}",
+            ),
+        ] {
+            assert!(Action::ALL.contains(&a));
+            assert_eq!(a.name(), name);
+            assert_eq!(Action::from_name(name), Some(a));
+            assert_eq!(a.title(), title);
+            assert_eq!(a.group(), ActionGroup::Windows);
+            assert_eq!(default_chord(true, a), None);
+            assert_eq!(default_chord(false, a), None);
+        }
     }
 
     #[test]

@@ -282,6 +282,7 @@ impl App {
             .chain(self.settings_window())
             .chain(self.schemes_window())
             .chain(self.tunnels_window())
+            .chain(self.archive_window())
             .collect();
         self.closing.extend(ids.iter().copied());
         Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
@@ -297,6 +298,7 @@ impl App {
             || self.settings_window() == Some(id)
             || self.schemes_window() == Some(id)
             || self.tunnels_window() == Some(id)
+            || self.archive_window() == Some(id)
         {
             self.close_window(id)
         } else if self.windows.len() > 1 {

@@ -4,9 +4,6 @@
 //! key path and passphrase flag cleared, and its secret and key lists are never filled,
 //! whatever the store holds.
 
-// The export dialog that calls `build` lands with the export and import UI.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
@@ -66,7 +63,11 @@ pub(crate) fn build(
             return Err(NO_SSH.into());
         }
         if !local_names.is_empty() {
-            let verb = if local_names.len() == 1 { "was" } else { "were" };
+            let verb = if local_names.len() == 1 {
+                "was"
+            } else {
+                "were"
+            };
             warnings.push(format!(
                 "Local profiles are not part of a shared archive, so {} {verb} left out.",
                 local_names.join(", ")
@@ -95,7 +96,10 @@ pub(crate) fn build(
 
 /// The selected profiles and every profile reachable through their jump chains. A jump to a
 /// profile that does not exist is skipped (the profile is already invalid in the store).
-fn closure(store: &ProfileStore, selected: &[ProfileId]) -> Result<HashSet<ProfileId>, String> {
+pub(crate) fn closure(
+    store: &ProfileStore,
+    selected: &[ProfileId],
+) -> Result<HashSet<ProfileId>, String> {
     let mut seen = HashSet::new();
     let mut todo = Vec::new();
     for &id in selected {

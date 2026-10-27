@@ -7,6 +7,7 @@ use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector, keyboard, mouse, window};
 
 use crate::app::Message;
+use crate::archive_window::ArchiveMsg;
 use crate::editor::EditorMsg;
 use crate::file_panel::{FilePanelMsg, PanelKey};
 use crate::find::FindMsg;
@@ -64,6 +65,10 @@ pub(crate) enum Mode {
     /// The Tunnels window: Cmd+W closes it, Settings, the profile editor, Color schemes and
     /// Quit work; other shortcuts do nothing (typing goes to the search bar).
     Tunnels,
+    /// The export and import window: Cmd+W closes it, Settings, the profile editor, Color
+    /// schemes, Tunnels and Quit work, and so do the export and import actions (they switch
+    /// its mode); other shortcuts do nothing (typing goes to its fields).
+    Archive,
     /// The Settings window recording a new chord: every key press goes to the recorder (plain
     /// Escape cancels), none reaches a field or acts as a shortcut.
     Recording,
@@ -188,7 +193,12 @@ fn key_message(
             }
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
-                Action::Quit | Action::Settings | Action::EditSchemes | Action::Tunnels
+                Action::Quit
+                | Action::Settings
+                | Action::EditSchemes
+                | Action::Tunnels
+                | Action::ExportProfiles
+                | Action::ImportProfiles
                     if !repeat =>
                 {
                     Some(Message::Shortcut(w, action))
@@ -224,6 +234,21 @@ fn key_message(
         Mode::Tunnels => shortcut.map(|action| match action {
             Action::CloseTab if !repeat => Some(Message::Tunnels(TunnelsMsg::Close)),
             Action::Quit | Action::Settings | Action::EditProfiles | Action::EditSchemes
+                if !repeat =>
+            {
+                Some(Message::Shortcut(w, action))
+            }
+            _ => None,
+        }),
+        Mode::Archive => shortcut.map(|action| match action {
+            Action::CloseTab if !repeat => Some(Message::Archive(ArchiveMsg::Close)),
+            Action::Quit
+            | Action::Settings
+            | Action::EditProfiles
+            | Action::EditSchemes
+            | Action::Tunnels
+            | Action::ExportProfiles
+            | Action::ImportProfiles
                 if !repeat =>
             {
                 Some(Message::Shortcut(w, action))
@@ -925,6 +950,21 @@ mod tests {
             Some(Some(Message::Shortcut(_, Action::EditProfiles)))
         ));
         assert!(matches!(press(Mode::Tunnels, "t", false), Some(None)));
+    }
+
+    #[test]
+    fn the_archive_window_closes_and_reaches_the_others() {
+        assert!(matches!(
+            press(Mode::Archive, "w", false),
+            Some(Some(Message::Archive(
+                crate::archive_window::ArchiveMsg::Close
+            )))
+        ));
+        assert!(matches!(
+            press(Mode::Archive, ",", true),
+            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
+        ));
+        assert!(matches!(press(Mode::Archive, "t", false), Some(None)));
     }
 
     #[test]

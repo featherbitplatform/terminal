@@ -172,6 +172,65 @@ impl App {
         self.open_tunnels()
     }
 
+    /// `FBTERM_OPEN_ARCHIVE=export|import` (debug aid): open the export and import window at
+    /// startup in that mode. With `FBTERM_DEMO_ARCHIVE=1`, export starts with the profiles
+    /// others jump through unchecked (so they show as included for jump hosts) and key files
+    /// on; import shows a sample archive built in memory against the current profiles (never
+    /// read from disk), with its key folder in the temporary folder, so pressing Import writes
+    /// only there and to the config folder in use.
+    pub(crate) fn open_debug_archive(&mut self) -> Task<Message> {
+        use crate::archive_window::ArchiveMode;
+        let Some(value) = debug_env("FBTERM_OPEN_ARCHIVE") else {
+            return Task::none();
+        };
+        let mode = if value == "import" {
+            ArchiveMode::Import
+        } else {
+            ArchiveMode::Export
+        };
+        let task = self.open_archive(mode);
+        if debug_env("FBTERM_DEMO_ARCHIVE").is_some() {
+            self.demo_archive(mode);
+        }
+        task
+    }
+
+    fn demo_archive(&mut self, mode: crate::archive_window::ArchiveMode) {
+        use crate::archive_window::ArchiveMode;
+        let profiles = self.profiles.clone();
+        let schemes = self.schemes.clone();
+        let Some((_, state)) = &mut self.archive_win else {
+            return;
+        };
+        match mode {
+            ArchiveMode::Export => {
+                for p in &profiles.profiles {
+                    if let fbterm_config::ProfileKind::Ssh(s) = &p.kind {
+                        state.export.unchecked.extend(s.jump.iter().copied());
+                    }
+                }
+                // Key files on, so a missing one shows in the warnings.
+                state.export.include_keys = true;
+                self.refresh_export_preview();
+            }
+            ArchiveMode::Import => {
+                let archive = crate::archive_window::demo_archive(&profiles);
+                match crate::archive_import::plan(&profiles, &archive, &schemes) {
+                    Ok(plan) => {
+                        state.import.file = Some(std::env::temp_dir().join(
+                            crate::archive_window::default_file_name(
+                                chrono::Local::now().date_naive(),
+                            ),
+                        ));
+                        state.import.key_dir = Some(std::env::temp_dir().join("fbterm-demo-keys"));
+                        state.import.opened = Some(crate::archive_window::Opened { archive, plan });
+                    }
+                    Err(e) => state.import.problem = Some(e),
+                }
+            }
+        }
+    }
+
     /// `FBTERM_DEMO_FILES=<folder>:<item>,<item>,...` (debug aid): the first window's file
     /// panel open, serving this sample listing for every SSH pane (connected or not) and every
     /// folder without touching the network, with a sample transfer queue (a running and a

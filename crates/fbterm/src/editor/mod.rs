@@ -62,6 +62,10 @@ pub enum EditorMsg {
     PickKey,
     /// Open the Color schemes window.
     EditSchemes,
+    /// `Export…`: the archive window in its Export mode.
+    Export,
+    /// `Import…`: the archive window in its Import mode.
+    Import,
     KeyPicked(Option<PathBuf>),
 
     Select(ProfileId),

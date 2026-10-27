@@ -16,9 +16,6 @@
 //! - Key file names are reduced to one plain file name inside the key folder, key files over
 //!   [`MAX_KEY_BYTES`] are left out with a warning, and an existing file is never replaced.
 
-// The import dialog that calls this lands with the export and import UI.
-#![cfg_attr(not(test), allow(dead_code))]
-
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
@@ -76,7 +73,7 @@ const MAX_KEY_NAME_TRIES: u32 = 1000;
 /// For a profile without a match, `Skip` leaves it out and either other choice adds it with
 /// its own id and name.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Choice {
+pub enum Choice {
     Skip,
     Overwrite,
     KeepBoth,

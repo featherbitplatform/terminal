@@ -512,6 +512,8 @@ fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Ele
                 (editable && has_selection).then(|| msg(EditorMsg::Delete)),
                 ui::danger_ghost
             ),
+            ui::text_button(t, "Export\u{2026}", Some(msg(EditorMsg::Export)), ui::ghost),
+            ui::text_button(t, "Import\u{2026}", Some(msg(EditorMsg::Import)), ui::ghost),
             messages,
             ui::text_button(t, "Close", Some(msg(EditorMsg::Close)), ui::secondary),
             ui::text_button(
