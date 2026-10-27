@@ -105,6 +105,20 @@ with the same host-key and password prompts as a shell would show.
 - The SOCKS proxy is SOCKS5, CONNECT only, no authentication, with hostnames resolved on the
   remote side (no local DNS lookups); no UDP or BIND.
 
+**Settled in the final review** *(my calls, 2026-10-27)*:
+- A tunnel started from the Tunnels window asks its questions over the terminal window used
+  last and raises it; with no terminal window open, a tunnel that needs to ask fails with
+  "Open a terminal window to answer the sign-in question".
+- Renaming a running tunnel (nothing else changed) keeps it running under the new name, marked
+  "restart to apply". While a tunnel runs, the panel shows the addresses it started with.
+- A tunnel whose saved definition fails validation (a hand-edited `profiles.toml`) is never
+  started; it shows failed with the validation message.
+- A local or SOCKS tunnel binds its port before it connects, so a port in use fails it before
+  any prompt. A changed host key during a reconnect counts as "needs your input".
+- The shared connection is reused only while the profile's route (its SSH settings and its jump
+  chain's) is unchanged; after an edit new shells connect afresh, and running tunnels keep the
+  old connection until restarted.
+
 **Relaunch.** Tunnels are part of the profile, so they survive relaunch as definitions.
 *(my call)* On-demand tunnels that were up when the app quit are not restarted automatically on
 relaunch; "with the shell" tunnels start with their restored shells.

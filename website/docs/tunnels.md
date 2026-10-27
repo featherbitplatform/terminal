@@ -29,6 +29,8 @@ Open the profile editor, pick an SSH profile and use the **Tunnels** section: **
 | Mode | Behavior |
 | --- | --- |
 | **On demand** (default) | Starts only when you switch it on, in the Tunnels window or from the palette, and runs until you switch it off. With no shell of the profile open it opens a connection of its own, with the same host key and password prompts a shell would show. |
+
+A tunnel switched on from the Tunnels window asks its questions (host key, password) in the terminal window you used last, which comes to the front. With no terminal window open, a tunnel that needs to ask fails with `Open a terminal window to answer the sign-in question`.
 | **With the shell** | Starts when the profile's first shell (tab or pane) connects and stops when the last shell of that profile closes or disconnects. While it waits for a shell it shows `Starts with the shell`. When a disconnected shell is reconnected, the tunnel starts again. |
 
 Details for **With the shell** tunnels:
@@ -37,7 +39,7 @@ Details for **With the shell** tunnels:
 - Switching one off by hand keeps it off until the next time a first shell connects.
 - Nothing is started when the app launches, except **With the shell** tunnels together with their restored shells. A tunnel that was up when you quit is not restarted on its own.
 
-The profile's connection is shared by its shells, the file panel and its tunnels, and it closes only when nothing uses it any more: no shell, no running tunnel.
+The profile's connection is shared by its shells and its tunnels, and it closes only when nothing uses it any more: no shell, no running tunnel. A shell opened after you edit the profile's host or jump hosts connects afresh; a tunnel still running on the old connection keeps it until you restart the tunnel.
 
 ## The Tunnels window
 
@@ -54,7 +56,7 @@ The window lists tunnels grouped by profile. Each row shows the name, the addres
 | `Reconnecting (attempt 2 of 10)` | The connection dropped and the app is trying again; see below. |
 | `Failed: <reason>` | Shown in red, with **Retry**. |
 
-A running tunnel keeps the definition it started with. If you edit the tunnel or its profile (host, jump hosts) meanwhile, the row shows `Restart to apply`: switch it off and on again. Deleting a running tunnel or its profile stops it.
+A running tunnel keeps the definition it started with, and its address line shows what it actually listens on. If you edit the tunnel or its profile (host, jump hosts) meanwhile, the row shows `Restart to apply`: switch it off and on again, and the new addresses show. Renaming a running tunnel keeps it running under its new name, also marked `Restart to apply`. Deleting a running tunnel or its profile stops it.
 
 In the palette every tunnel is a row `Tunnel: <profile> / <name>` with its state on the right. Choosing it switches the tunnel on or off.
 
@@ -64,7 +66,9 @@ When the connection under a running tunnel drops (an on-demand tunnel, or a **Wi
 
 An automatic attempt never asks you anything. If reconnecting needs you (a changed host key, a password that is not in the keychain, a key passphrase), the tunnel fails at once with `needs your input`; **Retry** then asks as a shell would.
 
-When the attempts run out, or a tunnel cannot start (the port is in use, the server refuses the forward), the tunnel turns red as `Failed: <reason>` and a banner says `Tunnel "db" (db-host) failed: <reason>`.
+When the attempts run out, or a tunnel cannot start (the port is in use, the server refuses the forward), the tunnel turns red as `Failed: <reason>` and a banner says `Tunnel "db" (db-host) failed: <reason>`. A local or SOCKS tunnel whose port is in use fails before it connects, so it never asks you to sign in first.
+
+A tunnel whose saved definition is not valid (for example a `profiles.toml` edited by hand with an empty `bind`, port `0` on a local tunnel, or two tunnels of one profile with the same name) is never started: it shows `Failed:` with the validation message until you fix it and choose **Retry**.
 
 ## In profiles.toml
 
