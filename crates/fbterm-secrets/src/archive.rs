@@ -135,7 +135,7 @@ pub enum ArchiveError {
 const TOO_LARGE: &str = "The file is too large to be an fbterm archive.";
 const DAMAGED: &str = "The archive is damaged or incomplete.";
 const UNREADABLE: &str = "The archive's contents could not be read.";
-const TOO_HARD: &str = "This archive takes too much work to open on this computer.";
+pub(crate) const TOO_HARD: &str = "This archive takes too much work to open on this computer.";
 const NOT_WRITTEN: &str = "The profiles could not be written to an archive.";
 
 /// Encrypt `archive` with `password`: its TOML form inside an `age` file with a passphrase
@@ -148,13 +148,18 @@ pub fn seal(archive: &Archive, password: &str) -> Result<Vec<u8>, ArchiveError> 
     let text = Zeroizing::new(
         toml::to_string(archive).map_err(|_| ArchiveError::Corrupt(NOT_WRITTEN.into()))?,
     );
+    encrypt(text.as_bytes(), password).map_err(|_| ArchiveError::Io(NOT_WRITTEN.into()))
+}
+
+/// Encrypt `plain` into an `age` file with a passphrase (scrypt) recipient at age's default
+/// work factor. Shared by archives and the secrets vault; the output is ciphertext only.
+pub(crate) fn encrypt(plain: &[u8], password: &str) -> std::io::Result<Vec<u8>> {
     let encryptor = age::Encryptor::with_user_passphrase(SecretString::from(password));
-    let failed = |_| ArchiveError::Io(NOT_WRITTEN.into());
     // Room for the header and the per-chunk tags, so the output rarely reallocates.
-    let mut out = Vec::with_capacity(text.len() + text.len() / 1024 + 512);
-    let mut writer = encryptor.wrap_output(&mut out).map_err(failed)?;
-    writer.write_all(text.as_bytes()).map_err(failed)?;
-    writer.finish().map_err(failed)?;
+    let mut out = Vec::with_capacity(plain.len() + plain.len() / 1024 + 512);
+    let mut writer = encryptor.wrap_output(&mut out)?;
+    writer.write_all(plain)?;
+    writer.finish()?;
     Ok(out)
 }
 
@@ -189,8 +194,8 @@ pub fn open_plaintext(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>
     decrypt(bytes, password)
 }
 
-/// Decrypt an archive file into a wiped buffer.
-fn decrypt(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, ArchiveError> {
+/// Decrypt an `age` passphrase file (an archive or the vault) into a wiped buffer.
+pub(crate) fn decrypt(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, ArchiveError> {
     if bytes.len() > MAX_ARCHIVE_BYTES {
         return Err(ArchiveError::Corrupt(TOO_LARGE.into()));
     }

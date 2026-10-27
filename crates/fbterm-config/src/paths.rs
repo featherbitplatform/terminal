@@ -29,6 +29,11 @@ impl Paths {
         self.config_dir.join("state.toml")
     }
 
+    /// The encrypted secrets vault (`age`, unlocked with the main password).
+    pub fn vault(&self) -> PathBuf {
+        self.config_dir.join("secrets.fbvault")
+    }
+
     /// Directory holding one TOML file per user color scheme.
     pub fn schemes(&self) -> PathBuf {
         self.config_dir.join("schemes")

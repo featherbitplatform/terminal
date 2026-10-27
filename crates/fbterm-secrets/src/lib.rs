@@ -5,8 +5,12 @@
 
 pub mod archive;
 mod keychain;
+pub mod vault;
 
-pub use keychain::KeychainStore;
+pub use keychain::{
+    KeychainStore, WINDOWS_KEYCHAIN_LIMIT, keychain_blob_bytes, keychain_fits, keychain_limit,
+};
+pub use vault::VaultStore;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -14,13 +18,21 @@ use fbterm_config::ProfileId;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use zeroize::Zeroizing;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SecretKind {
     Password,
     KeyPassphrase,
 }
+
+impl SecretKind {
+    pub const ALL: [SecretKind; 2] = [SecretKind::Password, SecretKind::KeyPassphrase];
+}
+
+/// One saved secret: the profile it belongs to, its kind and its value (wiped on drop).
+pub type SecretEntry = (ProfileId, SecretKind, Zeroizing<String>);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
@@ -28,6 +40,19 @@ pub enum SecretError {
     Backend(String),
     #[error("stored secret map is invalid: {0}")]
     Serialization(String),
+    /// The vault has not been unlocked in this session (or was locked again).
+    #[error("Saved secrets are locked.")]
+    Locked,
+    /// The main password does not open the vault.
+    #[error("Wrong main password.")]
+    WrongMainPassword,
+    /// `create` found a vault file already in place and left it alone.
+    #[error("An encrypted vault already exists.")]
+    VaultExists,
+    /// The vault file could not be read or written: a plain sentence for the user, never
+    /// secret material or raw parser output.
+    #[error("{0}")]
+    Vault(String),
 }
 
 pub trait SecretStore: Send + Sync {
@@ -37,6 +62,29 @@ pub trait SecretStore: Send + Sync {
     fn remove(&self, id: &ProfileId) -> Result<(), SecretError>;
     /// Forget one kind of secret of a profile (its other kind is kept).
     fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError>;
+
+    /// Every saved secret of the given profiles. Stores that cannot be enumerated (the
+    /// keychain) are asked by id, so callers pass the ids from the profile store.
+    fn entries(&self, ids: &[ProfileId]) -> Result<Vec<SecretEntry>, SecretError> {
+        let mut out = Vec::new();
+        for id in ids {
+            for kind in SecretKind::ALL {
+                if let Some(value) = self.get(id, kind)? {
+                    out.push((*id, kind, Zeroizing::new(value)));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Save several secrets. The default sets them one by one; stores whose every write is
+    /// expensive (the vault re-encrypts its whole file) save them in one write.
+    fn set_many(&self, items: &[SecretEntry]) -> Result<(), SecretError> {
+        for (id, kind, value) in items {
+            self.set(id, *kind, value)?;
+        }
+        Ok(())
+    }
 }
 
 /// The secrets of one profile; also the JSON shape stored per profile.
@@ -329,6 +377,70 @@ mod tests {
         assert!(!s.degraded());
         assert_eq!(s.get(&id, SecretKind::Password).unwrap(), None);
         assert!(!mock.blob.lock().clone().unwrap().contains("pw"));
+    }
+
+    fn entry(id: ProfileId, kind: SecretKind, value: &str) -> SecretEntry {
+        (id, kind, Zeroizing::new(value.to_owned()))
+    }
+
+    fn plain(entries: Vec<SecretEntry>) -> Vec<(ProfileId, SecretKind, String)> {
+        let mut v: Vec<_> = entries
+            .into_iter()
+            .map(|(id, kind, value)| (id, kind, value.as_str().to_owned()))
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn keychain_reports_entries_and_size() {
+        let mock = Arc::new(MockBlob::default());
+        let s = KeychainStore::with_backend(Box::new(mock.clone()));
+        let (a, b, unknown) = (pid(), pid(), pid());
+        let items = vec![
+            entry(a, SecretKind::Password, "pw-a"),
+            entry(a, SecretKind::KeyPassphrase, "pp-a"),
+            entry(b, SecretKind::Password, "pw-\u{e9}"),
+        ];
+        s.set_many(&items).unwrap();
+        assert_eq!(
+            mock.stores.load(Ordering::SeqCst),
+            1,
+            "a batch is one keychain write"
+        );
+        let mut expected = plain(items.clone());
+        assert_eq!(plain(s.entries(&[a, b, unknown]).unwrap()), expected);
+        expected.retain(|(id, _, _)| *id == b);
+        assert_eq!(plain(s.entries(&[b]).unwrap()), expected);
+
+        // The size is the stored item as Windows keeps it: the JSON blob in UTF-16.
+        let blob = mock.blob.lock().clone().unwrap();
+        assert_eq!(keychain_blob_bytes(&items), blob.encode_utf16().count() * 2);
+        assert_eq!(keychain_blob_bytes(&[]), "{}".len() * 2);
+        assert!(keychain_fits(&items, Some(WINDOWS_KEYCHAIN_LIMIT)));
+        assert!(keychain_fits(&items, None));
+        let big = vec![entry(a, SecretKind::Password, &"x".repeat(1200))];
+        assert!(keychain_blob_bytes(&big) > WINDOWS_KEYCHAIN_LIMIT);
+        assert!(!keychain_fits(&big, Some(WINDOWS_KEYCHAIN_LIMIT)));
+        assert!(keychain_fits(&big, None), "no limit off Windows");
+        assert_eq!(
+            keychain_limit(),
+            cfg!(windows).then_some(WINDOWS_KEYCHAIN_LIMIT)
+        );
+        const { assert!(WINDOWS_KEYCHAIN_LIMIT < 2560) };
+    }
+
+    #[test]
+    fn memory_store_entries_and_set_many() {
+        let s = MemoryStore::new();
+        let (a, b) = (pid(), pid());
+        let items = vec![
+            entry(a, SecretKind::KeyPassphrase, "pp"),
+            entry(b, SecretKind::Password, "pw"),
+        ];
+        s.set_many(&items).unwrap();
+        assert_eq!(plain(s.entries(&[a, b, pid()]).unwrap()), plain(items));
+        assert!(s.entries(&[]).unwrap().is_empty());
     }
 
     #[test]
