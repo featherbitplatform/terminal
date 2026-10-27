@@ -203,7 +203,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ForceHover<'_> {
     }
 }
 
-/// Which tab-bar button shows its tooltip for `FBTERM_DEMO_TOOLTIP=new|profiles|settings|close`.
+/// Which tab-bar button shows its tooltip for `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemoTip {
     New,

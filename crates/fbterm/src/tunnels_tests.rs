@@ -741,7 +741,7 @@ fn names(groups: &[crate::tunnels_window::Group]) -> Vec<(String, Vec<String>)> 
 #[test]
 fn panel_lists_tunnels_grouped_by_profile() {
     use crate::tunnels_window::Tone;
-    let (mut w, warehouse) = panel_world();
+    let (mut w, _) = panel_world();
     let g = groups(&w, "");
     assert_eq!(
         names(&g),
@@ -822,7 +822,6 @@ fn panel_lists_tunnels_grouped_by_profile() {
     assert!(w.running("db"));
     w.toggle("db");
     assert_eq!(groups(&w, "")[0].rows[1].state, "Off");
-    let _ = warehouse;
 }
 
 #[test]

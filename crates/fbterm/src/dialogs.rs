@@ -175,9 +175,9 @@ impl App {
         }
     }
 
-    /// The profile store changed: open palettes list the new names and tunnels, panes take new names,
-    /// accents and color schemes (they keep their sessions; they refer to profiles by id), and
-    /// the panes whose scheme changed are recolored.
+    /// The profile store changed: open palettes list the new names and tunnels, panes take new
+    /// names, accents and color schemes (they keep their sessions; they refer to profiles by id),
+    /// and the panes whose scheme changed are recolored.
     pub(crate) fn profiles_changed(&mut self) {
         let before = self.pane_colors();
         for w in self.windows.values_mut() {
