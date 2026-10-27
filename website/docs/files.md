@@ -73,6 +73,8 @@ Shortcuts you change are kept in a `[keys]` table at the end of `settings.toml`;
 
 This file belongs to the app. It records which windows and tabs were open, each window's size, and the last time each profile was opened, so the layout can be restored and the palette can rank recent profiles first. It is safe to delete; the app then opens a default window. Do not edit it by hand.
 
+It also keeps the [file panel](file-panel#in-statetoml)'s width (`file_panel_width`) and, once you turn hidden files off, `file_panel_show_hidden = false`.
+
 ## Secrets and the keychain
 
 Passwords and key passphrases are never written to any of these files. They are stored in the system keychain as a single item:
