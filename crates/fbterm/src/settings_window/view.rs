@@ -1,7 +1,7 @@
 //! The Settings window: Appearance, Terminal and Keyboard cards of labelled controls, and a
 //! footer with the settings file actions.
 
-use fbterm_config::keys::{Action, ActionGroup, Bindings, risk};
+use fbterm_config::keys::{Action, ActionGroup, Bindings, FixedShortcut, fixed_shortcuts, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
 use fbterm_config::{SecretStorage, ThemeMode, WindowDecorations};
 use iced::widget::{
@@ -28,7 +28,8 @@ fn msg(m: SettingsMsg) -> Message {
 
 /// `notice`: the banner line about `settings.toml` (a load error or clamped values), if any.
 /// `secrets`: what the `Saved secrets` section shows. `chrome_fell_back`: the desktop refused
-/// drawn chrome this session (the `Title bar` row then shows `System`).
+/// drawn chrome this session (the `Title bar` row then shows `System`). `opaque_windows`: an
+/// open terminal window was created opaque (see [`restart_note`]).
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
@@ -36,6 +37,7 @@ pub fn view<'a>(
     notice: Option<&'a str>,
     secrets: SectionInfo,
     chrome_fell_back: bool,
+    opaque_windows: bool,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut body = column![
@@ -57,7 +59,14 @@ pub fn view<'a>(
         .push(section(
             t,
             "Appearance",
-            appearance(t, state, schemes, editable, chrome_fell_back),
+            appearance(
+                t,
+                state,
+                schemes,
+                editable,
+                chrome_fell_back,
+                opaque_windows,
+            ),
         ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
         .push(section(t, "Tunnels", tunnels(t, state, editable)))
@@ -210,6 +219,7 @@ fn appearance<'a>(
     schemes: Vec<SchemeChoice>,
     editable: bool,
     chrome_fell_back: bool,
+    opaque_windows: bool,
 ) -> Vec<Element<'a, Message>> {
     let v = &state.values;
     let theme = row![
@@ -305,18 +315,37 @@ fn appearance<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
+    let mut opacity_row = column![setting(
+        t,
+        "Background opacity",
+        Some("Text stays opaque"),
+        false,
+        opacity,
+    )];
+    if let Some(note) = restart_note(v.background_opacity, opaque_windows) {
+        opacity_row = opacity_row.push(
+            container(
+                row![
+                    ui::icon(ui::ICON_WARNING, 13.0, t.warning),
+                    text(note).font(UI_FONT).size(12).color(t.text_secondary),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding {
+                top: 0.0,
+                right: 16.0,
+                bottom: 12.0,
+                left: 16.0,
+            }),
+        );
+    }
     let mut rows = vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
         setting(t, "Color scheme", None, false, scheme),
         setting(t, "Font size", None, false, size),
-        setting(
-            t,
-            "Background opacity",
-            Some("Text stays opaque"),
-            false,
-            opacity,
-        ),
+        opacity_row.into(),
         blur_setting(
             t,
             v.background_blur,
@@ -346,6 +375,13 @@ fn appearance<'a>(
         rows.push(setting(t, "Title bar", None, false, title_bar));
     }
     rows
+}
+
+/// The line under `Background opacity` at `opacity` when `opaque_windows` (an open terminal
+/// window was created opaque, which never happens on macOS): such a window shows a lower
+/// opacity only once fbterm restarts; windows opened from now on show it at once.
+pub fn restart_note(opacity: f32, opaque_windows: bool) -> Option<&'static str> {
+    (opacity < 1.0 && opaque_windows).then_some("Restart fbterm to apply this to open windows.")
 }
 
 /// The `Background blur` row: the switch for `on`, usable only when `editable` and the system
@@ -636,24 +672,17 @@ fn keyboard<'a>(
         if g > 0 {
             list = list.push(hairline(t));
         }
-        list = list.push(
-            container(
-                text(group.title())
-                    .font(UI_FONT)
-                    .size(11.5)
-                    .color(t.text_muted),
-            )
-            .padding(Padding {
-                top: 12.0,
-                right: 16.0,
-                bottom: 2.0,
-                left: 16.0,
-            }),
-        );
+        list = list.push(group_title(t, group.title()));
         for action in Action::ALL.into_iter().filter(|a| a.group() == group) {
             let recording = state.recording.as_ref().filter(|r| r.action == action);
             list = list.push(key_row(t, &bindings, action, recording, editable));
         }
+    }
+    // The shortcuts outside the table: shown so they can be found, never recorded.
+    let mac = bindings.mac();
+    list = list.push(hairline(t)).push(group_title(t, "Fixed"));
+    for shortcut in fixed_shortcuts(mac) {
+        list = list.push(fixed_key_row(t, shortcut, mac));
     }
     let list = container(list.padding(Padding {
         top: 0.0,
@@ -664,6 +693,69 @@ fn keyboard<'a>(
     .width(Length::Fill)
     .style(move |_| ui::card(t));
     column![header, list].spacing(8).into()
+}
+
+/// The name of a group of shortcuts in the Keyboard section.
+fn group_title<'a>(t: &'static Tokens, title: &'a str) -> Element<'a, Message> {
+    container(text(title).font(UI_FONT).size(11.5).color(t.text_muted))
+        .padding(Padding {
+            top: 12.0,
+            right: 16.0,
+            bottom: 2.0,
+            left: 16.0,
+        })
+        .into()
+}
+
+/// A shortcut that cannot be changed: its name, a `Fixed` tag and its chord, which is not a
+/// button; below, its other chord and what to know about it.
+pub(super) fn fixed_key_row<'a>(
+    t: &'static Tokens,
+    shortcut: FixedShortcut,
+    mac: bool,
+) -> Element<'a, Message> {
+    let pill = container(
+        text(shortcut.chord.label(mac))
+            .font(MONO)
+            .size(12)
+            .color(t.text_secondary),
+    )
+    .center_x(PILL_WIDTH)
+    .padding(Padding::from([4.0, 10.0]))
+    .style(move |_| container::Style {
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    });
+    let line = row![
+        text(shortcut.title)
+            .font(UI_FONT)
+            .size(13)
+            .color(t.text)
+            .width(Length::Fill),
+        text("Fixed").font(UI_FONT).size(11.5).color(t.text_muted),
+        Space::new().width(4),
+        pill,
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center);
+    let note = match (shortcut.also, shortcut.note) {
+        (Some(also), Some(note)) => Some(format!("Also {}. {note}", also.label(mac))),
+        (Some(also), None) => Some(format!("Also {}.", also.label(mac))),
+        (None, Some(note)) => Some(note.to_owned()),
+        (None, None) => None,
+    };
+    let mut body = column![line].spacing(6);
+    if let Some(n) = note {
+        body = body.push(text(n).font(UI_FONT).size(12).color(t.text_muted));
+    }
+    container(body)
+        .padding(Padding::from([5.0, 16.0]))
+        .width(Length::Fill)
+        .into()
 }
 
 /// Width of a chord in the Keyboard section.

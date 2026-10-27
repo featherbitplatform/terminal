@@ -525,3 +525,22 @@ fn lists_refresh_after_scheme_set_changes() {
     assert_eq!(with_global[0].id, None);
     assert_eq!(with_global[0].to_string(), "Use global scheme");
 }
+
+#[test]
+fn open_windows_remember_whether_they_were_created_opaque() {
+    let (mut app, _paths) = app();
+    app.windows.clear();
+    assert!(!app.opaque_window_open());
+    // At full opacity a window is created opaque, except on macOS (always transparent).
+    let (first, _) = app.new_window((800.0, 600.0));
+    let mac = cfg!(target_os = "macos");
+    assert_eq!(app.windows[&first].transparent, mac);
+    assert_eq!(app.opaque_window_open(), !mac);
+    // Lowering the opacity leaves it as it was made; a window opened now is transparent.
+    send(&mut app, SettingsMsg::Opacity(0.8));
+    let (second, _) = app.new_window((800.0, 600.0));
+    assert!(app.windows[&second].transparent);
+    assert_eq!(app.opaque_window_open(), !mac);
+    app.windows.remove(&first);
+    assert!(!app.opaque_window_open());
+}

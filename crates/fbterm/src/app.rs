@@ -138,6 +138,8 @@ pub enum Message {
     DismissNotices,
     /// Palette input for one window.
     Palette(window::Id, PaletteMsg),
+    /// The terminal's right-click menu in a window (see [`crate::context_menu`]).
+    ContextMenu(window::Id, crate::context_menu::MenuMsg),
     /// The find bar of a window's active tab.
     Find(window::Id, FindMsg),
     /// A pane's find-bar search finished.
@@ -281,6 +283,8 @@ pub struct App {
     pub(crate) last_terminal: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
+    /// The terminal's right-click menu, when open (one at a time).
+    pub(crate) context_menu: Option<crate::context_menu::ContextMenu>,
     /// The tab or tile being dragged, and in which window.
     pub(crate) carry: Option<(window::Id, crate::windows::Carry)>,
     /// The tab button a carried tab hovers: window, index and the hover's generation.
@@ -629,6 +633,7 @@ impl App {
             focused: None,
             last_terminal: None,
             palettes: Palettes::new(),
+            context_menu: None,
             carry: None,
             hover: None,
             hover_generation: 0,
@@ -859,6 +864,7 @@ impl App {
         // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
         // shows its focused pane's profile.
         self.sync_file_panels();
+        self.sync_context_menu();
         self.sync_quit_key();
         match self.sync_panel_focus() {
             Some(unfocus) => Task::batch([task, unfocus]),
@@ -975,6 +981,7 @@ impl App {
                 Task::batch([self.shown(id), detect])
             }
             Message::WindowUnfocused(id) => {
+                self.close_context_menu(id);
                 // Recording a chord ends when the Settings window loses focus: the keys go
                 // elsewhere then.
                 if let Some((sid, state)) = &mut self.settings_win
@@ -1010,6 +1017,7 @@ impl App {
             }
             Message::MoveCheck(token) => self.check_move(token),
             Message::WindowClosed(id) => {
+                self.close_context_menu(id);
                 if self.editor_window() == Some(id) {
                     self.editor = None;
                 }
@@ -1117,6 +1125,7 @@ impl App {
                 Task::none()
             }
             Message::Palette(wid, msg) => self.palette(wid, msg),
+            Message::ContextMenu(wid, msg) => self.context_menu_msg(wid, msg),
             Message::Find(wid, msg) => self.find(wid, msg),
             Message::Found { pane, seq, outcome } => self.found(pane, seq, outcome),
             Message::FindRefresh(pane) => self.find_refresh(pane),
@@ -1149,6 +1158,7 @@ impl App {
                 Task::none()
             }
             Message::WindowResized(id, size) => {
+                self.close_context_menu(id);
                 let drawn = self.chrome.get().draws_controls();
                 Task::batch([self.window_resized(id, size), query_mode(id, drawn)])
             }
