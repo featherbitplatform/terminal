@@ -9,9 +9,15 @@
 
 use fbterm_config::keys::fixed_shortcuts;
 use fbterm_term::TerminalOutput;
-use iced::widget::{Space, button, column, container, mouse_area, opaque, row, text};
-use iced::{Alignment, Border, Color, Element, Length, Padding, Point, Shadow, Size, Task, Vector};
-use iced::{keyboard, window};
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::widget::{Operation, Tree, Widget};
+use iced::advanced::{Clipboard, Shell, overlay, renderer};
+use iced::widget::{Space, button, column, container, opaque, row, text};
+use iced::{
+    Alignment, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Shadow, Size,
+    Task, Vector,
+};
+use iced::{keyboard, mouse, window};
 
 use crate::app::{App, Message};
 use crate::layout::PaneId;
@@ -138,10 +144,40 @@ pub(crate) fn menu_origin(at: Point, size: Size, window: Option<Size>) -> Point 
 }
 
 impl App {
-    /// The widget asked for the menu: open it at the pointer.
-    pub(crate) fn open_context_menu(&mut self, wid: window::Id, pane: PaneId, at: Point) {
-        if self.windows.contains_key(&wid) {
-            self.context_menu = Some(ContextMenu::new(wid, pane, at));
+    /// The widget asked for the menu: open it at the pointer (again, at the new point, when
+    /// it was already open) and focus the right-clicked pane, so the menu's Paste and the
+    /// paste chord go to the same pane. Not while the palette, the find-in-all-tabs box or a
+    /// dialog is up in that window: their backdrops let a right-click through to the terminal.
+    pub(crate) fn open_context_menu(
+        &mut self,
+        wid: window::Id,
+        pane: PaneId,
+        at: Point,
+    ) -> Task<Message> {
+        let covered = self.palettes.contains_key(&wid)
+            || self.find_box.as_ref().is_some_and(|f| f.window == wid)
+            || self.prompts.front(wid).is_some()
+            || self.vault.dialog.as_ref().is_some_and(|d| d.window == wid);
+        if covered || !self.windows.contains_key(&wid) {
+            return Task::none();
+        }
+        self.context_menu = Some(ContextMenu::new(wid, pane, at));
+        self.focus_pane(wid, pane)
+    }
+
+    /// Close the menu once its pane is no longer shown (closed, its tab closed or another
+    /// tab selected), so its Paste never has nowhere to go.
+    pub(crate) fn sync_context_menu(&mut self) {
+        let Some(menu) = &self.context_menu else {
+            return;
+        };
+        let shown = self
+            .windows
+            .get(&menu.window)
+            .and_then(|w| w.active_tab())
+            .is_some_and(|t| t.visible_panes().contains(&menu.pane));
+        if !shown {
+            self.context_menu = None;
         }
     }
 
@@ -241,11 +277,149 @@ pub(crate) fn view<'a>(
             left: origin.x,
             ..Padding::ZERO
         });
-    mouse_area(layer)
-        .on_press(msg(MenuMsg::Close))
-        .on_right_press(msg(MenuMsg::Close))
-        .on_middle_press(msg(MenuMsg::Close))
-        .into()
+    Element::new(Layer {
+        content: layer.into(),
+        close: msg(MenuMsg::Close),
+    })
+}
+
+/// The clear layer over the window while the menu is open. Outside the menu a press closes
+/// it, and only a right-click goes on to the terminal beneath, which then copies a selection
+/// there or opens the menu again at the new point (the same right-click rules). The wheel,
+/// pointer moves and other presses stop here, so the terminal neither scrolls, hovers nor
+/// reports them to its program while the menu is up.
+struct Layer<'a> {
+    content: Element<'a, Message>,
+    close: Message,
+}
+
+impl Widget<Message, iced::Theme, iced::Renderer> for Layer<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+        if shell.is_event_captured() {
+            return;
+        }
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                shell.publish(self.close.clone());
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(_)) => {
+                shell.publish(self.close.clone());
+                shell.capture_event();
+            }
+            Event::Mouse(_) | Event::Touch(_) => shell.capture_event(),
+            _ => {}
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &iced::Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, iced::Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
 }
 
 fn item_view<'a>(
@@ -400,7 +574,7 @@ mod tests {
         use crate::sessions::pane_tests::unix::{connected, shell, wait_for};
         let (mut app, _, _) = app_with_pane();
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let pane = connected("cat", shell("cat -v", tx));
+        let pane = connected("cat", shell("stty -echo; echo ready; cat -v", tx));
         let term = pane.terminal().unwrap().clone();
         let id = pane.id;
         let wid = window::Id::unique();
@@ -408,6 +582,7 @@ mod tests {
         w.push(Tab::single(pane));
         app.windows.clear();
         app.windows.insert(wid, w);
+        wait_for(&term, "ready");
         // A program that asked for bracketed paste gets the paste bracketed.
         term.lock().feed(b"\x1b[?2004h");
         let _ = app.update(Message::ContextMenu(
@@ -415,7 +590,148 @@ mod tests {
             MenuMsg::Pasted(id, Some("pasted\n".into())),
         ));
         wait_for(&term, "^[[200~pasted");
-        // Nothing on the clipboard sends nothing.
+        // Nothing (or nothing but an empty text) on the clipboard sends nothing: the next
+        // paste follows the first one's closing bracket directly.
         let _ = app.update(Message::ContextMenu(wid, MenuMsg::Pasted(id, None)));
+        let _ = app.update(Message::ContextMenu(
+            wid,
+            MenuMsg::Pasted(id, Some(String::new())),
+        ));
+        let _ = app.update(Message::ContextMenu(
+            wid,
+            MenuMsg::Pasted(id, Some("next\n".into())),
+        ));
+        wait_for(&term, "^[[201~^[[200~next");
+    }
+
+    /// An app with one window whose tab is split into two panes; the first is focused.
+    fn app_with_split() -> (App, window::Id, PaneId, PaneId) {
+        let (mut app, wid, a) = app_with_pane();
+        let second = Pane::new(ProfileId::new(), "two", None);
+        let b = second.id;
+        let tab = &mut app.windows.get_mut(&wid).unwrap().tabs[0];
+        tab.layout.split(a, crate::layout::Side::Right, b);
+        tab.panes.push(second);
+        assert_eq!(tab.focused, a);
+        (app, wid, a, b)
+    }
+
+    #[test]
+    fn the_menu_focuses_the_right_clicked_pane() {
+        let (mut app, wid, _, b) = app_with_split();
+        right_click(&mut app, wid, b);
+        assert_eq!(app.windows[&wid].tabs[0].focused, b);
+    }
+
+    #[test]
+    fn the_menu_closes_with_its_pane_or_tab() {
+        let (mut app, wid, a, b) = app_with_split();
+        right_click(&mut app, wid, b);
+        // Closing the right-clicked (now focused) pane.
+        let _ = app.update(Message::Shortcut(wid, crate::keys::Action::CloseTab));
+        assert!(app.windows[&wid].tabs[0].pane(b).is_none());
+        assert_eq!(app.context_menu, None);
+        // A tab that goes away with the menu's pane in it (the window keeps another tab).
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .push(Tab::single(Pane::new(ProfileId::new(), "three", None)));
+        let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Select(0)));
+        right_click(&mut app, wid, a);
+        let _ = app.update(Message::TabBar(wid, crate::app::TabBarMsg::Close(0)));
+        assert_eq!(app.windows[&wid].tabs.len(), 1);
+        assert_eq!(app.context_menu, None);
+    }
+
+    #[test]
+    fn a_right_click_while_the_menu_is_open_moves_it() {
+        let (mut app, wid, a, b) = app_with_split();
+        right_click(&mut app, wid, a);
+        let at = Point::new(400.0, 300.0);
+        let _ = app.update(Message::Terminal(wid, b, TerminalOutput::ContextMenu(at)));
+        assert_eq!(app.context_menu, Some(ContextMenu::new(wid, b, at)));
+    }
+
+    #[test]
+    fn the_menu_does_not_open_over_the_palette_or_the_find_box() {
+        use crate::keys::Action;
+        let (mut app, wid, pane) = app_with_pane();
+        let at = Point::new(120.0, 80.0);
+        let menu = TerminalOutput::ContextMenu(at);
+        let _ = app.update(Message::Shortcut(wid, Action::Palette));
+        assert!(app.palettes.contains_key(&wid));
+        let _ = app.update(Message::Terminal(wid, pane, menu.clone()));
+        assert_eq!(app.context_menu, None);
+        let _ = app.update(Message::Shortcut(wid, Action::Palette));
+        assert!(!app.palettes.contains_key(&wid));
+        let _ = app.update(Message::Shortcut(wid, Action::FindAll));
+        assert!(app.find_box.is_some());
+        let _ = app.update(Message::Terminal(wid, pane, menu));
+        assert_eq!(app.context_menu, None);
+    }
+
+    /// What the menu's full-window layer does with `event` with the pointer at `at`:
+    /// the messages it publishes and whether it keeps the event from the layers beneath.
+    fn layer_takes(event: iced::Event, at: Point) -> (Vec<Message>, bool) {
+        use iced::advanced::layout::{self, Layout};
+        use iced::advanced::widget::Tree;
+        use iced::advanced::{Shell, clipboard};
+        use iced::{Pixels, Rectangle, mouse};
+        let t = crate::theme::tokens(fbterm_config::ThemeMode::Dark);
+        let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+            iced::Font::DEFAULT,
+            Pixels(16.0),
+        ));
+        let size = Size::new(800.0, 600.0);
+        let wid = window::Id::unique();
+        let menu = ContextMenu::new(wid, PaneId::next(), Point::new(100.0, 100.0));
+        let mut element = view(t, wid, &menu, Some(size));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(size),
+        );
+        let captured = shell.is_event_captured();
+        (messages, captured)
+    }
+
+    #[test]
+    fn under_the_menu_only_a_right_click_reaches_the_terminal() {
+        use iced::{Event, mouse};
+        let outside = Point::new(500.0, 400.0);
+        let press = |b| Event::Mouse(mouse::Event::ButtonPressed(b));
+        let closes = |m: &[Message]| matches!(m, [Message::ContextMenu(_, MenuMsg::Close)]);
+        // A left click outside closes the menu and goes no further.
+        let (m, captured) = layer_takes(press(mouse::Button::Left), outside);
+        assert!(closes(&m) && captured);
+        // A right-click outside closes it and goes on to the terminal, which copies or
+        // opens the menu again at the new point.
+        let (m, captured) = layer_takes(press(mouse::Button::Right), outside);
+        assert!(closes(&m) && !captured);
+        // The wheel and pointer moves stop at the menu.
+        let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+        });
+        let (m, captured) = layer_takes(wheel, outside);
+        assert!(m.is_empty() && captured);
+        let moved = Event::Mouse(mouse::Event::CursorMoved { position: outside });
+        let (m, captured) = layer_takes(moved, outside);
+        assert!(m.is_empty() && captured);
+        // A right-click on the menu itself does nothing.
+        let (m, captured) = layer_takes(press(mouse::Button::Right), Point::new(150.0, 115.0));
+        assert!(m.is_empty() && captured);
     }
 }

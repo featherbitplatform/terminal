@@ -1488,6 +1488,40 @@ mod tests {
     }
 
     #[test]
+    fn every_reserved_chord_but_quit_is_a_fixed_shortcut() {
+        // Probe every key with every modifier set: each thing `reserved` names (Quit aside,
+        // a fixed action row of its own) is named by some chord of the fixed list.
+        let keys = ('a'..='z')
+            .map(ChordKey::Char)
+            .chain(NAMED.iter().map(|(k, _)| *k))
+            .chain((1..=12).map(ChordKey::F));
+        let keys: Vec<ChordKey> = keys.collect();
+        for mac in [true, false] {
+            let listed: std::collections::HashSet<&str> = fixed_shortcuts(mac)
+                .iter()
+                .flat_map(|f| std::iter::once(f.chord).chain(f.also))
+                .filter_map(|c| reserved(mac, c))
+                .collect();
+            for &key in &keys {
+                for bits in 0..16u8 {
+                    let chord = Chord {
+                        key,
+                        ctrl: bits & 1 != 0,
+                        alt: bits & 2 != 0,
+                        shift: bits & 4 != 0,
+                        cmd: bits & 8 != 0,
+                    };
+                    if let Some(what) = reserved(mac, chord)
+                        && what != "Quit (system)"
+                    {
+                        assert!(listed.contains(what), "{what} is not listed (mac: {mac})");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn reserved_chords_and_fixed_actions_are_dropped_from_overrides() {
         let mut k = KeyOverrides::default();
         k.map.insert(Action::NewTab, Some(c("cmd+c")));

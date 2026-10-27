@@ -862,6 +862,7 @@ impl App {
         // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
         // shows its focused pane's profile.
         self.sync_file_panels();
+        self.sync_context_menu();
         self.sync_quit_key();
         match self.sync_panel_focus() {
             Some(unfocus) => Task::batch([task, unfocus]),

@@ -362,10 +362,7 @@ impl App {
             }
             // The widget already put the text on the clipboard.
             TerminalOutput::Copy(_) => Task::none(),
-            TerminalOutput::ContextMenu(at) => {
-                self.open_context_menu(wid, pane, at);
-                Task::none()
-            }
+            TerminalOutput::ContextMenu(at) => self.open_context_menu(wid, pane, at),
             TerminalOutput::OpenUrl(url) => {
                 open_url(&url);
                 Task::none()
