@@ -11,7 +11,7 @@ workspace = true
 fbterm-config = { path = "../fbterm-config" }
 fbterm-term = { path = "../fbterm-term" }
 portable-pty = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 directories = { workspace = true }

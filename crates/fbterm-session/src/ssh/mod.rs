@@ -27,6 +27,7 @@ mod auth;
 mod known_hosts;
 pub(crate) mod pool;
 pub mod sftp;
+pub mod transfer;
 pub mod tunnel;
 
 use std::collections::HashMap;

@@ -17,7 +17,7 @@ use russh::ChannelMsg;
 use russh_sftp::client::error::Error as RawError;
 use russh_sftp::client::rawsession::Limits;
 use russh_sftp::client::{Config, RawSftpSession};
-use russh_sftp::protocol::{FileAttributes, StatusCode};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, Packet, StatusCode};
 
 use super::{Connection, HOP_TIMEOUT, Prompter, SshError, SshPool};
 
@@ -30,15 +30,52 @@ const MAX_ENTRIES: usize = 100_000;
 /// How long one listing (reading the folder and resolving its links) may take in all.
 const LIST_DEADLINE: Duration = Duration::from_secs(60);
 /// How long closing a folder handle may take before the listing stops waiting for it.
-const CLOSE_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const CLOSE_WAIT: Duration = Duration::from_secs(5);
+/// Bounds for the data length of one read or write request, whatever the server says.
+const MIN_CHUNK: u32 = 4 * 1024;
+const MAX_CHUNK: u32 = 255 * 1024;
+/// The data length of one read or write request when the server does not say.
+const DEFAULT_CHUNK: u32 = 32 * 1024;
+/// Room for a write request's header inside the server's packet limit.
+const PACKET_OVERHEAD: u64 = 1024;
+
+/// The data length for one request from the server's limit, kept within sane bounds.
+fn chunk_len(server: Option<u64>) -> u32 {
+    server.map_or(DEFAULT_CHUNK, |n| {
+        u32::try_from(n.clamp(u64::from(MIN_CHUNK), u64::from(MAX_CHUNK))).unwrap_or(MAX_CHUNK)
+    })
+}
+
+/// The read and write lengths to use for the server's `limits@openssh.com` answer, and the
+/// limits the session enforces on itself (so it never refuses one of those requests).
+fn chunk_lens(server: Option<Limits>) -> (u32, u32, Option<Limits>) {
+    let Some(server) = server else {
+        return (DEFAULT_CHUNK, DEFAULT_CHUNK, None);
+    };
+    let read = chunk_len(server.read_len);
+    let mut write = chunk_len(server.write_len);
+    if let Some(packet) = server.packet_len {
+        write = write.min(chunk_len(Some(packet.saturating_sub(PACKET_OVERHEAD))));
+    }
+    let own = Limits {
+        read_len: Some(u64::from(read)),
+        write_len: Some(u64::from(write)),
+        packet_len: server
+            .packet_len
+            .map(|p| p.max(u64::from(write.max(read)) + PACKET_OVERHEAD)),
+        open_handles: server.open_handles,
+    };
+    (read, write, Some(own))
+}
 
 /// An SFTP session on a profile's shared connection. Requests may run concurrently.
 pub struct Sftp {
     session: RawSftpSession,
     posix_rename: bool,
-    /// What the server allows per packet, read and write (`limits@openssh.com`), if it said.
-    #[allow(dead_code)]
-    limits: Option<Limits>,
+    /// Data length of one read and one write request: the server's `limits@openssh.com`
+    /// values within [`MIN_CHUNK`]..=[`MAX_CHUNK`], [`DEFAULT_CHUNK`] when it did not say.
+    read_len: u32,
+    write_len: u32,
     /// Keeps the profile's connection (and its jump chain) open while the session lives
     /// (`None` only in unit tests, which run the session over an in-memory stream).
     _connection: Option<Arc<Connection>>,
@@ -136,7 +173,7 @@ pub fn sort_entries(entries: &mut Vec<Entry>, key: SortKey, descending: bool) {
 }
 
 /// The kind a mode's file type bits name; a link's target is filled in later.
-fn kind_of_mode(mode: Option<u32>) -> EntryKind {
+pub(crate) fn kind_of_mode(mode: Option<u32>) -> EntryKind {
     const S_IFMT: u32 = 0o170000;
     match mode.map(|m| m & S_IFMT) {
         Some(0o100000) => EntryKind::File,
@@ -156,7 +193,7 @@ fn modified_of(attrs: &FileAttributes) -> Option<SystemTime> {
 }
 
 /// `name` inside the folder `dir`.
-fn join(dir: &str, name: &str) -> String {
+pub(crate) fn join(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         format!("{dir}{name}")
     } else {
@@ -209,7 +246,11 @@ fn error_for(error: RawError, path: &str) -> SftpError {
         }
         RawError::Timeout => SftpError::Unavailable("The server did not answer in time.".into()),
         RawError::IO(_) => SftpError::Unavailable("The SFTP session has ended.".into()),
-        RawError::UnexpectedBehavior(m) if m.contains("session closed") => {
+        RawError::UnexpectedBehavior(m)
+            if m.contains("session closed")
+                || m.contains("sender dropped")
+                || m.contains("SendError") =>
+        {
             SftpError::Unavailable("The SFTP session has ended.".into())
         }
         other => SftpError::Other(sentence(format!(
@@ -258,7 +299,10 @@ impl Sftp {
 
     /// Start the SFTP protocol on `stream` (the subsystem channel) and read the server's
     /// extensions.
-    async fn start<S>(stream: S, connection: Option<Arc<Connection>>) -> Result<Sftp, SshError>
+    pub(super) async fn start<S>(
+        stream: S,
+        connection: Option<Arc<Connection>>,
+    ) -> Result<Sftp, SshError>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
@@ -275,19 +319,22 @@ impl Sftp {
             let has =
                 |name: &str, ver: &str| version.extensions.get(name).is_some_and(|v| v == ver);
             let posix_rename = has(POSIX_RENAME, "1");
-            let limits = if has(russh_sftp::extensions::LIMITS, "1") {
-                let limits = Limits::from(session.limits().await.map_err(|e| {
+            let server = if has(russh_sftp::extensions::LIMITS, "1") {
+                Some(Limits::from(session.limits().await.map_err(|e| {
                     SshError::Protocol(format!("the sftp session did not start: {e}"))
-                })?);
-                session.set_limits(limits);
-                Some(limits)
+                })?))
             } else {
                 None
             };
+            let (read_len, write_len, own) = chunk_lens(server);
+            if let Some(own) = own {
+                session.set_limits(own);
+            }
             Ok(Sftp {
                 session,
                 posix_rename,
-                limits,
+                read_len,
+                write_len,
                 _connection: connection,
             })
         }
@@ -402,6 +449,156 @@ impl Sftp {
     /// (`posix-rename@openssh.com`).
     pub fn supports_posix_rename(&self) -> bool {
         self.posix_rename
+    }
+
+    /// Data length of one read request.
+    pub(crate) fn read_len(&self) -> u32 {
+        self.read_len
+    }
+
+    /// Data length of one write request.
+    pub(crate) fn write_len(&self) -> u32 {
+        self.write_len
+    }
+
+    /// The raw attributes of `path` itself (a link is not followed), owner and group included.
+    pub(crate) async fn lstat_attrs(&self, path: &str) -> Result<FileAttributes, SftpError> {
+        Ok(self
+            .session
+            .lstat(path)
+            .await
+            .map_err(|e| error_for(e, path))?
+            .attrs)
+    }
+
+    /// The raw attributes of what `path` ends at (links followed).
+    pub(crate) async fn stat_attrs(&self, path: &str) -> Result<FileAttributes, SftpError> {
+        Ok(self
+            .session
+            .stat(path)
+            .await
+            .map_err(|e| error_for(e, path))?
+            .attrs)
+    }
+
+    async fn open_file(&self, path: &str, flags: OpenFlags) -> Result<String, SftpError> {
+        Ok(self
+            .session
+            .open(path, flags, FileAttributes::empty())
+            .await
+            .map_err(|e| error_for(e, path))?
+            .handle)
+    }
+
+    /// Open `path` for reading; returns the handle.
+    pub(crate) async fn open_read(&self, path: &str) -> Result<String, SftpError> {
+        self.open_file(path, OpenFlags::READ).await
+    }
+
+    /// Create `path` for writing, failing when anything exists there. The server gives it its
+    /// default permissions.
+    pub(crate) async fn create_new(&self, path: &str) -> Result<String, SftpError> {
+        self.open_file(
+            path,
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::EXCLUDE,
+        )
+        .await
+    }
+
+    /// Open the existing file `path` for writing, emptied first; never creates it.
+    pub(crate) async fn open_truncate(&self, path: &str) -> Result<String, SftpError> {
+        self.open_file(path, OpenFlags::WRITE | OpenFlags::TRUNCATE)
+            .await
+    }
+
+    /// Up to `len` bytes of `handle` (opened on `path`) at `offset`; `None` at the end of
+    /// the file. The server may return fewer bytes than asked for.
+    pub(crate) async fn read(
+        &self,
+        handle: &str,
+        path: &str,
+        offset: u64,
+        len: u32,
+    ) -> Result<Option<Vec<u8>>, SftpError> {
+        match self.session.read(handle, offset, len).await {
+            Ok(data) => Ok(Some(data.data)),
+            Err(RawError::Status(s)) if s.status_code == StatusCode::Eof => Ok(None),
+            Err(e) => Err(error_for(e, path)),
+        }
+    }
+
+    /// Write `data` at `offset` of `handle` (opened on `path`).
+    pub(crate) async fn write(
+        &self,
+        handle: &str,
+        path: &str,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<(), SftpError> {
+        self.session
+            .write(handle, offset, data)
+            .await
+            .map(drop)
+            .map_err(|e| error_for(e, path))
+    }
+
+    /// Close `handle` (opened on `path`); a failure can mean written data was lost.
+    pub(crate) async fn close(&self, handle: &str, path: &str) -> Result<(), SftpError> {
+        self.session
+            .close(handle)
+            .await
+            .map(drop)
+            .map_err(|e| error_for(e, path))
+    }
+
+    /// Set `attrs` on the open `handle` (opened on `path`).
+    pub(crate) async fn fsetstat(
+        &self,
+        handle: &str,
+        path: &str,
+        attrs: FileAttributes,
+    ) -> Result<(), SftpError> {
+        self.session
+            .fsetstat(handle, attrs)
+            .await
+            .map(drop)
+            .map_err(|e| error_for(e, path))
+    }
+
+    /// Remove the file (or link) `path`.
+    pub(crate) async fn remove(&self, path: &str) -> Result<(), SftpError> {
+        self.session
+            .remove(path)
+            .await
+            .map(drop)
+            .map_err(|e| error_for(e, path))
+    }
+
+    /// Rename `from` to `to`; fails when `to` exists (the server never replaces it).
+    pub(crate) async fn rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
+        self.session
+            .rename(from, to)
+            .await
+            .map(drop)
+            .map_err(|e| error_for(e, to))
+    }
+
+    /// Rename `from` over `to` atomically (`posix-rename@openssh.com`); only when
+    /// [`Sftp::supports_posix_rename`].
+    pub(crate) async fn posix_rename(&self, from: &str, to: &str) -> Result<(), SftpError> {
+        let mut data = Vec::with_capacity(8 + from.len() + to.len());
+        for s in [from, to] {
+            let len = u32::try_from(s.len())
+                .map_err(|_| SftpError::Other(format!("The path {to} is too long.")))?;
+            data.extend_from_slice(&len.to_be_bytes());
+            data.extend_from_slice(s.as_bytes());
+        }
+        match self.session.extended(POSIX_RENAME, data).await {
+            Ok(Packet::Status(s)) if s.status_code == StatusCode::Ok => Ok(()),
+            Ok(Packet::Status(s)) => Err(error_for(RawError::Status(s), to)),
+            Ok(_) => Err(error_for(RawError::UnexpectedPacket, to)),
+            Err(e) => Err(error_for(e, to)),
+        }
     }
 
     /// The entry `name` at `full` with `attrs`; a link gets its target and what it ends at.
@@ -652,6 +849,39 @@ mod tests {
         assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(server.closes(), 1, "the folder handle is closed");
+    }
+
+    #[test]
+    fn chunk_lengths_are_clamped() {
+        assert_eq!(chunk_len(None), 32 * 1024);
+        assert_eq!(chunk_len(Some(1)), 4 * 1024);
+        assert_eq!(chunk_len(Some(64 * 1024)), 64 * 1024);
+        assert_eq!(chunk_len(Some(u64::MAX)), 255 * 1024);
+        // OpenSSH's answer: 255 KiB reads and writes in 256 KiB packets.
+        let openssh = Limits {
+            packet_len: Some(256 * 1024),
+            read_len: Some(255 * 1024),
+            write_len: Some(255 * 1024),
+            open_handles: None,
+        };
+        let (read, write, own) = chunk_lens(Some(openssh));
+        assert_eq!((read, write), (255 * 1024, 255 * 1024));
+        assert_eq!(own.unwrap().write_len, Some(255 * 1024));
+        // A small packet limit bounds writes, never below the floor.
+        let small = Limits {
+            packet_len: Some(16 * 1024),
+            read_len: None,
+            write_len: Some(1024 * 1024),
+            open_handles: Some(8),
+        };
+        let (read, write, own) = chunk_lens(Some(small));
+        assert_eq!((read, write), (32 * 1024, 15 * 1024));
+        let own = own.unwrap();
+        assert_eq!(own.open_handles, Some(8));
+        assert!(own.packet_len.unwrap() >= u64::from(read.max(write)) + PACKET_OVERHEAD);
+        let (read, write, own) = chunk_lens(None);
+        assert_eq!((read, write), (32 * 1024, 32 * 1024));
+        assert!(own.is_none());
     }
 
     #[test]
