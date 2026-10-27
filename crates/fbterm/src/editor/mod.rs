@@ -18,6 +18,7 @@ use fbterm_secrets::{SecretChange, SecretKind, SecretStore, Zeroizing};
 
 use crate::redact::Redacted;
 
+mod duplicate;
 mod ssh_view;
 pub mod view;
 
@@ -69,6 +70,11 @@ pub enum EditorMsg {
     Export,
     /// `Import…`: the archive window in its Import mode.
     Import,
+    /// `Duplicate`: save a copy of the selected profile (see [`duplicate`]).
+    Duplicate,
+    /// Duplicate this profile without asking for the main password first (it was asked, or
+    /// cancelled: the copy is then made without its saved secrets).
+    DuplicateNoAsk(ProfileId),
     KeyPicked(Option<PathBuf>),
 
     Select(ProfileId),
@@ -485,6 +491,8 @@ pub struct EditorState {
     /// Whether the key file at this path (as typed) is an RSA private key; refreshed when the
     /// path or the selection changes, so drawing never touches the disk.
     key_check: Option<(String, bool)>,
+    /// The Name field, focused when a duplicate opens for renaming.
+    pub name_input: iced::widget::Id,
 }
 
 /// The advice shown (editor, terminal) when a login uses an RSA key.
@@ -531,6 +539,7 @@ impl EditorState {
             saving: None,
             secrets,
             key_check: None,
+            name_input: iced::widget::Id::unique(),
         };
         state.refresh_key_check();
         state
@@ -674,6 +683,20 @@ impl EditorState {
         }
         self.refresh_key_check();
         Ok(())
+    }
+
+    /// `copy`, a saved duplicate of saved profile `original`, joins the drafts right after it,
+    /// selected. Only called while nothing is unsaved, so the drafts are the saved profiles.
+    pub fn insert_copy(&mut self, original: ProfileId, copy: &Profile) {
+        let pos = self
+            .drafts
+            .iter()
+            .position(|d| d.id == original)
+            .map_or(self.drafts.len(), |i| i + 1);
+        self.drafts.insert(pos, Draft::from_profile(copy));
+        self.selected = Some(copy.id);
+        self.errors.clear();
+        self.refresh_key_check();
     }
 
     fn unique_name(&self, base: &str) -> String {
@@ -1117,5 +1140,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
     true
 }
 
+#[cfg(test)]
+mod duplicate_tests;
 #[cfg(test)]
 mod tests;

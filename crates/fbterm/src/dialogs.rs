@@ -38,6 +38,11 @@ impl App {
             }
             EditorMsg::Export => self.open_archive(crate::archive_window::ArchiveMode::Export),
             EditorMsg::Import => self.open_archive(crate::archive_window::ArchiveMode::Import),
+            EditorMsg::Duplicate => match self.editor.as_ref().and_then(|(_, ed)| ed.selected) {
+                Some(id) => self.duplicate_profile(id, true),
+                None => Task::none(),
+            },
+            EditorMsg::DuplicateNoAsk(id) => self.duplicate_profile(id, false),
             EditorMsg::Reload => {
                 self.reload_profiles(true);
                 Task::none()

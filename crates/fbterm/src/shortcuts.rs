@@ -207,6 +207,7 @@ fn key_message(
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
                 Action::Quit
+                | Action::DuplicateProfile
                 | Action::Settings
                 | Action::EditSchemes
                 | Action::Tunnels

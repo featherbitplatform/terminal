@@ -176,6 +176,8 @@ pub enum Message {
     Vault(crate::saved_secrets::VaultMsg),
     /// The secret changes of profile editor save `seq` ran.
     EditorSecrets(u64, Delivered<Result<crate::editor::SecretResults, String>>),
+    /// The saved secrets of profile editor duplicate `seq` were copied (how many), or not.
+    EditorDuplicated(u64, Result<usize, String>),
     Shoot,
     Shot(Screenshot),
     /// The OS close button (or equivalent) was used on a window; see [`App::close_requested`].
@@ -1134,6 +1136,10 @@ impl App {
             Message::Vault(msg) => self.vault_msg(msg),
             Message::EditorSecrets(seq, results) => {
                 self.editor_secrets_done(seq, results);
+                Task::none()
+            }
+            Message::EditorDuplicated(seq, result) => {
+                self.editor_duplicated(seq, result);
                 Task::none()
             }
             Message::WindowScale(id, s) => {

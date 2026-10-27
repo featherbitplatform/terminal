@@ -27,6 +27,9 @@ pub enum Action {
     Quit,
     /// The profile editor: Cmd+Shift+, on macOS, Ctrl+Shift+, elsewhere.
     EditProfiles,
+    /// Copy a profile (the one selected in the profile editor, or the focused pane's) and
+    /// open the copy in the editor (no chord by default).
+    DuplicateProfile,
     /// The Settings window: Cmd+, on macOS, Ctrl+, elsewhere.
     Settings,
     /// The Color schemes window (no chord by default).
@@ -118,7 +121,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings window lists them.
-    pub const ALL: [Action; 44] = [
+    pub const ALL: [Action; 45] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -148,6 +151,7 @@ impl Action {
         Action::TileToTab,
         Action::NewWindow,
         Action::EditProfiles,
+        Action::DuplicateProfile,
         Action::ExportProfiles,
         Action::ImportProfiles,
         Action::Settings,
@@ -185,6 +189,7 @@ impl Action {
             Self::NewWindow => "new_window",
             Self::Quit => "quit",
             Self::EditProfiles => "edit_profiles",
+            Self::DuplicateProfile => "duplicate_profile",
             Self::Settings => "settings",
             Self::EditSchemes => "edit_schemes",
             Self::Tunnels => "tunnels",
@@ -232,6 +237,7 @@ impl Action {
             Self::NewWindow => "New window".into(),
             Self::Quit => "Quit".into(),
             Self::EditProfiles => "Edit profiles".into(),
+            Self::DuplicateProfile => "Duplicate profile".into(),
             Self::Settings => "Settings".into(),
             Self::EditSchemes => "Color schemes".into(),
             Self::Tunnels => "Tunnels".into(),
@@ -285,6 +291,7 @@ impl Action {
             | Self::TileToTab => ActionGroup::Panes,
             Self::NewWindow
             | Self::EditProfiles
+            | Self::DuplicateProfile
             | Self::Settings
             | Self::EditSchemes
             | Self::Tunnels
@@ -752,6 +759,7 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
         | Action::Tunnels
         | Action::ExportProfiles
         | Action::ImportProfiles
+        | Action::DuplicateProfile
         | Action::ExportTab
         | Action::FindInTab
         | Action::MergeTab
