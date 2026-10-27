@@ -7,7 +7,10 @@ use iced::{
 };
 
 use crate::app::Message;
-use crate::chrome::{self, BarAction, Chrome, Control, Platform, Side};
+use crate::chrome::{
+    self, BarAction, Chrome, Control, LINUX_CONTROL_GAP, LINUX_CONTROL_SIZE, Platform, Side,
+    WINDOWS_CONTROL_WIDTH,
+};
 use crate::theme::{Tokens, UI_FONT};
 
 /// Real values (hosts, ports, paths, fingerprints) are set in Geist Mono.
@@ -272,12 +275,6 @@ pub fn window_header<'a>(
     })
 }
 
-/// Width of a drawn control in the Windows style (the system's caption button width).
-const WINDOWS_CONTROL_WIDTH: f32 = 46.0;
-/// Diameter of a drawn control in the Linux style (round, as the desktops draw them).
-const LINUX_CONTROL_SIZE: f32 = 24.0;
-/// Space between Linux-style controls, and around the group.
-const LINUX_CONTROL_GAP: f32 = 8.0;
 /// The Windows close button's hover color, white glyph on it.
 const WINDOWS_CLOSE_RED: Color = Color::from_rgb(
     0xc4 as f32 / 255.0,

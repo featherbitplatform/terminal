@@ -11,7 +11,10 @@
 //! layout ([`controls_layout`]). Empty bar space moves the window, a double click maximizes
 //! it, and an [`EDGE_BAND`] wide band along the window's edges resizes it ([`edges`]).
 //!
-//! [`Chrome::Native`] (the OS title bar) stays for a Linux desktop that refuses drawn chrome.
+//! [`Chrome::Native`] (the OS title bar) is Linux's other choice: the `window_decorations`
+//! setting picks it, and so does a desktop that refuses fbterm's move and resize requests.
+//! The chrome can change while fbterm runs ([`ChromeCell`]); open windows then switch their
+//! OS decorations.
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::mouse::{self, click};
@@ -20,6 +23,7 @@ use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::window::Direction;
 use iced::{Element, Event, Length, Point, Rectangle, Size, Vector, window};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Whether the macOS app menu's Quit keeps `Cmd+Q` with `running` transfers: only while none
 /// runs. While some do, the key is taken from the menu so it reaches the app's own Quit, which
@@ -93,6 +97,20 @@ const DRAWN_BAR_HEIGHT: f32 = 36.0;
 
 /// How wide the band along a window's edges is that resizes it where the chrome is drawn.
 pub const EDGE_BAND: f32 = 8.0;
+
+/// How tall the band along the top edge is: the gap above the tabs, so a press on a tab never
+/// resizes the window.
+pub const NORTH_BAND: f32 = 4.0;
+
+/// Within the drawn controls only this outermost corner square still resizes the window.
+const CONTROLS_CORNER: f32 = 2.0;
+
+/// Width of a drawn control in the Windows style (the system's caption button width).
+pub const WINDOWS_CONTROL_WIDTH: f32 = 46.0;
+/// Diameter of a drawn control in the Linux style (round, as the desktops draw them).
+pub const LINUX_CONTROL_SIZE: f32 = 24.0;
+/// Space between Linux-style controls, and around the group.
+pub const LINUX_CONTROL_GAP: f32 = 8.0;
 
 /// How far a corner's resize area reaches along each edge from the corner, so a corner is
 /// easier to hit than the band's own 8 by 8 px square.
@@ -318,6 +336,7 @@ fn gsettings_button_layout() -> Option<String> {
 /// What this run draws, chosen once by [`init`] before the first window opens.
 #[derive(Debug)]
 pub struct Setup {
+    /// The chrome the run starts with; [`Chrome::current`] is what it uses now.
     pub chrome: Chrome,
     /// Whose conventions the drawn controls follow (look and default placement).
     pub look: Platform,
@@ -340,8 +359,9 @@ pub fn setup() -> &'static Setup {
 }
 
 /// Choose this run's chrome, before the first window opens (on Linux this reads the desktop's
-/// button layout: see `desktop_layout`). The Linux `window_decorations` setting, and the
-/// fallback to [`Chrome::Native`] where the desktop refuses drawn chrome, decide here too.
+/// button layout: see `desktop_layout`). The Linux `window_decorations` setting and the
+/// fallback to [`Chrome::Native`] where the desktop refuses drawn chrome switch it later,
+/// through [`CHROME`].
 ///
 /// Debug aid: `FBTERM_DEMO_CHROME=windows|linux[:<button-layout>]` draws that system's
 /// controls on any system (e.g. `linux:close,minimize,maximize:`), for screenshots.
@@ -386,14 +406,27 @@ fn demo_chrome(value: &str) -> Option<(Platform, Option<String>)> {
 }
 
 /// Where a point `point` (window coordinates) in a window of `size` resizes it from: the
-/// [`EDGE_BAND`] wide band along each edge, corners reaching `CORNER_REACH` along both edges.
-/// A maximized (or full-screen) window does not resize from its edges.
-pub fn edge_hit(size: Size, point: Point, maximized: bool) -> Option<Direction> {
+/// [`EDGE_BAND`] wide band along each edge ([`NORTH_BAND`] along the top, above the tabs),
+/// corners reaching `CORNER_REACH` along both edges. A maximized (or full-screen) window does
+/// not resize from its edges. `controls`: where the drawn controls are (see
+/// [`controls_rect`]); a press there is theirs, except in the outermost corner.
+pub fn edge_hit(
+    size: Size,
+    point: Point,
+    maximized: bool,
+    controls: Option<Rectangle>,
+) -> Option<Direction> {
     let (x, y, w, h) = (point.x, point.y, size.width, size.height);
     if maximized || x < 0.0 || y < 0.0 || x > w || y > h {
         return None;
     }
-    let (north, south) = (y < EDGE_BAND, y >= h - EDGE_BAND);
+    if controls.is_some_and(|r| r.contains(point)) {
+        let corner = y < CONTROLS_CORNER && (x < CONTROLS_CORNER || x >= w - CONTROLS_CORNER);
+        if !corner {
+            return None;
+        }
+    }
+    let (north, south) = (y < NORTH_BAND, y >= h - EDGE_BAND);
     let (west, east) = (x < EDGE_BAND, x >= w - EDGE_BAND);
     if !(north || south || west || east) {
         return None;
@@ -417,6 +450,26 @@ pub fn edge_hit(size: Size, point: Point, maximized: bool) -> Option<Direction> 
     } else {
         Direction::East
     })
+}
+
+/// Where the drawn controls of `layout` in `look`'s style sit in a window of `size`: at the
+/// top, at the layout's end, as tall as the bar.
+pub fn controls_rect(size: Size, layout: &ControlsLayout, look: Platform) -> Rectangle {
+    let width = controls_width(look, layout.order.len());
+    let x = match layout.side {
+        Side::Left => 0.0,
+        Side::Right => size.width - width,
+    };
+    Rectangle::new(Point::new(x, 0.0), Size::new(width, DRAWN_BAR_HEIGHT))
+}
+
+/// Width of `count` drawn controls in `look`'s style, with their spacing.
+pub fn controls_width(look: Platform, count: usize) -> f32 {
+    let n = count as f32;
+    match look {
+        Platform::Windows => n * WINDOWS_CONTROL_WIDTH,
+        Platform::Linux | Platform::MacOs => n * LINUX_CONTROL_SIZE + (n + 1.0) * LINUX_CONTROL_GAP,
+    }
 }
 
 /// The pointer over an edge that resizes toward `direction`.
@@ -458,9 +511,9 @@ impl PartialEq for BarAction {
 impl Eq for BarAction {}
 
 impl Chrome {
-    /// The strategy of this run (see [`init`]).
+    /// The strategy in use now (see [`init`] and [`CHROME`]).
     pub fn current() -> Self {
-        setup().chrome
+        CHROME.get()
     }
 
     /// The default strategy of `platform`.
@@ -548,6 +601,91 @@ impl Chrome {
     }
 }
 
+/// The chrome in use, which can switch between [`Chrome::Drawn`] and [`Chrome::Native`]
+/// while fbterm runs (Linux: the `window_decorations` setting, or a desktop that refuses
+/// drawn chrome). Until first switched it is the [`Setup`]'s.
+#[derive(Debug)]
+pub struct ChromeCell(AtomicU8);
+
+/// The chrome every window uses now.
+pub static CHROME: ChromeCell = ChromeCell::new();
+
+impl ChromeCell {
+    const UNSET: u8 = 0;
+
+    /// A cell that follows [`setup`] until switched.
+    pub const fn new() -> Self {
+        Self(AtomicU8::new(Self::UNSET))
+    }
+
+    /// A cell that starts at `chrome` (tests, and the app's own cell in tests).
+    #[cfg(test)]
+    pub fn starting(chrome: Chrome) -> Self {
+        Self(AtomicU8::new(Self::code(chrome)))
+    }
+
+    fn code(chrome: Chrome) -> u8 {
+        match chrome {
+            Chrome::Unified => 1,
+            Chrome::Native => 2,
+            Chrome::Drawn => 3,
+        }
+    }
+
+    pub fn get(&self) -> Chrome {
+        match self.0.load(Ordering::Relaxed) {
+            1 => Chrome::Unified,
+            2 => Chrome::Native,
+            3 => Chrome::Drawn,
+            _ => setup().chrome,
+        }
+    }
+
+    /// Use `to` from now on, if this is a switch between drawn and system chrome (the
+    /// unified bar never switches). Returns whether it changed.
+    fn switch(&self, to: Chrome) -> bool {
+        let from = self.get();
+        let switchable = |c: Chrome| matches!(c, Chrome::Drawn | Chrome::Native);
+        if from == to || !switchable(from) || !switchable(to) {
+            return false;
+        }
+        self.0.store(Self::code(to), Ordering::Relaxed);
+        true
+    }
+}
+
+impl Default for ChromeCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Switch `cell` to `to` (drawn or system chrome). The `open` windows were made for the old
+/// one, so each has its OS decorations toggled; new windows get `to`'s through
+/// [`Chrome::window_settings`]. `None` when nothing changes. The caller forgets what it
+/// tracks only for drawn chrome (which windows are maximized).
+#[allow(dead_code)] // Wired to the app with the Linux title bar fallback.
+pub fn use_chrome<T: Send + 'static>(
+    cell: &ChromeCell,
+    to: Chrome,
+    open: impl IntoIterator<Item = window::Id>,
+) -> Option<iced::Task<T>> {
+    cell.switch(to).then(|| {
+        tracing::info!(chrome = ?to, "window chrome switched");
+        iced::Task::batch(open.into_iter().map(window::toggle_decorations))
+    })
+}
+
+/// Give up drawn chrome for this run: the desktop's title bar on every open window and every
+/// new one (see [`use_chrome`]).
+#[allow(dead_code)] // Wired to the app with the Linux title bar fallback.
+pub fn fall_back_to_system<T: Send + 'static>(
+    cell: &ChromeCell,
+    open: impl IntoIterator<Item = window::Id>,
+) -> Option<iced::Task<T>> {
+    use_chrome(cell, Chrome::Native, open)
+}
+
 /// How a terminal window is created for a background opacity and blur setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Backdrop {
@@ -625,10 +763,12 @@ impl<Message> Edges<'_, Message> {
     fn hit(&self, layout: Layout<'_>, cursor: mouse::Cursor) -> Option<Direction> {
         let bounds = layout.bounds();
         let p = cursor.position_over(bounds)?;
+        let setup = setup();
         edge_hit(
             bounds.size(),
             Point::new(p.x - bounds.x, p.y - bounds.y),
             self.maximized,
+            Some(controls_rect(bounds.size(), &setup.controls, setup.look)),
         )
     }
 }
@@ -1106,7 +1246,7 @@ mod tests {
     #[test]
     fn edge_hit_corners_and_edges() {
         let size = Size::new(800.0, 600.0);
-        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false);
+        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false, None);
         let is = |d: Option<Direction>, want: Direction| {
             d.is_some_and(|d| std::mem::discriminant(&d) == std::mem::discriminant(&want))
         };
@@ -1118,6 +1258,7 @@ mod tests {
         assert!(is(hit(EDGE_BAND - 0.5, 300.0), Direction::West));
         assert!(is(hit(799.0, 300.0), Direction::East));
         assert!(is(hit(400.0, 0.0), Direction::North));
+        assert!(is(hit(400.0, NORTH_BAND - 0.5), Direction::North));
         assert!(is(hit(400.0, 595.0), Direction::South));
         // Corners, reaching along both edges.
         assert!(is(hit(1.0, 1.0), Direction::NorthWest));
@@ -1130,11 +1271,121 @@ mod tests {
         assert!(hit(400.0, 600.5).is_none());
     }
 
+    fn is_dir(d: Option<Direction>, want: Direction) -> bool {
+        d.is_some_and(|d| std::mem::discriminant(&d) == std::mem::discriminant(&want))
+    }
+
+    #[test]
+    fn the_top_band_stays_above_the_tabs() {
+        let size = Size::new(800.0, 600.0);
+        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false, None);
+        // The tabs start 4 px below the top: a press on them never resizes.
+        assert!(hit(400.0, 5.0).is_none());
+        assert!(hit(400.0, 4.0).is_none());
+        assert!(is_dir(hit(400.0, 3.0), Direction::North));
+        // The other edges and the corners keep their reach.
+        assert!(is_dir(hit(2.0, 12.0), Direction::NorthWest));
+        assert!(is_dir(hit(798.0, 12.0), Direction::NorthEast));
+        assert!(is_dir(hit(7.0, 300.0), Direction::West));
+        assert!(is_dir(hit(400.0, 593.0), Direction::South));
+    }
+
+    #[test]
+    fn the_drawn_controls_are_not_an_edge() {
+        let size = Size::new(800.0, 600.0);
+        let windows = controls_rect(size, &ControlsLayout::standard(), Platform::Windows);
+        assert_eq!(windows.width, 3.0 * WINDOWS_CONTROL_WIDTH);
+        assert_eq!(windows.height, DRAWN_BAR_HEIGHT);
+        assert_eq!(windows.x, 800.0 - windows.width);
+        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false, Some(windows));
+        // The top of the caption buttons and the right of close are the buttons.
+        assert!(hit(700.0, 2.0).is_none());
+        assert!(hit(799.0, 20.0).is_none());
+        assert!(hit(795.0, 10.0).is_none());
+        // Only the outermost corner still resizes.
+        assert!(is_dir(hit(799.5, 0.5), Direction::NorthEast));
+        // Away from the controls the edges are as before.
+        assert!(is_dir(hit(600.0, 2.0), Direction::North));
+        assert!(is_dir(hit(799.0, 300.0), Direction::East));
+        assert!(is_dir(hit(1.0, 1.0), Direction::NorthWest));
+
+        // Linux controls on the left: the west edge beside them is theirs.
+        let layout = controls_layout(Platform::Linux, Some("close,minimize,maximize:"));
+        let linux = controls_rect(size, &layout, Platform::Linux);
+        assert_eq!(linux.x, 0.0);
+        assert_eq!(
+            linux.width,
+            3.0 * LINUX_CONTROL_SIZE + 4.0 * LINUX_CONTROL_GAP
+        );
+        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false, Some(linux));
+        assert!(hit(2.0, 20.0).is_none());
+        assert!(hit(40.0, 1.0).is_none());
+        assert!(is_dir(hit(0.5, 0.5), Direction::NorthWest));
+        assert!(is_dir(hit(400.0, 1.0), Direction::North));
+        assert!(is_dir(hit(799.0, 10.0), Direction::NorthEast));
+    }
+
+    #[test]
+    fn gnome_default_and_canonical_layouts() {
+        // GNOME's default: only a close button, on the right.
+        assert_eq!(
+            controls_layout(Platform::Linux, Some("appmenu:close")),
+            ControlsLayout {
+                side: Side::Right,
+                order: vec![Control::Close],
+            }
+        );
+        assert_eq!(
+            controls_layout(Platform::Linux, Some(":minimize,maximize,close")),
+            ControlsLayout::standard()
+        );
+    }
+
+    #[test]
+    fn kde_missing_key_takes_kdes_default() {
+        // Only the left key: the right one is KDE's default (help, minimize, maximize, close).
+        let layout = kde_layout("[org.kde.kdecoration2]\nButtonsOnLeft=X\n").expect("a key set");
+        assert_eq!(layout, "close:minimize,maximize,close");
+        assert_eq!(
+            controls_layout(Platform::Linux, Some(&layout)),
+            ControlsLayout {
+                side: Side::Left,
+                order: vec![Control::Close, Control::Minimize, Control::Maximize],
+            }
+        );
+    }
+
+    #[test]
+    fn the_chrome_switches_between_drawn_and_system_while_running() {
+        let a = window::Id::unique();
+        let b = window::Id::unique();
+        let cell = ChromeCell::starting(Chrome::Drawn);
+        assert_eq!(cell.get(), Chrome::Drawn);
+        // Falling back toggles the decorations of every open window once.
+        let task: iced::Task<()> = fall_back_to_system(&cell, [a, b]).expect("was drawn");
+        assert_eq!(task.units(), 2);
+        assert_eq!(cell.get(), Chrome::Native);
+        // Already the system's: nothing more to do.
+        assert!(fall_back_to_system::<()>(&cell, [a, b]).is_none());
+        // And back to drawn chrome.
+        let task: iced::Task<()> = use_chrome(&cell, Chrome::Drawn, [a]).expect("was native");
+        assert_eq!(task.units(), 1);
+        assert_eq!(cell.get(), Chrome::Drawn);
+        // macOS's unified bar never switches.
+        let mac = ChromeCell::starting(Chrome::Unified);
+        assert!(fall_back_to_system::<()>(&mac, [a]).is_none());
+        assert!(use_chrome::<()>(&mac, Chrome::Drawn, [a]).is_none());
+        assert_eq!(mac.get(), Chrome::Unified);
+        // Nothing is ever switched to the unified bar.
+        assert!(use_chrome::<()>(&cell, Chrome::Unified, [a]).is_none());
+        assert_eq!(cell.get(), Chrome::Drawn);
+    }
+
     #[test]
     fn maximized_disables_edge_resize() {
         let size = Size::new(800.0, 600.0);
         for p in [(0.0, 0.0), (0.0, 300.0), (799.0, 599.0), (400.0, 2.0)] {
-            assert!(edge_hit(size, Point::new(p.0, p.1), true).is_none());
+            assert!(edge_hit(size, Point::new(p.0, p.1), true, None).is_none());
         }
     }
 
