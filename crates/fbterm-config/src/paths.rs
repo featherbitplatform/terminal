@@ -34,6 +34,12 @@ impl Paths {
         self.config_dir.join("secrets.fbvault")
     }
 
+    /// The Windows system storage for saved secrets: a file protected with DPAPI for the
+    /// user's Windows account.
+    pub fn dpapi(&self) -> PathBuf {
+        self.config_dir.join("secrets.dpapi")
+    }
+
     /// Directory holding one TOML file per user color scheme.
     pub fn schemes(&self) -> PathBuf {
         self.config_dir.join("schemes")

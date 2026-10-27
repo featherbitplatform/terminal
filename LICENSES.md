@@ -8,7 +8,7 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 | License | Where it appears |
 | --- | --- |
-| Apache-2.0 | Most of the dependency tree, including `russh`, `russh-sftp` (the file panel's SFTP client), `feathercritty`, `iced` support crates and `wgpu`; also `age` (profile archives, MIT or Apache-2.0) with its RustCrypto dependencies (`scrypt`, `chacha20poly1305`, `secrecy`), `zeroize` and `base64`. |
+| Apache-2.0 | Most of the dependency tree, including `russh`, `russh-sftp` (the file panel's SFTP client), `feathercritty`, `iced` support crates and `wgpu`; also `age` (profile archives, MIT or Apache-2.0) with its RustCrypto dependencies (`scrypt`, `chacha20poly1305`, `secrecy`), `zeroize` and `base64`; and `windows-sys` (MIT or Apache-2.0), used directly on Windows for DPAPI, the system storage for saved secrets there. |
 | MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also `i18n-embed`, `rust-embed` and `bech32`, which `age` uses for its own messages and key encoding; also the Lucide icons derived from Feather (see below). |
 | BSD-2-Clause | `arrayref`, `serial2`, `zerocopy`. |
 | BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `x25519-dalek` (via `age`), `subtle`, `tiny-skia`, `num_enum`. |

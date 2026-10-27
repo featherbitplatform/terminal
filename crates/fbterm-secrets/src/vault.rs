@@ -11,17 +11,15 @@
 //! release build), so callers keep them off the UI thread and save batches with
 //! [`SecretStore::set_many`], which writes the file once.
 
-use std::collections::BTreeMap;
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use fbterm_config::ProfileId;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::archive::{self, ArchiveError, ArchivedSecret};
+use crate::archive::{self, ArchiveError};
+use crate::secrets_file::{self, Contents, ParseError, ReadError};
 use crate::{SecretEntry, SecretError, SecretKind, SecretStore};
 
 /// The vault format this build writes and the newest it reads.
@@ -40,16 +38,6 @@ const TOO_HARD: &str = "This vault takes too much work to open on this computer.
 const NOT_READ: &str = "The vault could not be read.";
 const NOT_WRITTEN: &str = "The vault could not be written.";
 const NOT_DELETED: &str = "The vault could not be deleted.";
-
-type Contents = BTreeMap<(ProfileId, SecretKind), Zeroizing<String>>;
-
-/// The decrypted document.
-#[derive(Serialize, Deserialize)]
-struct VaultFile {
-    format: u32,
-    #[serde(default)]
-    secrets: Vec<ArchivedSecret>,
-}
 
 /// What exists only while the vault is unlocked.
 struct Unlocked {
@@ -156,22 +144,11 @@ impl VaultStore {
 
     /// Encrypt `contents` and atomically replace the file at `path`.
     fn write(&self, path: &Path, password: &str, contents: &Contents) -> Result<(), SecretError> {
-        let file = VaultFile {
-            format: VAULT_FORMAT,
-            secrets: contents
-                .iter()
-                .map(|((profile, kind), value)| ArchivedSecret {
-                    profile: *profile,
-                    kind: *kind,
-                    value: value.clone(),
-                })
-                .collect(),
-        };
-        let text = Zeroizing::new(toml::to_string(&file).map_err(|_| vault_err(NOT_WRITTEN))?);
-        drop(file);
+        let text =
+            secrets_file::to_toml(contents, VAULT_FORMAT).ok_or_else(|| vault_err(NOT_WRITTEN))?;
         let sealed =
             archive::encrypt(text.as_bytes(), password).map_err(|_| vault_err(NOT_WRITTEN))?;
-        write_atomic(path, &sealed).map_err(|e| {
+        secrets_file::write_atomic(path, &sealed).map_err(|e| {
             tracing::warn!(error = %e, "could not write the secrets vault");
             vault_err(NOT_WRITTEN)
         })?;
@@ -237,85 +214,25 @@ fn vault_err(message: &str) -> SecretError {
     SecretError::Vault(message.to_owned())
 }
 
-/// Read the vault file, refusing anything larger than [`MAX_VAULT_BYTES`]. The bytes are
-/// ciphertext, so they need no wiping.
+/// Read the vault file, refusing anything larger than [`MAX_VAULT_BYTES`].
 fn read_bounded(path: &Path) -> Result<Vec<u8>, SecretError> {
-    let file = std::fs::File::open(path).map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => vault_err(MISSING),
-        _ => vault_err(NOT_READ),
-    })?;
-    let mut bytes = Vec::new();
-    file.take(MAX_VAULT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|_| vault_err(NOT_READ))?;
-    if bytes.len() as u64 > MAX_VAULT_BYTES {
-        return Err(vault_err(TOO_LARGE));
-    }
-    Ok(bytes)
+    secrets_file::read_bounded(path, MAX_VAULT_BYTES).map_err(|e| {
+        vault_err(match e {
+            ReadError::Missing => MISSING,
+            ReadError::TooLarge => TOO_LARGE,
+            ReadError::Io => NOT_READ,
+        })
+    })
 }
 
-/// Parse the decrypted document. Parser messages quote the offending line, which may hold
-/// a secret: never pass them on.
+/// Parse the decrypted document; the errors quote nothing from it.
 fn parse(plain: &[u8]) -> Result<Contents, SecretError> {
-    let text = std::str::from_utf8(plain).map_err(|_| vault_err(UNREADABLE))?;
-    // The version first, so a newer layout is reported as such rather than as unreadable.
-    #[derive(Deserialize)]
-    struct Version {
-        format: Option<u32>,
-    }
-    let version: Version = toml::from_str(text).map_err(|_| vault_err(UNREADABLE))?;
-    match version.format {
-        Some(f) if f > VAULT_FORMAT => return Err(vault_err(NEWER)),
-        Some(f) if f >= 1 => {}
-        _ => return Err(vault_err(UNREADABLE)),
-    }
-    let file: VaultFile = toml::from_str(text).map_err(|_| vault_err(UNREADABLE))?;
-    Ok(file
-        .secrets
-        .into_iter()
-        .map(|s| ((s.profile, s.kind), s.value))
-        .collect())
-}
-
-/// Write `bytes` to a new part file (mode 0600 on Unix) next to `path`, sync it, rename it
-/// over `path` and sync the directory where the platform allows. The part file is removed
-/// on failure.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    std::fs::create_dir_all(dir)?;
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-    let part = dir.join(format!(".{name}.{}.part", ProfileId::new().0));
-    let result = (|| {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&part)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
-        std::fs::rename(&part, path)
-    })();
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&part);
-        return Err(e);
-    }
-    // Make the rename itself durable. Not possible on every platform (Windows cannot open a
-    // directory this way), so a failure here is not an error.
-    #[cfg(unix)]
-    if let Ok(d) = std::fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
-    Ok(())
+    secrets_file::parse(plain, VAULT_FORMAT).map_err(|e| {
+        vault_err(match e {
+            ParseError::Newer => NEWER,
+            ParseError::Unreadable => UNREADABLE,
+        })
+    })
 }
 
 #[cfg(test)]

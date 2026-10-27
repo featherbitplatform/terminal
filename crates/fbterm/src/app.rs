@@ -472,7 +472,7 @@ impl App {
         let (secrets, fallback): (Arc<dyn SecretStore>, _) = if memory_secrets {
             (Arc::new(MemoryStore::new()), None)
         } else {
-            let store = Arc::new(FallbackStore::new());
+            let store = Arc::new(FallbackStore::new(&paths));
             (store.clone(), Some(store))
         };
         let known_hosts = directories::BaseDirs::new()

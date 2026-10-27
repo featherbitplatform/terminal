@@ -1,4 +1,5 @@
-//! OS keychain store: one item holding a JSON map of every profile's secrets.
+//! OS keychain store (macOS Keychain, Linux Secret Service): one item holding a JSON map
+//! of every profile's secrets. Not built on Windows, whose system storage is DPAPI.
 
 use std::collections::BTreeMap;
 
@@ -176,33 +177,4 @@ impl SecretStore for KeychainStore {
         }
         self.commit(&mut guard, map)
     }
-}
-
-/// The most bytes fbterm stores in one Windows credential, keeping a margin under the
-/// system's 2560-byte cap. Compared with [`keychain_blob_bytes`], which counts the item the
-/// way Windows stores it (UTF-16).
-pub const WINDOWS_KEYCHAIN_LIMIT: usize = 2400;
-
-/// The size limit of the keychain item on this platform: [`WINDOWS_KEYCHAIN_LIMIT`] on
-/// Windows, none elsewhere.
-pub fn keychain_limit() -> Option<usize> {
-    cfg!(windows).then_some(WINDOWS_KEYCHAIN_LIMIT)
-}
-
-/// The size in bytes of the single keychain item that would hold `entries` (every saved
-/// secret is in that one item): its JSON text as Windows stores a credential, in UTF-16,
-/// so two bytes per UTF-16 unit. Pure: nothing is read from or written to the keychain.
-pub fn keychain_blob_bytes(entries: &[SecretEntry]) -> usize {
-    let mut map = SecretMap::new();
-    for (id, kind, value) in entries {
-        map.entry(id.to_string()).or_default().set(*kind, value);
-    }
-    let blob = Zeroizing::new(serde_json::to_string(&map).unwrap_or_default());
-    blob.encode_utf16().count() * 2
-}
-
-/// Whether `entries` fit in the keychain item under `limit` (`None`: no limit). Pass
-/// [`keychain_limit`] for this platform.
-pub fn keychain_fits(entries: &[SecretEntry], limit: Option<usize>) -> bool {
-    limit.is_none_or(|limit| keychain_blob_bytes(entries) <= limit)
 }
