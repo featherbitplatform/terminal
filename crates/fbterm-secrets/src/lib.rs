@@ -1,8 +1,9 @@
-//! Keychain-backed secret storage.
+//! Keychain-backed secret storage and encrypted profile archives.
 //!
 //! Saved SSH passwords and key passphrases live here, never in config files.
 //! Secret values are never logged.
 
+pub mod archive;
 mod keychain;
 
 pub use keychain::KeychainStore;
@@ -14,7 +15,8 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SecretKind {
     Password,
     KeyPassphrase,

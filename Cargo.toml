@@ -40,6 +40,13 @@ flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 regex = { version = "1", default-features = false, features = ["std", "perf", "unicode"] }
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
+# Profile archives and the vault: passphrase (scrypt) encryption only, no other recipients.
+# 0.12 needs a prerelease `kem` 0.3 API while russh needs the released one; Cargo allows only one.
+age = { version = "0.11.5", default-features = false }
+# Wipes secret buffers (archive plaintext, archived secrets and key files) when dropped.
+zeroize = { version = "1.9.1", features = ["serde"] }
+# Key file bytes inside the archive TOML.
+base64 = "0.22.1"
 
 [profile.release]
 lto = "thin"
