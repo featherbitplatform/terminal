@@ -849,7 +849,10 @@ fn blank_target_port_blocks_save() {
         name: "db".into(),
     };
     assert_eq!(refused(&mut ed, &mut store), vec![err.clone()]);
-    assert_eq!(err.to_string(), "Tunnel \"db\" in web needs a target port");
+    assert_eq!(
+        err.to_string(),
+        "tunnel \"db\" of profile \"web\" needs a target port"
+    );
     // The same on a remote tunnel; SOCKS has no target.
     ed.update(EditorMsg::TunnelKind(0, KindChoice::Remote));
     assert_eq!(refused(&mut ed, &mut store), vec![err]);

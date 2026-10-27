@@ -80,7 +80,10 @@ impl fmt::Display for ValidationError {
                 )
             }
             Self::TunnelTargetPort { profile, name } => {
-                write!(f, "Tunnel {name:?} in {profile} needs a target port")
+                write!(
+                    f,
+                    "tunnel {name:?} of profile {profile:?} needs a target port"
+                )
             }
             Self::EmptyTunnelBind { profile, name } => {
                 write!(
