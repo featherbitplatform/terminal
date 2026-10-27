@@ -16,13 +16,13 @@ You need a desktop session, Wayland or X11, with Vulkan or OpenGL graphics.
 
 ## Download
 
-Each release provides, for each architecture and format, the package and its checksum. For version 0.2.0 on x86-64:
+Each release provides, for each architecture and format, the package and its checksum. For example, for version 0.2.0 on x86-64:
 
 - `fbterm-0.2.0-linux-x86_64.deb` and `fbterm-0.2.0-linux-x86_64.deb.sha256`
 - `fbterm-0.2.0-linux-x86_64.rpm` and `fbterm-0.2.0-linux-x86_64.rpm.sha256`
 - `fbterm-0.2.0-linux-x86_64.tar.gz` and `fbterm-0.2.0-linux-x86_64.tar.gz.sha256`
 
-Replace the version and `x86_64` with the ones you downloaded (`aarch64` on Arm machines).
+In the commands on this page, replace the example version 0.2.0 and `x86_64` with the ones you downloaded (`aarch64` on Arm machines).
 
 ## Verify the download
 
@@ -76,7 +76,7 @@ fbterm draws on the GPU through Vulkan or OpenGL (EGL). The packages recommend t
 
 On Linux fbterm draws the window's title bar itself, in the tab bar: minimize, maximize and close buttons that follow your desktop's button layout (GNOME and KDE settings are read; otherwise the three buttons sit on the right), drag on an empty part of the bar to move the window, double-click it to maximize, and drag any edge or corner to resize.
 
-If you prefer the desktop's own title bar, change the `window_decorations` setting, or **Title bar** in Settings, to `"system"`:
+If you prefer the desktop's own title bar, choose **System** under **Title bar** in Settings, or set the `window_decorations` setting to `"system"`:
 
 ```toml
 window_decorations = "system"
