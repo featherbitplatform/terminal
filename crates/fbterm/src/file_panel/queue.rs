@@ -711,6 +711,17 @@ impl App {
             .count()
     }
 
+    /// macOS: the app menu's Quit keeps `Cmd+Q` only while no transfer runs; while some do,
+    /// the key goes to the app's Quit, which asks first. Runs after every message (transfers
+    /// start and end only through messages), touching the menu only when that flips.
+    pub(crate) fn sync_quit_key(&mut self) {
+        let free = !crate::chrome::quit_key_wanted(self.running_total());
+        if free != self.quit_key_free && crate::chrome::set_quit_key(!free) {
+            self.quit_key_free = free;
+            tracing::info!(free, "Cmd+Q taken from the app menu while transfers run");
+        }
+    }
+
     fn running_total(&self) -> usize {
         self.file_panels
             .by_profile

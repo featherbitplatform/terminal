@@ -289,8 +289,8 @@ impl Action {
     }
 
     /// Whether the action's chord cannot be changed on this platform: on macOS Quit stays Cmd+Q,
-    /// the key every Mac app quits with (the app takes it from its menu's Quit item, so it
-    /// reaches this binding and Quit can ask first).
+    /// the key every Mac app quits with (the app menu's Quit handles it, except while file
+    /// transfers run: then the app takes it from the menu so this binding can ask first).
     pub fn is_fixed(self, mac: bool) -> bool {
         mac && self == Self::Quit
     }

@@ -659,7 +659,7 @@ fn key_row<'a>(
             .into(),
         ),
         None if fixed => Some(
-            text("Fixed on macOS, where every app quits with it.")
+            text("Fixed on macOS. While transfers run it asks first.")
                 .font(UI_FONT)
                 .size(12)
                 .color(t.text_muted)

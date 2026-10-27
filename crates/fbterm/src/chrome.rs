@@ -15,19 +15,25 @@ use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector, window};
 
-/// Whether a menu item with `action` and `key` (its key equivalent) is the app menu's Quit on
-/// `Cmd+Q`: the item [`release_quit_key`] takes the key from.
-#[cfg(any(test, target_os = "macos"))]
-pub(crate) fn is_quit_key_item(action: Option<&str>, key: &str) -> bool {
-    action == Some("terminate:") && key.eq_ignore_ascii_case("q")
+/// Whether the macOS app menu's Quit keeps `Cmd+Q` with `running` transfers: only while none
+/// runs. While some do, the key is taken from the menu so it reaches the app's own Quit, which
+/// asks first; the menu would end the app at once (and works with every window minimised).
+pub(crate) fn quit_key_wanted(running: usize) -> bool {
+    running == 0
 }
 
-/// Take `Cmd+Q` from the macOS app menu's Quit, so the key reaches the window and goes
-/// through the app's own Quit (which asks first while transfers run). The menu item stays;
-/// choosing it with the mouse still ends the app at once. Returns whether the key was found
-/// and freed (the menu exists only once the app has launched); does nothing elsewhere.
-#[cfg(target_os = "macos")]
-pub(crate) fn release_quit_key() -> bool {
+/// Whether a menu item with `action` is the app menu's Quit.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn is_quit_item(action: Option<&str>) -> bool {
+    action == Some("terminate:")
+}
+
+/// Give the macOS app menu's Quit its `Cmd+Q` (`menu_has_it`) or take it away, so the key
+/// goes through the app's own Quit. The item stays; choosing it with the mouse still ends the
+/// app at once. Returns whether the item was found and set (the menu exists once the app has
+/// launched). Elsewhere, and in tests, there is no menu: it only reports success.
+#[cfg(all(target_os = "macos", not(test)))]
+pub(crate) fn set_quit_key(menu_has_it: bool) -> bool {
     use objc2::MainThreadMarker;
     use objc2_app_kit::NSApplication;
     use objc2_foundation::NSString;
@@ -38,7 +44,8 @@ pub(crate) fn release_quit_key() -> bool {
     let Some(menu) = NSApplication::sharedApplication(mtm).mainMenu() else {
         return false;
     };
-    let mut freed = false;
+    let key = NSString::from_str(if menu_has_it { "q" } else { "" });
+    let mut set = false;
     for top in menu.itemArray().iter() {
         let Some(submenu) = top.submenu() else {
             continue;
@@ -47,20 +54,18 @@ pub(crate) fn release_quit_key() -> bool {
             let action = item
                 .action()
                 .map(|sel| sel.name().to_string_lossy().into_owned());
-            if is_quit_key_item(action.as_deref(), &item.keyEquivalent().to_string()) {
-                item.setKeyEquivalent(&NSString::from_str(""));
-                freed = true;
+            if is_quit_item(action.as_deref()) {
+                // The modifier mask (Cmd) stays as the menu built it.
+                item.setKeyEquivalent(&key);
+                set = true;
             }
         }
     }
-    if freed {
-        tracing::info!("Cmd+Q now goes through the app's Quit");
-    }
-    freed
+    set
 }
 
-#[cfg(not(target_os = "macos"))]
-pub(crate) fn release_quit_key() -> bool {
+#[cfg(any(not(target_os = "macos"), test))]
+pub(crate) fn set_quit_key(_menu_has_it: bool) -> bool {
     true
 }
 
@@ -467,13 +472,15 @@ mod tests {
     }
 
     #[test]
-    fn only_the_menus_quit_on_cmd_q_is_picked() {
-        assert!(is_quit_key_item(Some("terminate:"), "q"));
-        assert!(is_quit_key_item(Some("terminate:"), "Q"));
-        assert!(!is_quit_key_item(Some("terminate:"), ""));
-        assert!(!is_quit_key_item(Some("hide:"), "h"));
-        assert!(!is_quit_key_item(Some("performClose:"), "q"));
-        assert!(!is_quit_key_item(None, "q"));
+    fn the_menus_quit_keeps_cmd_q_unless_transfers_run() {
+        assert!(is_quit_item(Some("terminate:")));
+        assert!(!is_quit_item(Some("hide:")));
+        assert!(!is_quit_item(Some("performClose:")));
+        assert!(!is_quit_item(None));
+        // The menu keeps Cmd+Q unless a transfer runs.
+        assert!(quit_key_wanted(0));
+        assert!(!quit_key_wanted(1));
+        assert!(!quit_key_wanted(3));
     }
 
     #[cfg(target_os = "macos")]

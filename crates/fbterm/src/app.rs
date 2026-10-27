@@ -285,8 +285,8 @@ pub struct App {
     /// The app is quitting: windows closing from now on are not the user dropping them, so
     /// the layout saved at quit must stay as it is.
     pub(crate) quitting: bool,
-    /// macOS: `Cmd+Q` was taken from the app menu's Quit, so it reaches the app's own Quit
-    /// (see [`crate::chrome::release_quit_key`]); tried as windows open until it is.
+    /// macOS: `Cmd+Q` is taken from the app menu's Quit (while transfers run, so the key
+    /// reaches the app's Quit, which asks first); see [`App::sync_quit_key`].
     pub(crate) quit_key_free: bool,
     /// Windows we asked to close. A window that closes without being asked is the OS tearing
     /// the app down (macOS Cmd+Q from the menu): that is a quit too.
@@ -718,6 +718,7 @@ impl App {
         // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
         // shows its focused pane's profile.
         self.sync_file_panels();
+        self.sync_quit_key();
         match self.sync_panel_focus() {
             Some(unfocus) => Task::batch([task, unfocus]),
             None => task,
@@ -767,10 +768,6 @@ impl App {
             Message::NewWindow => self.action(None, Action::NewWindow),
             Message::WindowOpened(id) => {
                 self.focused.get_or_insert(id);
-                // The app menu exists once the app has launched, before any window opens.
-                if !self.quit_key_free {
-                    self.quit_key_free = crate::chrome::release_quit_key();
-                }
                 if self.windows.contains_key(&id) {
                     Task::batch([
                         visibility::watch(id, &self.visibility),

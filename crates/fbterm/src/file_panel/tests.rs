@@ -2623,11 +2623,14 @@ fn a_transfer_finding_the_session_gone_lets_it_go() {
 fn close_question_stays_current_and_quit_falls_back() {
     let (mut w, _dir) = World::downloading(vec![file("app.log"), file("db.dump")]);
     let wid = w.wid;
+    assert!(!w.app.quit_key_free, "no transfer: the menu keeps Cmd+Q");
     w.select("app.log");
     w.download();
     w.select("db.dump");
     w.download();
     let ids: Vec<TransferId> = w.downloads().iter().map(|d| d.2).collect();
+    // While transfers run, Cmd+Q is taken from the app menu (so it asks first).
+    assert!(w.app.quit_key_free);
     let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
     assert_eq!(w.running_asked(), Some(2));
     let done = || TransferEvent::Finished {
@@ -2639,6 +2642,8 @@ fn close_question_stays_current_and_quit_falls_back() {
     w.transfer(ids[1], done());
     assert!(w.dialog().is_none(), "nothing runs: nothing to ask about");
     assert!(!w.app.quitting, "nothing closes by itself");
+    // Nothing runs: the menu has Cmd+Q again.
+    assert!(!w.app.quit_key_free);
 
     // A cancelled transfer that never reports: the quit goes ahead after the wait.
     w.select("app.log");
