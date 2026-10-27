@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use fbterm_config::profile::{AuthMethod, ProfileKind};
+use fbterm_config::profile::{AuthMethod, ProfileKind, SshProfile, TunnelDef, TunnelKind};
 use fbterm_config::schemes::SchemeSet;
 use fbterm_config::{Profile, ProfileId, ProfileStore};
 use fbterm_secrets::archive::{Archive, ArchiveKind, ArchivedKey, ArchivedSecret, MAX_KEY_BYTES};
@@ -20,6 +20,7 @@ use fbterm_secrets::{SecretKind, SecretStore};
 use zeroize::Zeroizing;
 
 const GONE: &str = "A selected profile no longer exists.";
+const NO_SSH: &str = "A shared archive needs at least one SSH profile.";
 const SECRETS_UNREADABLE: &str = "The saved passwords and passphrases could not be read.";
 
 /// Build an archive of the `selected` profiles plus every profile their jump chains reach,
@@ -31,6 +32,8 @@ const SECRETS_UNREADABLE: &str = "The saved passwords and passphrases could not 
 ///   [`MAX_KEY_BYTES`] files are left out with a warning).
 /// - `Shared`: SSH profiles only, with key profiles reduced to "key" without a path or a
 ///   passphrase flag; no secrets and no key files (`include_keys` is ignored).
+///   Local profiles left out are named in a warning; with no SSH profile left it is an
+///   error.
 ///
 /// User color schemes the archived profiles use travel with them.
 pub(crate) fn build(
@@ -48,15 +51,27 @@ pub(crate) fn build(
     );
     let mut warnings = Vec::new();
 
-    archive.profiles = store
-        .profiles
-        .iter()
-        .filter(|p| wanted.contains(&p.id))
-        .filter_map(|p| match kind {
-            ArchiveKind::Full => Some(p.clone()),
-            ArchiveKind::Shared => shared_copy(p),
-        })
-        .collect();
+    let mut local_names = Vec::new();
+    for p in store.profiles.iter().filter(|p| wanted.contains(&p.id)) {
+        match kind {
+            ArchiveKind::Full => archive.profiles.push(p.clone()),
+            ArchiveKind::Shared => match shared_copy(p) {
+                Some(copy) => archive.profiles.push(copy),
+                None => local_names.push(p.name.as_str()),
+            },
+        }
+    }
+    if kind == ArchiveKind::Shared {
+        if archive.profiles.is_empty() {
+            return Err(NO_SSH.into());
+        }
+        if !local_names.is_empty() {
+            warnings.push(format!(
+                "Local profiles are not part of a shared archive, so {} were left out.",
+                local_names.join(", ")
+            ));
+        }
+    }
 
     if kind == ArchiveKind::Full {
         archive.secrets = saved_secrets(&archive.profiles, secrets)?;
@@ -104,27 +119,100 @@ fn closure(store: &ProfileStore, selected: &[ProfileId]) -> Result<HashSet<Profi
 
 /// The shared form of a profile: `None` for a local profile; an SSH profile without its key
 /// path or passphrase flag. Everything else (host, user, jumps, tunnels, scheme) travels.
+///
+/// Every struct is taken apart field by field (no `..`), so a field added to the model does
+/// not compile here until someone decides whether it may travel to teammates.
 fn shared_copy(profile: &Profile) -> Option<Profile> {
-    let ProfileKind::Ssh(ssh) = &profile.kind else {
+    let Profile {
+        id,
+        name,
+        group,
+        accent,
+        accent_style,
+        color_scheme,
+        kind,
+    } = profile;
+    let ProfileKind::Ssh(SshProfile {
+        host,
+        port,
+        user,
+        auth,
+        jump,
+        tunnels,
+    }) = kind
+    else {
         return None;
     };
-    let mut ssh = ssh.clone();
-    ssh.auth = match ssh.auth {
+    let auth = match auth {
         AuthMethod::Password => AuthMethod::Password,
-        AuthMethod::Key { .. } => AuthMethod::Key {
+        // Never the key path or whether the key has a passphrase.
+        AuthMethod::Key {
+            path: _,
+            passphrase: _,
+        } => AuthMethod::Key {
             path: None,
             passphrase: false,
         },
         AuthMethod::Agent => AuthMethod::Agent,
     };
     Some(Profile {
-        kind: ProfileKind::Ssh(ssh),
-        ..profile.clone()
+        id: *id,
+        name: name.clone(),
+        group: group.clone(),
+        accent: *accent,
+        accent_style: *accent_style,
+        color_scheme: color_scheme.clone(),
+        kind: ProfileKind::Ssh(SshProfile {
+            host: host.clone(),
+            port: *port,
+            user: user.clone(),
+            auth,
+            jump: jump.clone(),
+            tunnels: tunnels.iter().map(shared_tunnel).collect(),
+        }),
     })
 }
 
+/// A tunnel travels whole; taken apart field by field for the same reason as `shared_copy`.
+fn shared_tunnel(tunnel: &TunnelDef) -> TunnelDef {
+    let TunnelDef { name, kind, start } = tunnel;
+    let kind = match kind {
+        TunnelKind::Local {
+            bind,
+            port,
+            host,
+            host_port,
+        } => TunnelKind::Local {
+            bind: bind.clone(),
+            port: *port,
+            host: host.clone(),
+            host_port: *host_port,
+        },
+        TunnelKind::Remote {
+            bind,
+            port,
+            host,
+            host_port,
+        } => TunnelKind::Remote {
+            bind: bind.clone(),
+            port: *port,
+            host: host.clone(),
+            host_port: *host_port,
+        },
+        TunnelKind::Socks { bind, port } => TunnelKind::Socks {
+            bind: bind.clone(),
+            port: *port,
+        },
+    };
+    TunnelDef {
+        name: name.clone(),
+        kind,
+        start: *start,
+    }
+}
+
 /// The saved secret each SSH profile's method uses: the password of a password profile, the
-/// passphrase of a key profile. A store that cannot be read stops the export rather than
+/// passphrase of a key profile whose key has one. A store that cannot be read stops the export rather than
 /// silently making an archive without secrets.
 fn saved_secrets(
     profiles: &[Profile],
@@ -137,8 +225,13 @@ fn saved_secrets(
         };
         let kind = match ssh.auth {
             AuthMethod::Password => SecretKind::Password,
-            AuthMethod::Key { .. } => SecretKind::KeyPassphrase,
-            AuthMethod::Agent => continue,
+            AuthMethod::Key {
+                passphrase: true, ..
+            } => SecretKind::KeyPassphrase,
+            AuthMethod::Key {
+                passphrase: false, ..
+            }
+            | AuthMethod::Agent => continue,
         };
         let value = secrets
             .get(&p.id, kind)

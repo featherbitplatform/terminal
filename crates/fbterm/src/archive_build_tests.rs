@@ -106,12 +106,13 @@ fn jump_chain_profiles_are_included() {
 fn shared_leaves_out_local_profiles() {
     let shell = local("shell");
     let server = ssh("server", AuthMethod::Agent, Vec::new());
+    let tools = local("tools");
     let store = ProfileStore {
-        profiles: vec![shell.clone(), server.clone()],
+        profiles: vec![shell.clone(), server.clone(), tools.clone()],
     };
     let secrets = MemoryStore::new();
-    let selected = [shell.id, server.id];
-    let (shared, _) = build(
+    let selected = [tools.id, shell.id, server.id];
+    let (shared, warnings) = build(
         &store,
         &selected,
         ArchiveKind::Shared,
@@ -121,9 +122,28 @@ fn shared_leaves_out_local_profiles() {
     )
     .unwrap();
     assert_eq!(ids(&shared), vec![server.id]);
+    assert_eq!(
+        warnings,
+        vec![
+            "Local profiles are not part of a shared archive, so shell, tools were left out."
+                .to_string()
+        ]
+    );
 
-    // A full archive carries the local profile as it is.
-    let (full, _) = build(
+    // Nothing left to share is an error, not an empty archive.
+    let err = build(
+        &store,
+        &[shell.id, tools.id],
+        ArchiveKind::Shared,
+        false,
+        &secrets,
+        &no_schemes(),
+    )
+    .unwrap_err();
+    assert_eq!(err, "A shared archive needs at least one SSH profile.");
+
+    // A full archive carries the local profiles as they are, without a warning.
+    let (full, warnings) = build(
         &store,
         &selected,
         ArchiveKind::Full,
@@ -132,7 +152,92 @@ fn shared_leaves_out_local_profiles() {
         &no_schemes(),
     )
     .unwrap();
-    assert_eq!(full.profiles, vec![shell, server]);
+    assert_eq!(full.profiles, vec![shell, server, tools]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+}
+
+#[test]
+fn broken_jump_chains_still_export() {
+    // A cycle (a -> b -> a), a jump to a profile that does not exist, and a local profile
+    // used as a hop: all invalid in the store, none of them blocks or hangs the export.
+    let mut a = ssh("a", AuthMethod::Agent, Vec::new());
+    let b = ssh("b", AuthMethod::Agent, vec![a.id]);
+    let hop = local("hop");
+    let missing = ProfileId::new();
+    if let ProfileKind::Ssh(s) = &mut a.kind {
+        s.jump = vec![b.id, missing, hop.id];
+    }
+    let store = ProfileStore {
+        profiles: vec![a.clone(), b.clone(), hop.clone()],
+    };
+    let secrets = MemoryStore::new();
+
+    let (full, warnings) = build(
+        &store,
+        &[a.id],
+        ArchiveKind::Full,
+        false,
+        &secrets,
+        &no_schemes(),
+    )
+    .unwrap();
+    assert_eq!(ids(&full), vec![a.id, b.id, hop.id]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // Shared drops the local hop (with the warning); the jump list keeps its id, which names
+    // nothing local.
+    let (shared, warnings) = build(
+        &store,
+        &[a.id],
+        ArchiveKind::Shared,
+        false,
+        &secrets,
+        &no_schemes(),
+    )
+    .unwrap();
+    assert_eq!(ids(&shared), vec![a.id, b.id]);
+    let ProfileKind::Ssh(s) = &shared.profiles[0].kind else {
+        panic!("not ssh")
+    };
+    assert_eq!(s.jump, vec![b.id, missing, hop.id]);
+    assert_eq!(
+        warnings,
+        vec!["Local profiles are not part of a shared archive, so hop were left out.".to_string()]
+    );
+}
+
+#[test]
+fn passphrase_read_only_when_the_key_has_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = write_key(dir.path(), "id_plain", KEY_BYTES);
+    let plain = ssh("plain", key(&key_path, false), Vec::new());
+    let store = ProfileStore {
+        profiles: vec![plain.clone()],
+    };
+    let secrets = MemoryStore::new();
+    secrets
+        .set(&plain.id, SecretKind::KeyPassphrase, "pp-stale-0c2f")
+        .unwrap();
+    let (full, _) = build(
+        &store,
+        &[plain.id],
+        ArchiveKind::Full,
+        false,
+        &secrets,
+        &no_schemes(),
+    )
+    .unwrap();
+    assert!(full.secrets.is_empty());
+    // Not even read: a store that fails every read does not stop the export.
+    build(
+        &store,
+        &[plain.id],
+        ArchiveKind::Full,
+        false,
+        &Unreadable,
+        &no_schemes(),
+    )
+    .unwrap();
 }
 
 #[test]
