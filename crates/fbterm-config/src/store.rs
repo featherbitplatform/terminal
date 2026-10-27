@@ -47,6 +47,8 @@ pub enum ValidationError {
     EmptyTunnelName { profile: String },
     DuplicateTunnel { profile: String, name: String },
     TunnelPort { profile: String, name: String },
+    EmptyTunnelBind { profile: String, name: String },
+    EmptyTunnelHost { profile: String, name: String },
 }
 
 impl fmt::Display for ValidationError {
@@ -74,6 +76,18 @@ impl fmt::Display for ValidationError {
                 write!(
                     f,
                     "tunnel {name:?} of profile {profile:?} needs a port above 0"
+                )
+            }
+            Self::EmptyTunnelBind { profile, name } => {
+                write!(
+                    f,
+                    "tunnel {name:?} of profile {profile:?} has an empty bind address"
+                )
+            }
+            Self::EmptyTunnelHost { profile, name } => {
+                write!(
+                    f,
+                    "tunnel {name:?} of profile {profile:?} has an empty host"
                 )
             }
         }
@@ -189,6 +203,22 @@ impl ProfileStore {
                 );
                 if zero {
                     errors.push(ValidationError::TunnelPort {
+                        profile: p.name.clone(),
+                        name: t.name.clone(),
+                    });
+                }
+            }
+            for t in &ssh.tunnels {
+                if t.bind().trim().is_empty() {
+                    errors.push(ValidationError::EmptyTunnelBind {
+                        profile: p.name.clone(),
+                        name: t.name.clone(),
+                    });
+                }
+                if let TunnelKind::Local { host, .. } | TunnelKind::Remote { host, .. } = &t.kind
+                    && host.trim().is_empty()
+                {
+                    errors.push(ValidationError::EmptyTunnelHost {
                         profile: p.name.clone(),
                         name: t.name.clone(),
                     });

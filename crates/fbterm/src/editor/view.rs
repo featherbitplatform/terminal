@@ -6,7 +6,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::ssh_view::{auth, jumps};
+use super::ssh_view::{auth, jumps, tunnels};
 use super::{ACCENTS, Draft, DraftKind, EditorMsg, EditorState};
 use crate::app::Message;
 use crate::schemes::SchemeChoice;
@@ -416,7 +416,9 @@ fn form<'a>(
                 .push(section(t, "Authentication"))
                 .push(auth(t, s, editable, degraded, state.selected_key_is_rsa()))
                 .push(section(t, "Jump hosts"))
-                .push(jumps(t, state, d.id, s, editable));
+                .push(jumps(t, state, d.id, s, editable))
+                .push(section(t, "Tunnels"))
+                .push(tunnels(t, s, editable));
         }
     }
     col.into()

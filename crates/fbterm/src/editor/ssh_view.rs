@@ -2,12 +2,12 @@
 
 use std::fmt;
 
-use fbterm_config::ProfileId;
-use iced::widget::{button, checkbox, column, container, pick_list, row, text};
+use fbterm_config::{ProfileId, StartMode, TunnelDef, TunnelKind};
+use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
 use iced::{Alignment, Border, Color, Element, Length, Padding};
 
 use super::view::{detail, input, msg};
-use super::{AuthChoice, EditorMsg, EditorState, SshDraft};
+use super::{AuthChoice, EditorMsg, EditorState, KindChoice, SshDraft, tunnel_warning};
 use crate::app::Message;
 use crate::redact::Redacted;
 use crate::theme::{Tokens, UI_FONT};
@@ -301,4 +301,196 @@ pub(super) fn jumps<'a>(
 
 fn secret_msg(v: String) -> EditorMsg {
     EditorMsg::Secret(Redacted(v))
+}
+
+/// A tunnel text field whose edits carry the row index.
+fn tunnel_input<'a>(
+    t: &'static Tokens,
+    placeholder: &str,
+    value: &str,
+    editable: bool,
+    on_input: impl Fn(String) -> EditorMsg + 'a,
+) -> text_input::TextInput<'a, Message> {
+    text_input(placeholder, value)
+        .on_input_maybe(editable.then_some(move |v| msg(on_input(v))))
+        .font(MONO)
+        .size(13)
+        .padding(Padding::from([7.0, 10.0]))
+        .style(move |_, s| ui::input_style(t, s))
+}
+
+/// A port as typed: empty while unset (remote 0 is a real choice: the server picks).
+fn port_text(port: u16, show_zero: bool) -> String {
+    if port == 0 && !show_zero {
+        String::new()
+    } else {
+        port.to_string()
+    }
+}
+
+fn tunnel_row<'a>(
+    t: &'static Tokens,
+    i: usize,
+    def: &'a TunnelDef,
+    editable: bool,
+) -> Element<'a, Message> {
+    let kind = KindChoice::of(&def.kind);
+    let choice = |caption: &'a str, value: KindChoice| {
+        segment(
+            t,
+            caption,
+            kind == value,
+            editable.then(|| msg(EditorMsg::TunnelKind(i, value))),
+        )
+    };
+    let start = |caption: &'a str, value: StartMode| {
+        segment(
+            t,
+            caption,
+            def.start == value,
+            editable.then(|| msg(EditorMsg::TunnelStart(i, value))),
+        )
+    };
+    let remove = button(ui::icon(ui::ICON_X, 13.0, t.text_secondary))
+        .on_press_maybe(editable.then(|| msg(EditorMsg::TunnelRemove(i))))
+        .padding(5)
+        .style(move |_, st| ui::ghost(t, st));
+    let labelled = |caption: &'a str, w: Element<'a, Message>| -> Element<'a, Message> {
+        column![ui::label(t, caption), w].spacing(6).into()
+    };
+    let (bind, port, target) = match &def.kind {
+        TunnelKind::Local {
+            bind,
+            port,
+            host,
+            host_port,
+        } => (bind, *port, Some((host, *host_port))),
+        TunnelKind::Remote {
+            bind,
+            port,
+            host,
+            host_port,
+        } => (bind, *port, Some((host, *host_port))),
+        TunnelKind::Socks { bind, port } => (bind, *port, None),
+    };
+    let remote = kind == KindChoice::Remote;
+    let bind_caption = if remote {
+        "Server address"
+    } else {
+        "Listen address"
+    };
+    let mut listen = row![
+        container(labelled(
+            bind_caption,
+            tunnel_input(t, "127.0.0.1", bind, editable, move |v| {
+                EditorMsg::TunnelBind(i, v)
+            })
+            .into()
+        ))
+        .width(Length::Fill),
+        container(labelled(
+            "Port",
+            tunnel_input(t, "8080", &port_text(port, remote), editable, move |v| {
+                EditorMsg::TunnelPort(i, v)
+            })
+            .into()
+        ))
+        .width(90),
+    ]
+    .spacing(12);
+    let mut col = column![
+        row![
+            tunnel_input(t, "Name", &def.name, editable, move |v| {
+                EditorMsg::TunnelName(i, v)
+            })
+            .font(UI_FONT)
+            .width(Length::Fill),
+            segmented(
+                t,
+                row![
+                    choice("Local", KindChoice::Local),
+                    choice("Remote", KindChoice::Remote),
+                    choice("SOCKS", KindChoice::Socks),
+                ]
+            ),
+            remove,
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(10);
+    if let Some((host, host_port)) = target {
+        let target_caption = if remote {
+            "Local target"
+        } else {
+            "Target host"
+        };
+        let target_row = row![
+            container(labelled(
+                target_caption,
+                tunnel_input(t, "db.internal", host, editable, move |v| {
+                    EditorMsg::TunnelHost(i, v)
+                })
+                .into()
+            ))
+            .width(Length::Fill),
+            container(labelled(
+                "Port",
+                tunnel_input(
+                    t,
+                    "5432",
+                    &port_text(host_port, false),
+                    editable,
+                    move |v| { EditorMsg::TunnelHostPort(i, v) }
+                )
+                .into()
+            ))
+            .width(90),
+        ]
+        .spacing(12);
+        col = col.push(listen).push(target_row);
+        listen = row![];
+    }
+    if matches!(def.kind, TunnelKind::Socks { .. }) {
+        col = col.push(listen);
+    }
+    col = col.push(segmented(
+        t,
+        row![
+            start("On demand", StartMode::OnDemand),
+            start("With the shell", StartMode::WithShell),
+        ],
+    ));
+    if let Some(w) = tunnel_warning(def) {
+        col = col.push(text(w).font(UI_FONT).size(12.5).color(t.warning));
+    }
+    container(col)
+        .padding(12)
+        .width(Length::Fill)
+        .style(move |_| ui::card(t))
+        .into()
+}
+
+pub(super) fn tunnels<'a>(
+    t: &'static Tokens,
+    s: &'a SshDraft,
+    editable: bool,
+) -> Element<'a, Message> {
+    let mut col = column![
+        text("Forward ports or run a SOCKS proxy over this connection.")
+            .font(UI_FONT)
+            .size(12.5)
+            .color(t.text_muted)
+    ]
+    .spacing(10);
+    for (i, def) in s.tunnels.iter().enumerate() {
+        col = col.push(tunnel_row(t, i, def, editable));
+    }
+    col.push(ui::text_button(
+        t,
+        "Add tunnel",
+        editable.then(|| msg(EditorMsg::TunnelAdd)),
+        ui::secondary,
+    ))
+    .into()
 }
