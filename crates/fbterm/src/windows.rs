@@ -61,7 +61,13 @@ impl App {
                 ..window::Settings::default()
             },
         );
-        self.windows.insert(id, WindowState::new());
+        self.windows.insert(
+            id,
+            WindowState {
+                transparent: backdrop.transparent,
+                ..WindowState::new()
+            },
+        );
         self.sizes.insert(id, size);
         (id, open.map(Message::WindowOpened))
     }
@@ -321,6 +327,12 @@ impl App {
         self.sizes.insert(id, (size.width, size.height));
         // Dragging a window edge resizes continuously: save once it settles.
         self.save_state_soon()
+    }
+
+    /// Whether an open terminal window was created opaque: a background opacity below 1
+    /// shows in it only after a restart (never on macOS, where every window is transparent).
+    pub(crate) fn opaque_window_open(&self) -> bool {
+        self.windows.values().any(|w| !w.transparent)
     }
 
     /// What is carried in `wid`, if anything.

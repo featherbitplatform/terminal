@@ -811,3 +811,80 @@ fn retries_field_writes_setting() {
     s.update(SettingsMsg::RetriesSubmit);
     assert_eq!(s.retries_text, "100");
 }
+
+#[test]
+fn a_fixed_shortcut_row_shows_its_chord_and_cannot_be_recorded() {
+    use crate::app::Message;
+    use fbterm_config::keys::fixed_shortcuts;
+    use iced::advanced::layout::{self, Layout};
+    use iced::advanced::widget::{Operation, Tree};
+    use iced::advanced::{Shell, clipboard};
+    use iced::{Element, Event, Pixels, Point, Rectangle, Size, mouse};
+
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, _b: Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let t = crate::theme::tokens(ThemeMode::Dark);
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let size = Size::new(560.0, 80.0);
+    for mac in [false, true] {
+        let shortcut = fixed_shortcuts(mac)[4];
+        let mut element: Element<'_, Message> = view::fixed_key_row(t, shortcut, mac);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let mut texts = Texts(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        let mut expected = vec![
+            "Scroll to top".to_owned(),
+            "Fixed".to_owned(),
+            shortcut.chord.label(mac),
+        ];
+        if mac {
+            expected.push("Also \u{2318}Home.".to_owned());
+        }
+        assert_eq!(texts.0, expected);
+        // A click on the chord records nothing.
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let at = Point::new(size.width - 16.0 - 40.0, 17.0);
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Mouse(event),
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &Rectangle::with_size(size),
+            );
+        }
+        assert!(messages.is_empty(), "{messages:?}");
+    }
+}
+
+#[test]
+fn the_restart_note_needs_a_lower_opacity_and_an_opaque_window() {
+    let note = Some("Restart fbterm to apply this to open windows.");
+    assert_eq!(view::restart_note(0.8, true), note);
+    assert_eq!(view::restart_note(1.0, true), None);
+    assert_eq!(view::restart_note(0.8, false), None);
+}

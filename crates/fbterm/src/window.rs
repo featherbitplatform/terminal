@@ -108,6 +108,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
             notice,
             app.secrets_section(),
             app.chrome_fell_back,
+            app.opaque_window_open(),
         ));
         return Element::new(Shortcuts {
             content: content.into(),
