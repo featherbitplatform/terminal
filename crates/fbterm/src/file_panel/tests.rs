@@ -18,18 +18,29 @@ use crate::restore_tests::{paths_with, profile};
 use crate::tabs::{Pane, Tab, TabState, WindowState};
 use crate::tiles::TilesMsg;
 
-/// Records every request; answers nothing by itself.
+/// Records every request; answers nothing by itself. With `runtime`, each open is a task
+/// that never finishes on it, so tests can see whether it was aborted.
 #[derive(Default)]
 struct Fake {
     opens: Mutex<Vec<(ProfileId, window::Id, u64)>>,
     lists: Mutex<Vec<(ProfileId, String, u64)>>,
+    runtime: Option<tokio::runtime::Runtime>,
+    tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
 }
 
 impl Backend for Fake {
-    fn open(&self, request: OpenRequest, _sink: super::PanelSink) {
+    fn open(
+        &self,
+        request: OpenRequest,
+        _sink: super::PanelSink,
+    ) -> Option<tokio::task::AbortHandle> {
         self.opens
             .lock()
             .push((request.profile, request.window, request.token));
+        let task = self.runtime.as_ref()?.spawn(std::future::pending());
+        let abort = task.abort_handle();
+        self.tasks.lock().push(task);
+        Some(abort)
     }
 
     fn list(&self, request: ListRequest, _sink: super::PanelSink) {
@@ -492,4 +503,202 @@ fn single_pane_tab_layout_unchanged_when_closed() {
         (first, children.next().map(|l| l.bounds()))
     };
     assert!(content.width >= crate::window::MIN_TERMINAL_WIDTH);
+}
+
+mod dock {
+    use iced::advanced::layout::{Layout, Limits, Node};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::{Shell, clipboard};
+    use iced::widget::{Space, text_input};
+    use iced::{Element, Event, Length, Pixels, Point, Rectangle, Size, mouse};
+
+    use crate::app::Message;
+    use crate::file_panel::FilePanelMsg;
+
+    const WINDOW: Size = Size::new(1000.0, 600.0);
+    /// Where the panel's left edge is with a 300 px panel in WINDOW.
+    const EDGE_X: f32 = 700.0;
+
+    fn renderer() -> iced::Renderer {
+        iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+            iced::Font::DEFAULT,
+            Pixels(16.0),
+        ))
+    }
+
+    fn fill<'a>() -> Element<'a, Message> {
+        Space::new().width(Length::Fill).height(Length::Fill).into()
+    }
+
+    fn docked<'a>() -> Element<'a, Message> {
+        crate::window::dock(fill(), Some((fill(), 300.0)))
+    }
+
+    /// Runs `events` (each with the pointer position) through a docked panel; returns the
+    /// file-panel messages published.
+    fn drive(events: &[(Event, Point)]) -> Vec<FilePanelMsg> {
+        let renderer = renderer();
+        let mut element = docked();
+        let mut tree = Tree::new(&element);
+        let node: Node =
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, WINDOW));
+        let viewport = Rectangle::with_size(WINDOW);
+        let mut messages = Vec::new();
+        for (event, at) in events {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                event,
+                Layout::new(&node),
+                mouse::Cursor::Available(*at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+        }
+        messages
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::FilePanel(m) => Some(m),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn press(at: Point) -> (Event, Point) {
+        (
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            at,
+        )
+    }
+
+    fn moved(at: Point) -> (Event, Point) {
+        (Event::Mouse(mouse::Event::CursorMoved { position: at }), at)
+    }
+
+    fn summary(messages: &[FilePanelMsg]) -> Vec<String> {
+        messages
+            .iter()
+            .map(|m| match m {
+                FilePanelMsg::Resize(w) => format!("resize {w}"),
+                FilePanelMsg::ResizeEnd => "end".into(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn edge_drag_ends_when_the_window_loses_focus_or_the_pointer_leaves() {
+        let grab = Point::new(EDGE_X + 2.0, 300.0);
+        for cancel in [
+            Event::Window(iced::window::Event::Unfocused),
+            Event::Mouse(mouse::Event::CursorLeft),
+        ] {
+            let messages = drive(&[
+                press(grab),
+                moved(Point::new(650.0, 300.0)),
+                (cancel.clone(), Point::new(650.0, 300.0)),
+                // No button is held any more: moving does not resize.
+                moved(Point::new(500.0, 300.0)),
+            ]);
+            assert_eq!(
+                summary(&messages),
+                ["resize 350", "end"],
+                "the drag ends on {cancel:?} and the width is still saved"
+            );
+        }
+    }
+
+    #[test]
+    fn the_edge_grab_takes_no_press_on_the_terminal_side() {
+        let messages = drive(&[
+            press(Point::new(EDGE_X - 2.0, 300.0)),
+            moved(Point::new(650.0, 300.0)),
+        ]);
+        assert!(messages.is_empty(), "{:?}", summary(&messages));
+        let messages = drive(&[
+            press(Point::new(EDGE_X + 1.0, 300.0)),
+            moved(Point::new(650.0, 300.0)),
+        ]);
+        assert_eq!(summary(&messages), ["resize 350"]);
+    }
+
+    #[test]
+    fn toggling_the_panel_keeps_the_content_state() {
+        type Paragraph = <iced::Renderer as iced::advanced::text::Renderer>::Paragraph;
+        let input = || -> Element<'static, Message> { text_input("Find", "").into() };
+        let closed = crate::window::dock(input(), None);
+        let mut tree = Tree::new(&closed);
+        tree.children[0]
+            .state
+            .downcast_mut::<text_input::State<Paragraph>>()
+            .focus();
+        // The panel opens: the same widget, with the panel added after the content.
+        let open = crate::window::dock(input(), Some((fill(), 300.0)));
+        tree.diff(&open);
+        assert_eq!(tree.children.len(), 2);
+        let focused = |tree: &Tree| {
+            tree.children[0]
+                .state
+                .downcast_ref::<text_input::State<Paragraph>>()
+                .is_focused()
+        };
+        assert!(
+            focused(&tree),
+            "the find bar keeps focus when the panel opens"
+        );
+        let closed = crate::window::dock(input(), None);
+        tree.diff(&closed);
+        assert_eq!(tree.children.len(), 1);
+        assert!(focused(&tree), "and when it closes");
+    }
+}
+
+#[test]
+fn hiding_the_panel_aborts_an_open_in_flight() {
+    let mut w = world();
+    let fake = Arc::new(Fake {
+        runtime: Some(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap(),
+        ),
+        ..Fake::default()
+    });
+    w.app.file_panel_work.backend = fake.clone();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.toggle();
+    assert_eq!(fake.opens.lock().len(), 1);
+    // Hidden before the session opened: the open stops, so it can raise no question later.
+    w.toggle();
+    let task = fake.tasks.lock().pop().unwrap();
+    let rt = fake.runtime.as_ref().unwrap();
+    let outcome =
+        rt.block_on(async { tokio::time::timeout(std::time::Duration::from_secs(2), task).await });
+    assert!(
+        matches!(outcome, Ok(Err(ref e)) if e.is_cancelled()),
+        "the open was aborted: {outcome:?}"
+    );
+}
+
+#[test]
+fn without_a_runtime_the_panel_says_so_instead_of_loading_forever() {
+    // The real backend, outside any runtime.
+    let mut w = world();
+    w.app.file_panel_work = super::Work::new(w.app.pool.clone());
+    let mut rx = w.app.file_panel_work.receiver.0.lock().take().unwrap();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.toggle();
+    let event = rx.try_recv().expect("the open reports at once");
+    w.event(event);
+    let Some(Body::Note(line)) = w.body() else {
+        panic!("a note, not {:?}", w.body());
+    };
+    assert!(line.starts_with("SFTP is not available: "), "{line}");
 }

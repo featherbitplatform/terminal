@@ -60,6 +60,9 @@ pub(crate) struct ProfilePanel {
     pub transfers: Vec<TransferRow>,
     /// Counts opens and folder reads, so only the latest answer is taken.
     pub(crate) token: u64,
+    /// Stops the open under way, if any: a session no panel wants any more must not go on to
+    /// ask a sign-in question.
+    pub(crate) opening: Option<tokio::task::AbortHandle>,
 }
 
 impl ProfilePanel {
@@ -70,11 +73,16 @@ impl ProfilePanel {
             listing: Listing::Closed,
             transfers: Vec::new(),
             token: 0,
+            opening: None,
         }
     }
 
-    /// Let go of the SFTP session (and ignore anything still on its way).
+    /// Let go of the SFTP session: an open under way stops, and anything still on its way is
+    /// ignored.
     pub(crate) fn release(&mut self) {
+        if let Some(open) = self.opening.take() {
+            open.abort();
+        }
         self.sftp = None;
         self.listing = Listing::Closed;
         self.token += 1;

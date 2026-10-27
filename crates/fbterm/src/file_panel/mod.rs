@@ -14,8 +14,10 @@
 //!   ([`UiPrompter`]). The session holds the connection open. It is kept while a panel shows
 //!   the profile, while a panel is open anywhere and the profile still has a connected shell
 //!   (so moving focus back and forth does not reopen it), and while its transfers run; else it
-//!   is let go. A server that refuses SFTP shows `SFTP is not available: {reason}`; there is
-//!   no fallback.
+//!   is let go (an open still under way is aborted, so it can raise no question after the
+//!   panel is gone). Holding the channel while a panel is open elsewhere adds no connection
+//!   lifetime: the profile's connected shell holds the connection anyway. A server that
+//!   refuses SFTP shows `SFTP is not available: {reason}`; there is no fallback.
 //! - **Folders.** Each profile's folder is kept for the app session ([`ProfilePanel`]); it
 //!   starts as the server's answer for `.`. Answers that come back after their profile moved
 //!   on (a newer open or read, a released session) are dropped by their token.
@@ -113,12 +115,26 @@ pub(crate) type PanelSink = UnboundedSender<PanelEvent>;
 
 /// Opens sessions and reads folders: on the app's SSH pool, or a fake in tests.
 pub(crate) trait Backend: Send + Sync {
-    fn open(&self, request: OpenRequest, sink: PanelSink);
+    /// Start opening; the handle stops the open when the session is no longer wanted.
+    fn open(&self, request: OpenRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle>;
     fn list(&self, request: ListRequest, sink: PanelSink);
 }
 
 /// Runs the panel's work as tasks on the app's runtime, sessions on the app's SSH pool.
 struct PoolBackend(Arc<SshPool>);
+
+/// Why work could not start: the app always runs inside its runtime, so this is a bug, but the
+/// panel must say so rather than show `Loading…` forever.
+const NO_RUNTIME: &str = "the app's background runtime is not running";
+
+/// The app's runtime, or a warning when there is none.
+fn runtime() -> Option<tokio::runtime::Handle> {
+    let rt = tokio::runtime::Handle::try_current().ok();
+    if rt.is_none() {
+        tracing::warn!("file panel: {NO_RUNTIME}");
+    }
+    rt
+}
 
 /// Why SFTP is not available, from the error opening it: a refused subsystem says so without
 /// the generic prefix.
@@ -130,12 +146,17 @@ fn unavailable_reason(e: &SshError) -> String {
 }
 
 impl Backend for PoolBackend {
-    fn open(&self, r: OpenRequest, sink: PanelSink) {
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            return;
+    fn open(&self, r: OpenRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle> {
+        let Some(rt) = runtime() else {
+            let _ = sink.send(PanelEvent::Opened {
+                profile: r.profile,
+                token: r.token,
+                result: Err(NO_RUNTIME.into()),
+            });
+            return None;
         };
         let pool = self.0.clone();
-        rt.spawn(async move {
+        let task = rt.spawn(async move {
             let result = match Sftp::open(&pool, &r.store, &r.profile, r.prompter).await {
                 Ok(sftp) => {
                     let sftp = Arc::new(sftp);
@@ -153,10 +174,17 @@ impl Backend for PoolBackend {
                 result,
             });
         });
+        Some(task.abort_handle())
     }
 
     fn list(&self, r: ListRequest, sink: PanelSink) {
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        let Some(rt) = runtime() else {
+            let _ = sink.send(PanelEvent::Listed {
+                profile: r.profile,
+                token: r.token,
+                folder: r.folder,
+                result: Err(SftpError::Other(NO_RUNTIME.into())),
+            });
             return;
         };
         rt.spawn(async move {
@@ -221,7 +249,7 @@ impl Remote for DemoRemote {
 }
 
 impl Backend for Demo {
-    fn open(&self, r: OpenRequest, sink: PanelSink) {
+    fn open(&self, r: OpenRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle> {
         let _ = sink.send(PanelEvent::Opened {
             profile: r.profile,
             token: r.token,
@@ -230,6 +258,7 @@ impl Backend for Demo {
                 home: Ok(self.home.clone()),
             }),
         });
+        None
     }
 
     fn list(&self, r: ListRequest, sink: PanelSink) {
@@ -381,6 +410,7 @@ impl App {
                 if panel.token != token || panel.listing != Listing::Opening {
                     return;
                 }
+                panel.opening = None;
                 match result {
                     Err(reason) => panel.listing = Listing::Unavailable(reason),
                     Ok(Opened { remote, home }) => {
@@ -455,9 +485,12 @@ impl App {
             .by_profile
             .entry(profile)
             .or_insert_with(ProfilePanel::new);
+        if let Some(old) = panel.opening.take() {
+            old.abort();
+        }
         panel.token += 1;
         panel.listing = Listing::Opening;
-        self.file_panel_work.backend.open(
+        panel.opening = self.file_panel_work.backend.open(
             OpenRequest {
                 profile,
                 token: panel.token,
