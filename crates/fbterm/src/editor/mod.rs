@@ -133,17 +133,25 @@ fn typed_port(v: &str, allow_zero: bool) -> Option<u16> {
     if v.is_empty() {
         return Some(0);
     }
+    if !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     v.parse::<u16>().ok().filter(|&p| allow_zero || p > 0)
 }
 
 /// Edit one tunnel; returns whether anything changed.
-fn edit_tunnel(tunnels: &mut Vec<TunnelDef>, msg: EditorMsg) -> bool {
+fn edit_tunnel(draft: &mut SshDraft, msg: EditorMsg) -> bool {
+    let SshDraft {
+        tunnels, parked, ..
+    } = draft;
+    parked.resize(tunnels.len(), (String::new(), 0));
     match msg {
         EditorMsg::TunnelAdd => {
             let name = (1..)
                 .map(|i| format!("Tunnel {i}"))
                 .find(|n| tunnels.iter().all(|t| t.name != *n))
                 .expect("an unused name exists");
+            parked.push((String::new(), 0));
             tunnels.push(TunnelDef {
                 name,
                 kind: TunnelKind::Local {
@@ -158,6 +166,7 @@ fn edit_tunnel(tunnels: &mut Vec<TunnelDef>, msg: EditorMsg) -> bool {
         }
         EditorMsg::TunnelRemove(i) if i < tunnels.len() => {
             tunnels.remove(i);
+            parked.remove(i);
             return true;
         }
         _ => {}
@@ -172,7 +181,7 @@ fn edit_tunnel(tunnels: &mut Vec<TunnelDef>, msg: EditorMsg) -> bool {
     else {
         return false;
     };
-    let Some(t) = tunnels.get_mut(i) else {
+    let (Some(t), Some(park)) = (tunnels.get_mut(i), parked.get_mut(i)) else {
         return false;
     };
     match msg {
@@ -201,8 +210,11 @@ fn edit_tunnel(tunnels: &mut Vec<TunnelDef>, msg: EditorMsg) -> bool {
                     host,
                     host_port,
                 } => (bind, port, host, host_port),
-                TunnelKind::Socks { bind, port } => (bind, port, String::new(), 0),
+                TunnelKind::Socks { bind, port } => (bind, port, park.0.clone(), park.1),
             };
+            if choice == KindChoice::Socks {
+                *park = (host.clone(), host_port);
+            }
             t.kind = match choice {
                 KindChoice::Local => TunnelKind::Local {
                     bind,
@@ -274,6 +286,8 @@ pub struct SshDraft {
     pub key_passphrase: bool,
     pub jump: Vec<ProfileId>,
     pub tunnels: Vec<TunnelDef>,
+    /// Per tunnel, the target a SOCKS switch set aside, so Local, SOCKS, Local keeps it.
+    parked: Vec<(String, u16)>,
     /// Typed secret for the chosen auth; empty keeps whatever the keychain has.
     pub secret: String,
 }
@@ -341,6 +355,7 @@ impl Draft {
                     key_passphrase,
                     jump: s.jump.clone(),
                     tunnels: s.tunnels.clone(),
+                    parked: Vec::new(),
                     secret: String::new(),
                 })
             }
@@ -644,6 +659,7 @@ impl EditorState {
                 key_passphrase: false,
                 jump: Vec::new(),
                 tunnels: Vec::new(),
+                parked: Vec::new(),
                 secret: String::new(),
             }),
         )
@@ -947,7 +963,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
             | EditorMsg::TunnelHostPort(..)
             | EditorMsg::TunnelStart(..)),
             DraftKind::Ssh(s),
-        ) => return edit_tunnel(&mut s.tunnels, m),
+        ) => return edit_tunnel(s, m),
         (EditorMsg::Program(v), DraftKind::Local(l)) => l.program = v,
         (EditorMsg::Args(v), DraftKind::Local(l)) => {
             l.args = v.split_whitespace().map(str::to_owned).collect();

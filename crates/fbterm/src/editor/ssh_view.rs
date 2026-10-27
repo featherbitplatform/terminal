@@ -319,9 +319,9 @@ fn tunnel_input<'a>(
         .style(move |_, s| ui::input_style(t, s))
 }
 
-/// A port as typed: empty while unset (remote 0 is a real choice: the server picks).
-fn port_text(port: u16, show_zero: bool) -> String {
-    if port == 0 && !show_zero {
+/// A port as typed: empty while unset (0).
+fn port_text(port: u16) -> String {
+    if port == 0 {
         String::new()
     } else {
         port.to_string()
@@ -374,14 +374,13 @@ fn tunnel_row<'a>(
         TunnelKind::Socks { bind, port } => (bind, *port, None),
     };
     let remote = kind == KindChoice::Remote;
-    let bind_caption = if remote {
-        "Server address"
-    } else {
-        "Listen address"
-    };
-    let mut listen = row![
+    let listen = row![
         container(labelled(
-            bind_caption,
+            if remote {
+                "Server address"
+            } else {
+                "Listen address"
+            },
             tunnel_input(t, "127.0.0.1", bind, editable, move |v| {
                 EditorMsg::TunnelBind(i, v)
             })
@@ -390,9 +389,14 @@ fn tunnel_row<'a>(
         .width(Length::Fill),
         container(labelled(
             "Port",
-            tunnel_input(t, "8080", &port_text(port, remote), editable, move |v| {
-                EditorMsg::TunnelPort(i, v)
-            })
+            // Remote 0 asks the server to pick a port: shown as `any`.
+            tunnel_input(
+                t,
+                if remote { "any" } else { "8080" },
+                &port_text(port),
+                editable,
+                move |v| EditorMsg::TunnelPort(i, v)
+            )
             .into()
         ))
         .width(90),
@@ -400,10 +404,14 @@ fn tunnel_row<'a>(
     .spacing(12);
     let mut col = column![
         row![
-            tunnel_input(t, "Name", &def.name, editable, move |v| {
-                EditorMsg::TunnelName(i, v)
-            })
-            .font(UI_FONT)
+            container(labelled(
+                "Name",
+                tunnel_input(t, "postgres", &def.name, editable, move |v| {
+                    EditorMsg::TunnelName(i, v)
+                })
+                .font(UI_FONT)
+                .into()
+            ))
             .width(Length::Fill),
             segmented(
                 t,
@@ -416,43 +424,37 @@ fn tunnel_row<'a>(
             remove,
         ]
         .spacing(10)
-        .align_y(Alignment::Center),
+        .align_y(Alignment::End),
+        listen,
     ]
     .spacing(10);
     if let Some((host, host_port)) = target {
-        let target_caption = if remote {
-            "Local target"
+        let (host_caption, port_caption) = if remote {
+            ("Local target host", "Local target port")
         } else {
-            "Target host"
+            ("Target host", "Target port")
         };
-        let target_row = row![
-            container(labelled(
-                target_caption,
-                tunnel_input(t, "db.internal", host, editable, move |v| {
-                    EditorMsg::TunnelHost(i, v)
-                })
-                .into()
-            ))
-            .width(Length::Fill),
-            container(labelled(
-                "Port",
-                tunnel_input(
-                    t,
-                    "5432",
-                    &port_text(host_port, false),
-                    editable,
-                    move |v| { EditorMsg::TunnelHostPort(i, v) }
-                )
-                .into()
-            ))
-            .width(90),
-        ]
-        .spacing(12);
-        col = col.push(listen).push(target_row);
-        listen = row![];
-    }
-    if matches!(def.kind, TunnelKind::Socks { .. }) {
-        col = col.push(listen);
+        col = col.push(
+            row![
+                container(labelled(
+                    host_caption,
+                    tunnel_input(t, "db.internal", host, editable, move |v| {
+                        EditorMsg::TunnelHost(i, v)
+                    })
+                    .into()
+                ))
+                .width(Length::Fill),
+                container(labelled(
+                    port_caption,
+                    tunnel_input(t, "5432", &port_text(host_port), editable, move |v| {
+                        EditorMsg::TunnelHostPort(i, v)
+                    })
+                    .into()
+                ))
+                .width(130),
+            ]
+            .spacing(12),
+        );
     }
     col = col.push(segmented(
         t,

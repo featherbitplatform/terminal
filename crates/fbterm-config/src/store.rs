@@ -47,6 +47,7 @@ pub enum ValidationError {
     EmptyTunnelName { profile: String },
     DuplicateTunnel { profile: String, name: String },
     TunnelPort { profile: String, name: String },
+    TunnelTargetPort { profile: String, name: String },
     EmptyTunnelBind { profile: String, name: String },
     EmptyTunnelHost { profile: String, name: String },
 }
@@ -77,6 +78,9 @@ impl fmt::Display for ValidationError {
                     f,
                     "tunnel {name:?} of profile {profile:?} needs a port above 0"
                 )
+            }
+            Self::TunnelTargetPort { profile, name } => {
+                write!(f, "Tunnel {name:?} in {profile} needs a target port")
             }
             Self::EmptyTunnelBind { profile, name } => {
                 write!(
@@ -209,6 +213,14 @@ impl ProfileStore {
                 }
             }
             for t in &ssh.tunnels {
+                if let TunnelKind::Local { host_port: 0, .. }
+                | TunnelKind::Remote { host_port: 0, .. } = t.kind
+                {
+                    errors.push(ValidationError::TunnelTargetPort {
+                        profile: p.name.clone(),
+                        name: t.name.clone(),
+                    });
+                }
                 if t.bind().trim().is_empty() {
                     errors.push(ValidationError::EmptyTunnelBind {
                         profile: p.name.clone(),

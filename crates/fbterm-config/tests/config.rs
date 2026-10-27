@@ -866,3 +866,49 @@ fn tunnel_max_retries_defaults_clamps_and_writes() {
     assert_eq!(Settings::load(&path).unwrap().tunnel_max_retries, 7);
     assert!(SETTINGS_TEMPLATE.contains("#tunnel_max_retries = 10"));
 }
+
+#[test]
+fn blank_target_port_blocks_save() {
+    use fbterm_config::{StartMode, TunnelDef, TunnelKind, ValidationError};
+    let mut store = ProfileStore::default();
+    let mut p = Profile {
+        id: ProfileId::new(),
+        name: "web".into(),
+        group: None,
+        accent: None,
+        accent_style: Default::default(),
+        color_scheme: None,
+        kind: ProfileKind::Ssh(SshProfile {
+            host: "h".into(),
+            port: 22,
+            user: "u".into(),
+            auth: AuthMethod::Agent,
+            jump: vec![],
+            tunnels: vec![TunnelDef {
+                name: "db".into(),
+                kind: TunnelKind::Local {
+                    bind: "127.0.0.1".into(),
+                    port: 5432,
+                    host: "db".into(),
+                    host_port: 0,
+                },
+                start: StartMode::OnDemand,
+            }],
+        }),
+    };
+    store.profiles.push(p.clone());
+    assert_eq!(
+        store.validate(),
+        vec![ValidationError::TunnelTargetPort {
+            profile: "web".into(),
+            name: "db".into()
+        }]
+    );
+    if let ProfileKind::Ssh(s) = &mut p.kind
+        && let TunnelKind::Local { host_port, .. } = &mut s.tunnels[0].kind
+    {
+        *host_port = 5432;
+    }
+    store.profiles[0] = p;
+    assert!(store.validate().is_empty());
+}
