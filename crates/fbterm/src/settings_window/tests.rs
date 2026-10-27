@@ -239,11 +239,120 @@ fn blur_switch_disabled_when_unsupported() {
         assert!(!row.enabled);
         assert!(row.inert);
     }
+}
+
+#[test]
+fn the_windows_build_is_read_from_the_registry_output() {
+    use crate::chrome::windows_build;
+    let reg = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\r\n    \
+               CurrentBuildNumber    REG_SZ    22631\r\n\r\n";
+    assert_eq!(windows_build(reg), Some(22631));
     assert_eq!(
-        crate::chrome::windows_build("\r\nMicrosoft Windows [Version 10.0.22631.4317]\r\n"),
-        Some(22631)
+        windows_build("CurrentBuildNumber\tREG_SZ\t19045  \n"),
+        Some(19045)
     );
-    assert_eq!(crate::chrome::windows_build("garbage"), None);
+    // A missing value, another value, a wrong type or a non-number: unknown.
+    assert_eq!(windows_build(""), None);
+    assert_eq!(
+        windows_build(
+            "ERROR: The system was unable to find the specified registry key or value.\r\n"
+        ),
+        None
+    );
+    assert_eq!(
+        windows_build("    CurrentBuild    REG_SZ    22631\r\n"),
+        None
+    );
+    assert_eq!(
+        windows_build("    CurrentBuildNumber    REG_DWORD    0x5867\r\n"),
+        None
+    );
+    assert_eq!(
+        windows_build("    CurrentBuildNumber    REG_SZ    22631a\r\n"),
+        None
+    );
+    assert_eq!(windows_build("    CurrentBuildNumber    REG_SZ\r\n"), None);
+    assert_eq!(
+        windows_build("    CurrentBuildNumber    REG_SZ    22631 extra\r\n"),
+        None
+    );
+    // `ver` output (which is translated) is not read.
+    assert_eq!(
+        windows_build("Microsoft Windows [Version 10.0.22631.4317]"),
+        None
+    );
+}
+
+#[test]
+fn an_unsupported_blur_switch_cannot_be_toggled() {
+    use crate::app::Message;
+    use iced::advanced::layout::{self, Layout};
+    use iced::advanced::widget::{Operation, Tree};
+    use iced::advanced::{Shell, clipboard};
+    use iced::{Element, Event, Pixels, Point, Rectangle, Size, mouse};
+
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+        fn text(&mut self, _id: Option<&iced::advanced::widget::Id>, _b: Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let t = crate::theme::tokens(ThemeMode::Dark);
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let size = Size::new(560.0, 72.0);
+    // Lay the blur row out, click the switch at its right end: what does it publish and say?
+    let run = |supported: bool| -> (Vec<Message>, Vec<String>) {
+        let mut element: Element<'_, Message> = view::blur_setting(t, false, true, supported, 0.8);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        let bounds = node.bounds();
+        let mut texts = Texts(Vec::new());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        let at = Point::new(bounds.width - 16.0 - 9.0, bounds.height / 2.0);
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(size),
+        );
+        (messages, texts.0)
+    };
+    let (messages, texts) = run(true);
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [Message::Settings(SettingsMsg::Blur(true))]
+        ),
+        "{messages:?}"
+    );
+    assert!(
+        texts.iter().any(|x| x == "Applies to new windows"),
+        "{texts:?}"
+    );
+    let (messages, texts) = run(false);
+    assert!(messages.is_empty(), "{messages:?}");
+    assert!(
+        texts.iter().any(|x| x == "Not supported on this system"),
+        "{texts:?}"
+    );
 }
 
 #[test]

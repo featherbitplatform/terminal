@@ -302,7 +302,7 @@ fn desktop_layout() -> Option<String> {
 fn gsettings_button_layout() -> Option<String> {
     let mut command = std::process::Command::new("gsettings");
     command.args(["get", "org.gnome.desktop.wm.preferences", "button-layout"]);
-    probe_output(command, "gsettings")
+    probe_output(command, PROBE_TIMEOUT, "gsettings")
 }
 
 /// What this run draws, chosen once by [`init`] before the first window opens.
@@ -313,8 +313,6 @@ pub struct Setup {
     /// Whose conventions the drawn controls follow (look and default placement).
     pub look: Platform,
     pub controls: ControlsLayout,
-    /// Whether this system can blur what shows through a window ([`blur_supported`]).
-    pub blur: bool,
 }
 
 static SETUP: OnceLock<Setup> = OnceLock::new();
@@ -328,7 +326,6 @@ pub fn setup() -> &'static Setup {
             chrome: Chrome::for_platform(platform),
             look: platform,
             controls: controls_layout(platform, None),
-            blur: blur_supported(platform, &BlurProbe::default()),
         }
     })
 }
@@ -343,7 +340,7 @@ pub fn setup() -> &'static Setup {
 pub fn init() {
     let platform = Platform::current();
     // Blur is the real system's, also with the debug aid.
-    let blur = blur_supported(platform, &BlurProbe::read());
+    probe_blur(platform);
     let demo =
         crate::app::debug_env("FBTERM_DEMO_CHROME").and_then(|v| v.to_str().and_then(demo_chrome));
     let setup = match demo {
@@ -351,7 +348,6 @@ pub fn init() {
             chrome: Chrome::Drawn,
             look,
             controls: controls_layout(look, desktop.as_deref()),
-            blur,
         },
         None => {
             let chrome = Chrome::for_platform(platform);
@@ -363,16 +359,10 @@ pub fn init() {
                 chrome,
                 look: platform,
                 controls: controls_layout(platform, desktop.as_deref()),
-                blur,
             }
         }
     };
-    tracing::info!(
-        chrome = ?setup.chrome,
-        controls = ?setup.controls,
-        blur = setup.blur,
-        "window chrome"
-    );
+    tracing::info!(chrome = ?setup.chrome, controls = ?setup.controls, "window chrome");
     let _ = SETUP.set(setup);
 }
 
@@ -425,17 +415,53 @@ pub fn blur_supported(platform: Platform, probe: &BlurProbe) -> bool {
     }
 }
 
-/// The build number in the output of Windows' `ver` (`Microsoft Windows [Version
-/// 10.0.22631.4317]`).
+/// Whether this system can blur, once known (see [`blur_here`]).
+static BLUR: OnceLock<bool> = OnceLock::new();
+
+/// Whether this system can blur what shows through a window ([`blur_supported`]). Until the
+/// probe [`init`] starts has answered (Windows reads its build in the background) and in
+/// tests, it is what the platform alone says: macOS yes, the others no.
+pub fn blur_here() -> bool {
+    BLUR.get()
+        .copied()
+        .unwrap_or_else(|| blur_supported(Platform::current(), &BlurProbe::default()))
+}
+
+/// Find out whether this system can blur: at once where that only takes reading the
+/// environment, on a background thread on Windows (a registry query), so startup never waits.
+fn probe_blur(platform: Platform) {
+    if platform == Platform::Windows {
+        let spawned = std::thread::Builder::new()
+            .name("blur-probe".into())
+            .spawn(move || {
+                let _ = BLUR.set(blur_supported(platform, &BlurProbe::read()));
+            });
+        if spawned.is_err() {
+            let _ = BLUR.set(false);
+        }
+    } else {
+        let _ = BLUR.set(blur_supported(platform, &BlurProbe::read()));
+    }
+}
+
+/// The build number in the output of `reg query "HKLM\SOFTWARE\Microsoft\Windows
+/// NT\CurrentVersion" /v CurrentBuildNumber`: the line `CurrentBuildNumber    REG_SZ
+/// 22631`, the same in every system language. Anything else (a missing value, another type,
+/// a value that is not a whole number) gives `None`.
 #[cfg(any(test, target_os = "windows"))]
-pub fn windows_build(ver: &str) -> Option<u32> {
-    let (_, rest) = ver.split_once("Version ")?;
-    let version = rest.split(']').next()?.trim();
-    version.split('.').nth(2)?.parse().ok()
+pub fn windows_build(reg: &str) -> Option<u32> {
+    reg.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (name, kind, value) = (fields.next()?, fields.next()?, fields.next()?);
+        let digits = !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit());
+        (name == "CurrentBuildNumber" && kind == "REG_SZ" && digits && fields.next().is_none())
+            .then(|| value.parse().ok())
+            .flatten()
+    })
 }
 
 impl BlurProbe {
-    /// This system's (on Windows `ver` runs once, given at most `PROBE_TIMEOUT`).
+    /// This system's (on Windows a registry query, given at most `WINDOWS_PROBE_TIMEOUT`).
     fn read() -> Self {
         #[cfg(target_os = "linux")]
         {
@@ -467,14 +493,22 @@ fn is_kde() -> bool {
         .is_ok_and(|d| d.split(':').any(|d| d.eq_ignore_ascii_case("kde")))
 }
 
-/// How long a desktop or system query at startup may take.
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+/// How long the desktop query at startup may take (it runs before the first window opens).
+#[cfg(target_os = "linux")]
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
 
-/// The output of `command`, or `None` if it fails or takes longer than `PROBE_TIMEOUT`
-/// (then it is killed).
+/// How long the Windows build query may take (it runs in the background).
+#[cfg(target_os = "windows")]
+const WINDOWS_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The output of `command`, or `None` if it fails or takes longer than `timeout` (then it is
+/// killed).
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-fn probe_output(mut command: std::process::Command, what: &str) -> Option<String> {
+fn probe_output(
+    mut command: std::process::Command,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Option<String> {
     use std::io::Read;
     use std::process::Stdio;
     use std::time::{Duration, Instant};
@@ -484,7 +518,7 @@ fn probe_output(mut command: std::process::Command, what: &str) -> Option<String
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -502,14 +536,21 @@ fn probe_output(mut command: std::process::Command, what: &str) -> Option<String
     status.success().then_some(out)
 }
 
-/// Windows' build number, from `cmd /c ver` (no console window).
+/// Windows' build number, from the registry through `reg query` (no console window).
 #[cfg(target_os = "windows")]
 fn read_windows_build() -> Option<u32> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut command = std::process::Command::new("cmd");
-    command.args(["/c", "ver"]).creation_flags(CREATE_NO_WINDOW);
-    probe_output(command, "ver")
+    let mut command = std::process::Command::new("reg");
+    command
+        .args([
+            "query",
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "/v",
+            "CurrentBuildNumber",
+        ])
+        .creation_flags(CREATE_NO_WINDOW);
+    probe_output(command, WINDOWS_PROBE_TIMEOUT, "reg query")
         .as_deref()
         .and_then(windows_build)
 }
@@ -804,6 +845,46 @@ pub fn fall_back_to_system<T: Send + 'static>(
     open: impl IntoIterator<Item = window::Id>,
 ) -> Option<iced::Task<T>> {
     use_chrome(cell, Chrome::Native, open)
+}
+
+/// The chrome each window was opened with, until the app sees it open (see
+/// [`take_created`]).
+static CREATED: std::sync::Mutex<Vec<(window::Id, Chrome)>> = std::sync::Mutex::new(Vec::new());
+
+/// Note that window `id` was opened with `chrome`'s window settings.
+pub fn record_created(id: window::Id, chrome: Chrome) {
+    if let Ok(mut created) = CREATED.lock() {
+        created.push((id, chrome));
+    }
+}
+
+/// The chrome window `id` was opened with, once (`None` if not recorded or already taken).
+pub fn take_created(id: window::Id) -> Option<Chrome> {
+    let mut created = CREATED.lock().ok()?;
+    let i = created.iter().position(|(w, _)| *w == id)?;
+    Some(created.swap_remove(i).1)
+}
+
+/// Open a window from `base` with the chrome in use now, noting which (a switch can come
+/// before the window has opened; the app then fixes its decorations).
+pub fn open_window(base: window::Settings) -> (window::Id, iced::Task<window::Id>) {
+    open_window_as(Chrome::current(), base)
+}
+
+/// [`open_window`] with `chrome`, the chrome in use the caller already read.
+pub fn open_window_as(
+    chrome: Chrome,
+    base: window::Settings,
+) -> (window::Id, iced::Task<window::Id>) {
+    let (id, open) = window::open(chrome.window_settings(base));
+    record_created(id, chrome);
+    (id, open)
+}
+
+/// Whether a window opened with `made` needs its decorations toggled to suit `now`.
+pub fn needs_toggle(made: Chrome, now: Chrome) -> bool {
+    let switchable = |c: Chrome| matches!(c, Chrome::Drawn | Chrome::Native);
+    made != now && switchable(made) && switchable(now)
 }
 
 /// How a terminal window is created for a background opacity and blur setting.

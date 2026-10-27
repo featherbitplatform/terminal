@@ -27,13 +27,15 @@ fn msg(m: SettingsMsg) -> Message {
 }
 
 /// `notice`: the banner line about `settings.toml` (a load error or clamped values), if any.
-/// `secrets`: what the `Saved secrets` section shows.
+/// `secrets`: what the `Saved secrets` section shows. `chrome_fell_back`: the desktop refused
+/// drawn chrome this session (the `Title bar` row then shows `System`).
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SettingsState,
     schemes: Vec<SchemeChoice>,
     notice: Option<&'a str>,
     secrets: SectionInfo,
+    chrome_fell_back: bool,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut body = column![
@@ -55,7 +57,7 @@ pub fn view<'a>(
         .push(section(
             t,
             "Appearance",
-            appearance(t, state, schemes, editable),
+            appearance(t, state, schemes, editable, chrome_fell_back),
         ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
         .push(section(t, "Tunnels", tunnels(t, state, editable)))
@@ -207,6 +209,7 @@ fn appearance<'a>(
     state: &'a SettingsState,
     schemes: Vec<SchemeChoice>,
     editable: bool,
+    chrome_fell_back: bool,
 ) -> Vec<Element<'a, Message>> {
     let v = &state.values;
     let theme = row![
@@ -302,7 +305,6 @@ fn appearance<'a>(
     ]
     .spacing(10)
     .align_y(Alignment::Center);
-    let blur = blur_row(chrome::setup().blur, v.background_opacity);
     let mut rows = vec![
         setting(t, "Theme", None, false, theme),
         setting(t, "Font family", None, false, fonts),
@@ -315,32 +317,27 @@ fn appearance<'a>(
             false,
             opacity,
         ),
-        setting(
+        blur_setting(
             t,
-            "Background blur",
-            Some(blur.hint),
-            blur.inert,
-            switch(
-                t,
-                v.background_blur,
-                editable && blur.enabled,
-                blur.inert,
-                SettingsMsg::Blur,
-            ),
+            v.background_blur,
+            editable,
+            chrome::blur_here(),
+            v.background_opacity,
         ),
     ];
     if shows_title_bar_row(chrome::setup().look) {
+        let shown = title_bar_shown(v.window_decorations, chrome_fell_back);
         let title_bar = row![
             segment(
                 t,
                 "fbterm",
-                v.window_decorations == WindowDecorations::Fbterm,
+                shown == WindowDecorations::Fbterm,
                 editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::Fbterm))),
             ),
             segment(
                 t,
                 "System",
-                v.window_decorations == WindowDecorations::System,
+                shown == WindowDecorations::System,
                 editable.then(|| msg(SettingsMsg::TitleBar(WindowDecorations::System))),
             ),
         ]
@@ -349,6 +346,42 @@ fn appearance<'a>(
         rows.push(setting(t, "Title bar", None, false, title_bar));
     }
     rows
+}
+
+/// The `Background blur` row: the switch for `on`, usable only when `editable` and the system
+/// can blur (`supported`), with the hint for `opacity` (see [`blur_row`]).
+pub(super) fn blur_setting<'a>(
+    t: &'static Tokens,
+    on: bool,
+    editable: bool,
+    supported: bool,
+    opacity: f32,
+) -> Element<'a, Message> {
+    let blur = blur_row(supported, opacity);
+    setting(
+        t,
+        "Background blur",
+        Some(blur.hint),
+        blur.inert,
+        switch(
+            t,
+            on,
+            editable && blur.enabled,
+            blur.inert,
+            SettingsMsg::Blur,
+        ),
+    )
+}
+
+/// What the `Title bar` row shows as chosen: what is on screen. After the desktop refused
+/// drawn chrome that is `System` even though the setting stays `"fbterm"`, so one click on
+/// `fbterm` tries drawn chrome again.
+pub fn title_bar_shown(setting: WindowDecorations, fell_back: bool) -> WindowDecorations {
+    if fell_back {
+        WindowDecorations::System
+    } else {
+        setting
+    }
 }
 
 /// Whether the Settings window offers the `Title bar` choice: only where windows follow

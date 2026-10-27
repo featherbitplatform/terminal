@@ -4,9 +4,15 @@
 //!
 //! A request is refused when, within [`ANSWER_TIME`] of it, the window neither moved nor
 //! resized while the pointer travelled more than [`TRAVEL`] over the window with the button
-//! still held. While a desktop carries a move out it holds the pointer (fbterm sees no motion)
-//! or the window follows it, so travel over an unmoved window means nothing happened. A press
-//! let go in place, or one that stays still, is no evidence either way.
+//! still held, and the pointer never left the window before that travel.
+//!
+//! A desktop that carries a request out takes the pointer for it: the pointer leaves the
+//! window when the move starts and enters it again when it ends, and the button release goes
+//! to the desktop, so fbterm never sees it. A leave while the button is held and before any
+//! travel is therefore an answer, and after any leave or enter travel no longer counts (the
+//! button may have been let go unseen). A desktop that refuses never takes the pointer, so its
+//! travel is seen before the pointer can leave. A press let go in place, or one that stays
+//! still, is no evidence either way.
 //!
 //! The decision is a pure state machine over the events the app feeds it and the time it is
 //! given; the app checks it once, from a one-shot timer started with the request.
@@ -33,6 +39,10 @@ pub enum Seen {
     Cursor(Point),
     /// The left button was let go.
     Released,
+    /// The pointer left the window (the desktop took it, or it moved off).
+    Left,
+    /// The pointer entered the window (the desktop gave it back).
+    Entered,
     WindowMoved,
     WindowResized,
 }
@@ -66,6 +76,8 @@ struct Pending {
     /// Where the pointer first was after the request.
     origin: Option<Point>,
     held: bool,
+    /// The pointer left or entered the window since the request: travel no longer counts.
+    crossed: bool,
     travelled: bool,
     answered: bool,
 }
@@ -82,6 +94,7 @@ impl MoveWatch {
             started: now,
             origin: None,
             held: true,
+            crossed: false,
             travelled: false,
             answered: false,
         });
@@ -100,7 +113,7 @@ impl MoveWatch {
             return;
         };
         match what {
-            Seen::Cursor(at) if p.held => match p.origin {
+            Seen::Cursor(at) if p.held && !p.crossed => match p.origin {
                 None => p.origin = Some(at),
                 Some(o) => {
                     let (dx, dy) = (at.x - o.x, at.y - o.y);
@@ -111,6 +124,14 @@ impl MoveWatch {
             },
             Seen::Cursor(_) => {}
             Seen::Released => p.held = false,
+            Seen::Left => {
+                if p.held && !p.travelled {
+                    // The desktop took the pointer: it is carrying the request out.
+                    p.answered = true;
+                }
+                p.crossed = true;
+            }
+            Seen::Entered => p.crossed = true,
             Seen::WindowMoved | Seen::WindowResized => p.answered = true,
         }
     }
@@ -143,6 +164,8 @@ pub(crate) fn watch_event(
     let seen = match event {
         Event::Mouse(mouse::Event::CursorMoved { position }) => Seen::Cursor(position),
         Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => Seen::Released,
+        Event::Mouse(mouse::Event::CursorLeft) => Seen::Left,
+        Event::Mouse(mouse::Event::CursorEntered) => Seen::Entered,
         Event::Window(window::Event::Moved(_)) => Seen::WindowMoved,
         Event::Window(window::Event::Resized(_)) => Seen::WindowResized,
         _ => return None,
@@ -342,24 +365,78 @@ mod tests {
         );
     }
 
-    fn app() -> App {
-        let dir = std::env::temp_dir().join(format!(
-            "fbterm-move-watch-test-{}",
-            fbterm_config::ProfileId::new()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let (mut app, _) = App::build(fbterm_config::Paths { config_dir: dir }, true);
+    /// An app on a temporary config folder (removed when the returned guard drops).
+    fn app() -> (App, tempfile::TempDir) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = fbterm_config::Paths {
+            config_dir: dir.path().to_path_buf(),
+        };
+        let (mut app, _) = App::build(paths, true);
         // A Linux run with drawn chrome, whatever system the test runs on.
         app.chrome = Box::leak(Box::new(ChromeCell::starting(Chrome::Drawn)));
         app.chrome_base = (chrome::Platform::Linux, Chrome::Drawn);
         app.watch_moves = true;
-        app
+        (app, dir)
+    }
+
+    #[test]
+    fn a_granted_move_never_counts_as_refused() {
+        let t0 = Instant::now();
+        let w = window::Id::unique();
+        let mut watch = MoveWatch::default();
+        // The desktop takes the pointer for the move (it leaves the window) and gives it back
+        // when the move ends; the release went to the desktop. Then the pointer travels.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Left);
+        watch.seen(w, Seen::Entered);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Answered);
+
+        // A click on the bar: the release is unseen, the pointer comes back and moves on
+        // into the terminal.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Entered);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 200.0)));
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Answered);
+    }
+
+    #[test]
+    fn x11_click_without_move_and_edge_click_are_answered() {
+        let t0 = Instant::now();
+        let w = window::Id::unique();
+        let mut watch = MoveWatch::default();
+        // X11: the window manager grabs the pointer on the request (leave), the click ends
+        // without moving the window (no Moved), the pointer comes back and travels.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Left);
+        watch.seen(w, Seen::Entered);
+        watch.seen(w, Seen::Cursor(Point::new(300.0, 20.0)));
+        watch.seen(w, Seen::Cursor(Point::new(300.0, 80.0)));
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Answered);
+        // A click on a resize edge: the same, with no Resized.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(799.0, 300.0)));
+        watch.seen(w, Seen::Left);
+        watch.seen(w, Seen::Entered);
+        watch.seen(w, Seen::Cursor(Point::new(760.0, 300.0)));
+        watch.seen(w, Seen::Cursor(Point::new(700.0, 320.0)));
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Answered);
+        // A refusing desktop never takes the pointer: travel first, then the pointer may
+        // leave the window it could not move. Still refused.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));
+        watch.seen(w, Seen::Left);
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Refused);
     }
 
     #[test]
     fn the_app_falls_back_once_and_the_setting_switches_back() {
         use crate::settings_window::SettingsMsg;
-        let mut app = app();
+        let (mut app, _dir) = app();
         let (w, other) = (window::Id::unique(), window::Id::unique());
         let _ = app.update(Message::AnyWindowOpened(w));
         let _ = app.update(Message::AnyWindowOpened(other));
@@ -417,5 +494,36 @@ mod tests {
             1
         );
         assert_eq!(app.chrome.get(), Chrome::Native);
+        // The Title bar row shows what is on screen, so one click on fbterm tries again.
+        use crate::settings_window::view::title_bar_shown;
+        assert_eq!(
+            title_bar_shown(app.settings.window_decorations, app.chrome_fell_back),
+            WindowDecorations::System
+        );
+        let _ = app.update(Message::Settings(SettingsMsg::TitleBar(
+            WindowDecorations::Fbterm,
+        )));
+        assert_eq!(app.chrome.get(), Chrome::Drawn);
+        assert!(!app.chrome_fell_back);
+        assert_eq!(
+            title_bar_shown(app.settings.window_decorations, app.chrome_fell_back),
+            WindowDecorations::Fbterm
+        );
+    }
+
+    #[test]
+    fn a_window_opened_across_a_switch_gets_the_current_decorations() {
+        let (mut app, _dir) = app();
+        let (late, fine) = (window::Id::unique(), window::Id::unique());
+        // Opened while drawn; the switch to the system title bar came before it was shown.
+        chrome::record_created(late, Chrome::Drawn);
+        chrome::record_created(fine, Chrome::Native);
+        let _ = app.fall_back_to_system_chrome();
+        assert_eq!(app.chrome.get(), Chrome::Native);
+        assert_eq!(app.update(Message::AnyWindowOpened(late)).units(), 1);
+        assert_eq!(app.update(Message::AnyWindowOpened(fine)).units(), 0);
+        assert!(app.open_windows.contains(&late) && app.open_windows.contains(&fine));
+        // Recorded once: a second report changes nothing.
+        assert_eq!(app.update(Message::AnyWindowOpened(late)).units(), 0);
     }
 }

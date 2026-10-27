@@ -10,7 +10,6 @@ use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
 use iced::{Task, window};
 
 use crate::app::{App, Message};
-use crate::chrome::Chrome;
 use crate::palette::{Fuzzy, PaletteItem};
 use crate::tunnels::Tunnels;
 
@@ -269,12 +268,12 @@ impl App {
                 iced::widget::operation::focus(input),
             ]);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(640.0, 560.0),
             min_size: Some(iced::Size::new(460.0, 320.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         let state = TunnelsState {
             query: String::new(),
             input: iced::widget::Id::unique(),

@@ -904,7 +904,9 @@ impl App {
                         self.settings.background_opacity,
                         self.settings.background_blur,
                     );
-                    let blur = if backdrop.blur && chrome::setup().blur {
+                    // Not gated on `blur_here`: on Windows its probe may still run when the
+                    // first window opens, and a build without backdrops refuses harmlessly.
+                    let blur = if backdrop.blur {
                         chrome::system_backdrop(id)
                     } else {
                         Task::none()
@@ -921,7 +923,14 @@ impl App {
             }
             Message::AnyWindowOpened(id) => {
                 self.open_windows.insert(id);
-                Task::none()
+                // The chrome switched after this window was asked for: give it the current
+                // decorations, as the switch gave every window already open.
+                match chrome::take_created(id) {
+                    Some(made) if chrome::needs_toggle(made, self.chrome.get()) => {
+                        window::toggle_decorations(id)
+                    }
+                    _ => Task::none(),
+                }
             }
             Message::WindowVisible(id, visible) => {
                 if visible {

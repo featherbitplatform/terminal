@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use fbterm_config::Settings;
+use fbterm_config::{Settings, WindowDecorations};
 use fbterm_term::{ColorScheme, TerminalStyle};
 use iced::{Font, Task, window};
 use parking_lot::Mutex;
@@ -104,6 +104,15 @@ impl App {
             }
             SettingsMsg::SecretStorage(choice) => self.choose_secret_storage(choice),
             SettingsMsg::ResetVault => self.ask_reset_vault(),
+            // The row shows `System` after the desktop refused drawn chrome while the setting
+            // stays "fbterm": choosing fbterm tries drawn chrome again (nothing to write).
+            SettingsMsg::TitleBar(WindowDecorations::Fbterm)
+                if self.chrome_fell_back
+                    && self.settings.window_decorations == WindowDecorations::Fbterm =>
+            {
+                self.chrome_fell_back = false;
+                self.reapply_chrome()
+            }
             other => {
                 // Locking every open terminal is only worth it for what reads the answer: a typed
                 // or submitted scrollback, and the debounce of a lowered one held back.
@@ -159,12 +168,12 @@ impl App {
         if let Some(id) = self.settings_window() {
             return window::gain_focus(id);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(640.0, 720.0),
             min_size: Some(iced::Size::new(520.0, 420.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         let read_only = Settings::load(&self.paths.settings()).err();
         let mut state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
         state.display_hz = self.display_hz();

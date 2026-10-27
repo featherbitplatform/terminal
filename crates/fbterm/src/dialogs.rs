@@ -6,7 +6,6 @@ use fbterm_config::{AuthMethod, ProfileId, ProfileKind};
 use iced::{Task, window};
 
 use crate::app::{App, Delivered, Message, load_profiles};
-use crate::chrome::Chrome;
 use crate::editor::{EditorMsg, EditorState, SaveError, SecretResults, run_secret_ops};
 use crate::file_panel::ClashAnswer;
 use crate::prompts::{
@@ -70,12 +69,12 @@ impl App {
         if let Some(id) = self.editor_window() {
             return window::gain_focus(id);
         }
-        let (id, open) = window::open(Chrome::current().window_settings(window::Settings {
+        let (id, open) = crate::chrome::open_window(window::Settings {
             size: iced::Size::new(920.0, 720.0),
             min_size: Some(iced::Size::new(640.0, 420.0)),
             exit_on_close_request: false,
             ..window::Settings::default()
-        }));
+        });
         let state = EditorState::new(
             &self.profiles,
             self.secrets.clone(),
