@@ -38,6 +38,16 @@ A profile with an `accent` marks its tabs in one of two ways, chosen with **Colo
 
 Without an accent, both look the same: a plain tab. The tint follows the background opacity like the rest of the tab bar.
 
+## Duplicating a profile
+
+**Duplicate** at the bottom of the profile editor saves a copy of the selected profile at once and opens it, with the name field ready for a new name. The palette action **Duplicate profile** does the same for the focused pane's profile (in the profile editor, for the selected one) and opens the editor on the copy; it has no shortcut by default, and can be given one as `duplicate_profile` (see [Keyboard shortcuts](keyboard-shortcuts#the-keys-table)).
+
+The copy gets a new `id` and every other setting of the original: group, accent, color scheme, host, port, user, authentication and key path, jump hosts and tunnels, or the program, arguments, working directory and environment of a local profile. Only the name changes: `<name> copy`, or `<name> copy 2`, `<name> copy 3` and so on when that name is taken. It is listed right after the original.
+
+The copy also gets the original's [saved](saved-secrets) password or key passphrase. When they are in a locked vault, **Unlock saved secrets** asks first; cancelling still makes the copy, without them, and the editor says `Duplicated without its saved secrets: they are locked.`
+
+Duplicate copies the saved profile, so it is refused while the editor has unsaved changes (`Unsaved changes: save or discard them before duplicating.`), and while `profiles.toml` cannot be read.
+
 ## Local profiles (`kind = "local"`)
 
 | Field | Type | Default | Meaning |

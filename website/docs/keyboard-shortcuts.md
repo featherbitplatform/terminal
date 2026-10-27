@@ -107,6 +107,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Find in all tabs | Open the search over every tab. |
 | Find in this tab | Open the same search restricted to the panes of the current tab. |
 | Edit profiles | Open the profile editor. |
+| Duplicate profile | Save a copy of the focused pane's profile (in the profile editor, of the selected one) and open it in the editor; see [Duplicating a profile](profiles#duplicating-a-profile). It has no shortcut by default. |
 | Settings | Open the Settings window. |
 | Tunnels | Open the [Tunnels](tunnels) window. It has no shortcut by default. |
 | File panel | Show or hide the [file panel](file-panel) beside the focused pane's terminal. |
@@ -167,6 +168,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `new_tab`, `close_tab`, `next_tab`, `previous_tab` | New tab, close pane (the tab when it is the last), next and previous tab |
 | `export_tab` | Export tab to file (no default shortcut) |
 | `export_profiles`, `import_profiles` | Export and import profiles (no default shortcuts) |
+| `duplicate_profile` | Duplicate profile (no default shortcut) |
 | `split_right`, `split_down`, `maximize_pane` | Split the focused pane, maximize it |
 | `focus_left`, `focus_right`, `focus_up`, `focus_down` | Move focus to the neighbouring pane |
 | `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |
