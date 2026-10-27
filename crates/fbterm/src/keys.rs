@@ -104,8 +104,8 @@ impl Press {
     }
 
     /// The press of `key` (iced's `key`), `modified_key` (with modifiers applied) at `physical`
-    /// in `location`. `num_lock` is the Num Lock state where the system reports it
-    /// ([`num_lock`]: Windows), `None` elsewhere.
+    /// in `location`. `num_lock` gives the Num Lock state where the system reports it
+    /// ([`num_lock`]: Windows), `None` elsewhere; it is asked only for a numpad key.
     ///
     /// With Num Lock on, Windows reports a numpad digit wrongly twice over: the key without
     /// modifiers is worked out as if Num Lock were off (Numpad1 is End), and Shift turns Num
@@ -118,10 +118,10 @@ impl Press {
         physical: Physical,
         location: Location,
         mods: Modifiers,
-        num_lock: Option<bool>,
+        num_lock: impl FnOnce() -> Option<bool>,
     ) -> Self {
         let plain = Self::plain(key.clone(), mods);
-        if location != Location::Numpad || num_lock != Some(true) {
+        if location != Location::Numpad || num_lock() != Some(true) {
             return plain;
         }
         let Some(digit) = numpad_digit(physical) else {
@@ -711,7 +711,7 @@ mod tests {
                 Physical::Code(code),
                 Location::Numpad,
                 Modifiers::CTRL,
-                Some(true),
+                || Some(true),
             );
             assert_eq!(p.chord_key, digit(i), "{code:?}");
             assert_eq!(p.chord_mods, Modifiers::CTRL | Modifiers::SHIFT, "{code:?}");
@@ -733,7 +733,7 @@ mod tests {
                 Physical::Code(code),
                 Location::Numpad,
                 Modifiers::CTRL,
-                Some(true),
+                || Some(true),
             );
             assert_eq!(p.chord_key, digit(i), "{code:?}");
             assert_eq!(p.chord_mods, Modifiers::CTRL, "{code:?}");
@@ -751,7 +751,7 @@ mod tests {
                     Physical::Code(code),
                     Location::Numpad,
                     mods,
-                    Some(false),
+                    || Some(false),
                 );
                 assert_eq!((p.chord_key, p.chord_mods), (nav, mods), "{code:?}");
             }
@@ -769,10 +769,38 @@ mod tests {
                 Physical::Code(Code::Insert),
                 Location::Standard,
                 ctrl_shift,
-                num_lock,
+                || num_lock,
             );
             assert_eq!((p.chord_key, p.chord_mods), (insert.clone(), ctrl_shift));
         }
+    }
+
+    #[test]
+    fn num_lock_is_asked_only_for_numpad_keys() {
+        let insert = Key::Named(Named::Insert);
+        let asked = std::cell::Cell::new(0);
+        let num_lock = || {
+            asked.set(asked.get() + 1);
+            Some(true)
+        };
+        let _ = Press::new(
+            &insert,
+            &insert,
+            Physical::Code(Code::Insert),
+            Location::Standard,
+            Modifiers::CTRL,
+            num_lock,
+        );
+        assert_eq!(asked.get(), 0);
+        let _ = Press::new(
+            &insert,
+            &insert,
+            Physical::Code(Code::Numpad0),
+            Location::Numpad,
+            Modifiers::CTRL,
+            num_lock,
+        );
+        assert_eq!(asked.get(), 1);
     }
 
     #[test]
@@ -786,7 +814,7 @@ mod tests {
             Physical::Code(Code::Numpad1),
             Location::Numpad,
             Modifiers::LOGO,
-            None,
+            || None,
         );
         assert_eq!((p.chord_key, p.chord_mods), (one, Modifiers::LOGO));
         let end = Key::Named(Named::End);
@@ -796,7 +824,7 @@ mod tests {
             Physical::Code(Code::Numpad1),
             Location::Numpad,
             Modifiers::CTRL,
-            None,
+            || None,
         );
         assert_eq!((p.chord_key, p.chord_mods), (end, Modifiers::CTRL));
     }

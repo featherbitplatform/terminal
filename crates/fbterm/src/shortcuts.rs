@@ -462,7 +462,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
                     *physical_key,
                     *location,
                     *modifiers,
-                    keys::num_lock(),
+                    keys::num_lock,
                 ),
                 *repeat,
                 text.as_deref(),
@@ -1305,7 +1305,7 @@ mod tests {
             Physical::Code(Code::Numpad1),
             keyboard::Location::Numpad,
             keyboard::Modifiers::CTRL,
-            Some(true),
+            || Some(true),
         );
         let Some(Some(Message::Settings(SettingsMsg::Pressed(Some(c))))) =
             press_message(&b, Mode::Recording, w, &press, false, None)
