@@ -3,12 +3,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
 use fbterm_config::{
     ConfigError, Paths, ProfileId, ProfileKind, ProfileStore, SavedState, Settings, discover_shells,
 };
 use fbterm_secrets::{FallbackStore, MemoryStore, SecretStore};
+use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
 use fbterm_session::ssh::{SshContext, SshPool};
 use fbterm_session::{EventSink, SessionEvent, SessionHandle, SessionId};
 use fbterm_term::{GridSize, SearchOutcome, TerminalOutput, TerminalStyle};
@@ -29,10 +31,13 @@ use crate::prompts::{
     PromptEvent, PromptMsg, PromptQueues, PromptReceiver, UiPrompter, prompt_stream,
 };
 use crate::restore;
+use crate::schemes_window::{SchemesMsg, SchemesState};
 use crate::sessions::{EventReceiver, session_stream, write_notice};
 use crate::settings_window::{SettingsMsg, SettingsState};
 use crate::tabs::{Pane, TabState, WindowState};
 use crate::theme;
+use crate::tunnels::{Tunnels, tunnel_stream};
+use crate::tunnels_window::{TunnelsMsg, TunnelsState};
 use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
 
@@ -43,6 +48,8 @@ pub enum TabBarMsg {
     Close(usize),
     New,
     Profiles,
+    /// The tunnels indicator: opens the Tunnels window.
+    Tunnels,
     Settings,
 }
 
@@ -148,6 +155,10 @@ pub enum Message {
     },
     Editor(EditorMsg),
     Settings(SettingsMsg),
+    /// The Color schemes window.
+    Schemes(SchemesMsg),
+    /// The Tunnels window.
+    Tunnels(TunnelsMsg),
     /// Exporting a tab to a file.
     Export(crate::export::ExportMsg),
     Prompt(PromptMsg),
@@ -163,8 +174,12 @@ pub enum Message {
     WindowMode(window::Id, window::Mode),
     /// The quiet period after a resize passed; saves if no newer resize happened (its count).
     SaveState(u64),
-    /// `profiles.toml` and/or `settings.toml` changed on disk.
+    /// `profiles.toml`, `settings.toml` and/or a file in `schemes/` changed on disk.
     ConfigChanged(Changed),
+    /// A tunnel's state changed (see [`crate::tunnels`]).
+    Tunnel(TunnelKey, TunnelState),
+    /// The file panel (see [`crate::file_panel`]).
+    FilePanel(crate::file_panel::FilePanelMsg),
 }
 
 /// Where a settings change came from. The scrollback notice is for edits made in
@@ -191,6 +206,8 @@ pub(crate) enum ShotWindow {
     Terminal,
     Editor,
     Settings,
+    Schemes,
+    Tunnels,
 }
 
 pub struct App {
@@ -208,6 +225,14 @@ pub struct App {
     pub(crate) secrets: Arc<dyn fbterm_secrets::SecretStore>,
     pub(crate) fallback: Option<Arc<FallbackStore>>,
     pub(crate) pool: Arc<SshPool>,
+    /// Every tunnel that has run, with its state (see [`crate::tunnels`]).
+    pub(crate) tunnels: Tunnels,
+    /// `tunnel_max_retries`, shared with running tunnels so a change applies to them at once.
+    pub(crate) tunnel_retries: Arc<AtomicU32>,
+    /// The file panel of every window (see [`crate::file_panel`]).
+    pub(crate) file_panels: crate::file_panel::FilePanels,
+    /// The file panel's background work: opening SFTP sessions and reading folders.
+    pub(crate) file_panel_work: crate::file_panel::Work,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
     pub(crate) visibility: visibility::Changes,
@@ -227,6 +252,9 @@ pub struct App {
     pub(crate) resize_generation: u64,
     /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
+    /// The terminal window that last had focus: where questions go while another of our
+    /// windows (the Tunnels window, say) has it.
+    pub(crate) last_terminal: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
     /// The tab or tile being dragged, and in which window.
@@ -241,6 +269,10 @@ pub struct App {
     pub editor: Option<(window::Id, EditorState)>,
     /// The Settings window, when open.
     pub settings_win: Option<(window::Id, SettingsState)>,
+    /// The Color schemes window, when open.
+    pub schemes_win: Option<(window::Id, SchemesState)>,
+    /// The Tunnels window, when open.
+    pub tunnels_win: Option<(window::Id, TunnelsState)>,
     /// Connection dialogs waiting per window.
     pub prompts: PromptQueues,
     pub(crate) prompt_tx: tokio::sync::mpsc::UnboundedSender<PromptEvent>,
@@ -253,6 +285,9 @@ pub struct App {
     /// The app is quitting: windows closing from now on are not the user dropping them, so
     /// the layout saved at quit must stay as it is.
     pub(crate) quitting: bool,
+    /// macOS: `Cmd+Q` is taken from the app menu's Quit (while transfers run, so the key
+    /// reaches the app's Quit, which asks first); see [`App::sync_quit_key`].
+    pub(crate) quit_key_free: bool,
     /// Windows we asked to close. A window that closes without being asked is the OS tearing
     /// the app down (macOS Cmd+Q from the menu): that is a quit too.
     pub(crate) closing: std::collections::HashSet<window::Id>,
@@ -268,6 +303,12 @@ pub struct App {
     pub(crate) settings_seen: Option<String>,
     /// The banner line for a `settings.toml` that failed to load.
     pub(crate) settings_notice: Option<String>,
+    /// Every color scheme: the built-ins and the files in `schemes/`.
+    pub schemes: fbterm_config::schemes::SchemeSet,
+    /// The scheme files that did not load, as banner lines.
+    pub(crate) scheme_errors: Vec<String>,
+    /// The banner lines about schemes now in `notices` (see `App::refresh_scheme_notices`).
+    pub(crate) scheme_notices: Vec<String>,
     /// Terminals of tabs the user closed that a session task still holds; the release is
     /// requested when `SessionEvent::Released` shows the last holder let go (`windows.rs`).
     pub(crate) pending_release: Vec<Vec<crate::memory::WeakTerminal>>,
@@ -277,11 +318,12 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings` (debug aid): capture that window instead.
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels` (debug aid): capture that
+    /// window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
-    /// `FBTERM_DEMO_TOOLTIP=new|profiles|close` (debug aid): that tab-bar button's tooltip always
-    /// shows.
+    /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close` (debug aid): that tab-bar
+    /// button's tooltip always shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
     /// `FBTERM_SCALE` (debug aid): extra UI scale on top of the OS's, e.g. 0.625 on a 2x
     /// screen for a fractional 1.25 physical scale. 1.0 otherwise.
@@ -411,6 +453,7 @@ impl App {
         } else {
             restore::plan(&saved, &profiles)
         };
+        let (schemes, scheme_errors) = crate::schemes::load(&paths.schemes());
         let profiles_seen = std::fs::read_to_string(paths.profiles()).ok();
         let settings_seen = std::fs::read_to_string(paths.settings()).ok();
 
@@ -433,7 +476,15 @@ impl App {
 
         let style = crate::settings_window::terminal_style(&settings);
         let (events, rx) = unbounded_channel();
+        let tunnel_retries = Arc::new(AtomicU32::new(settings.tunnel_max_retries));
         let mut app = Self {
+            tunnels: Tunnels::new(pool.clone()),
+            file_panels: crate::file_panel::FilePanels::new(
+                saved.file_panel_width,
+                saved.file_panel_show_hidden.unwrap_or(true),
+            ),
+            file_panel_work: crate::file_panel::Work::new(pool.clone()),
+            tunnel_retries,
             bindings: Bindings::current(&settings.keys.map),
             theme: theme::graphite_theme(settings.theme),
             tokens: theme::tokens(settings.theme),
@@ -458,6 +509,7 @@ impl App {
             pending_resizes: HashMap::new(),
             resize_generation: 0,
             focused: None,
+            last_terminal: None,
             palettes: Palettes::new(),
             carry: None,
             hover: None,
@@ -465,6 +517,8 @@ impl App {
             find_box: None,
             editor: None,
             settings_win: None,
+            schemes_win: None,
+            tunnels_win: None,
             prompts: PromptQueues::default(),
             prompt_tx,
             prompt_rx: PromptReceiver(Arc::new(Mutex::new(Some(prompt_rx)))),
@@ -474,6 +528,7 @@ impl App {
                 && debug_env("FBTERM_SCREENSHOT").is_none()
                 && crate::perf::opts().is_none(),
             quitting: false,
+            quit_key_free: false,
             closing: Default::default(),
             sizes: HashMap::new(),
             fullscreen: Default::default(),
@@ -481,6 +536,9 @@ impl App {
             profiles_seen,
             settings_seen,
             settings_notice,
+            schemes,
+            scheme_errors,
+            scheme_notices: Vec::new(),
             pending_release: Vec::new(),
             app_active: true,
             style,
@@ -488,6 +546,8 @@ impl App {
             screenshot_window: match debug_env("FBTERM_SCREENSHOT_WINDOW") {
                 Some(w) if w == "editor" => ShotWindow::Editor,
                 Some(w) if w == "settings" => ShotWindow::Settings,
+                Some(w) if w == "schemes" => ShotWindow::Schemes,
+                Some(w) if w == "tunnels" => ShotWindow::Tunnels,
                 _ => ShotWindow::Terminal,
             },
             shooting: false,
@@ -502,6 +562,7 @@ impl App {
             os_scales: HashMap::new(),
         };
         app.update_output_rate();
+        app.refresh_scheme_notices();
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -511,8 +572,11 @@ impl App {
         task = task.chain(app.open_debug_palette());
         task = task.chain(app.open_debug_editor());
         task = task.chain(app.open_debug_settings());
+        task = task.chain(app.open_debug_schemes());
+        task = task.chain(app.open_debug_tunnels());
         task = task.chain(app.open_debug_prompt());
         task = task.chain(app.open_debug_find());
+        task = task.chain(app.open_debug_files());
         (app, task)
     }
 
@@ -553,6 +617,12 @@ impl App {
         if self.settings_window() == Some(id) {
             return "Settings · fbterm".into();
         }
+        if self.schemes_window() == Some(id) {
+            return "Color schemes · fbterm".into();
+        }
+        if self.tunnels_window() == Some(id) {
+            return "Tunnels · fbterm".into();
+        }
         match self.windows.get(&id).and_then(WindowState::active_tab) {
             Some(tab) => format!("{} · fbterm", tab.title()),
             None => "fbterm".into(),
@@ -581,11 +651,33 @@ impl App {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
+                // Files dropped from the OS on a window: only these start an upload by drag.
+                Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
+                    crate::file_panel::FilePanelMsg::Dropped(id, path),
+                )),
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
             window::close_requests().map(Message::CloseRequested),
             Subscription::run_with(self.prompt_rx.clone(), prompt_stream).map(Message::Prompt),
+            Subscription::run_with(self.tunnels.receiver.clone(), tunnel_stream)
+                .map(|(key, state)| Message::Tunnel(key, state)),
+            Subscription::run_with(
+                self.file_panel_work.receiver.clone(),
+                crate::file_panel::panel_stream,
+            )
+            .map(|event| {
+                Message::FilePanel(crate::file_panel::FilePanelMsg::Event(Delivered::new(
+                    event,
+                )))
+            }),
+            Subscription::run_with(
+                self.file_panel_work.transfers.clone(),
+                crate::file_panel::transfer_stream,
+            )
+            .map(|(id, event)| {
+                Message::FilePanel(crate::file_panel::FilePanelMsg::Transfer(id, event))
+            }),
             Subscription::run_with(self.visibility.clone(), visibility::stream)
                 .map(|(id, visible)| Message::WindowVisible(id, visible)),
             Subscription::run_with(self.display.clone(), display_rate::stream)
@@ -610,6 +702,8 @@ impl App {
         match self.screenshot_window {
             ShotWindow::Editor if self.editor.is_none() => return false,
             ShotWindow::Settings if self.settings_win.is_none() => return false,
+            ShotWindow::Schemes if self.schemes_win.is_none() => return false,
+            ShotWindow::Tunnels if self.tunnels_win.is_none() => return false,
             _ => {}
         }
         self.windows
@@ -620,6 +714,18 @@ impl App {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch(message);
+        // Whatever changed (focus, tabs, connections, the panel itself), each open file panel
+        // shows its focused pane's profile.
+        self.sync_file_panels();
+        self.sync_quit_key();
+        match self.sync_panel_focus() {
+            Some(unfocus) => Task::batch([task, unfocus]),
+            None => task,
+        }
+    }
+
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Session(id, event) => self.session_event(id, event),
             Message::Terminal(wid, pane, output) => self.terminal_output(wid, pane, output),
@@ -693,6 +799,9 @@ impl App {
             }
             Message::WindowFocused(id) => {
                 self.focused = Some(id);
+                if self.windows.contains_key(&id) {
+                    self.last_terminal = Some(id);
+                }
                 self.app_active = true;
                 let detect = if self.windows.contains_key(&id) {
                     display_rate::detect(id, &self.display)
@@ -722,6 +831,7 @@ impl App {
                     TabBarMsg::Close(i) => self.close_tab_asking(wid, i),
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
+                    TabBarMsg::Tunnels => self.action(Some(wid), Action::Tunnels),
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }
@@ -734,6 +844,12 @@ impl App {
                     // Closed by the OS button or Quit: what is still waiting is written.
                     self.write_pending_settings();
                     self.settings_win = None;
+                }
+                if self.schemes_window() == Some(id) {
+                    self.schemes_win = None;
+                }
+                if self.tunnels_window() == Some(id) {
+                    self.tunnels_win = None;
                 }
                 // Quit and close rules: see `App::quit`. A close nobody asked for is the OS
                 // ending the app; state.toml is current (saved on every change), so just
@@ -755,6 +871,9 @@ impl App {
                     .unwrap_or_default();
                 self.forget_panes(&gone);
                 let was_terminal = self.windows.remove(&id).is_some();
+                if was_terminal {
+                    self.sync_all_shell_tunnels();
+                }
                 visibility::unwatch(id);
                 display_rate::unwatch(id);
                 if self.display_rates.remove(&id).is_some() {
@@ -765,6 +884,14 @@ impl App {
                 self.os_scales.remove(&id);
                 self.fullscreen.remove(&id);
                 self.palettes.remove(&id);
+                self.file_panels.open.remove(&id);
+                self.file_panels.ui.remove(&id);
+                // A save dialog it had open answers nothing now.
+                self.file_panels.saving.remove(&id);
+                // Nor does its picker; its drops and undecided uploads are forgotten.
+                self.file_panels.picking.remove(&id);
+                self.file_panels.dropped.remove(&id);
+                self.file_panels.batches.remove(&id);
                 if self.carry.is_some_and(|(w, _)| w == id) {
                     self.carry = None;
                     self.hover = None;
@@ -789,7 +916,12 @@ impl App {
                 if was_terminal {
                     self.save_state();
                 }
-                if self.windows.is_empty() && self.editor.is_none() && self.settings_win.is_none() {
+                if self.windows.is_empty()
+                    && self.editor.is_none()
+                    && self.settings_win.is_none()
+                    && self.schemes_win.is_none()
+                    && self.tunnels_win.is_none()
+                {
                     iced::exit()
                 } else if self.quitting {
                     Task::none()
@@ -816,6 +948,8 @@ impl App {
             Message::Editor(msg) => self.editor_msg(msg),
             Message::Export(msg) => self.export_msg(msg),
             Message::Settings(msg) => self.settings_msg(msg),
+            Message::Schemes(msg) => self.schemes_msg(msg),
+            Message::Tunnels(msg) => self.tunnels_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
@@ -841,14 +975,20 @@ impl App {
                 Task::none()
             }
             Message::ConfigChanged(changed) => {
+                let mut tasks = Vec::new();
+                if changed.schemes {
+                    tasks.push(self.reload_schemes());
+                }
                 if changed.profiles {
                     self.profiles_file_changed();
                 }
                 if changed.settings {
-                    return self.settings_file_changed();
+                    tasks.push(self.settings_file_changed());
                 }
-                Task::none()
+                Task::batch(tasks)
             }
+            Message::Tunnel(key, state) => self.tunnel_event(key, state),
+            Message::FilePanel(msg) => self.file_panel_msg(msg),
             Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
@@ -881,9 +1021,13 @@ impl App {
         self.os_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale
     }
 
+    /// The focused terminal window; while another of our windows has focus, the terminal
+    /// window focused last (or any, if that one is gone).
     pub(crate) fn focused_window(&self) -> Option<window::Id> {
+        let terminal = |id: &window::Id| self.windows.contains_key(id);
         self.focused
-            .filter(|id| self.windows.contains_key(id))
+            .filter(terminal)
+            .or_else(|| self.last_terminal.filter(terminal))
             .or_else(|| self.windows.keys().next().copied())
     }
 
@@ -927,6 +1071,8 @@ impl App {
         let target = match self.screenshot_window {
             ShotWindow::Editor => self.editor_window(),
             ShotWindow::Settings => self.settings_window(),
+            ShotWindow::Schemes => self.schemes_window(),
+            ShotWindow::Tunnels => self.tunnels_window(),
             ShotWindow::Terminal => self.windows.keys().next().copied(),
         };
         let Some(wid) = target else {

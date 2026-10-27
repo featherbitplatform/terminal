@@ -148,6 +148,68 @@ impl App {
         self.open_settings()
     }
 
+    /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
+    /// value selects the scheme of that name.
+    pub(crate) fn open_debug_schemes(&mut self) -> Task<Message> {
+        let Some(value) = debug_env("FBTERM_OPEN_SCHEMES") else {
+            return Task::none();
+        };
+        let value = value.to_string_lossy();
+        let select = self
+            .schemes
+            .all()
+            .iter()
+            .find(|s| s.name == value)
+            .map(|s| s.id.clone());
+        self.open_schemes(select)
+    }
+
+    /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the Tunnels window at startup.
+    pub(crate) fn open_debug_tunnels(&mut self) -> Task<Message> {
+        if debug_env("FBTERM_OPEN_TUNNELS").is_none() {
+            return Task::none();
+        }
+        self.open_tunnels()
+    }
+
+    /// `FBTERM_DEMO_FILES=<folder>:<item>,<item>,...` (debug aid): the first window's file
+    /// panel open, serving this sample listing for every SSH pane (connected or not) and every
+    /// folder without touching the network, with a sample transfer queue (a running and a
+    /// finished download and a failed upload); see [`crate::file_panel::Demo::parse`]. With
+    /// `FBTERM_DEMO_UPLOAD=<name>,<name>` those names are uploaded into the first listing
+    /// shown, which raises the clash dialog for names the listing has.
+    pub(crate) fn open_debug_files(&mut self) -> Task<Message> {
+        let Some(spec) = debug_env("FBTERM_DEMO_FILES") else {
+            return Task::none();
+        };
+        let demo = crate::file_panel::Demo::parse(&spec.to_string_lossy());
+        let rows = || demo.sample_rows();
+        self.file_panels.demo = true;
+        if let Some(&wid) = self.windows.keys().next() {
+            self.file_panels.show(wid);
+            if let Some(names) = debug_env("FBTERM_DEMO_UPLOAD") {
+                let paths = names
+                    .to_string_lossy()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                self.file_panels.demo_upload = Some((wid, paths));
+            }
+        }
+        self.file_panel_work.backend = std::sync::Arc::new(crate::file_panel::Demo {
+            home: demo.home.clone(),
+            entries: demo.entries.clone(),
+        });
+        self.sync_file_panels();
+        // Every session opened for the demo shows a sample transfer queue.
+        for panel in self.file_panels.by_profile.values_mut() {
+            panel.transfers.extend(rows());
+        }
+        Task::none()
+    }
+
     /// `FBTERM_FIND=<text>` / `FBTERM_FIND_ALL=<text>` (debug aids): the find bar of the first
     /// window's active tab, or the find-in-all-tabs box, open with that query once the tabs
     /// have had a second to print something.

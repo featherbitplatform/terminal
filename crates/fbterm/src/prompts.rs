@@ -1,5 +1,7 @@
 //! Connection prompts: the [`Prompter`] that asks through the UI, and the per-window queue of
-//! dialogs it feeds (trust this host?, changed host key, password or passphrase).
+//! dialogs it feeds (trust this host?, changed host key, password or passphrase), and the app's
+//! own questions in the same queue (closing a split tab, an upload's name clash, closing while
+//! transfers run).
 //!
 //! A dial asks from its own task: [`UiPrompter`] sends the question with a `oneshot` reply
 //! channel to the update loop and waits. Dropping the reply (window closed, dialog dismissed)
@@ -11,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbterm_secrets::SecretKind;
+use fbterm_session::ssh::tunnel::TunnelKey;
 use fbterm_session::ssh::{Prompter, SecretAnswer};
 use iced::futures::Stream;
 use iced::window;
@@ -19,6 +22,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 
 use crate::app::Delivered;
+use crate::layout::PaneId;
 use crate::redact::Redacted;
 use crate::tabs::TabId;
 
@@ -52,6 +56,9 @@ pub enum PromptEvent {
     Ask {
         id: PromptId,
         window: Option<window::Id>,
+        /// The tunnel asking, when a tunnel's connect asks: its window is raised, and with no
+        /// terminal window to ask in the tunnel fails.
+        tunnel: Option<TunnelKey>,
         ask: Ask,
     },
     /// The asker stopped waiting (answered, or its dial was given up).
@@ -61,12 +68,30 @@ pub enum PromptEvent {
 /// Asks the user through the UI, over the window the dial belongs to.
 pub struct UiPrompter {
     window: Option<window::Id>,
+    tunnel: Option<TunnelKey>,
     tx: UnboundedSender<PromptEvent>,
 }
 
 impl UiPrompter {
     pub fn new(window: Option<window::Id>, tx: UnboundedSender<PromptEvent>) -> Self {
-        Self { window, tx }
+        Self {
+            window,
+            tunnel: None,
+            tx,
+        }
+    }
+
+    /// The prompter of tunnel `key`'s connect (see [`PromptEvent::Ask`]).
+    pub fn for_tunnel(
+        window: Option<window::Id>,
+        key: TunnelKey,
+        tx: UnboundedSender<PromptEvent>,
+    ) -> Self {
+        Self {
+            window,
+            tunnel: Some(key),
+            tx,
+        }
     }
 
     /// Send `ask` and wait for the answer; `None` if the UI dropped the question.
@@ -76,6 +101,7 @@ impl UiPrompter {
         let event = PromptEvent::Ask {
             id,
             window: self.window,
+            tunnel: self.tunnel.clone(),
             ask: make(reply),
         };
         if self.tx.send(event).is_err() {
@@ -166,6 +192,46 @@ pub enum PromptMsg {
     Copy(String),
     /// Close the tab the shown close confirmation names.
     CloseTab(window::Id),
+    /// The clash dialog's `Replace`.
+    ClashReplace(window::Id),
+    /// The clash dialog's `Rename`: show the name field.
+    ClashRename(window::Id),
+    /// The clash dialog's `Apply to all`.
+    ClashApplyAll(window::Id, bool),
+    /// Typing in the clash dialog's name field.
+    ClashName(window::Id, String),
+    /// `Cancel transfers and close` in the close confirmation.
+    StopTransfers(window::Id),
+}
+
+/// An upload whose name exists in its folder: `"{name}" already exists in {folder}.`
+pub struct Clash {
+    /// The name as the server would get it (shown as plain text).
+    pub name: String,
+    pub folder: String,
+    /// `Apply to all` is offered: other files of the same upload are still to decide.
+    pub offer_all: bool,
+    pub apply_all: bool,
+    /// The `Rename` field, once asked for.
+    pub rename: Option<Rename>,
+}
+
+/// The name field of a clash dialog.
+pub struct Rename {
+    pub value: String,
+    /// Why the typed name cannot be used.
+    pub problem: Option<String>,
+    pub input: iced::widget::Id,
+}
+
+/// What closes once the user agrees to cancel the transfers it would end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closing {
+    Tab(TabId),
+    Pane(PaneId),
+    /// The window the question is shown in.
+    Window,
+    Quit,
 }
 
 /// A dialog waiting in a window's queue.
@@ -180,6 +246,16 @@ pub enum Dialog {
     Changed { host: String, port: u16 },
     /// Closing a whole tab that has `panes` panes, more than one of them live: asked first.
     CloseTab { tab: TabId, panes: usize },
+    /// An upload's name exists in its folder: `Replace`, `Rename` or `Cancel`.
+    Clash(Clash),
+    /// Closing (or quitting) would end `count` running transfers: asked first. With
+    /// `in_place`, one of them is a replace writing over the existing file in place, which
+    /// cancelling may leave incomplete: the question says so.
+    Transfers {
+        count: usize,
+        in_place: bool,
+        then: Closing,
+    },
     Secret {
         profile: String,
         kind: SecretKind,
@@ -231,6 +307,9 @@ impl Dialog {
     pub fn input(&self) -> Option<iced::widget::Id> {
         match self {
             Self::Secret { input, .. } => Some(input.clone()),
+            Self::Clash(Clash {
+                rename: Some(r), ..
+            }) => Some(r.input.clone()),
             _ => None,
         }
     }
@@ -248,7 +327,10 @@ impl Dialog {
                     let _ = r.send(None);
                 }
             }
-            Self::Changed { .. } | Self::CloseTab { .. } => {}
+            Self::Changed { .. }
+            | Self::CloseTab { .. }
+            | Self::Clash(_)
+            | Self::Transfers { .. } => {}
         }
     }
 }
@@ -285,7 +367,7 @@ impl PromptQueues {
     }
 
     /// Take the shown dialog off its window's queue.
-    fn pop(&mut self, window: window::Id) -> Option<Dialog> {
+    pub fn pop(&mut self, window: window::Id) -> Option<Dialog> {
         let q = self.0.get_mut(&window)?;
         let p = q.pop_front();
         if q.is_empty() {
@@ -363,6 +445,73 @@ impl PromptQueues {
         self.0.get(&window).is_some_and(|q| {
             q.iter()
                 .any(|p| matches!(&p.dialog, Dialog::CloseTab { tab: t, .. } if *t == tab))
+        })
+    }
+
+    /// Whether `window` already asks about closing with transfers running for `then`.
+    pub fn has_transfers(&self, window: window::Id, then: Closing) -> bool {
+        self.0.get(&window).is_some_and(|q| {
+            q.iter()
+                .any(|p| matches!(&p.dialog, Dialog::Transfers { then: t, .. } if *t == then))
+        })
+    }
+
+    /// Every close confirmation queued: its window and what it would close.
+    pub fn transfer_questions(&self) -> Vec<(window::Id, Closing)> {
+        self.0
+            .iter()
+            .flat_map(|(w, q)| {
+                q.iter().filter_map(move |p| match &p.dialog {
+                    Dialog::Transfers { then, .. } => Some((*w, *then)),
+                    _ => None,
+                })
+            })
+            .collect()
+    }
+
+    /// Set the count of `window`'s close confirmation for `then`, and whether it warns about
+    /// in-place replaces; at 0 there is nothing left to ask about, and it goes.
+    pub fn set_transfers(
+        &mut self,
+        window: window::Id,
+        then: Closing,
+        count: usize,
+        in_place: bool,
+    ) {
+        let Some(q) = self.0.get_mut(&window) else {
+            return;
+        };
+        if count == 0 {
+            q.retain(|p| !matches!(&p.dialog, Dialog::Transfers { then: t, .. } if *t == then));
+            if q.is_empty() {
+                self.0.remove(&window);
+            }
+            return;
+        }
+        for p in q.iter_mut() {
+            if let Dialog::Transfers {
+                count: c,
+                in_place: i,
+                then: t,
+            } = &mut p.dialog
+                && *t == then
+            {
+                *c = count;
+                *i = in_place;
+            }
+        }
+    }
+
+    /// Whether any window asks about quitting with transfers running.
+    pub fn asks_quit(&self) -> bool {
+        self.0.values().flatten().any(|p| {
+            matches!(
+                &p.dialog,
+                Dialog::Transfers {
+                    then: Closing::Quit,
+                    ..
+                }
+            )
         })
     }
 

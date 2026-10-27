@@ -409,7 +409,7 @@ fn chords_the_terminal_or_the_system_owns_are_refused() {
     assert!(why.ends_with("is used by Copy"), "{why}");
     assert!(s.values.keys.map.is_empty());
     if mac {
-        // Cmd+Q belongs to the app menu even for another action, and Quit itself is fixed.
+        // Cmd+Q is Quit's even for another action, and Quit itself is fixed.
         s.update(SettingsMsg::Pressed(Some(chord("cmd+q"))));
         assert!(matches!(
             s.recording.as_ref().unwrap().problem,
@@ -597,4 +597,32 @@ fn thousands_separates_groups_of_three() {
     assert_eq!(thousands(2_000), "2,000");
     assert_eq!(thousands(100_000), "100,000");
     assert_eq!(thousands(1_000_000), "1,000,000");
+}
+
+#[test]
+fn retries_field_writes_setting() {
+    let mut s = state();
+    assert_eq!(s.retries_text, "10");
+    // Typing applies in range, after a quiet period.
+    let e = s.update(SettingsMsg::RetriesText("5".into()));
+    assert_eq!(e.apply, Some(SettingChange::TunnelMaxRetries(5)));
+    assert!(matches!(e.write, Write::After(_)));
+    assert_eq!(s.values.tunnel_max_retries, 5);
+    // 0 is allowed: it turns automatic reconnecting off.
+    let e = s.update(SettingsMsg::RetriesText("0".into()));
+    assert_eq!(e.apply, Some(SettingChange::TunnelMaxRetries(0)));
+    // Out of range waits for Enter, which clamps.
+    assert_eq!(
+        s.update(SettingsMsg::RetriesText("500".into())),
+        Effect::NONE
+    );
+    assert_eq!(s.values.tunnel_max_retries, 0);
+    let e = s.update(SettingsMsg::RetriesSubmit);
+    assert_eq!(e.apply, Some(SettingChange::TunnelMaxRetries(100)));
+    assert_eq!(e.write, Write::Now);
+    assert_eq!(s.retries_text, "100");
+    // Garbage goes back to the current value.
+    s.update(SettingsMsg::RetriesText("many".into()));
+    s.update(SettingsMsg::RetriesSubmit);
+    assert_eq!(s.retries_text, "100");
 }

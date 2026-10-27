@@ -103,6 +103,9 @@ pub struct Profile {
     /// How the accent shows on tabs (`"stripe"` or `"tab"`); written only when not the default.
     #[serde(default, skip_serializing_if = "AccentStyle::is_default")]
     pub accent_style: AccentStyle,
+    /// Id of the color scheme this profile's sessions use; none follows the global scheme.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_scheme: Option<String>,
     #[serde(flatten)]
     pub kind: ProfileKind,
 }
@@ -138,6 +141,94 @@ pub struct SshProfile {
     pub auth: AuthMethod,
     #[serde(default)]
     pub jump: Vec<ProfileId>,
+    /// Port forwards and SOCKS proxies riding this profile's connection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tunnels: Vec<TunnelDef>,
+}
+
+fn loopback() -> String {
+    "127.0.0.1".into()
+}
+
+/// A named port forward or SOCKS proxy of an SSH profile.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct TunnelDef {
+    pub name: String,
+    #[serde(flatten)]
+    pub kind: TunnelKind,
+    /// When the tunnel starts; written only when not the default.
+    #[serde(default, skip_serializing_if = "StartMode::is_default")]
+    pub start: StartMode,
+}
+
+/// What a tunnel forwards. For `Remote`, `bind` and `port` are on the server and `host` and
+/// `host_port` are seen from this machine.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TunnelKind {
+    Local {
+        #[serde(default = "loopback")]
+        bind: String,
+        port: u16,
+        host: String,
+        host_port: u16,
+    },
+    Remote {
+        #[serde(default = "loopback")]
+        bind: String,
+        port: u16,
+        host: String,
+        host_port: u16,
+    },
+    Socks {
+        #[serde(default = "loopback")]
+        bind: String,
+        port: u16,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartMode {
+    /// Started by hand (or on demand) only.
+    #[default]
+    OnDemand,
+    /// Runs while at least one shell of the profile is connected.
+    WithShell,
+}
+
+impl StartMode {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+impl TunnelDef {
+    /// The address the tunnel listens on.
+    pub fn bind(&self) -> &str {
+        match &self.kind {
+            TunnelKind::Local { bind, .. }
+            | TunnelKind::Remote { bind, .. }
+            | TunnelKind::Socks { bind, .. } => bind,
+        }
+    }
+
+    /// Whether the tunnel listens on something other than a loopback address, so other
+    /// machines can reach it.
+    pub fn non_loopback(&self) -> bool {
+        let bind = self.bind().trim();
+        let bind = bind
+            .strip_prefix('[')
+            .and_then(|b| b.strip_suffix(']'))
+            .unwrap_or(bind);
+        if bind.eq_ignore_ascii_case("localhost") {
+            return false;
+        }
+        match bind.parse::<std::net::IpAddr>() {
+            Ok(ip) => !ip.is_loopback(),
+            Err(_) => true,
+        }
+    }
 }
 
 /// How to authenticate. Secrets are never stored in the profile file.

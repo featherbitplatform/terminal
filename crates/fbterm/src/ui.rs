@@ -28,6 +28,14 @@ pub const ICON_SETTINGS: &str = "\u{e154}";
 pub const ICON_RESET: &str = "\u{e148}"; // rotate-ccw
 pub const ICON_WARNING: &str = "\u{e193}"; // triangle-alert
 pub const ICON_GRIP: &str = "\u{e0ea}"; // grip-horizontal
+pub const ICON_TUNNELS: &str = "\u{e4e3}"; // cable
+pub const ICON_SEARCH: &str = "\u{e151}";
+pub const ICON_FOLDER: &str = "\u{e0d7}";
+pub const ICON_FILE: &str = "\u{e0c0}";
+pub const ICON_FOLDER_LINK: &str = "\u{e33b}"; // folder-symlink
+pub const ICON_FILE_LINK: &str = "\u{e327}"; // file-symlink
+pub const ICON_PARENT: &str = "\u{e0a4}"; // corner-left-up
+pub const ICON_FILE_OTHER: &str = "\u{e322}"; // file-question-mark
 
 /// An icon `size` pixels square. The font draws each icon on the full em square (the 24-unit
 /// SVG grid scaled to the em, baseline at the bottom), so a one-em line holds it exactly.

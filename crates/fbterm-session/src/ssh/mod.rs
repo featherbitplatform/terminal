@@ -17,11 +17,20 @@
 //! handshake and authentication each get [`HOP_TIMEOUT`], not counting time spent waiting for
 //! the user to answer a prompt. [`SshPool`] builds jump chains and shares one connection per
 //! profile between all of its shells.
+//!
+//! Server-initiated channels are refused, with one exception: a `forwarded-tcpip` channel for
+//! a remote forward this app requested on that connection (registered in its [`Forwards`])
+//! reaches the code that asked for it. Hops of a jump chain have no registry and refuse them
+//! all, so a remote program can never open a tunnel or a session of its own.
 
 mod auth;
 mod known_hosts;
 pub(crate) mod pool;
+pub mod sftp;
+pub mod transfer;
+pub mod tunnel;
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,13 +40,14 @@ use async_trait::async_trait;
 use fbterm_config::{Profile, ProfileKind, SshProfile, ValidationError};
 use fbterm_secrets::{SecretKind, SecretStore};
 use parking_lot::Mutex;
-use russh::client::{self, DisconnectReason, Handle};
+use russh::client::{self, DisconnectReason, Handle, Msg, Session};
 use russh::keys::{HashAlg, PublicKey, PublicKeyOrCertificate};
+use russh::{Channel, ChannelOpenFailure};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc, watch};
 
 pub use known_hosts::{HostKeyStatus, check_host_key, learn_host_key};
-pub use pool::SshPool;
+pub use pool::{Connection, SshPool};
 
 use crate::AuthWarning;
 
@@ -85,6 +95,38 @@ pub trait Prompter: Send + Sync {
         kind: SecretKind,
         retry: bool,
     ) -> Option<SecretAnswer>;
+
+    /// Whether this prompter can reach a person at all. `false` for [`NoPrompt`]: a connect
+    /// that would have needed a question then fails with [`SshError::NeedsInput`].
+    fn can_ask(&self) -> bool {
+        true
+    }
+}
+
+/// The prompter of automatic reconnects: never asks anyone. Unknown host keys are not
+/// trusted and no secret is given, so a connect that needs the user fails at once (as
+/// [`SshError::NeedsInput`] from [`SshPool::acquire`]) instead of opening a prompt. That
+/// includes a saved secret the server rejects: asking again for a better one is a question.
+pub struct NoPrompt;
+
+#[async_trait]
+impl Prompter for NoPrompt {
+    async fn confirm_host_key(&self, _host: &str, _port: u16, _fingerprint: &str) -> bool {
+        false
+    }
+
+    async fn ask_secret(
+        &self,
+        _profile_name: &str,
+        _kind: SecretKind,
+        _retry: bool,
+    ) -> Option<SecretAnswer> {
+        None
+    }
+
+    fn can_ask(&self) -> bool {
+        false
+    }
 }
 
 /// A secret typed by the user, and whether to save it once the server accepts it.
@@ -133,6 +175,10 @@ pub enum SshError {
     Jump(ValidationError),
     #[error("ssh error: {0}")]
     Protocol(String),
+    /// A connect made without prompts ([`NoPrompt`]) needed the user: an unknown host key or
+    /// a secret that is not saved.
+    #[error("needs your input")]
+    NeedsInput,
 }
 
 impl SshError {
@@ -151,6 +197,16 @@ impl SshError {
             Self::Connect(e) => Self::Connect(std::io::Error::new(e.kind(), e.to_string())),
             Self::Jump(e) => Self::Jump(e.clone()),
             Self::Protocol(m) => Self::Protocol(m.clone()),
+            Self::NeedsInput => Self::NeedsInput,
+        }
+    }
+
+    /// The error of a connect made for a prompter that cannot ask (`can_ask == false`): the
+    /// refusals that stand for an unanswered question become [`SshError::NeedsInput`].
+    pub(crate) fn without_prompts(self, can_ask: bool) -> Self {
+        match self {
+            Self::HostKeyRejected | Self::Cancelled if !can_ask => Self::NeedsInput,
+            other => other,
         }
     }
 }
@@ -168,7 +224,29 @@ impl From<russh::Error> for SshError {
     }
 }
 
-/// The russh client handler of one hop: verifies the server's host key.
+/// The remote forwards requested on one connection, by the address and port the server
+/// listens on (as requested, with the port the server allocated for a request of port 0).
+/// Each forwarded channel for a listed forward goes to its sender.
+pub(crate) type Forwards = Arc<Mutex<HashMap<(String, u32), mpsc::UnboundedSender<Channel<Msg>>>>>;
+
+/// Where a server-initiated `forwarded-tcpip` channel for `address:port` goes: the sender of
+/// a forward this app requested and still listens for, or `None` (refuse it). A hop of a jump
+/// chain has no registry (`forwards == None`) and refuses every one.
+fn forward_route(
+    forwards: Option<&Forwards>,
+    address: &str,
+    port: u32,
+) -> Option<mpsc::UnboundedSender<Channel<Msg>>> {
+    forwards?
+        .lock()
+        .get(&(address.to_owned(), port))
+        .filter(|tx| !tx.is_closed())
+        .cloned()
+}
+
+/// The russh client handler of one hop: verifies the server's host key, records why the
+/// connection ended and refuses channels the server opens unless they belong to a remote
+/// forward this app requested.
 pub struct ClientHandler {
     host: String,
     port: u16,
@@ -180,6 +258,20 @@ pub struct ClientHandler {
     lost: Arc<Mutex<Option<String>>>,
     /// Raised when the connect that created this handler was given up before it finished.
     cancel: Arc<Cancel>,
+    /// Set to `true` once the connection ended (after `lost`). Dropped with the handler when
+    /// russh's session task ends, which its receivers see as an end too.
+    ended: watch::Sender<bool>,
+    /// The remote forwards of this connection; `None` on a jump hop (refuses them all).
+    forwards: Option<Forwards>,
+}
+
+/// Refuse a channel the server wanted to open. Logged at debug level only: a server can open
+/// channels as fast as it likes, and must not be able to flood the log.
+async fn refuse(kind: &str, reply: client::ChannelOpenHandle) {
+    tracing::debug!(kind, "refused a channel opened by the server");
+    reply
+        .reject(ChannelOpenFailure::AdministrativelyProhibited)
+        .await;
 }
 
 /// A one-way "give up" signal.
@@ -306,7 +398,114 @@ impl client::Handler for ClientHandler {
         };
         tracing::info!(host = %self.host, port = self.port, reason = %text, "ssh connection ended");
         self.lost.lock().get_or_insert(text);
+        self.ended.send_replace(true);
         result
+    }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        match forward_route(self.forwards.as_ref(), connected_address, connected_port) {
+            Some(tx) => {
+                reply.accept().await;
+                // A forward stopped in between hands the channel back: close it (a raw
+                // channel dropped as it is would stay open on the server).
+                if let Err(unrouted) = tx.send(channel) {
+                    drop(unrouted.0.into_stream());
+                }
+            }
+            None => {
+                // Debug level (a server must not flood the log) and Debug-formatted (the
+                // address is server-supplied text).
+                tracing::debug!(
+                    host = %self.host,
+                    address = ?connected_address,
+                    port = connected_port,
+                    "refused a forwarded connection nobody asked for"
+                );
+                reply
+                    .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                    .await;
+            }
+        }
+        Ok(())
+    }
+
+    // Every other channel the server may open is refused: russh would accept them.
+
+    async fn server_channel_open_forwarded_streamlocal(
+        &mut self,
+        _channel: Channel<Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        refuse("forwarded-streamlocal", reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        _channel: Channel<Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        refuse("agent", reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_session(
+        &mut self,
+        _channel: Channel<Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        refuse("session", reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_tcpip(
+        &mut self,
+        _channel: Channel<Msg>,
+        _host_to_connect: &str,
+        _port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        refuse("direct-tcpip", reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_direct_streamlocal(
+        &mut self,
+        _channel: Channel<Msg>,
+        _socket_path: &str,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        refuse("direct-streamlocal", reply).await;
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        _channel: Channel<Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut Session,
+    ) -> Result<(), SshError> {
+        refuse("x11", reply).await;
+        Ok(())
     }
 }
 
@@ -446,6 +645,10 @@ impl Prompter for ClockedPrompter {
         let _paused = self.clock.pause();
         self.inner.ask_secret(profile_name, kind, retry).await
     }
+
+    fn can_ask(&self) -> bool {
+        self.inner.can_ask()
+    }
 }
 
 /// Client configuration for one hop: keepalives on, known host-key types preferred.
@@ -508,17 +711,21 @@ pub(crate) struct Hop {
     pub handle: Handle<ClientHandler>,
     /// Why the connection ended, once it has.
     pub lost: Arc<Mutex<Option<String>>>,
+    /// Turns `true` (or loses its sender) once the connection ended; `lost` is set first.
+    pub ended: watch::Receiver<bool>,
     /// Set when authentication succeeded in a way the user should hear about.
     pub warning: Option<AuthWarning>,
 }
 
 /// Run SSH over `stream` to the host of `profile`: verify its host key and authenticate.
+/// `forwards` is the registry of the chain's target; jump hops pass `None`.
 pub(crate) async fn connect_hop<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream: S,
     profile: &Profile,
     ctx: &SshContext,
+    forwards: Option<Forwards>,
 ) -> Result<Hop, SshError> {
-    connect_hop_within(stream, profile, ctx, HOP_TIMEOUT).await
+    connect_hop_within(stream, profile, ctx, HOP_TIMEOUT, forwards).await
 }
 
 /// [`connect_hop`] with the handshake and the authentication each bounded by `limit`.
@@ -527,6 +734,7 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     profile: &Profile,
     ctx: &SshContext,
     limit: Duration,
+    forwards: Option<Forwards>,
 ) -> Result<Hop, SshError> {
     let ssh = ssh_profile(profile)?;
     let clock = Arc::new(PromptClock::new());
@@ -540,7 +748,10 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let lost = Arc::new(Mutex::new(None));
     let cancel = Arc::new(Cancel::default());
     let give_up = CancelOnDrop(Some(cancel.clone()));
+    let (ended_tx, ended) = watch::channel(false);
     let handler = ClientHandler {
+        ended: ended_tx,
+        forwards,
         cancel,
         host: ssh.host.clone(),
         port: ssh.port,
@@ -577,6 +788,7 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     Ok(Hop {
         handle,
         lost,
+        ended,
         warning,
     })
 }
@@ -612,7 +824,8 @@ pub async fn connect_direct(
         )));
     }
     let stream = tcp_connect(ssh).await.map_err(|e| in_hop(profile, e))?;
-    let hop = connect_hop(stream, profile, ctx)
+    // No registry: nothing here requests remote forwards, so every forwarded channel is refused.
+    let hop = connect_hop(stream, profile, ctx, None)
         .await
         .map_err(|e| in_hop(profile, e))?;
     Ok(hop.handle)
@@ -768,17 +981,19 @@ mod tests {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: "127.0.0.1".into(),
                 port: addr.port(),
                 user: "u".into(),
                 auth: fbterm_config::AuthMethod::Password,
                 jump: vec![],
+                tunnels: Vec::new(),
             }),
         };
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let started = Instant::now();
-        let err = connect_hop_within(stream, &profile, &ctx, Duration::from_millis(200))
+        let err = connect_hop_within(stream, &profile, &ctx, Duration::from_millis(200), None)
             .await
             .err()
             .unwrap();
@@ -820,12 +1035,14 @@ mod tests {
             group: None,
             accent: None,
             accent_style: Default::default(),
+            color_scheme: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: "10.0.0.5".into(),
                 port: 22,
                 user: "u".into(),
                 auth: fbterm_config::AuthMethod::Agent,
                 jump: vec![],
+                tunnels: Vec::new(),
             }),
         };
         match in_hop(&p, timed_out("no answer".into())) {
@@ -852,6 +1069,91 @@ mod tests {
                 .to_string()
                 .contains("bastion-1 ([fe80::1]:22): x")
         );
+    }
+
+    #[test]
+    fn unsolicited_forwarded_channel_is_rejected() {
+        let forwards: Forwards = Arc::default();
+        let (tx, rx) = mpsc::unbounded_channel();
+        forwards.lock().insert(("127.0.0.1".into(), 4022), tx);
+        // The target routes its own forward, and only that one.
+        assert!(forward_route(Some(&forwards), "127.0.0.1", 4022).is_some());
+        assert!(forward_route(Some(&forwards), "127.0.0.1", 4023).is_none());
+        assert!(forward_route(Some(&forwards), "0.0.0.0", 4022).is_none());
+        assert!(forward_route(Some(&forwards), "localhost", 4022).is_none());
+        // A jump hop has no registry and refuses everything.
+        assert!(forward_route(None, "127.0.0.1", 4022).is_none());
+        // A forward whose receiver is gone (stopped tunnel) refuses too.
+        drop(rx);
+        assert!(forward_route(Some(&forwards), "127.0.0.1", 4022).is_none());
+        // So does one that was unregistered.
+        let (tx, _rx) = mpsc::unbounded_channel();
+        forwards.lock().insert(("127.0.0.1".into(), 4022), tx);
+        forwards.lock().remove(&("127.0.0.1".to_owned(), 4022));
+        assert!(forward_route(Some(&forwards), "127.0.0.1", 4022).is_none());
+    }
+
+    #[tokio::test]
+    async fn no_prompt_asks_nothing_and_needs_input() {
+        let p = NoPrompt;
+        assert!(!p.can_ask());
+        assert!(!p.confirm_host_key("h", 22, "SHA256:x").await);
+        assert!(
+            p.ask_secret("p", SecretKind::Password, false)
+                .await
+                .is_none()
+        );
+        // Clocked (as inside a connect) it still cannot ask.
+        let clocked = ClockedPrompter {
+            inner: Arc::new(NoPrompt),
+            clock: Arc::new(PromptClock::new()),
+        };
+        assert!(!clocked.can_ask());
+        assert!(Slow(Duration::ZERO).can_ask());
+
+        // Unanswered questions become NeedsInput, but only without prompts.
+        let needs = |e: SshError, can_ask| e.without_prompts(can_ask);
+        assert!(matches!(
+            needs(SshError::HostKeyRejected, false),
+            SshError::NeedsInput
+        ));
+        assert!(matches!(
+            needs(SshError::Cancelled, false),
+            SshError::NeedsInput
+        ));
+        assert!(matches!(
+            needs(SshError::HostKeyRejected, true),
+            SshError::HostKeyRejected
+        ));
+        assert!(matches!(
+            needs(SshError::Cancelled, true),
+            SshError::Cancelled
+        ));
+        // A changed key or a wrong saved secret is no question: it stays what it is.
+        assert!(matches!(
+            needs(
+                SshError::HostKeyChanged {
+                    host: "h".into(),
+                    port: 22
+                },
+                false
+            ),
+            SshError::HostKeyChanged { .. }
+        ));
+        assert!(matches!(
+            needs(
+                SshError::AuthFailed {
+                    profile: "p".into()
+                },
+                false
+            ),
+            SshError::AuthFailed { .. }
+        ));
+        assert_eq!(SshError::NeedsInput.to_string(), "needs your input");
+        assert!(matches!(
+            SshError::NeedsInput.duplicate(),
+            SshError::NeedsInput
+        ));
     }
 
     #[tokio::test]

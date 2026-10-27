@@ -229,6 +229,8 @@ pub fn snapshot(
             })
             .collect(),
         recency: recency.clone().into(),
+        file_panel_width: None,
+        file_panel_show_hidden: None,
     }
 }
 
@@ -249,6 +251,7 @@ mod tests {
                     group: None,
                     accent: None,
                     accent_style: Default::default(),
+                    color_scheme: None,
                     kind: ProfileKind::Local(LocalProfile {
                         program: "/bin/sh".into(),
                         args: vec![],

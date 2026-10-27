@@ -41,3 +41,11 @@ host = "db-1.internal"
 user = "ada"
 auth = { type = "password" }
 jump = ["c3d94e17-92b6-4c38-b5a0-77f0e41d8a03"]
+
+[[profiles.tunnels]]
+name = "db"
+kind = "local"
+port = 5432
+host = "localhost"
+host_port = 5432
+start = "with_shell"

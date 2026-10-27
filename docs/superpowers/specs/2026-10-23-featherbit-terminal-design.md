@@ -143,8 +143,8 @@ scrollback is complete) but never render. The UI thread only renders the visible
 **Connection model** *(builder's call made at design time)*: one SSH connection per profile,
 shared by everything using it, in the spirit of OpenSSH's ControlMaster. Each tab or pane on that
 profile is its own shell channel on the shared connection; the file panel and tunnels are further
-channels on it. Tunnels are owned by the connection, not by a tab, so `on-connect` tunnels start once
-when the connection is first established. Starting an on-demand tunnel with no tab open creates a
+channels on it. Tunnels are owned by the connection, not by a tab, so `with-shell` tunnels start once
+when the profile's first shell connects and stop when its last shell closes. Starting an on-demand tunnel with no tab open creates a
 background connection without a shell. The connection closes when its last channel (tab, file panel
 or tunnel) closes; closing a tab never drops a tunnel that is still running.
 
@@ -208,10 +208,12 @@ palette does; profiles rank above actions.
 ### 5.7 Tunnels
 
 Defined per SSH profile: name, kind, bind address/port, target host/port, start mode
-(`on-connect` | `on-demand`). Kinds: **local forward** (the owner's use cases), plus *(builder's
+(`with-shell` | `on-demand`). Kinds: **local forward** (the owner's use cases), plus *(builder's
 call)* **remote forward** and **dynamic SOCKS**. All ride the profile's connection, therefore
 through its jump chain. Each tunnel shows state (listening, active connections, failed with reason
-such as "port in use"); on-demand tunnels toggle from the session UI and the palette.
+such as "port in use"); every tunnel toggles from the Tunnels window and the palette. A dropped connection under a
+running tunnel is retried with backoff and shown as reconnecting. Done 2026-10-27 (milestone 3);
+see `2026-10-27-tunnels-design.md`.
 
 ### 5.8 File panel
 
@@ -220,6 +222,8 @@ listing with size/mtime, navigate, download, upload, drag in from and out to Fin
 mkdir/rename/delete *(builder's call)*. Transfers run in a queue with progress at the bottom of the
 panel and do not block the terminal. Starting directory: the remote home *(builder's call; following
 the shell's cwd can come later)*.
+Done 2026-10-27 (milestone 4): SFTP browsing, downloads and uploads with a transfer queue; mkdir,
+rename, delete and drag out to Finder were left out; see `2026-10-27-file-panel-design.md`.
 
 ### 5.9 Export / import
 
@@ -240,8 +244,10 @@ Jump-chain references are exported together with the profiles they point to.
 - Terminal color scheme: built-in schemes (including a default derived from the Graphite palette)
   plus user-imported schemes *(builder's call: accept a simple TOML scheme format; supporting popular
   third-party formats is a nice-to-have)*.
-- Per-profile accent: shown on tab and pane border; a scheme override per profile is a
-  nice-to-have.
+- Per-profile accent: shown on tab and pane border (pane border in split tabs only). A scheme
+  override per profile is built too. *(Done 2026-10-27, milestone 2: built-in schemes Graphite,
+  Graphite Light, Harbor and Ember, user schemes as TOML files, the Color schemes window, global
+  and per-profile choice; see `2026-10-27-color-schemes-design.md`.)*
 - *(Owner's decision, 2026-10-23)* **Unified title bar on macOS.** The tab bar is the title bar:
   the OS title strip is transparent and hidden, the content runs under it, the native window
   buttons stay and sit vertically centered on the bar (32 px high, tabs start 78 px in, at the
@@ -447,11 +453,11 @@ Order after milestone 1 is a *builder's call*; the owner only fixed milestone 1.
    keychain password), jump hosts, host-key checks, profile editor, quick-launch palette, settings
    file, Graphite theme, CI (macOS + Linux + Windows build/test), unsigned macOS `.dmg` (Apple
    Silicon and Intel) on GitHub releases, docs site skeleton on GitHub Pages.
-2. Tiling, per-profile accent, color schemes, find in scrollback (find in scrollback done
+2. Tiling, per-profile accent, color schemes, find in scrollback (milestone 2 done 2026-10-27; color schemes and pane accent borders: see 5.10 and `2026-10-27-color-schemes-design.md`; find in scrollback done
    2026-10-24, with a search over all tabs; see 5.12; tiling done 2026-10-26, see 5.6 and
    `2026-10-26-tiling-design.md`; measurements in `dev/perf/README.md`, scenario H).
-3. Tunnels.
-4. File panel.
+3. Tunnels (done 2026-10-27; see 5.7 and `2026-10-27-tunnels-design.md`).
+4. File panel (done 2026-10-27; see 5.8 and `2026-10-27-file-panel-design.md`).
 5. Export/import, optional main-password vault.
 6. Windows and Linux release artifacts; reading `~/.ssh/config` hosts into the palette; signing
    (when decided); deferred auth methods (2FA, FIDO keys, certificates, agent forwarding).
