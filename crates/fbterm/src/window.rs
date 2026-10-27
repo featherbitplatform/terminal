@@ -27,6 +27,15 @@ use crate::tooltip::{DemoTip, tip, tooltip_text};
 use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_TUNNELS, ICON_USERS, ICON_X, icon};
 use crate::windows::{Carry, DragMsg};
 
+/// Space around the terminal area. Where the chrome is drawn the window's resize band lies
+/// within it, so a press on the terminal's text never resizes the window.
+pub(crate) const TERMINAL_PADDING: Padding = Padding {
+    top: 4.0,
+    right: 8.0,
+    bottom: 4.0,
+    left: 8.0,
+};
+
 /// Gap between the top of the tab bar and the top of a tab.
 const TAB_TOP_GAP: f32 = 4.0;
 /// How far a pressed tab must travel before it is carried (less is a click).
@@ -282,7 +291,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         None => text("").into(),
     };
     let terminal_area: Element<'_, Message> = container(content)
-        .padding(Padding::from([4.0, 8.0]))
+        .padding(TERMINAL_PADDING)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_| container::Style {

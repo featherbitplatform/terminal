@@ -2855,3 +2855,72 @@ impl World {
         }
     }
 }
+
+/// With drawn chrome the panel sits at the window's right edge, inside the resize band's
+/// reach: a press on its list's scrollbar must scroll the list, never resize the window.
+#[test]
+fn the_list_scrollbar_is_clear_of_the_resize_edge() {
+    use crate::chrome::{self, BarAction, Chrome, ChromeCell};
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::{Shell, clipboard};
+    use iced::widget::Space;
+    use iced::{Element, Event, Length, Pixels, Point, Rectangle, Size, mouse};
+
+    const WINDOW: Size = Size::new(1000.0, 600.0);
+    let entries: Vec<Entry> = (0..500).map(|i| file(&format!("f{i:04}"))).collect();
+    let mut w = World::browsing(entries);
+    w.app.chrome = Box::leak(Box::new(ChromeCell::starting(Chrome::Drawn)));
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    // The drawn bar, with its margin on both sides.
+    let margin = crate::ui::edge_scrollbar_margin(true, 1.0);
+    let width = super::view::SCROLLBAR_WIDTH;
+    let bar = (WINDOW.width - margin - width, WINDOW.width - margin);
+    for x in [bar.0 + 0.5, (bar.0 + bar.1) / 2.0, bar.1 - 0.5] {
+        let at = Point::new(x, 300.0);
+        let (panel, width) = super::view::panel(&w.app, w.wid).expect("the panel is open");
+        let content: Element<'_, Message> =
+            Space::new().width(Length::Fill).height(Length::Fill).into();
+        let docked = crate::window::dock(content, Some(side(panel, width)));
+        let wid = w.wid;
+        let mut element = chrome::edges(docked, false, move |a| Message::TitleBar(wid, a));
+        let mut tree = Tree::new(&element);
+        let node =
+            element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, WINDOW));
+        let viewport = Rectangle::with_size(WINDOW);
+        let mut messages = Vec::new();
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved { position: at }),
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+        ] {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut clipboard::Null,
+                &mut shell,
+                &viewport,
+            );
+        }
+        assert!(
+            !messages
+                .iter()
+                .any(|m| matches!(m, Message::TitleBar(_, BarAction::ResizeFrom(_)))),
+            "a press on the scrollbar at x = {x} resized the window"
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|m| matches!(m, Message::FilePanel(FilePanelMsg::Scrolled(..)))),
+            "a press on the scrollbar at x = {x} scrolled nothing"
+        );
+    }
+}

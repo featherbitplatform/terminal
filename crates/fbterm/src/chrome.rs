@@ -96,8 +96,10 @@ const NATIVE_LEADING_INSET: f32 = 8.0;
 /// Height of the drawn title bar (Windows, Linux).
 const DRAWN_BAR_HEIGHT: f32 = 36.0;
 
-/// How wide the band along a window's edges is that resizes it where the chrome is drawn.
-pub const EDGE_BAND: f32 = 8.0;
+/// How wide the band along a window's side and bottom edges is that resizes it where the
+/// chrome is drawn. It lies within the terminal's padding, and scrollbars along the right edge
+/// keep clear of it ([`crate::ui::edge_scrollbar`]).
+pub const EDGE_BAND: f32 = 4.0;
 
 /// How tall the band along the top edge is: the gap above the tabs, so a press on a tab never
 /// resizes the window.
@@ -114,7 +116,7 @@ pub const LINUX_CONTROL_SIZE: f32 = 24.0;
 pub const LINUX_CONTROL_GAP: f32 = 8.0;
 
 /// How far a corner's resize area reaches along each edge from the corner, so a corner is
-/// easier to hit than the band's own 8 by 8 px square.
+/// easier to hit than the band's own 4 by 4 px square.
 const CORNER_REACH: f32 = 16.0;
 
 /// The system whose window conventions apply: where the controls go and how they look.
@@ -460,15 +462,28 @@ pub fn windows_build(reg: &str) -> Option<u32> {
     })
 }
 
+/// Where `reg.exe` is, from the `SystemRoot` environment variable (`C:\Windows` when it is
+/// unset or empty): by full path, so a `reg.exe` beside fbterm's own program never runs.
+#[cfg(any(test, target_os = "windows"))]
+pub fn reg_exe(system_root: Option<std::ffi::OsString>) -> std::ffi::OsString {
+    let mut path = system_root
+        .filter(|root| !root.is_empty())
+        .unwrap_or_else(|| r"C:\Windows".into());
+    if !path.to_string_lossy().ends_with('\\') {
+        path.push(r"\");
+    }
+    path.push(r"System32\reg.exe");
+    path
+}
+
 impl BlurProbe {
     /// This system's (on Windows a registry query, given at most `WINDOWS_PROBE_TIMEOUT`).
     fn read() -> Self {
         #[cfg(target_os = "linux")]
         {
-            let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
             Self {
                 windows_build: None,
-                wayland: set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET"),
+                wayland: wayland_session(),
                 kde: is_kde(),
             }
         }
@@ -483,6 +498,20 @@ impl BlurProbe {
         {
             Self::default()
         }
+    }
+}
+
+/// Whether this is a Wayland session (as the windowing picks it: a Wayland display is set).
+/// Always false off Linux.
+pub fn wayland_session() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
     }
 }
 
@@ -541,7 +570,7 @@ fn probe_output(
 fn read_windows_build() -> Option<u32> {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut command = std::process::Command::new("reg");
+    let mut command = std::process::Command::new(reg_exe(std::env::var_os("SystemRoot")));
     command
         .args([
             "query",
@@ -1516,19 +1545,28 @@ mod tests {
         // Inside the window, away from the edges: nothing.
         assert!(hit(400.0, 300.0).is_none());
         assert!(hit(EDGE_BAND, 300.0).is_none());
-        // The 8 px band on each edge.
+        // The 4 px band on each edge; a scrollbar 5 px from an edge is clear of it.
+        assert_eq!(EDGE_BAND, 4.0);
         assert!(is(hit(0.0, 300.0), Direction::West));
         assert!(is(hit(EDGE_BAND - 0.5, 300.0), Direction::West));
         assert!(is(hit(799.0, 300.0), Direction::East));
+        assert!(is(hit(796.5, 300.0), Direction::East));
         assert!(is(hit(400.0, 0.0), Direction::North));
         assert!(is(hit(400.0, NORTH_BAND - 0.5), Direction::North));
-        assert!(is(hit(400.0, 595.0), Direction::South));
+        assert!(is(hit(400.0, 597.0), Direction::South));
+        assert!(hit(5.0, 300.0).is_none());
+        assert!(hit(795.0, 300.0).is_none());
+        assert!(hit(400.0, 595.0).is_none());
         // Corners, reaching along both edges.
         assert!(is(hit(1.0, 1.0), Direction::NorthWest));
         assert!(is(hit(12.0, 2.0), Direction::NorthWest));
         assert!(is(hit(798.0, 2.0), Direction::NorthEast));
         assert!(is(hit(2.0, 590.0), Direction::SouthWest));
         assert!(is(hit(795.0, 598.0), Direction::SouthEast));
+        assert!(is(hit(2.0, 586.0), Direction::SouthWest));
+        assert!(is(hit(14.0, 598.0), Direction::SouthWest));
+        assert!(is(hit(786.0, 598.0), Direction::SouthEast));
+        assert!(is(hit(798.0, 14.0), Direction::NorthEast));
         // Outside the window: nothing.
         assert!(hit(-1.0, 300.0).is_none());
         assert!(hit(400.0, 600.5).is_none());
@@ -1549,8 +1587,20 @@ mod tests {
         // The other edges and the corners keep their reach.
         assert!(is_dir(hit(2.0, 12.0), Direction::NorthWest));
         assert!(is_dir(hit(798.0, 12.0), Direction::NorthEast));
-        assert!(is_dir(hit(7.0, 300.0), Direction::West));
-        assert!(is_dir(hit(400.0, 593.0), Direction::South));
+        assert!(is_dir(hit(3.0, 300.0), Direction::West));
+        assert!(is_dir(hit(400.0, 597.0), Direction::South));
+    }
+
+    #[test]
+    fn the_edges_stay_out_of_the_terminal() {
+        let size = Size::new(800.0, 600.0);
+        let hit = |x: f32, y: f32| edge_hit(size, Point::new(x, y), false, None);
+        // The terminal sits inside its padding: a selection started in its last row or its
+        // first or last column never resizes the window.
+        let pad = crate::window::TERMINAL_PADDING;
+        assert!(hit(400.0, size.height - pad.bottom - 0.5).is_none());
+        assert!(hit(pad.left + 0.5, 300.0).is_none());
+        assert!(hit(size.width - pad.right - 0.5, 300.0).is_none());
     }
 
     #[test]

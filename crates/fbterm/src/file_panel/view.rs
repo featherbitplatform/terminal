@@ -45,6 +45,8 @@ const SIZE_WIDTH: f32 = 52.0;
 const MODIFIED_WIDTH: f32 = 82.0;
 /// The modified column shows only when the list is at least this wide.
 const MODIFIED_FROM: f32 = 250.0;
+/// Width of the list's and the queue's scrollbars.
+pub(super) const SCROLLBAR_WIDTH: f32 = 6.0;
 /// Where a row's content starts and ends inside the list (the selection is inset by half).
 const ROW_PAD: f32 = 6.0;
 
@@ -187,6 +189,8 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
     let body = app.file_panel_body(wid)?;
     let ui = app.file_panels.ui.get(&wid);
     let t = app.tokens;
+    // The panel docks at the window's right edge: its scrollbars keep clear of the resize band.
+    let drawn = app.chrome.get().draws_controls();
     let title = app
         .windows
         .get(&wid)
@@ -232,7 +236,7 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
         Body::Loading => note(t, "Loading\u{2026}".into()),
         Body::Error(line) => error(t, wid, line),
         Body::Entries(panel) => match ui {
-            Some(ui) => listing(t, wid, panel, ui),
+            Some(ui) => listing(t, wid, panel, ui, drawn),
             None => note(t, String::new()),
         },
     };
@@ -241,7 +245,7 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
         .file_panel_transfers(wid)
         .filter(|rows| !rows.is_empty())
     {
-        content = content.push(transfers(t, wid, rows));
+        content = content.push(transfers(t, wid, rows, drawn));
     }
     let rule = container(Space::new())
         .width(1)
@@ -447,6 +451,7 @@ fn transfers<'a>(
     t: &'static Tokens,
     wid: window::Id,
     rows: &'a [TransferRow],
+    drawn: bool,
 ) -> Element<'a, Message> {
     let rule = container(Space::new())
         .width(Length::Fill)
@@ -460,12 +465,12 @@ fn transfers<'a>(
         .padding(Padding::from([8.0, PAD_X]));
     // A long queue scrolls instead of pushing the listing away.
     let list = scrollable(list)
-        .direction(scrollable::Direction::Vertical(
-            scrollable::Scrollbar::new()
-                .width(6)
-                .scroller_width(4)
-                .margin(1),
-        ))
+        .direction(scrollable::Direction::Vertical(crate::ui::edge_scrollbar(
+            drawn,
+            SCROLLBAR_WIDTH,
+            4.0,
+            1.0,
+        )))
         .style(move |theme, status| scroll_style(t, theme, status))
         .height(Length::Shrink);
     column![rule, container(list).max_height(TRANSFERS_MAX_HEIGHT)]
@@ -624,6 +629,7 @@ fn listing<'a>(
     wid: window::Id,
     panel: &'a ProfilePanel,
     ui: &'a WindowPanel,
+    drawn: bool,
 ) -> Element<'a, Message> {
     let entries: &'a [Entry] = match &panel.listing {
         state::Listing::Loaded(entries) => entries,
@@ -678,12 +684,12 @@ fn listing<'a>(
                 v.bounds().height,
             ))
         })
-        .direction(scrollable::Direction::Vertical(
-            scrollable::Scrollbar::new()
-                .width(6)
-                .scroller_width(4)
-                .margin(1),
-        ))
+        .direction(scrollable::Direction::Vertical(crate::ui::edge_scrollbar(
+            drawn,
+            SCROLLBAR_WIDTH,
+            4.0,
+            1.0,
+        )))
         .style(move |theme, status| scroll_style(t, theme, status))
         .height(Length::Fill);
         column![headers, list].into()

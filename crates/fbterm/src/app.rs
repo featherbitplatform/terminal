@@ -470,21 +470,29 @@ pub(crate) fn load_profiles(
 }
 
 /// Ask for `id`'s mode now and once the full-screen animation is over (the last resize can
-/// arrive before the OS reports the window as full screen).
-fn query_mode(id: window::Id) -> Task<Message> {
+/// arrive before the OS reports the window as full screen). Where the chrome is `drawn`, ask
+/// whether it is maximized too.
+fn query_mode(id: window::Id, drawn: bool) -> Task<Message> {
+    let after_settling = || {
+        Task::perform(
+            async { tokio::time::sleep(Duration::from_millis(800)).await },
+            |()| (),
+        )
+    };
     let now = window::mode(id).map(move |m| Message::WindowMode(id, m));
-    let settled = Task::perform(
-        async { tokio::time::sleep(Duration::from_millis(800)).await },
-        |()| (),
-    )
-    .then(move |()| window::mode(id))
-    .map(move |m| Message::WindowMode(id, m));
-    if !crate::chrome::Chrome::current().draws_controls() {
+    let settled = after_settling()
+        .then(move |()| window::mode(id))
+        .map(move |m| Message::WindowMode(id, m));
+    if !drawn {
         return Task::batch([now, settled]);
     }
-    // Maximizing and restoring resize the window too.
+    // Maximizing and restoring resize the window too. The window manager may report the
+    // maximized state only after the resize (X11 updates it separately), so ask again later.
     let maximized = window::is_maximized(id).map(move |m| Message::WindowMaximized(id, m));
-    Task::batch([now, settled, maximized])
+    let maximized_settled = after_settling()
+        .then(move |()| window::is_maximized(id))
+        .map(move |m| Message::WindowMaximized(id, m));
+    Task::batch([now, settled, maximized, maximized_settled])
 }
 
 /// The chrome cell the app switches: the one every window reads, or in tests one of its own,
@@ -649,7 +657,7 @@ impl App {
             chrome: app_chrome_cell(),
             chrome_base: (chrome::setup().look, chrome::setup().chrome),
             watch_moves: chrome::Platform::current() == chrome::Platform::Linux,
-            move_watch: Default::default(),
+            move_watch: crate::move_watch::MoveWatch::for_session(chrome::wayland_session()),
             chrome_fell_back: false,
             chrome_notice_shown: false,
             resize_count: 0,
@@ -1135,7 +1143,8 @@ impl App {
                 Task::none()
             }
             Message::WindowResized(id, size) => {
-                Task::batch([self.window_resized(id, size), query_mode(id)])
+                let drawn = self.chrome.get().draws_controls();
+                Task::batch([self.window_resized(id, size), query_mode(id, drawn)])
             }
             Message::WindowMode(id, mode) => {
                 if mode == window::Mode::Fullscreen {
@@ -1266,5 +1275,21 @@ impl App {
         };
         self.shooting = true;
         window::screenshot(wid).map(Message::Shot)
+    }
+}
+
+#[cfg(test)]
+mod query_mode_tests {
+    use super::query_mode;
+    use iced::window;
+
+    #[test]
+    fn drawn_chrome_asks_for_the_maximized_state_again_once_settled() {
+        let id = window::Id::unique();
+        // The mode now and once settled.
+        assert_eq!(query_mode(id, false).units(), 2);
+        // And the maximized state now and once settled: an X11 window manager can update it
+        // after the resize, and the controls' glyph and the edges follow it.
+        assert_eq!(query_mode(id, true).units(), 4);
     }
 }

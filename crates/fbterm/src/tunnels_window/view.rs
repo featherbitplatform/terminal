@@ -64,12 +64,12 @@ pub fn view<'a>(
             .padding(Padding::from([24.0, 32.0]))
             .center_x(Length::Fill),
     )
-    .direction(scrollable::Direction::Vertical(
-        scrollable::Scrollbar::new()
-            .width(6)
-            .scroller_width(6)
-            .margin(3),
-    ))
+    .direction(scrollable::Direction::Vertical(crate::ui::edge_scrollbar(
+        crate::chrome::Chrome::current().draws_controls(),
+        6.0,
+        6.0,
+        3.0,
+    )))
     .style(move |theme, status| {
         let mut s = scrollable::default(theme, status);
         s.vertical_rail.background = None;

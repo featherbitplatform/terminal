@@ -242,6 +242,25 @@ fn blur_switch_disabled_when_unsupported() {
 }
 
 #[test]
+fn reg_runs_from_system32_by_full_path() {
+    use crate::chrome::reg_exe;
+    assert_eq!(
+        reg_exe(Some(r"D:\Win".into())),
+        std::ffi::OsString::from(r"D:\Win\System32\reg.exe")
+    );
+    assert_eq!(
+        reg_exe(Some(r"C:\Windows\".into())),
+        std::ffi::OsString::from(r"C:\Windows\System32\reg.exe")
+    );
+    for unset in [None, Some("".into())] {
+        assert_eq!(
+            reg_exe(unset),
+            std::ffi::OsString::from(r"C:\Windows\System32\reg.exe")
+        );
+    }
+}
+
+#[test]
 fn the_windows_build_is_read_from_the_registry_output() {
     use crate::chrome::windows_build;
     let reg = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\r\n    \

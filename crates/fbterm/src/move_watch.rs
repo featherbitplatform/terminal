@@ -4,7 +4,8 @@
 //!
 //! A request is refused when, within [`ANSWER_TIME`] of it, the window neither moved nor
 //! resized while the pointer travelled more than [`TRAVEL`] over the window with the button
-//! still held, and the pointer never left the window before that travel.
+//! still held, and the pointer never left the window before that travel (on Wayland: never
+//! left it while the button was held).
 //!
 //! A desktop that carries a request out takes the pointer for it: the pointer leaves the
 //! window when the move starts and enters it again when it ends, and the button release goes
@@ -13,6 +14,11 @@
 //! button may have been let go unseen). A desktop that refuses never takes the pointer, so its
 //! travel is seen before the pointer can leave. A press let go in place, or one that stays
 //! still, is no evidence either way.
+//!
+//! On Wayland the window keeps the pointer while the button is held, so a leave before the
+//! release is always the compositor's grab and answers the request, travel or not: a fast
+//! flick can travel before the request reaches the compositor. On X11 a leave after travel
+//! may be the pointer simply moving off a window the desktop would not move.
 //!
 //! The decision is a pure state machine over the events the app feeds it and the time it is
 //! given; the app checks it once, from a one-shot timer started with the request.
@@ -66,6 +72,8 @@ pub struct MoveWatch {
     pending: Option<Pending>,
     /// The token of the last request.
     last: u64,
+    /// The session is Wayland's (else X11's): see [`seen`](Self::seen).
+    wayland: bool,
 }
 
 #[derive(Debug)]
@@ -83,6 +91,14 @@ struct Pending {
 }
 
 impl MoveWatch {
+    /// A watch for a Wayland session (`wayland`) or an X11 one.
+    pub fn for_session(wayland: bool) -> Self {
+        Self {
+            wayland,
+            ..Self::default()
+        }
+    }
+
     /// A move or resize of `window` was asked for at `now`, with the button held. Returns the
     /// token to [`check`](Self::check) with once [`ANSWER_TIME`] has passed. A request still
     /// watched is replaced.
@@ -125,8 +141,10 @@ impl MoveWatch {
             Seen::Cursor(_) => {}
             Seen::Released => p.held = false,
             Seen::Left => {
-                if p.held && !p.travelled {
-                    // The desktop took the pointer: it is carrying the request out.
+                // The desktop took the pointer: it is carrying the request out. On Wayland
+                // the window keeps the pointer while the button is held, so any leave then is
+                // the compositor's grab, even after travel seen before the request reached it.
+                if p.held && (self.wayland || !p.travelled) {
                     p.answered = true;
                 }
                 p.crossed = true;
@@ -426,6 +444,40 @@ mod tests {
         assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Answered);
         // A refusing desktop never takes the pointer: travel first, then the pointer may
         // leave the window it could not move. Still refused.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));
+        watch.seen(w, Seen::Left);
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Refused);
+    }
+
+    #[test]
+    fn a_wayland_leave_while_held_is_the_compositors_grab() {
+        let t0 = Instant::now();
+        let w = window::Id::unique();
+        // Wayland: while the button is held the pointer stays on the window (implicit grab),
+        // so a leave mid-press can only be the compositor taking it for the move, even after
+        // a fast flick travelled before the request reached the compositor.
+        let mut watch = MoveWatch::for_session(true);
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));
+        watch.seen(w, Seen::Left);
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Answered);
+        // A leave after the release proves nothing: travel while held stays a refusal.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));
+        watch.seen(w, Seen::Released);
+        watch.seen(w, Seen::Left);
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Refused);
+        // Travel with no leave at all: refused, as on X11.
+        let token = watch.start(w, t0);
+        watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
+        watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));
+        assert_eq!(watch.check(token, t0 + ANSWER_TIME), Verdict::Refused);
+        // X11 keeps its rule: a leave after travel follows a refusal.
+        let mut watch = MoveWatch::for_session(false);
         let token = watch.start(w, t0);
         watch.seen(w, Seen::Cursor(Point::new(100.0, 10.0)));
         watch.seen(w, Seen::Cursor(Point::new(140.0, 10.0)));

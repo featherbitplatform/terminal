@@ -1,7 +1,7 @@
 //! Shared chrome pieces for the editor and the dialogs: Graphite controls (radius 6), cards
 //! (radius 8), overlays (radius 12), Lucide icons.
 
-use iced::widget::{Space, button, column, container, row, text, text_input};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{
     Alignment, Background, Border, Color, Element, Font, Length, Padding, Shadow, Vector, window,
 };
@@ -237,6 +237,35 @@ pub fn to_color(c: fbterm_config::Rgb) -> Color {
     Color::from_rgb8(c.r, c.g, c.b)
 }
 
+/// The least margin of a scrollbar along a window's right edge where the chrome is drawn: the
+/// bar then lies clear of the resize band, so a press on it scrolls instead of resizing.
+pub const EDGE_SCROLLBAR_MARGIN: f32 = chrome::EDGE_BAND + 1.0;
+
+/// The margin a scrollbar along a window's right edge gets: `margin`, or at least
+/// [`EDGE_SCROLLBAR_MARGIN`] where the chrome is `drawn`.
+pub fn edge_scrollbar_margin(drawn: bool, margin: f32) -> f32 {
+    if drawn {
+        margin.max(EDGE_SCROLLBAR_MARGIN)
+    } else {
+        margin
+    }
+}
+
+/// A vertical scrollbar `width` wide (its scroller `scroller_width`) with `margin` around it,
+/// for a scrollable along a window's right edge: clear of the resize band where the chrome is
+/// `drawn` (see [`edge_scrollbar_margin`]).
+pub fn edge_scrollbar(
+    drawn: bool,
+    width: f32,
+    scroller_width: f32,
+    margin: f32,
+) -> scrollable::Scrollbar {
+    scrollable::Scrollbar::new()
+        .width(width)
+        .scroller_width(scroller_width)
+        .margin(edge_scrollbar_margin(drawn, margin))
+}
+
 /// The bar of the editor and Settings windows where the OS title bar is gone: room for the
 /// window buttons (or the drawn controls) and to move the window. It stays blank otherwise;
 /// the window's content titles it.
@@ -407,5 +436,24 @@ mod icon_font_tests {
             seen += 1;
         }
         assert!(seen >= 8, "found only {seen} ICON_ constants");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::edge_scrollbar_margin;
+    use crate::chrome::EDGE_BAND;
+
+    #[test]
+    fn edge_scrollbars_clear_the_resize_band_only_where_drawn() {
+        // Drawn chrome: the bar (between its margins) starts past the band.
+        for margin in [0.0, 1.0, 3.0] {
+            assert!(edge_scrollbar_margin(true, margin) > EDGE_BAND);
+        }
+        assert_eq!(edge_scrollbar_margin(true, 8.0), 8.0);
+        // Elsewhere (macOS, the system title bar) nothing changes.
+        for margin in [0.0, 1.0, 3.0] {
+            assert_eq!(edge_scrollbar_margin(false, margin), margin);
+        }
     }
 }
