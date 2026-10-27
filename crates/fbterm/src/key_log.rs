@@ -4,7 +4,7 @@
 //! system deliver the event at all, and did any widget capture it?) and once from each
 //! [`Shortcuts`](crate::shortcuts) wrapper it reaches (was it captured before the wrapper saw
 //! it?). Nothing is logged while no chord is being recorded, so terminal typing never is; the
-//! text a press types is logged only for the recording window.
+//! text a press types and character keys are logged only for the recording window.
 
 use std::sync::OnceLock;
 
@@ -39,7 +39,21 @@ pub fn set_recording(window: Option<window::Id>) {
 
 /// The window recording a chord, while the log is on.
 fn recorder() -> Option<window::Id> {
-    if enabled() { *RECORDING.lock() } else { None }
+    active(enabled(), *RECORDING.lock())
+}
+
+/// The window whose recording is logged: `recording`, only when the log is `enabled`.
+pub fn active(enabled: bool, recording: Option<window::Id>) -> Option<window::Id> {
+    recording.filter(|_| enabled)
+}
+
+/// `key` for the log: character keys only in the recording window (`here`); named keys
+/// everywhere.
+fn shown(key: &keyboard::Key, here: bool) -> String {
+    match key {
+        keyboard::Key::Character(_) if !here => "<character>".to_owned(),
+        key => format!("{key:?}"),
+    }
 }
 
 /// Where an event was seen.
@@ -80,7 +94,8 @@ pub fn shortcuts(window: window::Id, event: &iced::Event, captured: bool) {
 }
 
 /// The log line for keyboard `event` seen by `source` in `window`, while `recorder` records.
-/// The text a press types is shown only for `recorder`.
+/// The text a press types and character keys are shown only for `recorder`; elsewhere only
+/// named keys, physical keys and locations.
 pub fn describe(
     source: Source,
     window: window::Id,
@@ -109,8 +124,9 @@ pub fn describe(
             } else {
                 "<withheld>".to_owned()
             };
+            let (key, modified_key) = (shown(key, here), shown(modified_key, here));
             format!(
-                "{head} KeyPressed key={key:?} modified_key={modified_key:?} \
+                "{head} KeyPressed key={key} modified_key={modified_key} \
                  physical_key={physical_key:?} location={location:?} text={text} \
                  modifiers={modifiers:?} repeat={repeat} captured={captured}"
             )
@@ -122,9 +138,11 @@ pub fn describe(
             location,
             modifiers,
         } => format!(
-            "{head} KeyReleased key={key:?} modified_key={modified_key:?} \
+            "{head} KeyReleased key={} modified_key={} \
              physical_key={physical_key:?} location={location:?} modifiers={modifiers:?} \
-             captured={captured}"
+             captured={captured}",
+            shown(key, here),
+            shown(modified_key, here),
         ),
         keyboard::Event::ModifiersChanged(modifiers) => {
             format!("{head} ModifiersChanged modifiers={modifiers:?} captured={captured}")
@@ -172,16 +190,64 @@ mod tests {
     }
 
     #[test]
-    fn text_typed_in_another_window_is_never_logged() {
+    fn characters_typed_in_another_window_are_never_logged() {
         let (recorder, other) = (window::Id::unique(), window::Id::unique());
         let line = describe(Source::Listener, other, recorder, &press(Some("x")), true);
-        assert!(!line.contains("\"x\""), "{line}");
+        // Neither the text nor the character keys; the physical key and location stay.
+        for secret in ["\"x\"", "\"1\"", "\"!\""] {
+            assert!(!line.contains(secret), "{secret} in {line}");
+        }
+        for part in [
+            "text=<withheld>",
+            "key=<character>",
+            "modified_key=<character>",
+            "physical_key=Code(Digit1)",
+            "location=Standard",
+            "listener",
+            "captured=true",
+            "recording_window=false",
+        ] {
+            assert!(line.contains(part), "{part} in {line}");
+        }
+        let release = keyboard::Event::KeyReleased {
+            key: Key::Character("a".into()),
+            modified_key: Key::Character("a".into()),
+            physical_key: Physical::Code(Code::KeyA),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+        };
+        let line = describe(Source::Shortcuts, other, recorder, &release, false);
+        assert!(!line.contains("\"a\""), "{line}");
+        assert!(line.contains("physical_key=Code(KeyA)"), "{line}");
+    }
+
+    #[test]
+    fn named_keys_in_another_window_are_logged() {
+        let (recorder, other) = (window::Id::unique(), window::Id::unique());
+        let enter = keyboard::Event::KeyPressed {
+            key: Key::Named(Named::Enter),
+            modified_key: Key::Named(Named::Enter),
+            physical_key: Physical::Code(Code::Enter),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+            text: Some("\r".into()),
+            repeat: false,
+        };
+        let line = describe(Source::Listener, other, recorder, &enter, false);
+        assert!(line.contains("key=Named(Enter)"), "{line}");
         assert!(line.contains("text=<withheld>"), "{line}");
-        assert!(
-            line.contains("listener") && line.contains("captured=true"),
-            "{line}"
-        );
-        assert!(line.contains("recording_window=false"), "{line}");
+    }
+
+    #[test]
+    fn nothing_is_logged_or_listened_to_unless_on_and_recording() {
+        let w = window::Id::unique();
+        assert_eq!(active(false, None), None);
+        assert_eq!(active(false, Some(w)), None);
+        assert_eq!(active(true, None), None);
+        assert_eq!(active(true, Some(w)), Some(w));
+        // This test run never set FBTERM_LOG_KEYS: nothing is logged.
+        set_recording(Some(w));
+        assert_eq!(recorder(), None);
     }
 
     #[test]

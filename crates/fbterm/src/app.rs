@@ -833,7 +833,7 @@ impl App {
             subs.push(iced::time::every(Duration::from_millis(1500)).map(|_| Message::Shoot));
         }
         subs.push(window::resize_events().map(|(id, size)| Message::WindowResized(id, size)));
-        if crate::key_log::enabled() && self.recording_window().is_some() {
+        if self.key_log_listening() {
             // Debug aid, only while a shortcut is recorded: log what the windows receive.
             subs.push(iced::event::listen_with(crate::key_log::listen));
         }
@@ -867,8 +867,14 @@ impl App {
         }
     }
 
+    /// Whether the key log listens to every window's keyboard events now (`FBTERM_LOG_KEYS`
+    /// and a shortcut being recorded).
+    pub(crate) fn key_log_listening(&self) -> bool {
+        crate::key_log::active(crate::key_log::enabled(), self.recording_window()).is_some()
+    }
+
     /// The Settings window while it records a shortcut.
-    fn recording_window(&self) -> Option<window::Id> {
+    pub(crate) fn recording_window(&self) -> Option<window::Id> {
         self.settings_win
             .as_ref()
             .filter(|(_, state)| state.recording.is_some())
