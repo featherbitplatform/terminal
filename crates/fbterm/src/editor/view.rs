@@ -1,12 +1,16 @@
 //! The profile editor window: profiles by group on the left, the selected one's form on the right.
 
 use fbterm_config::{AccentStyle, Rgb};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, scrollable, text, text_input,
+};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::ssh_view::{auth, jumps};
+use super::ssh_view::{auth, jumps, tunnels};
 use super::{ACCENTS, Draft, DraftKind, EditorMsg, EditorState};
 use crate::app::Message;
+use crate::schemes::SchemeChoice;
+use crate::settings_window::view::{fixed_choice, menu_style, pick_style};
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
@@ -20,7 +24,8 @@ pub(super) fn msg(m: EditorMsg) -> Message {
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a EditorState,
-    degraded: bool,
+    schemes: Vec<SchemeChoice>,
+    storage: fbterm_secrets::Storage,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut main = column![];
@@ -29,7 +34,7 @@ pub fn view<'a>(
     }
     let form: Element<'a, Message> = match state.selected_draft() {
         Some(d) => scrollable(
-            container(form(t, state, d, editable, degraded))
+            container(form(t, state, d, schemes, editable, storage))
                 .padding(Padding::from([20.0, 28.0]))
                 .max_width(FORM_WIDTH + 56.0),
         )
@@ -251,6 +256,41 @@ fn field<'a>(
     .into()
 }
 
+/// The profile's scheme list (`Use global scheme` or one scheme; a still value when read-only)
+/// and the way to the Color schemes window.
+fn scheme_pick<'a>(
+    t: &'static Tokens,
+    d: &'a Draft,
+    schemes: Vec<SchemeChoice>,
+    editable: bool,
+) -> Element<'a, Message> {
+    let current = d.color_scheme.as_deref();
+    let picker: Element<'a, Message> = if editable {
+        let selected = crate::schemes::chosen(&schemes, current);
+        pick_list(schemes, selected, |c: SchemeChoice| {
+            msg(EditorMsg::ColorScheme(c.id))
+        })
+        .placeholder(crate::schemes::NOT_FOUND)
+        .font(UI_FONT)
+        .text_size(13)
+        .padding(Padding::from([7.0, 10.0]))
+        .width(240)
+        .style(move |_, status| pick_style(t, status))
+        .menu_style(move |_| menu_style(t))
+        .into()
+    } else {
+        fixed_choice(t, crate::schemes::shown(&schemes, current), 240.0)
+    };
+    let edit = button(text("Edit schemes\u{2026}").font(UI_FONT).size(12.5))
+        .on_press(msg(EditorMsg::EditSchemes))
+        .padding(Padding::from([5.0, 8.0]))
+        .style(move |_, s| ui::ghost(t, s));
+    row![picker, edit]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 pub(super) fn input<'a>(
     t: &'static Tokens,
     placeholder: &'a str,
@@ -279,8 +319,9 @@ fn form<'a>(
     t: &'static Tokens,
     state: &'a EditorState,
     d: &'a Draft,
+    schemes: Vec<SchemeChoice>,
     editable: bool,
-    degraded: bool,
+    storage: fbterm_secrets::Storage,
 ) -> Element<'a, Message> {
     let on = |f: fn(String) -> EditorMsg| editable.then_some(f);
     let mut col = column![
@@ -315,6 +356,11 @@ fn form<'a>(
             .spacing(6),
         ]
         .spacing(24),
+        column![
+            ui::label(t, "Color scheme"),
+            scheme_pick(t, d, schemes, editable)
+        ]
+        .spacing(6),
     ]
     .spacing(14)
     .width(Length::Fill);
@@ -368,9 +414,11 @@ fn form<'a>(
                 )
                 .push(field(t, "User", "user", &s.user, true, on(EditorMsg::User)))
                 .push(section(t, "Authentication"))
-                .push(auth(t, s, editable, degraded, state.selected_key_is_rsa()))
+                .push(auth(t, s, editable, storage, state.selected_key_is_rsa()))
                 .push(section(t, "Jump hosts"))
-                .push(jumps(t, state, d.id, s, editable));
+                .push(jumps(t, state, d.id, s, editable))
+                .push(section(t, "Tunnels"))
+                .push(tunnels(t, s, editable));
         }
     }
     col.into()
@@ -464,12 +512,14 @@ fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Ele
                 (editable && has_selection).then(|| msg(EditorMsg::Delete)),
                 ui::danger_ghost
             ),
+            ui::text_button(t, "Export\u{2026}", Some(msg(EditorMsg::Export)), ui::ghost),
+            ui::text_button(t, "Import\u{2026}", Some(msg(EditorMsg::Import)), ui::ghost),
             messages,
             ui::text_button(t, "Close", Some(msg(EditorMsg::Close)), ui::secondary),
             ui::text_button(
                 t,
                 "Save",
-                (editable && state.dirty).then(|| msg(EditorMsg::Save)),
+                (editable && state.dirty && state.saving.is_none()).then(|| msg(EditorMsg::Save)),
                 ui::primary
             ),
         ]

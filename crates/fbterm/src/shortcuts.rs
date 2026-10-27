@@ -7,13 +7,18 @@ use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector, keyboard, mouse, window};
 
 use crate::app::Message;
+use crate::archive_window::ArchiveMsg;
 use crate::editor::EditorMsg;
+use crate::file_panel::{FilePanelMsg, PanelKey};
 use crate::find::FindMsg;
 use crate::find::all::FindAllMsg;
 use crate::keys::{self, Action, Bindings};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
+use crate::saved_secrets::VaultMsg;
+use crate::schemes_window::{ImportChoice, SchemesMsg};
 use crate::settings_window::SettingsMsg;
+use crate::tunnels_window::TunnelsMsg;
 
 /// How a [`Shortcuts`] wrapper treats keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -33,14 +38,41 @@ pub(crate) enum Mode {
     /// move between matches, Escape closes the bar, application shortcuts act, and typing goes
     /// to the bar's field, never to the terminal (the terminal is drawn unfocused).
     Find,
+    /// A window whose file panel has the keyboard: application shortcuts act, keys go to the
+    /// panel's fields first, and what they leave (arrows, Enter, Backspace, Escape, typing)
+    /// drives the panel. Nothing reaches the terminal (the dock sends key presses to the panel
+    /// only). Escape is the panel's before any field sees it (a focused field would only let
+    /// go of the keyboard): it leaves the path field, else clears the filter, else gives the
+    /// keyboard back.
+    Panel,
     /// A connection dialog: Escape cancels, Enter submits; other keys go to its field.
     Prompt,
+    /// A main password dialog (`crate::saved_secrets`): Escape cancels, Enter submits, no
+    /// shortcut acts; other keys go to its fields.
+    Vault,
     /// The profile editor window: Cmd+W closes it, Cmd+S saves, Settings and Quit work; other
     /// shortcuts do nothing.
     Editor,
     /// The Settings window: Cmd+W closes it, the profile editor and Quit work; other shortcuts
     /// do nothing.
     Settings,
+    /// The Color schemes window: Cmd+W closes it, Cmd+S saves, Settings, the profile editor and
+    /// Quit work; other shortcuts do nothing.
+    Schemes,
+    /// The Color schemes window asking whether to delete a scheme: Enter deletes, Escape
+    /// cancels, and no other key reaches a field behind the question or acts as a shortcut.
+    SchemesConfirm,
+    /// The Color schemes window asking what to do with an imported scheme whose id is taken:
+    /// Enter keeps both, Escape cancels, and no other key reaches a field behind the question
+    /// or acts as a shortcut.
+    SchemesImport,
+    /// The Tunnels window: Cmd+W closes it, Settings, the profile editor, Color schemes and
+    /// Quit work; other shortcuts do nothing (typing goes to the search bar).
+    Tunnels,
+    /// The export and import window: Cmd+W closes it, Settings, the profile editor, Color
+    /// schemes, Tunnels and Quit work, and so do the export and import actions (they switch
+    /// its mode); other shortcuts do nothing (typing goes to its fields).
+    Archive,
     /// The Settings window recording a new chord: every key press goes to the recorder (plain
     /// Escape cancels), none reaches a field or acts as a shortcut.
     Recording,
@@ -142,11 +174,26 @@ fn key_message(
             Some(m) => Some(Some(Message::Find(w, m))),
             None => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
         },
+        Mode::Panel => match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => Some(Some(Message::FilePanel(
+                FilePanelMsg::Key(w, PanelKey::Escape),
+            ))),
+            _ => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
+        },
         Mode::Prompt => match key {
             keyboard::Key::Named(Named::Escape) => {
                 Some(Some(Message::Prompt(PromptMsg::Cancel(w))))
             }
             keyboard::Key::Named(Named::Enter) => Some(Some(Message::Prompt(PromptMsg::Submit(w)))),
+            _ => shortcut.map(|_| None),
+        },
+        Mode::Vault => match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => {
+                Some(Some(Message::Vault(VaultMsg::Cancel)))
+            }
+            keyboard::Key::Named(Named::Enter) if !repeat => {
+                Some(Some(Message::Vault(VaultMsg::Submit)))
+            }
             _ => shortcut.map(|_| None),
         },
         Mode::Editor => {
@@ -159,13 +206,84 @@ fn key_message(
             }
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
-                Action::Quit | Action::Settings if !repeat => Some(Message::Shortcut(w, action)),
+                Action::Quit
+                | Action::Settings
+                | Action::EditSchemes
+                | Action::Tunnels
+                | Action::ExportProfiles
+                | Action::ImportProfiles
+                    if !repeat =>
+                {
+                    Some(Message::Shortcut(w, action))
+                }
                 _ => None,
             })
         }
         Mode::Settings => shortcut.map(|action| match action {
             Action::CloseTab if !repeat => Some(Message::Settings(SettingsMsg::Close)),
-            Action::Quit | Action::EditProfiles if !repeat => Some(Message::Shortcut(w, action)),
+            Action::Quit | Action::EditProfiles | Action::EditSchemes | Action::Tunnels
+                if !repeat =>
+            {
+                Some(Message::Shortcut(w, action))
+            }
+            _ => None,
+        }),
+        Mode::Schemes => {
+            if mods == keyboard::Modifiers::COMMAND
+                && matches!(key, keyboard::Key::Character(c) if c.eq_ignore_ascii_case("s"))
+            {
+                return Some((!repeat).then_some(Message::Schemes(SchemesMsg::Save)));
+            }
+            shortcut.map(|action| match action {
+                Action::CloseTab if !repeat => Some(Message::Schemes(SchemesMsg::Close)),
+                Action::Quit | Action::Settings | Action::EditProfiles | Action::Tunnels
+                    if !repeat =>
+                {
+                    Some(Message::Shortcut(w, action))
+                }
+                _ => None,
+            })
+        }
+        Mode::Tunnels => shortcut.map(|action| match action {
+            Action::CloseTab if !repeat => Some(Message::Tunnels(TunnelsMsg::Close)),
+            Action::Quit | Action::Settings | Action::EditProfiles | Action::EditSchemes
+                if !repeat =>
+            {
+                Some(Message::Shortcut(w, action))
+            }
+            _ => None,
+        }),
+        Mode::Archive => shortcut.map(|action| match action {
+            Action::CloseTab if !repeat => Some(Message::Archive(ArchiveMsg::Close)),
+            Action::Quit
+            | Action::Settings
+            | Action::EditProfiles
+            | Action::EditSchemes
+            | Action::Tunnels
+            | Action::ExportProfiles
+            | Action::ImportProfiles
+                if !repeat =>
+            {
+                Some(Message::Shortcut(w, action))
+            }
+            _ => None,
+        }),
+        Mode::SchemesConfirm => Some(match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => {
+                Some(Message::Schemes(SchemesMsg::CancelDelete))
+            }
+            keyboard::Key::Named(Named::Enter) if !repeat => {
+                Some(Message::Schemes(SchemesMsg::ConfirmDelete))
+            }
+            _ => None,
+        }),
+        Mode::SchemesImport => Some(match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => Some(Message::Schemes(
+                SchemesMsg::ImportChoice(ImportChoice::Cancel),
+            )),
+            keyboard::Key::Named(Named::Enter) if !repeat => Some(Message::Schemes(
+                SchemesMsg::ImportChoice(ImportChoice::KeepBoth),
+            )),
             _ => None,
         }),
         Mode::Recording => Some(recording_key(key, mods, repeat)),
@@ -185,6 +303,51 @@ fn recording_key(key: &keyboard::Key, mods: keyboard::Modifiers, repeat: bool) -
     Some(Message::Settings(SettingsMsg::Pressed(keys::press_chord(
         key, mods,
     ))))
+}
+
+/// What a key press the panel's fields left means to the panel.
+fn panel_key(event: &Event) -> Option<PanelKey> {
+    use keyboard::key::Named;
+    let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event else {
+        return None;
+    };
+    if modifiers.command() || modifiers.control() || modifiers.alt() || modifiers.logo() {
+        return panel_text(event).map(PanelKey::Type);
+    }
+    Some(match key {
+        keyboard::Key::Named(Named::ArrowUp) => PanelKey::Up,
+        keyboard::Key::Named(Named::ArrowDown) => PanelKey::Down,
+        keyboard::Key::Named(Named::Home) => PanelKey::Home,
+        keyboard::Key::Named(Named::End) => PanelKey::End,
+        keyboard::Key::Named(Named::PageUp) => PanelKey::PageUp,
+        keyboard::Key::Named(Named::PageDown) => PanelKey::PageDown,
+        keyboard::Key::Named(Named::Enter) => PanelKey::Enter,
+        keyboard::Key::Named(Named::Backspace) => PanelKey::Backspace,
+        keyboard::Key::Named(Named::Escape) => PanelKey::Escape,
+        _ => return panel_text(event).map(PanelKey::Type),
+    })
+}
+
+/// Text a key press types for the panel: as [`typed_text`], and on macOS also what Option
+/// types (`~` is Option+5 on some layouts). Chords bound to app shortcuts never get here:
+/// [`Mode::Panel`] acts on them before the panel's fields.
+fn panel_text(event: &Event) -> Option<String> {
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        text: Some(text),
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+    if !(cfg!(target_os = "macos") && modifiers.alt()) {
+        return typed_text(event);
+    }
+    if modifiers.command() || modifiers.control() || modifiers.logo() {
+        return None;
+    }
+    let text = text.to_string();
+    (!text.is_empty() && text.chars().all(|c| !c.is_control())).then_some(text)
 }
 
 /// Printable text a key press types (no Cmd, Ctrl or Alt held).
@@ -291,6 +454,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
             shell,
             viewport,
         );
+        // The panel's fields did not take the key: the panel acts on it.
+        if self.mode == Mode::Panel
+            && !shell.is_event_captured()
+            && let Some(key) = panel_key(event)
+        {
+            shell.publish(Message::FilePanel(FilePanelMsg::Key(self.window, key)));
+            shell.capture_event();
+        }
         // Typing the bar's field did not take (it lost focus to a click): the bar takes it.
         if self.mode == Mode::Find
             && !shell.is_event_captured()
@@ -375,6 +546,75 @@ mod tests {
             mods |= keyboard::Modifiers::SHIFT;
         }
         (keyboard::Key::Character(c.into()), mods)
+    }
+
+    #[test]
+    fn panel_mode_keeps_shortcuts_and_hands_other_keys_to_the_panel() {
+        use keyboard::key::Named;
+        let panel = Mode::Panel;
+        assert!(matches!(
+            press(panel, "t", false),
+            Some(Some(Message::Shortcut(_, Action::NewTab)))
+        ));
+        let named = |mode, key| {
+            key_message(
+                &defaults(),
+                mode,
+                window::Id::unique(),
+                &keyboard::Key::Named(key),
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        // Plain keys go on to the panel's fields first.
+        assert!(named(panel, Named::Backspace).is_none());
+        // Escape is the panel's before any field sees it (a focused field would only let go
+        // of the keyboard): it leaves the path field, clears the filter, or gives the
+        // keyboard back.
+        assert!(matches!(
+            named(panel, Named::Escape),
+            Some(Some(Message::FilePanel(FilePanelMsg::Key(
+                _,
+                PanelKey::Escape
+            ))))
+        ));
+        // A held Escape does nothing more.
+        assert!(!matches!(
+            key_message(
+                &defaults(),
+                panel,
+                window::Id::unique(),
+                &keyboard::Key::Named(Named::Escape),
+                keyboard::Modifiers::empty(),
+                true,
+                None,
+            ),
+            Some(Some(Message::FilePanel(_)))
+        ));
+        let event = |key: keyboard::Key, text: Option<&str>| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: text.map(Into::into),
+                repeat: false,
+            })
+        };
+        assert_eq!(
+            panel_key(&event(keyboard::Key::Named(Named::Backspace), None)),
+            Some(PanelKey::Backspace)
+        );
+        assert_eq!(
+            panel_key(&event(keyboard::Key::Named(Named::ArrowDown), None)),
+            Some(PanelKey::Down)
+        );
+        assert_eq!(
+            panel_key(&event(keyboard::Key::Character("a".into()), Some("a"))),
+            Some(PanelKey::Type("a".into()))
+        );
     }
 
     fn press(mode: Mode, c: &str, shift: bool) -> Option<Option<Message>> {
@@ -646,6 +886,127 @@ mod tests {
     }
 
     #[test]
+    fn the_delete_question_takes_every_key() {
+        let named = |n| keyboard::Key::Named(n);
+        let at = |key: keyboard::Key| {
+            key_message(
+                &defaults(),
+                Mode::SchemesConfirm,
+                window::Id::unique(),
+                &key,
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        use keyboard::key::Named;
+        assert!(matches!(
+            at(named(Named::Escape)),
+            Some(Some(Message::Schemes(SchemesMsg::CancelDelete)))
+        ));
+        assert!(matches!(
+            at(named(Named::Enter)),
+            Some(Some(Message::Schemes(SchemesMsg::ConfirmDelete)))
+        ));
+        assert!(matches!(
+            at(keyboard::Key::Character("a".into())),
+            Some(None)
+        ));
+        assert!(matches!(
+            press(Mode::SchemesConfirm, "w", false),
+            Some(None)
+        ));
+    }
+
+    #[test]
+    fn the_import_question_takes_enter_and_escape_only() {
+        let at = |key: keyboard::Key| {
+            key_message(
+                &defaults(),
+                Mode::SchemesImport,
+                window::Id::unique(),
+                &key,
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        use keyboard::key::Named;
+        let named = |n| keyboard::Key::Named(n);
+        assert!(matches!(
+            at(named(Named::Escape)),
+            Some(Some(Message::Schemes(SchemesMsg::ImportChoice(
+                ImportChoice::Cancel
+            ))))
+        ));
+        assert!(matches!(
+            at(named(Named::Enter)),
+            Some(Some(Message::Schemes(SchemesMsg::ImportChoice(
+                ImportChoice::KeepBoth
+            ))))
+        ));
+        assert!(matches!(
+            at(keyboard::Key::Character("a".into())),
+            Some(None)
+        ));
+        assert!(matches!(press(Mode::SchemesImport, "w", false), Some(None)));
+    }
+
+    #[test]
+    fn the_tunnels_window_closes_and_reaches_the_others() {
+        assert!(matches!(
+            press(Mode::Tunnels, "w", false),
+            Some(Some(Message::Tunnels(TunnelsMsg::Close)))
+        ));
+        assert!(matches!(
+            press(Mode::Tunnels, ",", true),
+            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
+        ));
+        assert!(matches!(press(Mode::Tunnels, "t", false), Some(None)));
+    }
+
+    #[test]
+    fn the_archive_window_closes_and_reaches_the_others() {
+        assert!(matches!(
+            press(Mode::Archive, "w", false),
+            Some(Some(Message::Archive(
+                crate::archive_window::ArchiveMsg::Close
+            )))
+        ));
+        assert!(matches!(
+            press(Mode::Archive, ",", true),
+            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
+        ));
+        assert!(matches!(press(Mode::Archive, "t", false), Some(None)));
+    }
+
+    #[test]
+    fn the_schemes_window_closes_saves_and_reaches_the_others() {
+        assert!(matches!(
+            press(Mode::Schemes, "w", false),
+            Some(Some(Message::Schemes(SchemesMsg::Close)))
+        ));
+        assert!(matches!(
+            press(Mode::Schemes, ",", true),
+            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
+        ));
+        assert!(matches!(press(Mode::Schemes, "t", false), Some(None)));
+        let s = keyboard::Key::Character("s".into());
+        assert!(matches!(
+            key_message(
+                &defaults(),
+                Mode::Schemes,
+                window::Id::unique(),
+                &s,
+                keyboard::Modifiers::COMMAND,
+                false,
+                None
+            ),
+            Some(Some(Message::Schemes(SchemesMsg::Save)))
+        ));
+    }
+
+    #[test]
     fn the_settings_and_editor_windows_close_on_close_tab_and_reach_each_other() {
         assert!(matches!(
             press(Mode::Settings, "w", false),
@@ -723,6 +1084,67 @@ mod tests {
             Some(Some(Message::Shortcut(_, Action::Settings)))
         ));
         assert!(save(&b, M::COMMAND));
+    }
+
+    #[test]
+    fn option_typed_text_reaches_the_panel_unless_it_is_a_shortcut() {
+        let alt = keyboard::Modifiers::ALT;
+        let five = keyboard::Key::Character("5".into());
+        let event = Event::Keyboard(keyboard::Event::KeyPressed {
+            key: five.clone(),
+            modified_key: keyboard::Key::Character("~".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit5),
+            location: keyboard::Location::Standard,
+            modifiers: alt,
+            text: Some("~".into()),
+            repeat: false,
+        });
+        // Option+5 types `~` on some macOS layouts: the panel takes it as text.
+        let expected = cfg!(target_os = "macos").then(|| PanelKey::Type("~".into()));
+        assert_eq!(panel_key(&event), expected);
+        // Option with Cmd or Ctrl is never text.
+        let with = |mods| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key: five.clone(),
+                modified_key: five.clone(),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Digit5),
+                location: keyboard::Location::Standard,
+                modifiers: mods,
+                text: Some("~".into()),
+                repeat: false,
+            })
+        };
+        assert_eq!(panel_key(&with(alt | keyboard::Modifiers::CTRL)), None);
+        assert_eq!(panel_key(&with(alt | keyboard::Modifiers::LOGO)), None);
+        // A chord bound to an app shortcut acts as the shortcut before the panel sees it.
+        let mut overrides = fbterm_config::keys::Overrides::new();
+        overrides.insert(Action::NewTab, Some(parse_chord("alt+5")));
+        let b = Bindings::current(&overrides);
+        assert!(matches!(
+            key_message(
+                &b,
+                Mode::Panel,
+                window::Id::unique(),
+                &five,
+                alt,
+                false,
+                Some("~")
+            ),
+            Some(Some(Message::Shortcut(_, Action::NewTab)))
+        ));
+        // Unbound, it goes on to the panel.
+        assert!(
+            key_message(
+                &defaults(),
+                Mode::Panel,
+                window::Id::unique(),
+                &five,
+                alt,
+                false,
+                Some("~")
+            )
+            .is_none()
+        );
     }
 
     fn parse_chord(s: &str) -> keys::Chord {

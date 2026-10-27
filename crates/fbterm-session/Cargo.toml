@@ -11,13 +11,14 @@ workspace = true
 fbterm-config = { path = "../fbterm-config" }
 fbterm-term = { path = "../fbterm-term" }
 portable-pty = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
 directories = { workspace = true }
 tracing = { workspace = true }
 fbterm-secrets = { path = "../fbterm-secrets" }
 russh = { workspace = true }
+russh-sftp = { workspace = true }
 async-trait = { workspace = true }
 # known_hosts: hashed host names are HMAC-SHA1 with base64 salts (same versions as russh).
 hmac = "0.13"
@@ -25,6 +26,13 @@ sha1 = "0.11"
 data-encoding = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
+[features]
+# Raw remote-forward calls on `Connection` for the live tests (`tests/ssh_live.rs`); the app
+# never enables it.
+test-support = []
+
 [dev-dependencies]
+# The crate itself with `test-support`, for its integration tests.
+fbterm-session = { path = ".", features = ["test-support"] }
 tempfile = "3"
 feathercritty = { workspace = true }

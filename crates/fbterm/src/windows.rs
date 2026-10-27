@@ -9,6 +9,7 @@ use iced::{Task, window};
 use crate::app::{App, Message, unix_now};
 use crate::chrome::Chrome;
 use crate::layout::{Drop, Layout, PaneId};
+use crate::prompts::Closing;
 use crate::restore;
 use crate::tabs::{self, Pane, Tab, TabId, TabState, WindowState};
 
@@ -114,9 +115,17 @@ impl App {
         self.start(wid, id)
     }
 
-    /// The tab's close button: a tab with several live panes asks first (`Dialog::CloseTab`),
-    /// anything else closes at once. The pane shortcut and bulk closes call `close_tab` directly.
+    /// The tab's close button: a tab whose closing would end running transfers asks first
+    /// (`Dialog::Transfers`), then a tab with several live panes (`Dialog::CloseTab`);
+    /// anything else closes at once. Bulk closes call `close_tab` directly.
     pub(crate) fn close_tab_asking(&mut self, wid: window::Id, index: usize) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
+            return Task::none();
+        };
+        let (id, panes): (TabId, Vec<PaneId>) = (tab.id, tab.panes.iter().map(|p| p.id).collect());
+        if self.ask_before_closing(wid, &panes, Closing::Tab(id)) {
+            return Task::none();
+        }
         let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
             return Task::none();
         };
@@ -134,6 +143,23 @@ impl App {
         Task::none()
     }
 
+    /// Close the tab at `index` (the user agreed to close it), unless running transfers would
+    /// end with it: then that is asked first.
+    pub(crate) fn close_tab_if_no_transfers(
+        &mut self,
+        wid: window::Id,
+        index: usize,
+    ) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
+            return Task::none();
+        };
+        let (id, panes): (TabId, Vec<PaneId>) = (tab.id, tab.panes.iter().map(|p| p.id).collect());
+        if self.ask_before_closing(wid, &panes, Closing::Tab(id)) {
+            return Task::none();
+        }
+        self.close_tab(wid, index)
+    }
+
     pub(crate) fn close_tab(&mut self, wid: window::Id, index: usize) -> Task<Message> {
         let Some(window) = self.windows.get_mut(&wid) else {
             return Task::none();
@@ -145,6 +171,7 @@ impl App {
         let gone: Vec<_> = closed.tab.panes.iter().map(|p| p.id).collect();
         self.forget_panes(&gone);
         drop(closed.tab);
+        self.sync_all_shell_tunnels();
         self.save_state();
         self.release_closed(freed);
         if closed.window_empty {
@@ -214,7 +241,9 @@ impl App {
         if !self.state_saving_enabled || self.quitting || self.profiles_error.is_some() {
             return;
         }
-        let state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
+        let mut state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
+        state.file_panel_width = self.file_panels.saved_width();
+        state.file_panel_show_hidden = self.file_panels.saved_show_hidden();
         if let Err(e) = state.save(&self.paths.state()) {
             tracing::warn!(error = %e, "could not save the session state");
         }
@@ -232,8 +261,10 @@ impl App {
     /// - The close button on the last terminal window is Quit. On any other terminal window it
     ///   drops that window from the layout. Closing the last tab of the last window leaves no
     ///   tabs to save, so the next launch opens the default window.
-    /// - macOS Cmd+Q from the app menu is `terminate:`: winit closes the windows without a
-    ///   close request and the process ends; windows closing unasked count as a quit, and
+    /// - macOS: while transfers run, `Cmd+Q` is taken from the app menu (`App::sync_quit_key`),
+    ///   so the key reaches `quit_asking` like any shortcut and asks first. Otherwise, and when
+    ///   Quit is chosen in the app menu with the mouse, it is `terminate:`: winit closes the
+    ///   windows without a close request and the process ends; windows closing unasked count as a quit, and
     ///   state.toml is already current because it is saved on every layout change.
     pub(crate) fn quit(&mut self) -> Task<Message> {
         if self.quitting {
@@ -249,22 +280,34 @@ impl App {
             .copied()
             .chain(self.editor_window())
             .chain(self.settings_window())
+            .chain(self.schemes_window())
+            .chain(self.tunnels_window())
+            .chain(self.archive_window())
             .collect();
         self.closing.extend(ids.iter().copied());
         Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
     }
 
+    /// The OS close button: other windows close; a terminal window asks first when closing
+    /// it would end running transfers; the last terminal window quits (asking the same).
     pub(crate) fn close_requested(&mut self, id: window::Id) -> Task<Message> {
         if self.settings_window() == Some(id) {
             self.write_pending_settings();
         }
         if self.editor_window() == Some(id)
             || self.settings_window() == Some(id)
-            || self.windows.len() > 1
+            || self.schemes_window() == Some(id)
+            || self.tunnels_window() == Some(id)
+            || self.archive_window() == Some(id)
         {
             self.close_window(id)
+        } else if self.windows.len() > 1 {
+            if self.ask_before_closing_window(id) {
+                return Task::none();
+            }
+            self.close_window(id)
         } else {
-            self.quit()
+            self.quit_asking()
         }
     }
 
@@ -542,9 +585,9 @@ mod tests {
         (0..)
             .map_while(|i| state.at(i))
             .map(|item| match item {
-                PaletteItem::Choice { label, .. } | PaletteItem::Action { label, .. } => {
-                    label.clone()
-                }
+                PaletteItem::Choice { label, .. }
+                | PaletteItem::Action { label, .. }
+                | PaletteItem::Tunnel { label, .. } => label.clone(),
                 PaletteItem::Profile { name, .. } => name.clone(),
             })
             .collect()

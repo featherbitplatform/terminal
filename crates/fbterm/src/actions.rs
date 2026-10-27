@@ -70,6 +70,11 @@ impl App {
             Action::NewWindow => self.open_window(self.default_profile()),
             Action::EditProfiles => self.editor_msg(EditorMsg::Open),
             Action::Settings => self.settings_msg(SettingsMsg::Open),
+            Action::EditSchemes => self.open_schemes(None),
+            Action::Tunnels => self.open_tunnels(),
+            Action::ExportProfiles => self.open_archive(crate::archive_window::ArchiveMode::Export),
+            Action::ImportProfiles => self.open_archive(crate::archive_window::ArchiveMode::Import),
+            Action::FilePanel => self.on_window(wid, App::toggle_file_panel),
             Action::OpenSettingsFile => {
                 crate::config_files::open_settings_file(&self.paths);
                 Task::none()
@@ -79,7 +84,7 @@ impl App {
                 Task::none()
             }
             Action::ExportTab => self.export_tab(wid),
-            Action::Quit => self.quit(),
+            Action::Quit => self.quit_asking(),
             Action::Find => match wid {
                 Some(wid) => self.find(wid, crate::find::FindMsg::Open),
                 None => Task::none(),
@@ -111,12 +116,31 @@ impl App {
         }
     }
 
+    /// What the launcher lists: the profiles, the tunnels with their states, the actions.
+    pub(crate) fn palette_items(&self) -> Vec<PaletteItem> {
+        palette::items(
+            &self.profiles,
+            crate::tunnels_window::palette_rows(&self.profiles, &self.tunnels),
+        )
+    }
+
+    /// Open launchers list the profiles and tunnels as they are now (keeping their query).
+    pub(crate) fn refresh_palettes(&mut self) {
+        if self.palettes.is_empty() {
+            return;
+        }
+        let items = self.palette_items();
+        for state in self.palettes.values_mut() {
+            state.set_items(items.clone(), &self.recency);
+        }
+    }
+
     /// Open `wid`'s palette (or reset it) with `query`, and focus its input.
     pub(crate) fn open_palette(&mut self, wid: window::Id, query: String) -> Task<Message> {
         if !self.windows.contains_key(&wid) {
             return Task::none();
         }
-        let state = PaletteState::new(palette::items(&self.profiles), query, &self.recency);
+        let state = PaletteState::new(self.palette_items(), query, &self.recency);
         let input = state.input.clone();
         self.palettes.insert(wid, state);
         iced::widget::operation::focus(input)
@@ -162,6 +186,7 @@ impl App {
                 self.open_in_split(wid, id, Side::Right)
             }
             Some(PaletteItem::Profile { id, .. }) => self.open_tab(wid, id),
+            Some(PaletteItem::Tunnel { key, .. }) => self.tunnel_toggle(&key),
             Some(PaletteItem::Action { action, .. }) => self.run_palette_action(wid, action),
             Some(PaletteItem::Choice { pick, .. }) => self.palette_choice(wid, stage, pick),
             None => Task::none(),

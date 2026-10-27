@@ -30,7 +30,7 @@ use crate::windows::DragMsg;
 const SLOP: f32 = 2.0;
 /// Two presses on a divider within this time equalize its split.
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-/// Alpha of the terminal background laid over the panes that do not have focus.
+/// Alpha of a pane's own background laid over it when it does not have focus.
 const DIM: f32 = 0.35;
 /// Depth of the band along the content's outer edge that drops a tile as a whole row or column.
 const EDGE_BAND: f32 = 24.0;
@@ -244,7 +244,7 @@ fn ratio_at(axis: Axis, split: Rectangle, p: Point, grab: f32) -> f32 {
 
 /// Events that end a divider drag without its button release: the pointer leaving the window
 /// or the window losing focus.
-fn cancels_drag(event: &Event) -> bool {
+pub(crate) fn cancels_drag(event: &Event) -> bool {
     matches!(
         event,
         Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused)
@@ -272,21 +272,49 @@ pub struct Incoming {
     pub layout: Layout,
 }
 
-/// Lays `panes` (the views of `tab.visible_panes()`, in any order) out at their rectangles
-/// of the tab's layout. `focused_outline`: nothing modal covers the tiles, so (when the tab
-/// shows more than one pane) the focus outline is drawn and tiles can be picked up.
-/// `incoming`: a tab carried over the window, which may be dropped on these tiles.
+/// What the panes are painted on: the window paints `under` (the focused pane's scheme
+/// background) behind the tiles at `opacity`; a pane whose scheme has another background gets
+/// its own, at the same opacity. Below full opacity that pane lies over the window's
+/// background too, so it shows through a little less.
+#[derive(Debug, Clone, Copy)]
+pub struct Ground {
+    pub under: Color,
+    pub opacity: f32,
+}
+
+/// Lays `panes` (the views of `tab.visible_panes()`, in any order, each with its scheme's
+/// background and profile accent) out at their rectangles of the tab's layout. `focused_outline`: nothing modal
+/// covers the tiles, so (when the tab shows more than one pane) the focus outline is drawn and
+/// tiles can be picked up. `incoming`: a tab carried over the window, which may be dropped on
+/// these tiles.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one call site, each argument distinct"
+)]
 pub fn tiles<'a>(
     t: &'static Tokens,
     window: window::Id,
     tab: &'a Tab,
-    panes: Vec<(PaneId, Element<'a, Message>)>,
+    panes: Vec<(PaneId, Element<'a, Message>, Color, Option<Color>)>,
+    ground: Ground,
     focused_outline: bool,
     incoming: Option<Incoming>,
     cell: Option<Size>,
 ) -> Element<'a, Message> {
-    let (ids, children) = panes.into_iter().unzip();
+    let mut ids = Vec::with_capacity(panes.len());
+    let mut children = Vec::with_capacity(panes.len());
+    let mut backgrounds = Vec::with_capacity(panes.len());
+    let mut accents = Vec::with_capacity(panes.len());
+    for (id, child, bg, accent) in panes {
+        ids.push(id);
+        children.push(child);
+        backgrounds.push(bg);
+        accents.push(accent);
+    }
     Element::new(Tiles {
+        backgrounds,
+        accents,
+        ground: Some(ground),
         t,
         window,
         layout: tab.shown_layout(),
@@ -311,6 +339,12 @@ struct Tiles<'a> {
     focused: PaneId,
     ids: Vec<PaneId>,
     children: Vec<Element<'a, Message>>,
+    /// Each pane's scheme background (opaque), in `ids` order.
+    backgrounds: Vec<Color>,
+    /// Each pane's profile accent, in `ids` order; empty or none draws no border.
+    accents: Vec<Option<Color>>,
+    /// What the window paints behind the tiles; none paints no pane backgrounds.
+    ground: Option<Ground>,
     outline: bool,
     incoming: Option<Incoming>,
     /// The cell size the minimum pane size is measured in (the focused pane's).
@@ -373,6 +407,56 @@ struct State {
 impl Tiles<'_> {
     fn several(&self) -> bool {
         self.ids.len() > 1
+    }
+
+    /// The 1 px rectangles of the pane borders, in drawing order, for panes at `rects` (in
+    /// `ids` order). Only when the tab shows more than one pane. Each pane with a profile
+    /// accent gets a border in it, just outside the pane; the focused pane's outline (drawn
+    /// last, so it wins where borders meet) takes its accent, else the theme's; a pane
+    /// without an accent has none unless it is the focused one.
+    fn borders(&self, rects: &[Rectangle]) -> Vec<(Rectangle, Color)> {
+        let mut out = Vec::new();
+        if !self.several() {
+            return out;
+        }
+        let accent = |i: usize| self.accents.get(i).copied().flatten();
+        let mut ring = |r: Rectangle, color: Color| {
+            let o = r.expand(1.0);
+            out.push((Rectangle { height: 1.0, ..o }, color));
+            out.push((
+                Rectangle {
+                    y: o.y + o.height - 1.0,
+                    height: 1.0,
+                    ..o
+                },
+                color,
+            ));
+            out.push((Rectangle { width: 1.0, ..o }, color));
+            out.push((
+                Rectangle {
+                    x: o.x + o.width - 1.0,
+                    width: 1.0,
+                    ..o
+                },
+                color,
+            ));
+        };
+        let mut focused = None;
+        for (i, (id, r)) in self.ids.iter().zip(rects).enumerate() {
+            if *id == self.focused {
+                focused = Some((i, *r));
+            } else if let Some(c) = accent(i) {
+                ring(*r, c);
+            }
+        }
+        if let Some((i, r)) = focused {
+            match (accent(i), self.outline) {
+                (Some(c), _) => ring(r, c),
+                (None, true) => ring(r, self.t.accent),
+                (None, false) => {}
+            }
+        }
+        out
     }
 
     fn publish(&self, shell: &mut Shell<'_, Message>, msg: TilesMsg) {
@@ -1002,21 +1086,6 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
         viewport: &Rectangle,
     ) {
         use iced::advanced::Renderer as _;
-        for ((child, state), layout) in self
-            .children
-            .iter()
-            .zip(&tree.children)
-            .zip(layout.children())
-        {
-            child
-                .as_widget()
-                .draw(state, renderer, theme, style, layout, cursor, viewport);
-        }
-        let bounds = layout.bounds();
-        if !self.several() {
-            self.draw_incoming(tree, renderer, bounds);
-            return;
-        }
         let fill = |renderer: &mut iced::Renderer, bounds: Rectangle, color: Color| {
             renderer.fill_quad(
                 renderer::Quad {
@@ -1027,15 +1096,37 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                 color,
             );
         };
+        for (i, ((child, state), layout)) in self
+            .children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+            .enumerate()
+        {
+            // A pane whose scheme differs from what the window paints behind the tiles gets
+            // its own background (the terminal draws none of its own).
+            if let Some(ground) = self.ground
+                && let Some(&bg) = self.backgrounds.get(i)
+                && bg != ground.under
+            {
+                fill(renderer, layout.bounds(), bg.scale_alpha(ground.opacity));
+            }
+            child
+                .as_widget()
+                .draw(state, renderer, theme, style, layout, cursor, viewport);
+        }
+        let bounds = layout.bounds();
+        if !self.several() {
+            self.draw_incoming(tree, renderer, bounds);
+            return;
+        }
         // Over the panes' text, so in a layer of its own; one pixel wider for the outline.
         renderer.with_layer(bounds.expand(1.0), |renderer| {
-            let dim = self.t.terminal.scale_alpha(DIM);
-            let mut focused = None;
-            for (id, placed) in self.ids.iter().zip(layout.children()) {
-                if *id == self.focused {
-                    focused = Some(placed.bounds());
-                } else {
-                    fill(renderer, placed.bounds(), dim);
+            for (i, (id, placed)) in self.ids.iter().zip(layout.children()).enumerate() {
+                if *id != self.focused {
+                    // Each pane dims towards its own background.
+                    let bg = self.backgrounds.get(i).copied().unwrap_or(self.t.terminal);
+                    fill(renderer, placed.bounds(), bg.scale_alpha(DIM));
                 }
             }
             for d in self.layout.dividers(bounds) {
@@ -1054,33 +1145,11 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Tiles<'_> {
                 };
                 fill(renderer, line, self.t.border);
             }
-            // The outline sits just outside the focused pane: in the divider gap or the
-            // window padding, never over its text.
-            if self.outline
-                && let Some(f) = focused
-            {
-                let o = f.expand(1.0);
-                let accent = self.t.accent;
-                fill(renderer, Rectangle { height: 1.0, ..o }, accent);
-                fill(
-                    renderer,
-                    Rectangle {
-                        y: o.y + o.height - 1.0,
-                        height: 1.0,
-                        ..o
-                    },
-                    accent,
-                );
-                fill(renderer, Rectangle { width: 1.0, ..o }, accent);
-                fill(
-                    renderer,
-                    Rectangle {
-                        x: o.x + o.width - 1.0,
-                        width: 1.0,
-                        ..o
-                    },
-                    accent,
-                );
+            // Borders sit just outside the panes: in the divider gap or the window padding,
+            // never over their text.
+            let rects: Vec<Rectangle> = layout.children().map(|p| p.bounds()).collect();
+            for (rect, color) in self.borders(&rects) {
+                fill(renderer, rect, color);
             }
             let state = tree.state.downcast_ref::<State>();
             match &state.tile {
@@ -1148,6 +1217,84 @@ mod tests {
         let mut l = Layout::Pane(PaneId(1));
         l.split(PaneId(1), Side::Right, PaneId(2));
         l
+    }
+
+    fn bare(
+        ids: &[u64],
+        accents: Vec<Option<Color>>,
+        focused: u64,
+        outline: bool,
+    ) -> Tiles<'static> {
+        Tiles {
+            t: &crate::theme::DARK,
+            window: window::Id::unique(),
+            layout: two(),
+            full: two(),
+            focused: PaneId(focused),
+            ids: ids.iter().map(|i| PaneId(*i)).collect(),
+            children: Vec::new(),
+            backgrounds: Vec::new(),
+            accents,
+            ground: None,
+            outline,
+            incoming: None,
+            cell: None,
+        }
+    }
+
+    fn side_by_side() -> [Rectangle; 2] {
+        [
+            Rectangle::new(Point::new(10.0, 10.0), Size::new(100.0, 100.0)),
+            Rectangle::new(Point::new(114.0, 10.0), Size::new(100.0, 100.0)),
+        ]
+    }
+
+    const RED: Color = Color::from_rgb(1.0, 0.0, 0.0);
+    const BLUE: Color = Color::from_rgb(0.0, 0.0, 1.0);
+
+    #[test]
+    fn accent_border_only_in_split_tabs() {
+        let rects = side_by_side();
+        let lone = bare(&[1], vec![Some(RED)], 1, true);
+        assert!(lone.borders(&rects[..1]).is_empty());
+        let split = bare(&[1, 2], vec![Some(RED), Some(BLUE)], 1, true);
+        let drawn = split.borders(&rects);
+        // Four 1 px sides each, just outside the panes.
+        assert_eq!(drawn.len(), 8);
+        assert!(drawn.iter().all(|(r, _)| r.width == 1.0 || r.height == 1.0));
+        let blue: Vec<_> = drawn.iter().filter(|(_, c)| *c == BLUE).collect();
+        assert_eq!(blue.len(), 4);
+        assert!(blue.iter().any(|(r, _)| r.x == 113.0 && r.width == 1.0));
+    }
+
+    #[test]
+    fn focused_outline_uses_pane_accent() {
+        let rects = side_by_side();
+        let with = bare(&[1, 2], vec![Some(RED), None], 1, true).borders(&rects);
+        assert_eq!(with.len(), 4);
+        assert!(with.iter().all(|(_, c)| *c == RED));
+        let without = bare(&[1, 2], vec![None, None], 1, true).borders(&rects);
+        assert_eq!(without.len(), 4);
+        assert!(without.iter().all(|(_, c)| *c == crate::theme::DARK.accent));
+        // Drawn last, so it wins where borders meet.
+        let both = bare(&[1, 2], vec![Some(RED), Some(BLUE)], 2, true).borders(&rects);
+        assert!(both[4..].iter().all(|(_, c)| *c == BLUE));
+    }
+
+    #[test]
+    fn pane_without_accent_has_no_border() {
+        let rects = side_by_side();
+        let drawn = bare(&[1, 2], vec![Some(RED), None], 1, true).borders(&rects);
+        // Only the focused pane 1 is outlined; unfocused pane 2 has none.
+        assert!(drawn.iter().all(|(r, _)| r.x < 112.0));
+        let unfocused = bare(&[1, 2], vec![Some(RED), None], 2, true).borders(&rects);
+        assert_eq!(unfocused.len(), 8 - 4 + 4);
+        assert!(unfocused[..4].iter().all(|(r, c)| *c == RED && r.x < 112.0));
+        assert!(
+            unfocused[4..]
+                .iter()
+                .all(|(_, c)| *c == crate::theme::DARK.accent)
+        );
     }
 
     #[test]
@@ -1481,6 +1628,9 @@ mod tests {
                 focused: PaneId(1),
                 ids,
                 children,
+                backgrounds: Vec::new(),
+                accents: Vec::new(),
+                ground: None,
                 outline: true,
                 incoming,
                 cell: None,
@@ -1581,6 +1731,9 @@ mod tests {
                     focused: PaneId(1),
                     ids,
                     children,
+                    backgrounds: Vec::new(),
+                    accents: Vec::new(),
+                    ground: None,
                     outline: true,
                     incoming: None,
                     cell: None,

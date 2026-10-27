@@ -6,7 +6,7 @@ use std::path::Path;
 use toml_edit::{DocumentMut, Item, Value};
 
 use crate::keys::{Action, Overrides};
-use crate::settings::{DEFAULT_MAX_FPS, MaxFps, Settings, ThemeMode};
+use crate::settings::{DEFAULT_MAX_FPS, MaxFps, SecretStorage, Settings, ThemeMode};
 use crate::store::{ConfigError, atomic_write, line_of};
 
 /// One setting with its new value.
@@ -16,10 +16,13 @@ pub enum SettingChange {
     FontSize(f32),
     ScrollbackLines(usize),
     Theme(ThemeMode),
+    ColorScheme(String),
     KittyKeyboard(bool),
     BackgroundOpacity(f32),
     BackgroundBlur(bool),
     MaxFps(MaxFps),
+    TunnelMaxRetries(u32),
+    SecretStorage(SecretStorage),
     /// Every keyboard shortcut override (the whole `[keys]` table as the app sees it). Only
     /// the actions whose chord differs from what the file gives are written, so entries the
     /// app could not take (and other text in the table) stay as they are unless that action
@@ -35,10 +38,13 @@ impl SettingChange {
             Self::FontSize(_) => "font_size",
             Self::ScrollbackLines(_) => "scrollback_lines",
             Self::Theme(_) => "theme",
+            Self::ColorScheme(_) => "color_scheme",
             Self::KittyKeyboard(_) => "kitty_keyboard",
             Self::BackgroundOpacity(_) => "background_opacity",
             Self::BackgroundBlur(_) => "background_blur",
             Self::MaxFps(_) => "max_fps",
+            Self::TunnelMaxRetries(_) => "tunnel_max_retries",
+            Self::SecretStorage(_) => "secret_storage",
             Self::Keys(_) => "keys",
         }
     }
@@ -50,10 +56,13 @@ impl SettingChange {
             Self::FontSize(v) => settings.font_size = *v,
             Self::ScrollbackLines(v) => settings.scrollback_lines = *v,
             Self::Theme(v) => settings.theme = *v,
+            Self::ColorScheme(v) => settings.color_scheme.clone_from(v),
             Self::KittyKeyboard(v) => settings.kitty_keyboard = *v,
             Self::BackgroundOpacity(v) => settings.background_opacity = *v,
             Self::BackgroundBlur(v) => settings.background_blur = *v,
             Self::MaxFps(v) => settings.max_fps.clone_from(v),
+            Self::TunnelMaxRetries(v) => settings.tunnel_max_retries = *v,
+            Self::SecretStorage(v) => settings.secret_storage = *v,
             Self::Keys(v) => {
                 settings.keys.map.clone_from(v);
                 settings.keys.invalid.clear();
@@ -63,7 +72,7 @@ impl SettingChange {
 
     fn value(&self) -> Value {
         match self {
-            Self::FontFamily(v) => Value::from(v.as_str()),
+            Self::FontFamily(v) | Self::ColorScheme(v) => Value::from(v.as_str()),
             Self::FontSize(v) | Self::BackgroundOpacity(v) => Value::from(short_f64(*v)),
             Self::ScrollbackLines(v) => Value::from(i64::try_from(*v).unwrap_or(i64::MAX)),
             Self::Theme(ThemeMode::Dark) => Value::from("dark"),
@@ -73,6 +82,8 @@ impl SettingChange {
             Self::MaxFps(MaxFps::Fixed(n)) => Value::from(i64::from(*n)),
             Self::MaxFps(MaxFps::Display) => Value::from("display"),
             Self::MaxFps(MaxFps::Invalid(_)) => Value::from(i64::from(DEFAULT_MAX_FPS)),
+            Self::TunnelMaxRetries(v) => Value::from(i64::from(*v)),
+            Self::SecretStorage(v) => Value::from(v.as_str()),
             // Written per action by `edit_keys`.
             Self::Keys(_) => Value::from(""),
         }
@@ -346,6 +357,8 @@ mod tests {
             SettingChange::BackgroundBlur(true),
             SettingChange::MaxFps(MaxFps::Fixed(120)),
             SettingChange::MaxFps(MaxFps::Display),
+            SettingChange::TunnelMaxRetries(3),
+            SettingChange::SecretStorage(SecretStorage::Vault),
             keys(&[(Action::Palette, "ctrl+alt+p")]),
         ]
     }
@@ -645,6 +658,29 @@ mod tests {
         let (line, _) =
             edit_text("font_size = \"big\"\n", &SettingChange::KittyKeyboard(true)).unwrap_err();
         assert_eq!(line, Some(1));
+    }
+
+    #[test]
+    fn secret_storage_is_written_as_its_name() {
+        for (v, name) in [
+            (SecretStorage::Auto, "auto"),
+            (SecretStorage::Keychain, "keychain"),
+            (SecretStorage::Vault, "vault"),
+        ] {
+            let after = edit_text(SETTINGS_TEMPLATE, &SettingChange::SecretStorage(v)).unwrap();
+            assert!(
+                after.contains(&format!(
+                    "#secret_storage = \"auto\"\nsecret_storage = \"{name}\"\n"
+                )),
+                "{after}"
+            );
+            assert_eq!(
+                toml::from_str::<Settings>(&after).unwrap().secret_storage,
+                v
+            );
+        }
+        assert_eq!(Settings::default().secret_storage, SecretStorage::Auto);
+        assert!(toml::from_str::<Settings>("secret_storage = \"cloud\"\n").is_err());
     }
 
     #[test]

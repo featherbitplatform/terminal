@@ -13,6 +13,32 @@ pub enum ThemeMode {
     Light,
 }
 
+/// Where saved passwords and key passphrases live (`secret_storage`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretStorage {
+    /// The system's secure storage where it works, else the encrypted vault (fbterm then
+    /// writes `"vault"` and says why once).
+    #[default]
+    Auto,
+    /// The system's secure storage: the macOS Keychain, the Linux Secret Service, or on
+    /// Windows a DPAPI-protected file in the config directory.
+    Keychain,
+    /// The encrypted vault in the config directory, opened with a main password.
+    Vault,
+}
+
+impl SecretStorage {
+    /// The value as written in `settings.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Keychain => "keychain",
+            Self::Vault => "vault",
+        }
+    }
+}
+
 /// The most redraws per second caused by program output (`max_fps`). Typing, scrolling and
 /// resizing always redraw at once; this only caps how often streaming output is drawn.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -97,6 +123,9 @@ pub struct Settings {
     pub font_size: f32,
     pub scrollback_lines: usize,
     pub theme: ThemeMode,
+    /// Id of the terminal color scheme used by every session without its own (a built-in id or
+    /// `user-<uuid>`). Not validated here: the app reports ids it does not know.
+    pub color_scheme: String,
     /// Let programs turn on the kitty keyboard protocol (off: requests are ignored and keys keep
     /// their legacy encoding).
     pub kitty_keyboard: bool,
@@ -108,6 +137,11 @@ pub struct Settings {
     pub background_blur: bool,
     /// Most redraws per second caused by program output.
     pub max_fps: MaxFps,
+    /// Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
+    pub tunnel_max_retries: u32,
+    /// Where saved secrets live. Changed through the Settings window, which moves them; a
+    /// hand edit applies on the next launch and moves nothing.
+    pub secret_storage: SecretStorage,
     /// Keyboard shortcuts changed from their defaults (the `[keys]` table).
     pub keys: KeyOverrides,
 }
@@ -119,10 +153,13 @@ impl Default for Settings {
             font_size: 13.0,
             scrollback_lines: 10_000,
             theme: ThemeMode::Dark,
+            color_scheme: "graphite".into(),
             kitty_keyboard: false,
             background_opacity: 1.0,
             background_blur: false,
             max_fps: MaxFps::default(),
+            tunnel_max_retries: 10,
+            secret_storage: SecretStorage::Auto,
             keys: KeyOverrides::default(),
         }
     }
@@ -133,6 +170,8 @@ pub const FONT_SIZE_RANGE: (f32, f32) = (6.0, 72.0);
 /// Allowed range of `background_opacity`. Not quite zero: fully clear pixels can let clicks
 /// through to what is behind the window and leave nothing of it visible.
 pub const OPACITY_RANGE: (f32, f32) = (0.05, 1.0);
+/// Allowed range of `tunnel_max_retries`.
+pub const TUNNEL_RETRIES_RANGE: (u32, u32) = (0, 100);
 /// Allowed range of `scrollback_lines`.
 pub const SCROLLBACK_RANGE: (usize, usize) = (0, 1_000_000);
 /// Above this many lines the Settings window notes that resizing can pause while history
@@ -215,6 +254,18 @@ impl Settings {
                 ),
             ));
             self.scrollback_lines = used;
+        }
+        let (lo, hi) = TUNNEL_RETRIES_RANGE;
+        if !(lo..=hi).contains(&self.tunnel_max_retries) {
+            let used = self.tunnel_max_retries.clamp(lo, hi);
+            problems.push((
+                "tunnel_max_retries".into(),
+                format!(
+                    "tunnel_max_retries {} is out of range ({lo} to {hi}), using {used}",
+                    self.tunnel_max_retries
+                ),
+            ));
+            self.tunnel_max_retries = used;
         }
         let (lo, hi) = OPACITY_RANGE;
         if !(lo..=hi).contains(&self.background_opacity) {
@@ -312,6 +363,9 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Color theme: "dark" or "light".
 #theme = "dark"
 
+# Terminal color scheme for every session (a scheme id; see the Color schemes window).
+#color_scheme = "graphite"
+
 # Let programs turn on the kitty keyboard protocol (true or false).
 #kitty_keyboard = false
 
@@ -326,6 +380,14 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Caps redraws caused by program output; typing always redraws immediately. Higher values
 # use more CPU while output streams.
 #max_fps = 60
+
+# Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
+#tunnel_max_retries = 10
+
+# Where saved passwords and key passphrases live: "auto" (the system keychain where it
+# works, else the encrypted vault), "keychain" or "vault" (an encrypted file opened with a
+# main password). Change it in the Settings window, which moves the saved secrets across.
+#secret_storage = "auto"
 
 # Keyboard shortcuts changed from their defaults, by action. The Keyboard section of the
 # Settings window lists every action with its chord and changes them for you.

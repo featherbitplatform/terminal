@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use fbterm_config::{
     AccentStyle, AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind,
-    ProfileStore, Rgb, SshProfile, ValidationError,
+    ProfileStore, Rgb, SshProfile, StartMode, TunnelDef, TunnelKind, ValidationError,
 };
-use fbterm_secrets::{SecretKind, SecretStore};
+use fbterm_secrets::{SecretChange, SecretKind, SecretStore, Zeroizing};
 
 use crate::redact::Redacted;
 
@@ -56,10 +56,19 @@ pub enum EditorMsg {
     Open,
     Close,
     Save,
+    /// Save without asking for the main password first (it was asked, or cancelled: the
+    /// secret changes then fail and are reported).
+    SaveNoAsk,
     /// Re-read `profiles.toml` (offered while it failed to load).
     Reload,
     /// Open the file picker for the key path.
     PickKey,
+    /// Open the Color schemes window.
+    EditSchemes,
+    /// `Export…`: the archive window in its Export mode.
+    Export,
+    /// `Import…`: the archive window in its Import mode.
+    Import,
     KeyPicked(Option<PathBuf>),
 
     Select(ProfileId),
@@ -70,11 +79,13 @@ pub enum EditorMsg {
     Group(String),
     Accent(Option<Rgb>),
     AccentStyle(AccentStyle),
+    /// The profile's own scheme id, or `None` to follow the global one.
+    ColorScheme(Option<String>),
     Host(String),
     Port(String),
     User(String),
     Auth(AuthChoice),
-    /// The typed password or key passphrase (stored in the keychain on save).
+    /// The typed password or key passphrase (saved to secret storage on save).
     Secret(Redacted),
     KeyPath(String),
     KeyPassphrase(bool),
@@ -85,6 +96,181 @@ pub enum EditorMsg {
     Program(String),
     Args(String),
     Cwd(String),
+    TunnelAdd,
+    TunnelRemove(usize),
+    TunnelName(usize, String),
+    TunnelKind(usize, KindChoice),
+    TunnelBind(usize, String),
+    TunnelPort(usize, String),
+    TunnelHost(usize, String),
+    TunnelHostPort(usize, String),
+    TunnelStart(usize, StartMode),
+}
+
+/// Which kind of tunnel a row is, without the details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KindChoice {
+    Local,
+    Remote,
+    Socks,
+}
+
+impl KindChoice {
+    pub(super) fn of(kind: &TunnelKind) -> Self {
+        match kind {
+            TunnelKind::Local { .. } => Self::Local,
+            TunnelKind::Remote { .. } => Self::Remote,
+            TunnelKind::Socks { .. } => Self::Socks,
+        }
+    }
+}
+
+/// The warning under a tunnel that listens beyond this machine, if it does.
+pub fn tunnel_warning(t: &TunnelDef) -> Option<String> {
+    t.non_loopback().then(|| {
+        format!(
+            "Listens on {}: other machines can reach this tunnel.",
+            t.bind().trim()
+        )
+    })
+}
+
+/// Parse a typed port: empty is 0 (not set), otherwise a valid port; `None` rejects the input.
+fn typed_port(v: &str, allow_zero: bool) -> Option<u16> {
+    if v.is_empty() {
+        return Some(0);
+    }
+    if !v.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    v.parse::<u16>().ok().filter(|&p| allow_zero || p > 0)
+}
+
+/// Edit one tunnel; returns whether anything changed.
+fn edit_tunnel(draft: &mut SshDraft, msg: EditorMsg) -> bool {
+    let SshDraft {
+        tunnels, parked, ..
+    } = draft;
+    parked.resize(tunnels.len(), (String::new(), 0));
+    match msg {
+        EditorMsg::TunnelAdd => {
+            let name = (1..)
+                .map(|i| format!("Tunnel {i}"))
+                .find(|n| tunnels.iter().all(|t| t.name != *n))
+                .expect("an unused name exists");
+            parked.push((String::new(), 0));
+            tunnels.push(TunnelDef {
+                name,
+                kind: TunnelKind::Local {
+                    bind: "127.0.0.1".into(),
+                    port: 0,
+                    host: String::new(),
+                    host_port: 0,
+                },
+                start: StartMode::default(),
+            });
+            return true;
+        }
+        EditorMsg::TunnelRemove(i) if i < tunnels.len() => {
+            tunnels.remove(i);
+            parked.remove(i);
+            return true;
+        }
+        _ => {}
+    }
+    let (EditorMsg::TunnelName(i, _)
+    | EditorMsg::TunnelKind(i, _)
+    | EditorMsg::TunnelBind(i, _)
+    | EditorMsg::TunnelPort(i, _)
+    | EditorMsg::TunnelHost(i, _)
+    | EditorMsg::TunnelHostPort(i, _)
+    | EditorMsg::TunnelStart(i, _)) = msg
+    else {
+        return false;
+    };
+    let (Some(t), Some(park)) = (tunnels.get_mut(i), parked.get_mut(i)) else {
+        return false;
+    };
+    match msg {
+        EditorMsg::TunnelName(_, v) => t.name = v,
+        EditorMsg::TunnelStart(_, v) => t.start = v,
+        EditorMsg::TunnelKind(_, choice) => {
+            if KindChoice::of(&t.kind) == choice {
+                return false;
+            }
+            let (bind, port, host, host_port) = match std::mem::replace(
+                &mut t.kind,
+                TunnelKind::Socks {
+                    bind: String::new(),
+                    port: 0,
+                },
+            ) {
+                TunnelKind::Local {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                }
+                | TunnelKind::Remote {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                } => (bind, port, host, host_port),
+                TunnelKind::Socks { bind, port } => (bind, port, park.0.clone(), park.1),
+            };
+            if choice == KindChoice::Socks {
+                *park = (host.clone(), host_port);
+            }
+            t.kind = match choice {
+                KindChoice::Local => TunnelKind::Local {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                },
+                KindChoice::Remote => TunnelKind::Remote {
+                    bind,
+                    port,
+                    host,
+                    host_port,
+                },
+                KindChoice::Socks => TunnelKind::Socks { bind, port },
+            };
+        }
+        EditorMsg::TunnelBind(_, v) => match &mut t.kind {
+            TunnelKind::Local { bind, .. }
+            | TunnelKind::Remote { bind, .. }
+            | TunnelKind::Socks { bind, .. } => *bind = v,
+        },
+        EditorMsg::TunnelPort(_, v) => {
+            // A remote bind may use 0: the server picks the port.
+            let allow_zero = matches!(t.kind, TunnelKind::Remote { .. });
+            let Some(new) = typed_port(&v, allow_zero) else {
+                return false;
+            };
+            match &mut t.kind {
+                TunnelKind::Local { port, .. }
+                | TunnelKind::Remote { port, .. }
+                | TunnelKind::Socks { port, .. } => *port = new,
+            }
+        }
+        EditorMsg::TunnelHost(_, v) => match &mut t.kind {
+            TunnelKind::Local { host, .. } | TunnelKind::Remote { host, .. } => *host = v,
+            TunnelKind::Socks { .. } => return false,
+        },
+        EditorMsg::TunnelHostPort(_, v) => match &mut t.kind {
+            TunnelKind::Local { host_port, .. } | TunnelKind::Remote { host_port, .. } => {
+                let Some(new) = typed_port(&v, false) else {
+                    return false;
+                };
+                *host_port = new;
+            }
+            TunnelKind::Socks { .. } => return false,
+        },
+        _ => return false,
+    }
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +292,10 @@ pub struct SshDraft {
     pub key_path: String,
     pub key_passphrase: bool,
     pub jump: Vec<ProfileId>,
-    /// Typed secret for the chosen auth; empty keeps whatever the keychain has.
+    pub tunnels: Vec<TunnelDef>,
+    /// Per tunnel, the target a SOCKS switch set aside, so Local, SOCKS, Local keeps it.
+    parked: Vec<(String, u16)>,
+    /// Typed secret for the chosen auth; empty keeps whatever is saved.
     pub secret: String,
 }
 
@@ -137,6 +326,8 @@ pub struct Draft {
     pub group: String,
     pub accent: Option<Rgb>,
     pub accent_style: AccentStyle,
+    /// Carried through unchanged until the form edits it.
+    pub color_scheme: Option<String>,
     pub kind: DraftKind,
 }
 
@@ -157,9 +348,13 @@ impl Draft {
             ProfileKind::Ssh(s) => {
                 let (auth, key_path, key_passphrase) = match &s.auth {
                     AuthMethod::Password => (AuthChoice::Password, String::new(), false),
-                    AuthMethod::Key { path, passphrase } => {
-                        (AuthChoice::Key, path.display().to_string(), *passphrase)
-                    }
+                    AuthMethod::Key { path, passphrase } => (
+                        AuthChoice::Key,
+                        path.as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        *passphrase,
+                    ),
                     AuthMethod::Agent => (AuthChoice::Agent, String::new(), false),
                 };
                 DraftKind::Ssh(SshDraft {
@@ -170,6 +365,8 @@ impl Draft {
                     key_path,
                     key_passphrase,
                     jump: s.jump.clone(),
+                    tunnels: s.tunnels.clone(),
+                    parked: Vec::new(),
                     secret: String::new(),
                 })
             }
@@ -180,6 +377,7 @@ impl Draft {
             group: p.group.clone().unwrap_or_default(),
             accent: p.accent,
             accent_style: p.accent_style,
+            color_scheme: p.color_scheme.clone(),
             kind,
         }
     }
@@ -201,13 +399,17 @@ impl Draft {
                 user: s.user.trim().to_owned(),
                 auth: match s.auth {
                     AuthChoice::Password => AuthMethod::Password,
+                    // No path yet: connecting asks for the key file and remembers it.
                     AuthChoice::Key => AuthMethod::Key {
-                        path: PathBuf::from(s.key_path.trim()),
+                        path: Some(s.key_path.trim())
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from),
                         passphrase: s.key_passphrase,
                     },
                     AuthChoice::Agent => AuthMethod::Agent,
                 },
                 jump: s.jump.clone(),
+                tunnels: s.tunnels.clone(),
             }),
         };
         Profile {
@@ -224,12 +426,24 @@ impl Draft {
             } else {
                 AccentStyle::default()
             },
+            color_scheme: self.color_scheme.clone(),
             kind,
         }
     }
 
     pub fn is_ssh(&self) -> bool {
         matches!(self.kind, DraftKind::Ssh(_))
+    }
+
+    /// Whether this draft's authentication uses a saved secret of `kind`.
+    fn uses_kind(&self, kind: SecretKind) -> bool {
+        match &self.kind {
+            DraftKind::Ssh(s) => match kind {
+                SecretKind::Password => s.auth == AuthChoice::Password,
+                SecretKind::KeyPassphrase => s.auth == AuthChoice::Key && s.key_passphrase,
+            },
+            DraftKind::Local(_) => false,
+        }
     }
 
     /// The secret typed for this draft and the kind it is stored as, if any.
@@ -254,6 +468,9 @@ pub struct EditorState {
     pub selected: Option<ProfileId>,
     /// Saved profiles deleted in the editor; their secrets go on the next save.
     removed: Vec<ProfileId>,
+    /// Kinds of secret a saved profile no longer uses whose removal failed; retried on the
+    /// next save unless the profile uses that kind again by then.
+    removed_kinds: Vec<(ProfileId, SecretKind)>,
     /// Problems found by the last save attempt.
     pub errors: Vec<ValidationError>,
     /// A one-line message: a refused delete, a failed write, "Saved".
@@ -262,6 +479,8 @@ pub struct EditorState {
     pub read_only: Option<ConfigError>,
     /// Unsaved edits exist.
     pub dirty: bool,
+    /// The secret changes of this save number run in the background: Save waits.
+    pub saving: Option<u64>,
     secrets: Arc<dyn SecretStore>,
     /// Whether the key file at this path (as typed) is an RSA private key; refreshed when the
     /// path or the selection changes, so drawing never touches the disk.
@@ -304,10 +523,12 @@ impl EditorState {
             selected: drafts.first().map(|d| d.id),
             drafts,
             removed: Vec::new(),
+            removed_kinds: Vec::new(),
             errors: Vec::new(),
             notice: None,
             read_only,
             dirty: false,
+            saving: None,
             secrets,
             key_check: None,
         };
@@ -333,6 +554,36 @@ impl EditorState {
         }
         let rsa = key_file_is_rsa(&path);
         self.key_check = Some((path, rsa));
+    }
+
+    /// A connection remembered the key file chosen for key profile `id` (already saved in the
+    /// profiles): its draft shows it, unless a path was typed there meanwhile.
+    pub fn key_file_remembered(&mut self, id: ProfileId, path: &Path) {
+        if let Some(DraftKind::Ssh(s)) = self
+            .drafts
+            .iter_mut()
+            .find(|d| d.id == id)
+            .map(|d| &mut d.kind)
+            && s.auth == AuthChoice::Key
+            && s.key_path.trim().is_empty()
+        {
+            s.key_path = path.display().to_string();
+        }
+        self.refresh_key_check();
+    }
+
+    /// A connection saved the key passphrase of key profile `id` (the profile is already
+    /// marked as having one): its draft says so too, so a later save does not remove it.
+    pub fn passphrase_remembered(&mut self, id: ProfileId) {
+        if let Some(DraftKind::Ssh(s)) = self
+            .drafts
+            .iter_mut()
+            .find(|d| d.id == id)
+            .map(|d| &mut d.kind)
+            && s.auth == AuthChoice::Key
+        {
+            s.key_passphrase = true;
+        }
     }
 
     /// Whether the selected draft uses a key file that is an RSA private key.
@@ -443,6 +694,7 @@ impl EditorState {
             group: String::new(),
             accent: None,
             accent_style: AccentStyle::default(),
+            color_scheme: None,
             kind,
         };
         let id = draft.id;
@@ -468,6 +720,8 @@ impl EditorState {
                 key_path: String::new(),
                 key_passphrase: false,
                 jump: Vec::new(),
+                tunnels: Vec::new(),
+                parked: Vec::new(),
                 secret: String::new(),
             }),
         )
@@ -547,6 +801,16 @@ impl EditorState {
         }
     }
 
+    /// The scheme `id` was deleted and the saved profiles no longer use it: drafts that still
+    /// name it follow the global scheme too.
+    pub fn forget_scheme(&mut self, id: &str) {
+        for d in &mut self.drafts {
+            if d.color_scheme.as_deref() == Some(id) {
+                d.color_scheme = None;
+            }
+        }
+    }
+
     /// Validate the drafts against the saved `current` store. Returns the store to write and
     /// the secret changes to make once it is written; nothing is changed yet.
     pub fn prepare(&mut self, current: &ProfileStore) -> Result<Prepared, Vec<ValidationError>> {
@@ -595,6 +859,13 @@ impl EditorState {
                 });
             }
         }
+        for &(id, kind) in &self.removed_kinds {
+            let retry = SecretOp::RemoveKind { id, kind };
+            let still_unused = self.draft(id).is_some_and(|d| !d.uses_kind(kind));
+            if still_unused && !removes.contains(&retry) {
+                removes.push(retry);
+            }
+        }
         removes.extend(self.removed.iter().map(|&id| SecretOp::Remove(id)));
         sets.extend(removes);
         Ok(Prepared { store, ops: sets })
@@ -603,50 +874,76 @@ impl EditorState {
     /// Save: validate, write `path` atomically, then replace `store` and apply the secret
     /// changes (stores first, then removals). A refused or failed write changes nothing: the
     /// drafts keep their typed secrets. A secret the store refuses stays typed in its draft and
-    /// the editor stays dirty.
+    /// the editor stays dirty. Runs the secret changes here: the app runs them on the
+    /// blocking pool instead ([`Self::write`], [`run_secret_ops`], [`Self::finish`]).
+    #[cfg(test)]
     pub fn save(&mut self, store: &mut ProfileStore, path: &Path) -> Result<(), SaveError> {
+        let ops = self.write(store, path)?;
+        let results = run_secret_ops(self.secrets.as_ref(), ops);
+        self.finish(results)
+    }
+
+    /// The store the secret changes of a save go to.
+    pub fn secret_store(&self) -> Arc<dyn SecretStore> {
+        self.secrets.clone()
+    }
+
+    /// The first half of a save: validate, write `path` atomically and replace `store`.
+    /// Returns the secret changes still to make.
+    pub fn write(
+        &mut self,
+        store: &mut ProfileStore,
+        path: &Path,
+    ) -> Result<Vec<SecretOp>, SaveError> {
         let prepared = self.prepare(store).map_err(SaveError::Invalid)?;
         prepared.store.save(path).map_err(SaveError::Write)?;
         *store = prepared.store;
         self.errors.clear();
         self.removed.clear();
+        self.removed_kinds.clear();
+        Ok(prepared.ops)
+    }
+
+    /// The second half of a save: take in how each secret change went. A stored secret is
+    /// cleared from its draft (unless something else was typed there meanwhile); a failed
+    /// removal of a deleted profile's secrets is retried on the next save.
+    pub fn finish(&mut self, results: SecretResults) -> Result<(), SaveError> {
         let mut failures = Vec::new();
-        for op in prepared.ops {
+        for (op, result) in results {
             let name = |id: ProfileId| {
                 self.draft(id)
                     .map_or_else(|| id.to_string(), |d| d.name.clone())
             };
-            let (result, what) = match &op {
-                SecretOp::Set { id, kind, value } => (
-                    self.secrets.set(id, *kind, &value.0),
-                    format!("store the {} of {}", kind_name(*kind), name(*id)),
-                ),
-                SecretOp::RemoveKind { id, kind } => (
-                    self.secrets.remove_kind(id, *kind),
-                    format!("remove the old {} of {}", kind_name(*kind), name(*id)),
-                ),
-                SecretOp::Remove(id) => (
-                    self.secrets.remove(id),
-                    format!("remove the secrets of a deleted profile ({id})"),
-                ),
+            let what = match &op {
+                SecretOp::Set { id, kind, .. } => {
+                    format!("store the {} of {}", kind_name(*kind), name(*id))
+                }
+                SecretOp::RemoveKind { id, kind } => {
+                    format!("remove the old {} of {}", kind_name(*kind), name(*id))
+                }
+                SecretOp::Remove(id) => format!("remove the secrets of a deleted profile ({id})"),
             };
             match result {
                 Ok(()) => {
-                    if let SecretOp::Set { id, .. } = op
+                    if let SecretOp::Set { id, value, .. } = op
                         && let Some(DraftKind::Ssh(s)) = self
                             .drafts
                             .iter_mut()
                             .find(|d| d.id == id)
                             .map(|d| &mut d.kind)
+                        && s.secret == value.0
                     {
                         s.secret.clear();
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "keychain change failed after saving profiles");
+                    tracing::warn!(error = %e, "a secret change failed after saving profiles");
                     if let SecretOp::Remove(id) = op {
                         // Retried on the next save.
                         self.removed.push(id);
+                    }
+                    if let SecretOp::RemoveKind { id, kind } = op {
+                        self.removed_kinds.push((id, kind));
                     }
                     failures.push(format!("could not {what}: {e}"));
                 }
@@ -660,6 +957,53 @@ impl EditorState {
             Err(SaveError::Secrets(failures))
         }
     }
+
+    /// Whether the secret changes a save would make now need the vault: any, when it must
+    /// be unlocked; only stores, when it does not exist yet (nothing to remove then).
+    pub fn needs_vault(
+        &mut self,
+        current: &ProfileStore,
+        need: fbterm_secrets::MainPassword,
+    ) -> bool {
+        let errors = self.errors.clone();
+        let needs = match self.prepare(current) {
+            Ok(p) => match need {
+                fbterm_secrets::MainPassword::Unlock => !p.ops.is_empty(),
+                fbterm_secrets::MainPassword::Set => {
+                    p.ops.iter().any(|op| matches!(op, SecretOp::Set { .. }))
+                }
+            },
+            Err(_) => false,
+        };
+        // Only a real save reports problems.
+        self.errors = errors;
+        needs
+    }
+}
+
+/// How each secret change of a save went (errors as sentences, never secret values).
+pub type SecretResults = Vec<(SecretOp, Result<(), String>)>;
+
+/// Make the secret changes of a save as one batch ([`SecretStore::apply_changes`]: one
+/// vault write), in order. Every change gets the batch's outcome: the vault's batch is all or
+/// nothing, and on a failure the drafts keep their typed secrets and deleted profiles are
+/// retried, so saving again is safe. May reach the vault: never on the UI thread.
+pub fn run_secret_ops(secrets: &dyn SecretStore, ops: Vec<SecretOp>) -> SecretResults {
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    let changes: Vec<SecretChange> = ops
+        .iter()
+        .map(|op| match op {
+            SecretOp::Set { id, kind, value } => {
+                SecretChange::Set((*id, *kind, Zeroizing::new(value.0.clone())))
+            }
+            SecretOp::RemoveKind { id, kind } => SecretChange::RemoveKind(*id, *kind),
+            SecretOp::Remove(id) => SecretChange::Remove(*id),
+        })
+        .collect();
+    let result = secrets.apply_changes(&changes).map_err(|e| e.to_string());
+    ops.into_iter().map(|op| (op, result.clone())).collect()
 }
 
 fn kind_name(kind: SecretKind) -> &'static str {
@@ -708,6 +1052,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::Group(v), _) => d.group = v,
         (EditorMsg::Accent(v), _) => d.accent = v,
         (EditorMsg::AccentStyle(v), _) => d.accent_style = v,
+        (EditorMsg::ColorScheme(v), _) => d.color_scheme = v,
         (EditorMsg::Host(v), DraftKind::Ssh(s)) => s.host = v,
         (EditorMsg::Port(v), DraftKind::Ssh(s)) => {
             // Digits only, a valid port or empty while typing.
@@ -749,6 +1094,18 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::JumpDown(i), DraftKind::Ssh(s)) if i + 1 < s.jump.len() => {
             s.jump.swap(i, i + 1);
         }
+        (
+            m @ (EditorMsg::TunnelAdd
+            | EditorMsg::TunnelRemove(_)
+            | EditorMsg::TunnelName(..)
+            | EditorMsg::TunnelKind(..)
+            | EditorMsg::TunnelBind(..)
+            | EditorMsg::TunnelPort(..)
+            | EditorMsg::TunnelHost(..)
+            | EditorMsg::TunnelHostPort(..)
+            | EditorMsg::TunnelStart(..)),
+            DraftKind::Ssh(s),
+        ) => return edit_tunnel(s, m),
         (EditorMsg::Program(v), DraftKind::Local(l)) => l.program = v,
         (EditorMsg::Args(v), DraftKind::Local(l)) => {
             l.args = v.split_whitespace().map(str::to_owned).collect();
