@@ -27,6 +27,11 @@ const POSIX_RENAME: &str = "posix-rename@openssh.com";
 const LINK_LOOKUPS: usize = 16;
 /// The most entries one listing reads before giving up on the folder.
 const MAX_ENTRIES: usize = 100_000;
+/// The most bytes of names and link targets one listing holds before giving up on the
+/// folder: the entry cap alone still lets a server send very long names.
+const MAX_LIST_BYTES: usize = 64 * 1024 * 1024;
+/// What a session that is gone says (the connection may still be up).
+pub const SESSION_ENDED: &str = "The SFTP session has ended.";
 /// How long one listing (reading the folder and resolving its links) may take in all.
 const LIST_DEADLINE: Duration = Duration::from_secs(60);
 /// How long closing a folder handle may take before the listing stops waiting for it.
@@ -247,13 +252,13 @@ fn error_for(error: RawError, path: &str) -> SftpError {
             }
         }
         RawError::Timeout => SftpError::Unavailable("The server did not answer in time.".into()),
-        RawError::IO(_) => SftpError::Unavailable("The SFTP session has ended.".into()),
+        RawError::IO(_) => SftpError::Unavailable(SESSION_ENDED.into()),
         RawError::UnexpectedBehavior(m)
             if m.contains("session closed")
                 || m.contains("sender dropped")
                 || m.contains("SendError") =>
         {
-            SftpError::Unavailable("The SFTP session has ended.".into())
+            SftpError::Unavailable(SESSION_ENDED.into())
         }
         other => SftpError::Other(sentence(format!(
             "The server sent an unexpected answer for {path}: {other}"
@@ -365,7 +370,8 @@ impl Sftp {
     /// The folder `path`, without `.` and `..`, folders first then the rest by name. Links
     /// carry their target and what they end at.
     pub async fn list(&self, path: &str) -> Result<Vec<Entry>, SftpError> {
-        self.list_within(path, MAX_ENTRIES, LIST_DEADLINE).await
+        self.list_within(path, MAX_ENTRIES, MAX_LIST_BYTES, LIST_DEADLINE)
+            .await
     }
 
     /// [`Sftp::list`] with its limits as parameters, so tests can lower them.
@@ -373,9 +379,13 @@ impl Sftp {
         &self,
         path: &str,
         max_entries: usize,
+        max_bytes: usize,
         deadline: Duration,
     ) -> Result<Vec<Entry>, SftpError> {
         let deadline = tokio::time::Instant::now() + deadline;
+        let too_much = || SftpError::Other("This folder has too much data to list.".into());
+        // Bytes of names and link targets held so far.
+        let mut bytes = 0usize;
         let too_slow =
             || SftpError::Unavailable(format!("The server took too long to list {path}."));
         let handle = tokio::time::timeout_at(deadline, self.session.opendir(path))
@@ -392,12 +402,18 @@ impl Sftp {
                             name.files
                                 .into_iter()
                                 .filter(|f| f.filename != "." && f.filename != "..")
-                                .map(|f| (f.filename, f.attrs)),
+                                .map(|f| {
+                                    bytes = bytes.saturating_add(f.filename.len());
+                                    (f.filename, f.attrs)
+                                }),
                         );
                         if raw.len() > max_entries {
                             return Err(SftpError::Other(
                                 "This folder has too many entries to list.".into(),
                             ));
+                        }
+                        if bytes > max_bytes {
+                            return Err(too_much());
                         }
                     }
                     Err(RawError::Status(s)) if s.status_code == StatusCode::Eof => {
@@ -418,6 +434,16 @@ impl Sftp {
                 async move { self.entry(name, &full, &attrs).await }
             })
             .buffered(LINK_LOOKUPS)
+            .and_then(|entry| {
+                if let EntryKind::Link { target, .. } = &entry.kind {
+                    bytes = bytes.saturating_add(target.len());
+                }
+                std::future::ready(if bytes > max_bytes {
+                    Err(too_much())
+                } else {
+                    Ok(entry)
+                })
+            })
             .try_collect::<Vec<Entry>>();
         let mut entries = tokio::time::timeout_at(deadline, resolve)
             .await
@@ -850,7 +876,7 @@ mod tests {
     async fn endless_folder_stops_at_the_entry_cap() {
         let server = fake::Server::new(fake::Dir::Endless, None);
         let sftp = fake::session(server.clone()).await;
-        let err = bounded(sftp.list_within("/d", 95, Duration::from_secs(60)))
+        let err = bounded(sftp.list_within("/d", 95, MAX_LIST_BYTES, Duration::from_secs(60)))
             .await
             .unwrap_err();
         assert_eq!(
@@ -861,13 +887,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endless_folder_stops_at_the_byte_budget() {
+        let server = fake::Server::new(fake::Dir::Endless, None);
+        let sftp = fake::session(server.clone()).await;
+        let err = bounded(sftp.list_within("/d", MAX_ENTRIES, 50, Duration::from_secs(60)))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SftpError::Other("This folder has too much data to list.".into())
+        );
+        assert_eq!(server.closes(), 1, "the folder handle is closed");
+    }
+
+    #[tokio::test]
+    async fn link_targets_count_toward_the_byte_budget() {
+        // `link` (4 bytes) pointing at `target` (6 bytes).
+        let listed = |budget| async move {
+            let sftp = fake::session(fake::Server::new(fake::Dir::OneLink, None)).await;
+            bounded(sftp.list_within("/d", MAX_ENTRIES, budget, Duration::from_secs(60))).await
+        };
+        assert_eq!(listed(10).await.unwrap().len(), 1);
+        assert_eq!(
+            listed(9).await.unwrap_err(),
+            SftpError::Other("This folder has too much data to list.".into())
+        );
+    }
+
+    #[tokio::test]
     async fn slow_folder_stops_at_the_deadline() {
         let server = fake::Server::new(fake::Dir::Slow(Duration::from_millis(20)), None);
         let sftp = fake::session(server.clone()).await;
         let started = std::time::Instant::now();
-        let err = bounded(sftp.list_within("/d", MAX_ENTRIES, Duration::from_millis(300)))
-            .await
-            .unwrap_err();
+        let err = bounded(sftp.list_within(
+            "/d",
+            MAX_ENTRIES,
+            MAX_LIST_BYTES,
+            Duration::from_millis(300),
+        ))
+        .await
+        .unwrap_err();
         assert!(matches!(err, SftpError::Unavailable(_)), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(server.closes(), 1, "the folder handle is closed");
@@ -909,6 +968,7 @@ mod tests {
     #[test]
     fn default_listing_limits() {
         assert_eq!(MAX_ENTRIES, 100_000);
+        assert_eq!(MAX_LIST_BYTES, 64 * 1024 * 1024);
         assert_eq!(LIST_DEADLINE, Duration::from_secs(60));
     }
 
