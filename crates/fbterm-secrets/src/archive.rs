@@ -136,6 +136,10 @@ const NOT_WRITTEN: &str = "The profiles could not be written to an archive.";
 
 /// Encrypt `archive` with `password`: its TOML form inside an `age` file with a passphrase
 /// (scrypt) recipient at age's default work factor (about a second on this machine).
+///
+/// Expects `archive.format == FORMAT`, which [`Archive::new`] sets: build archives through
+/// it. The format is written as given (tests seal a newer one to check that `open` refuses
+/// it), so nothing here checks it.
 pub fn seal(archive: &Archive, password: &str) -> Result<Vec<u8>, ArchiveError> {
     let text = Zeroizing::new(
         toml::to_string(archive).map_err(|_| ArchiveError::Corrupt(NOT_WRITTEN.into()))?,
@@ -380,11 +384,16 @@ mod tests {
         let last = body.len() - 1;
         body[last] ^= 0x01;
         let body_err = open(&body, PASSWORD).unwrap_err();
-        assert!(matches!(body_err, ArchiveError::Corrupt(_)), "{body_err:?}");
+        assert_eq!(body_err, ArchiveError::Corrupt(DAMAGED.into()));
+        assert_eq!(
+            body_err.to_string(),
+            "The archive is damaged or incomplete."
+        );
 
         // A truncated file.
         let err = open(&sealed[..sealed.len() - 20], PASSWORD).unwrap_err();
-        assert!(matches!(err, ArchiveError::Corrupt(_)), "{err:?}");
+        assert_eq!(err, ArchiveError::Corrupt(DAMAGED.into()));
+        assert_eq!(err.to_string(), "The archive is damaged or incomplete.");
 
         // A flipped byte in the header MAC (checked before any scrypt work is trusted).
         let mac_start = sealed.windows(4).position(|w| w == b"\n---").unwrap() + 5;
@@ -406,10 +415,32 @@ mod tests {
 
         // An oversized input is refused before decrypting.
         let huge = vec![0u8; MAX_ARCHIVE_BYTES + 1];
-        assert!(matches!(
-            open(&huge, PASSWORD).unwrap_err(),
-            ArchiveError::Corrupt(_)
-        ));
+        let err = open(&huge, PASSWORD).unwrap_err();
+        assert_eq!(err, ArchiveError::Corrupt(TOO_LARGE.into()));
+        assert_eq!(
+            err.to_string(),
+            "The file is too large to be an fbterm archive."
+        );
+    }
+
+    #[test]
+    fn excessive_work_factor_is_refused() {
+        let (_, sealed) = sealed_sample();
+        // Rewrite the scrypt stanza's work factor (log2 N, the last argument) to 40.
+        let start = sealed.windows(10).position(|w| w == b"-> scrypt ").unwrap();
+        let end = start + sealed[start..].iter().position(|&b| b == b'\n').unwrap();
+        let line = std::str::from_utf8(&sealed[start..end]).unwrap();
+        let (head, _) = line.rsplit_once(' ').unwrap();
+        let mut crafted = sealed[..start].to_vec();
+        crafted.extend_from_slice(format!("{head} 40").as_bytes());
+        crafted.extend_from_slice(&sealed[end..]);
+
+        let err = open(&crafted, PASSWORD).unwrap_err();
+        assert_eq!(err, ArchiveError::Corrupt(TOO_HARD.into()));
+        assert_eq!(
+            err.to_string(),
+            "This archive takes too much work to open on this computer."
+        );
     }
 
     #[test]
