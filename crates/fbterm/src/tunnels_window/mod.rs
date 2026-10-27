@@ -201,10 +201,16 @@ pub fn groups(store: &ProfileStore, tunnels: &Tunnels, query: &str) -> Vec<Group
         }
         let entry = tunnels.entries.get(&key);
         let listening = entry.and_then(|e| e.handle.as_ref()).and_then(|h| h.port());
+        // While it runs, what is actually listening (an edit waits for the restart); off, what
+        // the next start uses.
+        let shown = entry
+            .filter(|e| e.handle.is_some())
+            .and_then(|e| e.def_started.as_ref())
+            .unwrap_or(def);
         let (state, tone, on) = status(tunnels, &key, def);
         let row = Row {
             name: def.name.clone(),
-            address: address(store, &key, def, listening),
+            address: address(store, &key, shown, listening),
             state,
             tone,
             restart_to_apply: on && entry.is_some_and(|e| e.restart_to_apply),

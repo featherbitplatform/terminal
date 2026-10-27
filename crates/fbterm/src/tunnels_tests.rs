@@ -591,13 +591,73 @@ fn added_with_shell_tunnel_starts_when_shell_open() {
 #[test]
 fn renamed_with_shell_tunnel_keeps_running() {
     let mut w = world();
-    let _pane = w.open_shell();
+    let pane = w.open_shell();
     assert!(w.running("db"));
     w.edit(|p| tunnels_of(p)[1].name = "postgres".into());
     assert!(!w.running("db"));
     assert!(!w.app.tunnels.entries.contains_key(&key(&w.srv, "db")));
     assert!(w.running("postgres"), "the renamed tunnel runs on");
-    assert_eq!(w.fake.count("postgres"), 1);
+    assert_eq!(
+        w.fake.count("postgres"),
+        0,
+        "the same instance, not a restart"
+    );
+    assert!(w.app.tunnels.entries[&key(&w.srv, "postgres")].restart_to_apply);
+    // It still stops with the last shell.
+    w.close_tab_of(pane);
+    assert!(!w.running("postgres"));
+}
+
+#[test]
+fn renamed_running_tunnel_carries_over() {
+    let mut w = world();
+    w.toggle("web");
+    let (old, new) = (key(&w.srv, "web"), key(&w.srv, "www"));
+    let _ = w.app.update(Message::Tunnel(
+        old.clone(),
+        TunnelState::Up { connections: 1 },
+    ));
+    w.edit(|p| tunnels_of(p)[0].name = "www".into());
+    // Not stopped: the client connections on its port stay up; the new name applies at the
+    // next start.
+    assert!(w.running("www"));
+    assert!(!w.app.tunnels.entries.contains_key(&old));
+    let entry = &w.app.tunnels.entries[&new];
+    assert!(entry.restart_to_apply && entry.manual);
+    assert_eq!(w.state("www"), TunnelState::Up { connections: 1 });
+    assert_eq!(w.fake.count("www"), 0);
+    // The instance still reports under the name it started with; that lands on the new row.
+    let _ = w.app.update(Message::Tunnel(
+        old.clone(),
+        TunnelState::Up { connections: 2 },
+    ));
+    assert_eq!(w.state("www"), TunnelState::Up { connections: 2 });
+    let _ = w.app.update(Message::Tunnel(
+        old.clone(),
+        TunnelState::Failed("lost".into()),
+    ));
+    assert_eq!(w.state("www"), TunnelState::Failed("lost".into()));
+    assert!(
+        w.app
+            .visible_notices()
+            .iter()
+            .any(|n| n == "Tunnel \"www\" (srv) failed: lost")
+    );
+    // Retry starts it under its new name.
+    let _ = w.app.tunnel_retry(&new);
+    assert!(w.running("www"));
+    assert_eq!(w.fake.count("www"), 1);
+    assert!(!w.app.tunnels.entries[&new].restart_to_apply);
+}
+
+#[test]
+fn rename_with_another_change_stops_the_tunnel() {
+    let mut w = world();
+    w.toggle("web");
+    // Renamed and moved to another port at once: not the same tunnel any more.
+    w.edit(|p| tunnels_of(p)[0] = local("www", 18081, StartMode::OnDemand));
+    assert!(!w.running("web") && !w.running("www"));
+    assert!(w.app.tunnels.entries.is_empty());
 }
 
 #[test]
@@ -806,13 +866,16 @@ fn panel_lists_tunnels_grouped_by_profile() {
         }
     });
     assert!(row(&w).restart_to_apply);
-    assert_eq!(row(&w).address, "127.0.0.1:18080 \u{2192} db.internal:5433");
+    // While it runs the address is what is actually listening, not the pending edit.
+    assert_eq!(row(&w).address, "127.0.0.1:18080 \u{2192} db.internal:5432");
     // A failure: red, switched off, with Retry.
     let _ = w.app.update(Message::Tunnel(
         web_key,
         TunnelState::Failed("port 18080 already in use".into()),
     ));
     let r = row(&w);
+    // Off, it shows the definition the next start uses.
+    assert_eq!(r.address, "127.0.0.1:18080 \u{2192} db.internal:5433");
     assert_eq!(r.state, "Failed: port 18080 already in use");
     assert_eq!(r.tone, Tone::Failed);
     assert!(!r.on && r.retry && !r.restart_to_apply);
@@ -1054,4 +1117,138 @@ fn palette_rows_show_state_and_refresh() {
         .expect("the Tunnels action is listed");
     let _ = w.app.update(Message::Palette(wid, PaletteMsg::Pick(at)));
     assert!(w.app.tunnels_window().is_some());
+}
+
+/// Asks a host-key question for every start, from a task of its own, as a tunnel connecting
+/// to an unknown host does.
+struct Asking;
+
+impl TunnelStarter for Asking {
+    fn start(&self, start: crate::tunnels::Start) -> TunnelHandle {
+        let prompter = start.prompter.clone();
+        tokio::spawn(async move {
+            prompter
+                .confirm_host_key("db.internal", 22, "SHA256:test")
+                .await
+        });
+        TunnelHandle::inert()
+    }
+}
+
+/// The next question a tunnel asked, handed to the app.
+fn deliver_prompt(rt: &tokio::runtime::Runtime, app: &mut App) {
+    let mut rx = app.prompt_rx.0.lock().take().expect("the prompt receiver");
+    let event = rt.block_on(async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a question within 5 s")
+            .expect("the prompt channel stays open")
+    });
+    *app.prompt_rx.0.lock() = Some(rx);
+    let _ = app.update(Message::Prompt(crate::prompts::PromptMsg::Event(
+        Delivered::new(event),
+    )));
+}
+
+#[test]
+fn panel_toggle_asks_over_the_last_used_terminal_window() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let mut w = world();
+    w.app.tunnels.set_starter(Arc::new(Asking));
+    let (a, b) = (w.wid, window::Id::unique());
+    w.app.windows.insert(b, WindowState::new());
+    // The user worked in B last, then switched the tunnel on in the Tunnels window.
+    let _ = w.app.update(Message::WindowFocused(b));
+    let panel = window::Id::unique();
+    let _ = w.app.update(Message::WindowFocused(panel));
+    w.toggle("web");
+    deliver_prompt(&rt, &mut w.app);
+    assert!(w.app.prompts.front(b).is_some(), "asked over B");
+    assert!(w.app.prompts.front(a).is_none());
+    assert_eq!(w.state("web"), TunnelState::Starting);
+}
+
+#[test]
+fn prompt_with_no_terminal_window_fails_the_tunnel() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    let mut w = world();
+    w.app.tunnels.set_starter(Arc::new(Asking));
+    // Only the Tunnels window is left.
+    w.app.windows.clear();
+    let panel = window::Id::unique();
+    let _ = w.app.update(Message::WindowFocused(panel));
+    w.toggle("web");
+    deliver_prompt(&rt, &mut w.app);
+    let reason = "Open a terminal window to answer the sign-in question";
+    assert_eq!(w.state("web"), TunnelState::Failed(reason.into()));
+    assert!(!w.running("web"));
+    let line = format!("Tunnel \"web\" (srv) failed: {reason}");
+    assert!(w.app.notices.contains(&line), "{line}");
+}
+
+#[test]
+fn invalid_tunnel_is_never_started() {
+    let mut w = world();
+    // Hand-edited profiles.toml: an empty bind (all interfaces on some servers) and a second
+    // tunnel under the same name.
+    w.edit(|p| {
+        if let TunnelKind::Local { bind, .. } = &mut tunnels_of(p)[0].kind {
+            bind.clear();
+        }
+        tunnels_of(p).push(local("db", 15433, StartMode::WithShell));
+    });
+    w.toggle("web");
+    assert_eq!(w.fake.count("web"), 0);
+    assert!(!w.running("web"));
+    assert_eq!(
+        w.state("web"),
+        TunnelState::Failed("tunnel \"web\" of profile \"srv\" has an empty bind address".into())
+    );
+    // Nor with the shell.
+    let _pane = w.open_shell();
+    assert_eq!(w.fake.count("db"), 0);
+    assert_eq!(
+        w.state("db"),
+        TunnelState::Failed("profile \"srv\" has two tunnels named \"db\"".into())
+    );
+    // Nor on Retry.
+    let _ = w.app.tunnel_retry(&key(&w.srv, "web"));
+    assert_eq!(w.fake.count("web"), 0);
+    // Fixed, it starts.
+    w.edit(|p| {
+        if let TunnelKind::Local { bind, .. } = &mut tunnels_of(p)[0].kind {
+            *bind = "127.0.0.1".into();
+        }
+    });
+    let _ = w.app.tunnel_retry(&key(&w.srv, "web"));
+    assert_eq!(w.fake.count("web"), 1);
+}
+
+#[test]
+fn failure_line_is_cleared_after_a_profile_rename() {
+    let mut w = world();
+    w.toggle("web");
+    let k = key(&w.srv, "web");
+    let _ = w.app.update(Message::Tunnel(
+        k.clone(),
+        TunnelState::Failed("refused".into()),
+    ));
+    let line = "Tunnel \"web\" (srv) failed: refused";
+    assert!(w.app.notices.iter().any(|n| n == line));
+    w.edit(|p| p.name = "srv-renamed".into());
+    // Up again after Retry: the old line goes, whatever the profile is called now.
+    let _ = w.app.tunnel_retry(&k);
+    assert!(
+        !w.app.notices.iter().any(|n| n == line),
+        "{:?}",
+        w.app.notices
+    );
 }

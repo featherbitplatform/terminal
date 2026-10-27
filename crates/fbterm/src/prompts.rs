@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use fbterm_secrets::SecretKind;
+use fbterm_session::ssh::tunnel::TunnelKey;
 use fbterm_session::ssh::{Prompter, SecretAnswer};
 use iced::futures::Stream;
 use iced::window;
@@ -52,6 +53,9 @@ pub enum PromptEvent {
     Ask {
         id: PromptId,
         window: Option<window::Id>,
+        /// The tunnel asking, when a tunnel's connect asks: its window is raised, and with no
+        /// terminal window to ask in the tunnel fails.
+        tunnel: Option<TunnelKey>,
         ask: Ask,
     },
     /// The asker stopped waiting (answered, or its dial was given up).
@@ -61,12 +65,30 @@ pub enum PromptEvent {
 /// Asks the user through the UI, over the window the dial belongs to.
 pub struct UiPrompter {
     window: Option<window::Id>,
+    tunnel: Option<TunnelKey>,
     tx: UnboundedSender<PromptEvent>,
 }
 
 impl UiPrompter {
     pub fn new(window: Option<window::Id>, tx: UnboundedSender<PromptEvent>) -> Self {
-        Self { window, tx }
+        Self {
+            window,
+            tunnel: None,
+            tx,
+        }
+    }
+
+    /// The prompter of tunnel `key`'s connect (see [`PromptEvent::Ask`]).
+    pub fn for_tunnel(
+        window: Option<window::Id>,
+        key: TunnelKey,
+        tx: UnboundedSender<PromptEvent>,
+    ) -> Self {
+        Self {
+            window,
+            tunnel: Some(key),
+            tx,
+        }
     }
 
     /// Send `ask` and wait for the answer; `None` if the UI dropped the question.
@@ -76,6 +98,7 @@ impl UiPrompter {
         let event = PromptEvent::Ask {
             id,
             window: self.window,
+            tunnel: self.tunnel.clone(),
             ask: make(reply),
         };
         if self.tx.send(event).is_err() {

@@ -6,6 +6,7 @@ use crate::app::{App, Message, load_profiles};
 use crate::chrome::Chrome;
 use crate::editor::{EditorMsg, EditorState, SaveError};
 use crate::prompts::{Dialog, PromptEvent, PromptMsg};
+use crate::tunnels::NO_WINDOW;
 
 impl App {
     pub fn editor_window(&self) -> Option<window::Id> {
@@ -201,14 +202,41 @@ impl App {
     pub(crate) fn prompt_msg(&mut self, msg: PromptMsg) -> Task<Message> {
         match msg {
             PromptMsg::Event(delivered) => match delivered.take() {
-                Some(PromptEvent::Ask { id, window, ask }) => {
+                Some(PromptEvent::Ask {
+                    id,
+                    window,
+                    tunnel,
+                    ask,
+                }) => {
                     let target = window
                         .filter(|w| self.windows.contains_key(w))
                         .or_else(|| self.focused_window());
-                    // No window to ask in: dropping `ask` answers "no".
-                    match target {
-                        Some(w) if self.prompts.ask(w, id, ask) => self.focus_prompt(w),
-                        _ => Task::none(),
+                    match (target, tunnel) {
+                        (Some(w), tunnel) => {
+                            if !self.prompts.ask(w, id, ask) {
+                                return Task::none();
+                            }
+                            // A tunnel switched on from the Tunnels window asks over the
+                            // terminal window used last, which may be behind it: bring that
+                            // one forward.
+                            let raise = if tunnel.is_some() && self.focused != Some(w) {
+                                window::gain_focus(w)
+                            } else {
+                                Task::none()
+                            };
+                            Task::batch([raise, self.focus_prompt(w)])
+                        }
+                        // No terminal window to ask in: the tunnel cannot go on (dropping
+                        // `ask` answers "no").
+                        (None, Some(key)) => {
+                            let key = self.tunnels.resolve(&key);
+                            if self.tunnels.running(&key) {
+                                self.tunnel_failed(&key, NO_WINDOW.into());
+                            }
+                            Task::none()
+                        }
+                        // Dropping `ask` answers "no".
+                        (None, None) => Task::none(),
                     }
                 }
                 Some(PromptEvent::Withdraw(id)) => match self.prompts.withdraw(id) {

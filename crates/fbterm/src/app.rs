@@ -246,6 +246,9 @@ pub struct App {
     pub(crate) resize_generation: u64,
     /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
+    /// The terminal window that last had focus: where questions go while another of our
+    /// windows (the Tunnels window, say) has it.
+    pub(crate) last_terminal: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
     /// The tab or tile being dragged, and in which window.
@@ -492,6 +495,7 @@ impl App {
             pending_resizes: HashMap::new(),
             resize_generation: 0,
             focused: None,
+            last_terminal: None,
             palettes: Palettes::new(),
             carry: None,
             hover: None,
@@ -747,6 +751,9 @@ impl App {
             }
             Message::WindowFocused(id) => {
                 self.focused = Some(id);
+                if self.windows.contains_key(&id) {
+                    self.last_terminal = Some(id);
+                }
                 self.app_active = true;
                 let detect = if self.windows.contains_key(&id) {
                     display_rate::detect(id, &self.display)
@@ -957,9 +964,13 @@ impl App {
         self.os_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale
     }
 
+    /// The focused terminal window; while another of our windows has focus, the terminal
+    /// window focused last (or any, if that one is gone).
     pub(crate) fn focused_window(&self) -> Option<window::Id> {
+        let terminal = |id: &window::Id| self.windows.contains_key(id);
         self.focused
-            .filter(|id| self.windows.contains_key(id))
+            .filter(terminal)
+            .or_else(|| self.last_terminal.filter(terminal))
             .or_else(|| self.windows.keys().next().copied())
     }
 

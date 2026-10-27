@@ -3,7 +3,10 @@
 //!
 //! - **Starting and stopping.** [`App::tunnel_toggle`] switches a tunnel on or off;
 //!   [`App::tunnel_retry`] starts a failed (or changed) one again. A start from the UI asks its
-//!   questions over the focused window. A stopped tunnel reports nothing more, so the registry
+//!   questions over the focused terminal window, or the one used last while the Tunnels window
+//!   has focus, and raises it; with no terminal window open, a tunnel that needs to ask fails
+//!   with [`NO_WINDOW`]. A tunnel whose definition does not validate is never started: it
+//!   fails with the validation message. A stopped tunnel reports nothing more, so the registry
 //!   sets `Off` itself.
 //! - **Restarts wait for the old instance.** A stopped tunnel releases its port, remote forward
 //!   and connection in its own task. A start under the same key while that is under way waits
@@ -18,8 +21,12 @@
 //!   itself except the `with_shell` tunnels of restored shells, as they connect.
 //! - **Profile edits.** A running tunnel keeps the definition it started with. When its
 //!   definition or its profile's connection (host, jump chain) changes it is marked
-//!   `restart_to_apply`; a deleted tunnel or profile stops it.
-//! - **Failures** put `Tunnel "{name}" ({profile}) failed: {reason}` on the banner.
+//!   `restart_to_apply`; a deleted tunnel or profile stops it. A running tunnel that was only
+//!   renamed moves to its new name, marked `restart_to_apply`; its instance still reports
+//!   under the old name (`reports_as`), and no other tunnel starts under that name until it
+//!   has stopped.
+//! - **Failures** put `Tunnel "{name}" ({profile}) failed: {reason}` on the banner; the line
+//!   is remembered per tunnel and removed by its exact text when the tunnel starts again.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
@@ -28,6 +35,7 @@ use std::sync::atomic::AtomicU32;
 
 use fbterm_config::{
     Profile, ProfileId, ProfileKind, ProfileStore, SshProfile, StartMode, TunnelDef,
+    ValidationError,
 };
 use fbterm_session::ssh::tunnel::{TunnelHandle, TunnelKey, TunnelSink, TunnelState, start_tunnel};
 use fbterm_session::ssh::{Prompter, SshPool};
@@ -39,6 +47,9 @@ use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use crate::app::{App, Message};
 use crate::prompts::UiPrompter;
 use crate::tabs::TabState;
+
+/// Why a tunnel that needed to ask something failed: no terminal window was open to ask in.
+pub(crate) const NO_WINDOW: &str = "Open a terminal window to answer the sign-in question";
 
 /// What starting one tunnel takes (see `start_tunnel`).
 pub(crate) struct Start {
@@ -102,6 +113,28 @@ fn definition(store: &ProfileStore, key: &TunnelKey) -> Option<TunnelDef> {
     }
 }
 
+/// Why `key`'s saved definition cannot run (a hand-edited profiles file can hold one): the
+/// first validation error that names it.
+fn invalid(store: &ProfileStore, key: &TunnelKey) -> Option<String> {
+    let alone = ProfileStore {
+        profiles: vec![store.get(key.profile)?.clone()],
+    };
+    let name = key.name.trim();
+    alone
+        .validate()
+        .into_iter()
+        .find(|e| match e {
+            ValidationError::EmptyTunnelName { .. } => name.is_empty(),
+            ValidationError::DuplicateTunnel { name: n, .. }
+            | ValidationError::TunnelPort { name: n, .. }
+            | ValidationError::TunnelTargetPort { name: n, .. }
+            | ValidationError::EmptyTunnelBind { name: n, .. }
+            | ValidationError::EmptyTunnelHost { name: n, .. } => n.trim() == name,
+            _ => false,
+        })
+        .map(|e| e.to_string())
+}
+
 /// One tunnel the registry knows.
 pub(crate) struct Entry {
     /// The definition the running instance started with.
@@ -119,6 +152,9 @@ pub(crate) struct Entry {
     releasing: bool,
     /// A start waiting for that release, with the window its questions go to.
     queued: Option<Option<window::Id>>,
+    /// The key the running instance reports under: its own, or the name it had before a
+    /// rename carried it over.
+    reports_as: Option<TunnelKey>,
 }
 
 impl Entry {
@@ -132,6 +168,7 @@ impl Entry {
             route_started: None,
             releasing: false,
             queued: None,
+            reports_as: None,
         }
     }
 
@@ -176,6 +213,8 @@ pub(crate) struct Tunnels {
     /// `with_shell` tunnels the user switched off by hand: they stay off, also through profile
     /// edits, until the next first shell of their profile (or until switched on again).
     off_by_hand: BTreeSet<TunnelKey>,
+    /// The banner line each failed tunnel put up, removed by its exact text.
+    banner: BTreeMap<TunnelKey, String>,
 }
 
 impl Tunnels {
@@ -188,7 +227,17 @@ impl Tunnels {
             starter: Arc::new(PoolStarter(pool)),
             shells_up: BTreeSet::new(),
             off_by_hand: BTreeSet::new(),
+            banner: BTreeMap::new(),
         }
+    }
+
+    /// The registry key of the tunnel that reported as `reported`: the entry whose running
+    /// instance reports under it (it may have been renamed since), else `reported` itself.
+    pub(crate) fn resolve(&self, reported: &TunnelKey) -> TunnelKey {
+        self.entries
+            .iter()
+            .find(|(_, e)| e.handle.is_some() && e.reports_as.as_ref() == Some(reported))
+            .map_or_else(|| reported.clone(), |(k, _)| k.clone())
     }
 
     #[cfg(test)]
@@ -304,15 +353,14 @@ impl App {
             return;
         };
         self.tunnels.off_by_hand.remove(key);
-        let blocked = self
-            .tunnels
-            .entries
-            .iter()
-            .any(|(k, e)| k.profile == key.profile && e.releasing);
-        if let Some(profile) = self.profiles.get(key.profile) {
-            let prefix = failure_prefix(&key.name, &profile.name);
-            self.notices.retain(|n| !n.starts_with(&prefix));
-        }
+        // Blocked while a stopped instance of the profile is releasing, or while a renamed
+        // tunnel still runs an instance that reports under this key.
+        let blocked = self.tunnels.entries.iter().any(|(k, e)| {
+            k.profile == key.profile
+                && (e.releasing
+                    || (k != key && e.handle.is_some() && e.reports_as.as_ref() == Some(key)))
+        });
+        self.clear_tunnel_banner(key);
         let entry = self
             .tunnels
             .entries
@@ -320,6 +368,11 @@ impl App {
             .or_insert_with(Entry::off);
         entry.manual = manual;
         entry.restart_to_apply = false;
+        if let Some(reason) = invalid(&self.profiles, key) {
+            entry.queued = None;
+            self.tunnel_failed(key, reason);
+            return;
+        }
         entry.state = TunnelState::Starting;
         if blocked {
             entry.queued = Some(window);
@@ -328,11 +381,16 @@ impl App {
         entry.queued = None;
         entry.def_started = Some(def.clone());
         entry.route_started = route(&self.profiles, key.profile);
+        entry.reports_as = Some(key.clone());
         entry.handle = Some(self.tunnels.starter.start(Start {
             store: self.profiles.clone(),
             key: key.clone(),
             def,
-            prompter: Arc::new(UiPrompter::new(window, self.prompt_tx.clone())),
+            prompter: Arc::new(UiPrompter::for_tunnel(
+                window,
+                key.clone(),
+                self.prompt_tx.clone(),
+            )),
             retries: self.tunnel_retries.clone(),
             sink: self.tunnels.sink.clone(),
         }));
@@ -340,6 +398,7 @@ impl App {
 
     /// A tunnel reported `state` (or, for `Off`, a stopped instance finished releasing).
     pub(crate) fn tunnel_event(&mut self, key: TunnelKey, state: TunnelState) -> Task<Message> {
+        let key = self.tunnels.resolve(&key);
         let Some(entry) = self.tunnels.entries.get_mut(&key) else {
             return Task::none();
         };
@@ -353,24 +412,43 @@ impl App {
             }
             // A late report of an instance already stopped.
             _ if entry.handle.is_none() => {}
-            TunnelState::Failed(reason) => {
-                if let Some(handle) = entry.handle.take() {
-                    Tunnels::retire(entry, &key, handle, &self.tunnels.sink);
-                }
-                entry.state = TunnelState::Failed(reason.clone());
-                let profile = self
-                    .profiles
-                    .get(key.profile)
-                    .map_or_else(|| key.profile.to_string(), |p| p.name.clone());
-                let prefix = failure_prefix(&key.name, &profile);
-                self.notices.retain(|n| !n.starts_with(&prefix));
-                self.notices.push(format!("{prefix}{reason}"));
-                self.notices_dismissed = false;
-            }
+            TunnelState::Failed(reason) => self.tunnel_failed(&key, reason),
             state => entry.state = state,
         }
         self.refresh_palettes();
         Task::none()
+    }
+
+    /// `key` (a registry key) failed for `reason`: its instance is let go, and the banner says
+    /// so (replacing the line of its previous failure, if any).
+    pub(crate) fn tunnel_failed(&mut self, key: &TunnelKey, reason: String) {
+        let Some(entry) = self.tunnels.entries.get_mut(key) else {
+            return;
+        };
+        entry.queued = None;
+        if let Some(handle) = entry.handle.take() {
+            Tunnels::retire(entry, key, handle, &self.tunnels.sink);
+        }
+        entry.state = TunnelState::Failed(reason.clone());
+        let profile = self
+            .profiles
+            .get(key.profile)
+            .map_or_else(|| key.profile.to_string(), |p| p.name.clone());
+        self.clear_tunnel_banner(key);
+        let line = format!("{}{reason}", failure_prefix(&key.name, &profile));
+        self.notices.push(line.clone());
+        self.tunnels.banner.insert(key.clone(), line);
+        self.notices_dismissed = false;
+        self.refresh_palettes();
+    }
+
+    /// Take down the banner line `key`'s last failure put up, if it is still there.
+    fn clear_tunnel_banner(&mut self, key: &TunnelKey) {
+        if let Some(line) = self.tunnels.banner.remove(key)
+            && let Some(i) = self.notices.iter().position(|n| *n == line)
+        {
+            self.notices.remove(i);
+        }
     }
 
     /// Start the queued tunnels of `profile` once none of its stopped instances is releasing.
@@ -477,10 +555,17 @@ impl App {
     /// for Retry or the next first shell.
     pub(crate) fn tunnels_profiles_changed(&mut self) {
         let keys: Vec<TunnelKey> = self.tunnels.entries.keys().cloned().collect();
+        let mut carried = BTreeSet::new();
         for key in keys {
             match definition(&self.profiles, &key) {
                 None => {
+                    if let Some(new) = self.renamed_to(&key, &carried) {
+                        self.carry_over(&key, &new);
+                        carried.insert(new);
+                        continue;
+                    }
                     self.tunnels.stop(&key);
+                    self.tunnels.banner.remove(&key);
                     self.tunnels.off_by_hand.remove(&key);
                     if self.tunnels.entries.get(&key).is_some_and(|e| !e.releasing) {
                         self.tunnels.entries.remove(&key);
@@ -500,6 +585,54 @@ impl App {
         let up: Vec<ProfileId> = self.tunnels.shells_up.iter().copied().collect();
         for profile in up {
             self.start_with_shell(profile, true);
+        }
+    }
+
+    /// The new name of `old`, a running tunnel whose name is gone from its profile, when it
+    /// was only renamed: exactly one tunnel of the profile defines what it started with (kind,
+    /// addresses and ports) under a name that is not running and not taken by another rename.
+    fn renamed_to(&self, old: &TunnelKey, carried: &BTreeSet<TunnelKey>) -> Option<TunnelKey> {
+        let entry = self.tunnels.entries.get(old)?;
+        let started = entry
+            .def_started
+            .as_ref()
+            .filter(|_| entry.handle.is_some())?;
+        let ProfileKind::Ssh(ssh) = &self.profiles.get(old.profile)?.kind else {
+            return None;
+        };
+        let mut candidates = ssh
+            .tunnels
+            .iter()
+            .filter(|t| t.kind == started.kind)
+            .map(|t| TunnelKey {
+                profile: old.profile,
+                name: t.name.clone(),
+            })
+            .filter(|k| {
+                !carried.contains(k)
+                    && self
+                        .tunnels
+                        .entries
+                        .get(k)
+                        .is_none_or(|e| !e.running() && !e.releasing)
+            });
+        let new = candidates.next()?;
+        candidates.next().is_none().then_some(new)
+    }
+
+    /// Move the running tunnel `old` to its new name `new`; it applies the new definition at
+    /// its next start.
+    fn carry_over(&mut self, old: &TunnelKey, new: &TunnelKey) {
+        let Some(mut entry) = self.tunnels.entries.remove(old) else {
+            return;
+        };
+        let def = definition(&self.profiles, new);
+        entry.restart_to_apply =
+            entry.def_started != def || entry.route_started != route(&self.profiles, new.profile);
+        self.tunnels.entries.insert(new.clone(), entry);
+        self.tunnels.off_by_hand.remove(old);
+        if let Some(line) = self.tunnels.banner.remove(old) {
+            self.tunnels.banner.insert(new.clone(), line);
         }
     }
 }
