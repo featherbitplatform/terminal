@@ -225,7 +225,7 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
             _ => "",
         };
         content = content.push(filter_bar(t, wid, filter, ui, app.file_panels.show_hidden));
-        content = content.push(toolbar(t, wid, app.can_download(wid)));
+        content = content.push(toolbar(t, wid, app.can_download(wid), app.can_upload(wid)));
     }
     let main = match body {
         Body::Note(line) => note(t, line),
@@ -241,7 +241,7 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
         .file_panel_transfers(wid)
         .filter(|rows| !rows.is_empty())
     {
-        content = content.push(transfers(t, rows));
+        content = content.push(transfers(t, wid, rows));
     }
     let rule = container(Space::new())
         .width(1)
@@ -402,30 +402,52 @@ fn filter_bar<'a>(
         .into()
 }
 
-/// `Download` and `Download as…`, for the selected file (`Upload…` joins them later).
-fn toolbar<'a>(t: &'static Tokens, wid: window::Id, enabled: bool) -> Element<'a, Message> {
-    let action = |caption: &'static str, m: FilePanelMsg| {
-        button(text(caption).font(UI_FONT).size(12))
-            .on_press_maybe(enabled.then(|| msg(m)))
-            .padding(Padding::from([4.0, 10.0]))
-            .style(move |_, status| crate::ui::secondary(t, status))
+/// `Download` and `Download as…` for the selected file, and `Upload…` into the folder.
+fn toolbar<'a>(
+    t: &'static Tokens,
+    wid: window::Id,
+    download: bool,
+    upload: bool,
+) -> Element<'a, Message> {
+    let action = |caption: &'static str, m: FilePanelMsg, enabled: bool| {
+        button(
+            text(caption)
+                .font(UI_FONT)
+                .size(12)
+                .wrapping(text::Wrapping::None),
+        )
+        .on_press_maybe(enabled.then(|| msg(m)))
+        .padding(Padding::from([4.0, 10.0]))
+        .style(move |_, status| crate::ui::secondary(t, status))
     };
-    row![
-        action("Download", FilePanelMsg::Download(wid)),
-        action("Download as\u{2026}", FilePanelMsg::DownloadAs(wid)),
+    let actions = row![
+        action("Download", FilePanelMsg::Download(wid), download),
+        action(
+            "Download as\u{2026}",
+            FilePanelMsg::DownloadAs(wid),
+            download
+        ),
+        action("Upload\u{2026}", FilePanelMsg::Upload(wid), upload),
     ]
     .spacing(8)
-    .padding(Padding {
-        top: 0.0,
-        right: PAD_X,
-        bottom: 6.0,
-        left: PAD_X,
-    })
-    .into()
+    .wrap()
+    .vertical_spacing(6);
+    container(actions)
+        .padding(Padding {
+            top: 0.0,
+            right: PAD_X,
+            bottom: 6.0,
+            left: PAD_X,
+        })
+        .into()
 }
 
 /// The transfer queue under the listing: one row per transfer.
-fn transfers<'a>(t: &'static Tokens, rows: &'a [TransferRow]) -> Element<'a, Message> {
+fn transfers<'a>(
+    t: &'static Tokens,
+    wid: window::Id,
+    rows: &'a [TransferRow],
+) -> Element<'a, Message> {
     let rule = container(Space::new())
         .width(Length::Fill)
         .height(1)
@@ -433,7 +455,7 @@ fn transfers<'a>(t: &'static Tokens, rows: &'a [TransferRow]) -> Element<'a, Mes
             background: Some(t.border.into()),
             ..container::Style::default()
         });
-    let list = column(rows.iter().map(|r| transfer_row(t, r)))
+    let list = column(rows.iter().map(|r| transfer_row(t, wid, r)))
         .spacing(10)
         .padding(Padding::from([8.0, PAD_X]));
     // A long queue scrolls instead of pushing the listing away.
@@ -462,11 +484,29 @@ pub(crate) fn progress_text(done: u64, total: Option<u64>) -> String {
     }
 }
 
-/// One transfer: direction and name with `Cancel` (running) or `Show in Finder` (finished),
-/// then its bar and bytes, or the reason it failed.
-fn transfer_row<'a>(t: &'static Tokens, r: &'a TransferRow) -> Element<'a, Message> {
+/// One transfer: direction and name with `Cancel` (running), `Show in Finder` (a finished
+/// download) or `Retry` (failed), and a dismiss button once it no longer runs; then its bar
+/// and bytes (or how it replaced its target), the reason it failed, or why it was skipped.
+fn transfer_row<'a>(
+    t: &'static Tokens,
+    wid: window::Id,
+    r: &'a TransferRow,
+) -> Element<'a, Message> {
     let arrow = match r.direction {
         Direction::Download => "\u{2193}",
+        Direction::Upload => "\u{2191}",
+    };
+    let small = |caption: &'static str, m: FilePanelMsg, primary: bool| {
+        button(text(caption).font(UI_FONT).size(11.5))
+            .on_press(msg(m))
+            .padding(Padding::from([2.0, 8.0]))
+            .style(move |_, status| {
+                if primary {
+                    crate::ui::secondary(t, status)
+                } else {
+                    crate::ui::ghost(t, status)
+                }
+            })
     };
     let mut top = row![
         mono(arrow, NAME_SIZE, t.text_muted),
@@ -478,31 +518,39 @@ fn transfer_row<'a>(t: &'static Tokens, r: &'a TransferRow) -> Element<'a, Messa
     .align_y(Alignment::Center);
     match &r.state {
         RowState::Running => {
-            top = top.push(
-                button(text("Cancel").font(UI_FONT).size(11.5))
-                    .on_press(msg(FilePanelMsg::CancelTransfer(r.id)))
-                    .padding(Padding::from([2.0, 8.0]))
-                    .style(move |_, status| crate::ui::ghost(t, status)),
-            );
+            // A row waiting for its session to open again has nothing to stop yet.
+            if r.cancel.is_some() {
+                top = top.push(small("Cancel", FilePanelMsg::CancelTransfer(r.id), false));
+            }
         }
-        RowState::Finished { local: Some(_) } => {
-            top = top.push(
-                button(text(REVEAL_LABEL).font(UI_FONT).size(11.5))
-                    .on_press(msg(FilePanelMsg::Reveal(r.id)))
-                    .padding(Padding::from([2.0, 8.0]))
-                    .style(move |_, status| crate::ui::secondary(t, status)),
-            );
+        RowState::Finished { local: Some(_), .. } if r.direction == Direction::Download => {
+            top = top.push(small(REVEAL_LABEL, FilePanelMsg::Reveal(r.id), true));
         }
-        RowState::Finished { local: None } | RowState::Failed(_) => {}
+        RowState::Failed(_) if r.retryable() => {
+            top = top.push(small("Retry", FilePanelMsg::RetryTransfer(wid, r.id), true));
+        }
+        RowState::Finished { .. } | RowState::Failed(_) | RowState::Skipped(_) => {}
     }
-    let detail: Element<'a, Message> = match r.failed() {
-        Some(reason) => text(plain_name(reason))
+    if !r.is_running() {
+        top = top.push(
+            button(icon(ICON_X, 12.0, t.text_muted))
+                .on_press(msg(FilePanelMsg::Dismiss(r.id)))
+                .padding(3)
+                .style(move |_, status| crate::ui::ghost(t, status)),
+        );
+    }
+    let line = |s: String, color| -> Element<'a, Message> {
+        text(s)
             .font(UI_FONT)
             .size(11.5)
-            .color(t.danger)
+            .color(color)
             .wrapping(text::Wrapping::WordOrGlyph)
-            .into(),
-        None => {
+            .into()
+    };
+    let detail: Element<'a, Message> = match &r.state {
+        RowState::Failed(reason) => line(plain_name(reason), t.danger),
+        RowState::Skipped(note) => line(note.clone(), t.text_muted),
+        RowState::Running | RowState::Finished { .. } => {
             let finished = matches!(r.state, RowState::Finished { .. });
             let fraction = match r.total {
                 _ if finished => 1.0,
@@ -520,12 +568,11 @@ fn transfer_row<'a>(t: &'static Tokens, r: &'a TransferRow) -> Element<'a, Messa
                         ..Border::default()
                     },
                 });
-            column![
-                bar,
-                mono(progress_text(r.done, r.total), VALUE_SIZE, t.text_muted)
-            ]
-            .spacing(4)
-            .into()
+            let under: Element<'a, Message> = match r.note() {
+                Some(note) => line(note.to_owned(), t.text_muted),
+                None => mono(progress_text(r.done, r.total), VALUE_SIZE, t.text_muted),
+            };
+            column![bar, under].spacing(4).into()
         }
     };
     column![top, detail].spacing(4).into()

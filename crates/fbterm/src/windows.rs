@@ -9,6 +9,7 @@ use iced::{Task, window};
 use crate::app::{App, Message, unix_now};
 use crate::chrome::Chrome;
 use crate::layout::{Drop, Layout, PaneId};
+use crate::prompts::Closing;
 use crate::restore;
 use crate::tabs::{self, Pane, Tab, TabId, TabState, WindowState};
 
@@ -114,9 +115,17 @@ impl App {
         self.start(wid, id)
     }
 
-    /// The tab's close button: a tab with several live panes asks first (`Dialog::CloseTab`),
-    /// anything else closes at once. The pane shortcut and bulk closes call `close_tab` directly.
+    /// The tab's close button: a tab whose closing would end running transfers asks first
+    /// (`Dialog::Transfers`), then a tab with several live panes (`Dialog::CloseTab`);
+    /// anything else closes at once. Bulk closes call `close_tab` directly.
     pub(crate) fn close_tab_asking(&mut self, wid: window::Id, index: usize) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
+            return Task::none();
+        };
+        let (id, panes): (TabId, Vec<PaneId>) = (tab.id, tab.panes.iter().map(|p| p.id).collect());
+        if self.ask_before_closing(wid, &panes, Closing::Tab(id)) {
+            return Task::none();
+        }
         let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
             return Task::none();
         };
@@ -132,6 +141,23 @@ impl App {
             );
         }
         Task::none()
+    }
+
+    /// Close the tab at `index` (the user agreed to close it), unless running transfers would
+    /// end with it: then that is asked first.
+    pub(crate) fn close_tab_if_no_transfers(
+        &mut self,
+        wid: window::Id,
+        index: usize,
+    ) -> Task<Message> {
+        let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
+            return Task::none();
+        };
+        let (id, panes): (TabId, Vec<PaneId>) = (tab.id, tab.panes.iter().map(|p| p.id).collect());
+        if self.ask_before_closing(wid, &panes, Closing::Tab(id)) {
+            return Task::none();
+        }
+        self.close_tab(wid, index)
     }
 
     pub(crate) fn close_tab(&mut self, wid: window::Id, index: usize) -> Task<Message> {
@@ -259,6 +285,8 @@ impl App {
         Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
     }
 
+    /// The OS close button: other windows close; a terminal window asks first when closing
+    /// it would end running transfers; the last terminal window quits (asking the same).
     pub(crate) fn close_requested(&mut self, id: window::Id) -> Task<Message> {
         if self.settings_window() == Some(id) {
             self.write_pending_settings();
@@ -267,11 +295,15 @@ impl App {
             || self.settings_window() == Some(id)
             || self.schemes_window() == Some(id)
             || self.tunnels_window() == Some(id)
-            || self.windows.len() > 1
         {
             self.close_window(id)
+        } else if self.windows.len() > 1 {
+            if self.ask_before_closing_window(id) {
+                return Task::none();
+            }
+            self.close_window(id)
         } else {
-            self.quit()
+            self.quit_asking()
         }
     }
 

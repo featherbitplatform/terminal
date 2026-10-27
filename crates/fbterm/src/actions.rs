@@ -82,7 +82,7 @@ impl App {
                 Task::none()
             }
             Action::ExportTab => self.export_tab(wid),
-            Action::Quit => self.quit(),
+            Action::Quit => self.quit_asking(),
             Action::Find => match wid {
                 Some(wid) => self.find(wid, crate::find::FindMsg::Open),
                 None => Task::none(),

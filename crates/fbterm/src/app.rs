@@ -647,6 +647,10 @@ impl App {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
+                // Files dropped from the OS on a window: only these start an upload by drag.
+                Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
+                    crate::file_panel::FilePanelMsg::Dropped(id, path),
+                )),
                 _ => None,
             }),
             window::close_events().map(Message::WindowClosed),
@@ -879,6 +883,10 @@ impl App {
                 self.file_panels.ui.remove(&id);
                 // A save dialog it had open answers nothing now.
                 self.file_panels.saving.remove(&id);
+                // Nor does its picker; its drops and undecided uploads are forgotten.
+                self.file_panels.picking.remove(&id);
+                self.file_panels.dropped.remove(&id);
+                self.file_panels.batches.remove(&id);
                 if self.carry.is_some_and(|(w, _)| w == id) {
                     self.carry = None;
                     self.hover = None;

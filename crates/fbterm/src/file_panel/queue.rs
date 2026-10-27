@@ -1,0 +1,817 @@
+//! Uploads, the transfer queue's `Retry` and dismiss, and the transfers closing would end.
+//!
+//! - **Uploads.** Only the toolbar's `Upload…` (the system's multi-file picker over the
+//!   window) and files the OS drops on a window whose panel is open start one; nothing a
+//!   remote program sends can. They go into the folder the panel shows. Files picked or
+//!   dropped together are one [`Batch`]: decided one at a time, folders skipped with
+//!   `Folders are not uploaded: {name}` in the queue. A name already in the folder (in its
+//!   listing, or being uploaded) is asked about with the clash dialog: `Replace`, `Rename` (a
+//!   name field prefilled with a free name) or `Cancel`, and `Apply to all` (Replace and
+//!   Cancel) while other files of the batch wait. Everything else uploads with
+//!   [`UploadMode::New`], which never replaces anything even when the listing was out of
+//!   date. Once no upload into the shown folder runs, the folder is read again.
+//! - **Drops** come one OS event per file; those of one burst are gathered (a single short
+//!   wait after the first, no timer otherwise) into one batch.
+//! - **Retry** does a failed row's [`Job`] again in its place. When the session is gone (the
+//!   connection dropped) it is opened again first, asking over the window `Retry` was
+//!   pressed in, and the row waits for it.
+//! - **Dismiss** removes a row that no longer runs; finished and skipped rows also go when no
+//!   panel shows their profile any more. Cancelled rows leave by themselves.
+//! - **Closing.** Closing a tab, a pane or a window that holds a profile's last panes while
+//!   that profile has transfers running, or quitting while any runs, asks first
+//!   (`{n} transfers are still running.`, `Cancel transfers and close` / `Keep open`).
+//!   Quitting waits (briefly, bounded) for the cancelled transfers to clean up.
+
+use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use fbterm_config::ProfileId;
+use fbterm_session::ssh::transfer::{UploadMode, free_name_avoiding, same_destination};
+use iced::{Task, window};
+
+use super::state::{AllChoice, Batch, Direction, Job, Listing, RowState, TransferRow};
+use super::{DownloadRequest, FilePanelMsg, Started, UploadRequest, plain_name};
+use crate::app::{App, Message};
+use crate::layout::PaneId;
+use crate::prompts::{Clash, Closing, Dialog};
+
+/// How long after the first dropped file the others of the same drop are waited for.
+const DROP_GATHER: Duration = Duration::from_millis(120);
+/// The longest a quit waits for cancelled transfers to clean up.
+const QUIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The clash dialog's answer for the file it asks about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClashAnswer {
+    Replace {
+        all: bool,
+    },
+    Cancel {
+        all: bool,
+    },
+    /// Upload under this (checked, free) name instead.
+    Rename(String),
+}
+
+/// The clash dialog's line.
+pub(crate) fn clash_message(name: &str, folder: &str) -> String {
+    format!("\"{name}\" already exists in {folder}.")
+}
+
+/// The close confirmation's line.
+pub(crate) fn running_message(count: usize) -> String {
+    if count == 1 {
+        "1 transfer is still running.".into()
+    } else {
+        format!("{count} transfers are still running.")
+    }
+}
+
+/// The first of `name`, `name (1).ext`, `name (2).ext`, … that `taken` does not claim.
+pub(crate) fn remote_free_name(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    if !taken(name) {
+        return name.to_owned();
+    }
+    let as_path = std::path::Path::new(name);
+    let (stem, ext) = match (as_path.file_stem(), as_path.extension()) {
+        (Some(stem), Some(ext)) => (stem.to_string_lossy(), Some(ext.to_string_lossy())),
+        _ => (name.into(), None),
+    };
+    (1u64..)
+        .map(|n| match &ext {
+            Some(ext) => format!("{stem} ({n}).{ext}"),
+            None => format!("{stem} ({n})"),
+        })
+        .find(|candidate| !taken(candidate))
+        .expect("some numbered name is free")
+}
+
+/// Why a name typed in the clash dialog cannot be used, if it cannot.
+pub(crate) fn rename_problem(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("Type a name.")
+    } else if name.contains('/') {
+        Some("A name cannot contain /.")
+    } else if name.chars().any(char::is_control) {
+        Some("A name cannot contain control characters.")
+    } else if name == "." || name == ".." {
+        Some("Choose another name.")
+    } else {
+        None
+    }
+}
+
+impl App {
+    /// Whether `wid`'s toolbar offers `Upload…`: its panel shows a loaded folder on an open
+    /// session.
+    pub(crate) fn can_upload(&self, wid: window::Id) -> bool {
+        self.shown_profile(wid)
+            .and_then(|p| self.file_panels.by_profile.get(&p))
+            .is_some_and(|p| {
+                p.sftp.is_some() && !p.folder.is_empty() && matches!(p.listing, Listing::Loaded(_))
+            })
+    }
+
+    /// `Upload…`: the system's picker over `wid`, several files at once.
+    pub(super) fn pick_uploads(&mut self, wid: window::Id) -> Task<Message> {
+        if !self.can_upload(wid) || !self.file_panels.picking.insert(wid) {
+            return Task::none();
+        }
+        self.file_panel_work
+            .backend
+            .pick_files(wid)
+            .map(move |paths| Message::FilePanel(FilePanelMsg::Picked(wid, paths)))
+    }
+
+    /// The picker closed: upload what was chosen.
+    pub(super) fn picked(&mut self, wid: window::Id, paths: Option<Vec<PathBuf>>) {
+        self.file_panels.picking.remove(&wid);
+        if let Some(paths) = paths {
+            self.upload_files(wid, paths);
+        }
+    }
+
+    /// The OS dropped `path` on `wid`. Ignored unless the panel there shows a server; the
+    /// files of one drop are gathered and uploaded together.
+    pub(super) fn dropped(&mut self, wid: window::Id, path: PathBuf) -> Task<Message> {
+        if self.shown_profile(wid).is_none() {
+            return Task::none();
+        }
+        let gathered = self.file_panels.dropped.entry(wid).or_default();
+        gathered.push(path);
+        if gathered.len() > 1 {
+            return Task::none();
+        }
+        Task::perform(async { tokio::time::sleep(DROP_GATHER).await }, move |()| {
+            Message::FilePanel(FilePanelMsg::DropsSettled(wid))
+        })
+    }
+
+    pub(super) fn drops_settled(&mut self, wid: window::Id) {
+        if let Some(paths) = self.file_panels.dropped.remove(&wid) {
+            self.upload_files(wid, paths);
+        }
+    }
+
+    /// Upload `paths` into the folder `wid`'s panel shows, as one batch.
+    pub(crate) fn upload_files(&mut self, wid: window::Id, paths: Vec<PathBuf>) {
+        let Some(profile) = self.shown_profile(wid) else {
+            return;
+        };
+        let Some(folder) = self
+            .file_panels
+            .by_profile
+            .get(&profile)
+            .map(|p| p.folder.clone())
+            .filter(|f| !f.is_empty())
+        else {
+            return;
+        };
+        let mut items = VecDeque::new();
+        for path in paths {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            if path.is_dir() {
+                let shown = plain_name(&name);
+                self.add_row(
+                    profile,
+                    TransferRow::stopped(
+                        shown.clone(),
+                        Direction::Upload,
+                        RowState::Skipped(format!("Folders are not uploaded: {shown}")),
+                    ),
+                );
+                continue;
+            }
+            items.push_back((path, name));
+        }
+        if items.is_empty() {
+            return;
+        }
+        self.file_panels
+            .batches
+            .entry(wid)
+            .or_default()
+            .push_back(Batch {
+                profile,
+                folder,
+                items,
+                asking: None,
+                all: None,
+            });
+        self.advance_uploads(wid);
+    }
+
+    /// Whether `name` is taken in `profile`'s remote `folder`: listed there, or being
+    /// uploaded there.
+    fn remote_taken(&self, profile: ProfileId, folder: &str, name: &str) -> bool {
+        let Some(panel) = self.file_panels.by_profile.get(&profile) else {
+            return false;
+        };
+        let listed = panel.folder == folder
+            && matches!(&panel.listing, Listing::Loaded(entries) if entries.iter().any(|e| e.name == name));
+        listed
+            || panel
+                .transfers
+                .iter()
+                .any(|r| r.uploading_into(folder) == Some(name))
+    }
+
+    /// Decide the files of `wid`'s batches in order until one needs the clash dialog.
+    fn advance_uploads(&mut self, wid: window::Id) {
+        loop {
+            let Some(queue) = self.file_panels.batches.get_mut(&wid) else {
+                return;
+            };
+            let Some(batch) = queue.front_mut() else {
+                self.file_panels.batches.remove(&wid);
+                return;
+            };
+            if batch.asking.is_some() {
+                return;
+            }
+            let Some((local, name)) = batch.items.pop_front() else {
+                queue.pop_front();
+                continue;
+            };
+            let (profile, folder, all, more) = (
+                batch.profile,
+                batch.folder.clone(),
+                batch.all,
+                !batch.items.is_empty(),
+            );
+            let upload = |mode| Job::Upload {
+                local: local.clone(),
+                folder: folder.clone(),
+                name: name.clone(),
+                mode,
+            };
+            if !self.remote_taken(profile, &folder, &name) {
+                self.start_job(profile, upload(UploadMode::New));
+                continue;
+            }
+            match all {
+                Some(AllChoice::Replace) => self.start_job(profile, upload(UploadMode::Replace)),
+                Some(AllChoice::Cancel) => {}
+                None => {
+                    if let Some(batch) = self
+                        .file_panels
+                        .batches
+                        .get_mut(&wid)
+                        .and_then(VecDeque::front_mut)
+                    {
+                        batch.asking = Some((local.clone(), name.clone()));
+                    }
+                    self.prompts.push(
+                        wid,
+                        None,
+                        Dialog::Clash(Clash {
+                            name,
+                            folder,
+                            offer_all: more,
+                            apply_all: false,
+                            rename: None,
+                        }),
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The clash dialog of `wid` was answered (and taken off the queue).
+    pub(crate) fn clash_answer(&mut self, wid: window::Id, answer: ClashAnswer) -> Task<Message> {
+        let Some(batch) = self
+            .file_panels
+            .batches
+            .get_mut(&wid)
+            .and_then(VecDeque::front_mut)
+        else {
+            return Task::none();
+        };
+        let Some((local, name)) = batch.asking.take() else {
+            return Task::none();
+        };
+        let (profile, folder) = (batch.profile, batch.folder.clone());
+        let job = |name: String, mode| Job::Upload {
+            local: local.clone(),
+            folder: folder.clone(),
+            name,
+            mode,
+        };
+        match answer {
+            ClashAnswer::Replace { all } => {
+                if all {
+                    batch.all = Some(AllChoice::Replace);
+                }
+                self.start_job(profile, job(name, UploadMode::Replace));
+            }
+            ClashAnswer::Cancel { all } => {
+                if all {
+                    batch.all = Some(AllChoice::Cancel);
+                }
+            }
+            ClashAnswer::Rename(new) => self.start_job(profile, job(new, UploadMode::New)),
+        }
+        self.advance_uploads(wid);
+        Task::none()
+    }
+
+    /// The name `Rename` offers for `name` in the folder `wid`'s clash dialog is about.
+    pub(crate) fn clash_free_name(&self, wid: window::Id, name: &str) -> String {
+        match self.file_panels.batches.get(&wid).and_then(VecDeque::front) {
+            Some(batch) => {
+                remote_free_name(name, |n| self.remote_taken(batch.profile, &batch.folder, n))
+            }
+            None => name.to_owned(),
+        }
+    }
+
+    /// `Rename` (or Enter) in the clash dialog's name field: a usable, free name uploads; a
+    /// name that is taken too is asked about again; anything else says why not.
+    pub(crate) fn clash_rename_submit(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(Dialog::Clash(Clash {
+            rename: Some(rename),
+            ..
+        })) = self.prompts.front(wid)
+        else {
+            return Task::none();
+        };
+        let typed = rename.value.clone();
+        if let Some(problem) = rename_problem(&typed) {
+            if let Some(Dialog::Clash(Clash {
+                rename: Some(rename),
+                ..
+            })) = self.prompts.front_mut(wid)
+            {
+                rename.problem = Some(problem.into());
+            }
+            return self.focus_prompt(wid);
+        }
+        let taken = self
+            .file_panels
+            .batches
+            .get(&wid)
+            .and_then(VecDeque::front)
+            .is_some_and(|b| self.remote_taken(b.profile, &b.folder, &typed));
+        if taken {
+            if let Some(batch) = self
+                .file_panels
+                .batches
+                .get_mut(&wid)
+                .and_then(VecDeque::front_mut)
+                && let Some(asking) = &mut batch.asking
+            {
+                asking.1.clone_from(&typed);
+            }
+            if let Some(Dialog::Clash(clash)) = self.prompts.front_mut(wid) {
+                clash.name = typed;
+                clash.rename = None;
+                clash.apply_all = false;
+            }
+            return Task::none();
+        }
+        self.prompts.pop(wid);
+        let task = self.clash_answer(wid, ClashAnswer::Rename(typed));
+        Task::batch([task, self.focus_prompt(wid)])
+    }
+
+    /// Start `job` on `profile`'s session, with a row in its queue.
+    pub(super) fn start_job(&mut self, profile: ProfileId, job: Job) {
+        let row = self.launch_job(profile, job);
+        self.add_row(profile, row);
+    }
+
+    /// Start `job` on `profile`'s session: its row, running, or failed with why it could not
+    /// start (and `Retry`).
+    fn launch_job(&self, profile: ProfileId, job: Job) -> TransferRow {
+        let (name, direction) = match &job {
+            Job::Download { name, .. } => (plain_name(name), Direction::Download),
+            Job::Upload { name, .. } => (plain_name(name), Direction::Upload),
+        };
+        let session = self
+            .file_panels
+            .by_profile
+            .get(&profile)
+            .and_then(|p| p.sftp.clone());
+        let started = match session {
+            None => Err("The SFTP session is not open.".to_owned()),
+            Some(remote) => {
+                let sink = self.file_panel_work.transfer_sink.clone();
+                match &job {
+                    Job::Download {
+                        remote: path, dest, ..
+                    } => self.file_panel_work.backend.download(
+                        DownloadRequest {
+                            remote,
+                            path: path.clone(),
+                            dest: dest.clone(),
+                        },
+                        sink,
+                    ),
+                    Job::Upload {
+                        local,
+                        folder,
+                        name,
+                        mode,
+                    } => self.file_panel_work.backend.upload(
+                        UploadRequest {
+                            remote,
+                            local: local.clone(),
+                            folder: folder.clone(),
+                            name: name.clone(),
+                            mode: *mode,
+                        },
+                        sink,
+                    ),
+                }
+            }
+        };
+        let mut row = match (started, &job) {
+            (Ok(Started { id, cancel }), Job::Download { dest, .. }) => {
+                TransferRow::download(id, name, dest.clone(), cancel)
+            }
+            (Ok(Started { id, cancel }), Job::Upload { .. }) => {
+                TransferRow::upload(id, name, cancel)
+            }
+            (Err(reason), _) => TransferRow::stopped(name, direction, RowState::Failed(reason)),
+        };
+        row.job = Some(job);
+        row
+    }
+
+    /// The profile whose queue holds row `id`, and the row's place in it.
+    fn find_row(
+        &self,
+        id: fbterm_session::ssh::transfer::TransferId,
+    ) -> Option<(ProfileId, usize)> {
+        self.file_panels
+            .by_profile
+            .iter()
+            .find_map(|(p, panel)| Some((*p, panel.transfers.iter().position(|r| r.id == id)?)))
+    }
+
+    /// A row's `Retry` in `wid`: its job again, in its place; a session that is gone is
+    /// opened again first (asking over `wid`) and the row waits for it.
+    pub(super) fn retry_transfer(
+        &mut self,
+        wid: window::Id,
+        id: fbterm_session::ssh::transfer::TransferId,
+    ) {
+        let Some((profile, index)) = self.find_row(id) else {
+            return;
+        };
+        let row = &self.file_panels.by_profile[&profile].transfers[index];
+        if !row.retryable() {
+            return;
+        }
+        let Some(mut job) = row.job.clone() else {
+            return;
+        };
+        match &mut job {
+            // A name now in the folder is asked about before anything is replaced.
+            Job::Upload {
+                local,
+                folder,
+                name,
+                mode: UploadMode::New,
+            } if self.remote_taken(profile, folder, name) => {
+                let batch = Batch {
+                    profile,
+                    folder: folder.clone(),
+                    items: VecDeque::from([(local.clone(), name.clone())]),
+                    asking: None,
+                    all: None,
+                };
+                if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                    panel.transfers.remove(index);
+                }
+                self.file_panels
+                    .batches
+                    .entry(wid)
+                    .or_default()
+                    .push_back(batch);
+                self.advance_uploads(wid);
+                return;
+            }
+            Job::Download {
+                name, dest, chosen, ..
+            } => {
+                let writing = self.writing();
+                if *chosen {
+                    if writing.iter().any(|w| same_destination(w, dest)) {
+                        let shown = dest
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                            panel.transfers[index].state = RowState::Failed(format!(
+                                "Already downloading to {}",
+                                plain_name(&shown)
+                            ));
+                        }
+                        return;
+                    }
+                } else if let Some(folder) = dest.parent() {
+                    // Never over a file that appeared since: a free name again.
+                    *dest = free_name_avoiding(folder, name, |p| {
+                        writing.iter().any(|w| same_destination(w, p))
+                    });
+                }
+            }
+            Job::Upload { .. } => {}
+        }
+        let alive = self
+            .file_panels
+            .by_profile
+            .get(&profile)
+            .and_then(|p| p.sftp.as_ref())
+            .is_some_and(|s| s.is_alive());
+        if alive {
+            let row = self.launch_job(profile, job);
+            if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                panel.transfers[index] = row;
+            }
+            return;
+        }
+        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
+            return;
+        };
+        let row = &mut panel.transfers[index];
+        if let Job::Download { dest, .. } = &job {
+            row.local = Some(dest.clone());
+        }
+        row.state = RowState::Running;
+        row.done = 0;
+        row.total = None;
+        row.cancel = None;
+        row.job = Some(job);
+        panel.waiting.push(id);
+        if panel.listing != Listing::Opening {
+            self.reopen(profile, wid);
+        }
+    }
+
+    /// `profile`'s session opened (`Ok`) or could not (`Err`, why): the rows waiting for it
+    /// start, or fail with the reason.
+    pub(super) fn run_waiting(&mut self, profile: ProfileId, opened: Result<(), &str>) {
+        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
+            return;
+        };
+        let waiting = std::mem::take(&mut panel.waiting);
+        for id in waiting {
+            let Some(index) = self.file_panels.by_profile[&profile]
+                .transfers
+                .iter()
+                .position(|r| r.id == id)
+            else {
+                continue;
+            };
+            let job = self.file_panels.by_profile[&profile].transfers[index]
+                .job
+                .clone();
+            let row = match (opened, job) {
+                (Ok(()), Some(job)) => self.launch_job(profile, job),
+                (Err(reason), job) => {
+                    let row = &self.file_panels.by_profile[&profile].transfers[index];
+                    let mut failed = TransferRow::stopped(
+                        row.name.clone(),
+                        row.direction,
+                        RowState::Failed(format!("SFTP is not available: {reason}")),
+                    );
+                    failed.job = job;
+                    failed
+                }
+                (Ok(()), None) => continue,
+            };
+            if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                panel.transfers[index] = row;
+            }
+        }
+    }
+
+    /// A row's dismiss button: rows that no longer run leave the queue.
+    pub(super) fn dismiss(&mut self, id: fbterm_session::ssh::transfer::TransferId) {
+        if let Some((profile, index)) = self.find_row(id)
+            && let Some(panel) = self.file_panels.by_profile.get_mut(&profile)
+            && !panel.transfers[index].is_running()
+        {
+            panel.transfers.remove(index);
+        }
+    }
+
+    /// No panel shows `profile` any more: its finished and skipped rows go.
+    pub(super) fn forget_finished(&mut self, profile: ProfileId) {
+        let shown = self
+            .file_panels
+            .open
+            .iter()
+            .any(|&w| self.shown_profile(w) == Some(profile));
+        if shown {
+            return;
+        }
+        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+            panel
+                .transfers
+                .retain(|r| !matches!(r.state, RowState::Finished { .. } | RowState::Skipped(_)));
+        }
+    }
+
+    /// An upload into `folder` of `profile` ended: once none runs there any more, the folder
+    /// is read again when the panel shows it, so the new names are listed (and clash).
+    pub(super) fn uploads_ended(&mut self, profile: ProfileId, folder: &str) {
+        let Some(panel) = self.file_panels.by_profile.get(&profile) else {
+            return;
+        };
+        let running = panel
+            .transfers
+            .iter()
+            .any(|r| r.uploading_into(folder).is_some());
+        if !running && panel.folder == folder && matches!(panel.listing, Listing::Loaded(_)) {
+            self.read_folder(profile);
+        }
+    }
+
+    // ---- Closing while transfers run ----
+
+    /// Running transfers of `profiles`.
+    fn running_of(&self, profiles: &[ProfileId]) -> usize {
+        profiles
+            .iter()
+            .filter_map(|p| self.file_panels.by_profile.get(p))
+            .flat_map(|p| p.transfers.iter())
+            .filter(|r| r.is_running())
+            .count()
+    }
+
+    fn running_total(&self) -> usize {
+        self.file_panels
+            .by_profile
+            .values()
+            .flat_map(|p| p.transfers.iter())
+            .filter(|r| r.is_running())
+            .count()
+    }
+
+    /// The profiles with transfers running that closing `panes` would leave without any
+    /// pane anywhere (their queue could no longer be seen).
+    fn ended_by(&self, panes: &[PaneId]) -> Vec<ProfileId> {
+        let all: Vec<(PaneId, ProfileId)> = self
+            .windows
+            .values()
+            .flat_map(|w| &w.tabs)
+            .flat_map(|t| &t.panes)
+            .map(|p| (p.id, p.profile))
+            .collect();
+        let mut ended: Vec<ProfileId> = Vec::new();
+        for &(id, profile) in &all {
+            if !panes.contains(&id) || ended.contains(&profile) {
+                continue;
+            }
+            let kept = all
+                .iter()
+                .any(|(other, p)| *p == profile && !panes.contains(other));
+            if !kept && self.running_of(&[profile]) > 0 {
+                ended.push(profile);
+            }
+        }
+        ended
+    }
+
+    /// The panes of `wid` (all its tabs).
+    fn window_panes(&self, wid: window::Id) -> Vec<PaneId> {
+        self.windows
+            .get(&wid)
+            .map(|w| w.tabs.iter().flat_map(|t| &t.panes).map(|p| p.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether closing `panes` (as `then`) must ask first; asks over `wid` when it must.
+    pub(crate) fn ask_before_closing(
+        &mut self,
+        wid: window::Id,
+        panes: &[PaneId],
+        then: Closing,
+    ) -> bool {
+        let count = self.running_of(&self.ended_by(panes));
+        if count == 0 {
+            return false;
+        }
+        if !self.prompts.has_transfers(wid, then) {
+            self.prompts
+                .push(wid, None, Dialog::Transfers { count, then });
+        }
+        true
+    }
+
+    /// Whether closing `wid` must ask first; asks when it must.
+    pub(crate) fn ask_before_closing_window(&mut self, wid: window::Id) -> bool {
+        let panes = self.window_panes(wid);
+        self.ask_before_closing(wid, &panes, Closing::Window)
+    }
+
+    /// Quit, asking first while transfers run.
+    pub(crate) fn quit_asking(&mut self) -> Task<Message> {
+        if self.quitting {
+            return Task::none();
+        }
+        let count = self.running_total();
+        if count == 0 {
+            return self.quit();
+        }
+        if self.prompts.asks_quit() || self.file_panels.quit_when_stopped {
+            return Task::none();
+        }
+        match self.focused_window() {
+            Some(wid) => {
+                self.prompts.push(
+                    wid,
+                    None,
+                    Dialog::Transfers {
+                        count,
+                        then: Closing::Quit,
+                    },
+                );
+                Task::none()
+            }
+            // Nowhere to ask: what runs is cancelled, as the user is leaving.
+            None => self.stop_transfers_and_close(None, Closing::Quit),
+        }
+    }
+
+    /// Cancel the running transfers of `profiles` (every profile with `None`).
+    fn cancel_transfers(&mut self, profiles: Option<&[ProfileId]>) {
+        for (profile, panel) in &mut self.file_panels.by_profile {
+            if profiles.is_some_and(|ps| !ps.contains(profile)) {
+                continue;
+            }
+            // A row waiting for its session has nothing to stop: it just goes.
+            let waiting = std::mem::take(&mut panel.waiting);
+            panel.transfers.retain(|r| !waiting.contains(&r.id));
+            for row in panel.transfers.iter().filter(|r| r.is_running()) {
+                if let Some(cancel) = &row.cancel {
+                    cancel();
+                }
+            }
+        }
+    }
+
+    /// `Cancel transfers and close`: the transfers closing ends are cancelled, then it
+    /// closes (a quit once they have cleaned up, or after a bounded wait).
+    pub(crate) fn stop_transfers_and_close(
+        &mut self,
+        wid: Option<window::Id>,
+        then: Closing,
+    ) -> Task<Message> {
+        match (then, wid) {
+            (Closing::Quit, _) => {
+                self.cancel_transfers(None);
+                if self.running_total() == 0 {
+                    return self.quit();
+                }
+                self.file_panels.quit_when_stopped = true;
+                Task::perform(async { tokio::time::sleep(QUIT_WAIT).await }, |()| {
+                    Message::FilePanel(FilePanelMsg::QuitWaited)
+                })
+            }
+            (Closing::Tab(tab), Some(wid)) => {
+                let Some(index) = self.windows.get(&wid).and_then(|w| w.find(tab)) else {
+                    return Task::none();
+                };
+                let panes: Vec<PaneId> = self.windows[&wid].tabs[index]
+                    .panes
+                    .iter()
+                    .map(|p| p.id)
+                    .collect();
+                let ended = self.ended_by(&panes);
+                self.cancel_transfers(Some(&ended));
+                self.close_tab(wid, index)
+            }
+            (Closing::Pane(pane), Some(wid)) => {
+                let ended = self.ended_by(&[pane]);
+                self.cancel_transfers(Some(&ended));
+                self.close_pane(wid, pane)
+            }
+            (Closing::Window, Some(wid)) => {
+                let ended = self.ended_by(&self.window_panes(wid));
+                self.cancel_transfers(Some(&ended));
+                self.close_window(wid)
+            }
+            (_, None) => Task::none(),
+        }
+    }
+
+    /// A quit is waiting for cancelled transfers: quit once none runs.
+    pub(super) fn quit_if_stopped(&mut self, waited: bool) -> Task<Message> {
+        if !self.file_panels.quit_when_stopped {
+            return Task::none();
+        }
+        if waited || self.running_total() == 0 {
+            self.file_panels.quit_when_stopped = false;
+            return self.quit();
+        }
+        Task::none()
+    }
+}

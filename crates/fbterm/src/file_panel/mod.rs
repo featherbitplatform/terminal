@@ -46,10 +46,14 @@
 //!   download is a task on the app's runtime ([`transfer::download`]); its events reach the
 //!   update loop through a stream (no timer), already coalesced to a few per second. Its row
 //!   shows progress and `Cancel`, then `Show in Finder` (`Show in folder` elsewhere), or the
-//!   reason it failed; a cancelled row goes away. Rows belong to the profile, not the
-//!   window: hiding the panel or moving focus leaves them running, and a running transfer
-//!   keeps the session.
+//!   reason it failed (with `Retry`); a cancelled row goes away. Rows belong to the
+//!   profile, not the window: hiding the panel or moving focus leaves them running, and a
+//!   running transfer keeps the session.
+//! - **Uploads, `Retry`, dismiss and closing with transfers running:** see [`queue`].
 
+#[cfg(test)]
+mod live_tests;
+mod queue;
 pub(crate) mod state;
 #[cfg(test)]
 mod tests;
@@ -62,8 +66,8 @@ use std::sync::Arc;
 use fbterm_config::{ProfileId, ProfileKind, ProfileStore};
 use fbterm_session::ssh::sftp::{Entry, Sftp, SftpError, SortKey, sort_entries};
 use fbterm_session::ssh::transfer::{
-    self, TransferEvent, TransferId, TransferSink, free_name_avoiding, safe_local_name,
-    same_destination,
+    self, MAY_BE_INCOMPLETE, TransferEvent, TransferId, TransferSink, UploadMode,
+    free_name_avoiding, safe_local_name, same_destination,
 };
 use fbterm_session::ssh::{Prompter, SshError, SshPool};
 use iced::futures::Stream;
@@ -74,7 +78,10 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use crate::app::{App, Delivered, Message};
 use crate::prompts::UiPrompter;
 use crate::tabs::{TabState, WindowState};
-use state::{CancelFn, PendingSave, TransferRow};
+#[cfg(test)]
+pub(crate) use queue::remote_free_name;
+pub(crate) use queue::{ClashAnswer, clash_message, running_message};
+use state::{CancelFn, Job, PendingSave, TransferRow};
 pub(crate) use state::{FilePanels, Listing, ProfilePanel};
 
 /// An open SFTP session as the panel uses it: the real one, or a fake in tests.
@@ -83,6 +90,10 @@ pub(crate) trait Remote: Send + Sync {
     async fn list(&self, path: &str) -> Result<Vec<Entry>, SftpError>;
     /// The session itself, for transfers (`None` for a test fake).
     fn sftp(&self) -> Option<Arc<Sftp>>;
+    /// Whether the session can still answer: its connection has not dropped.
+    fn is_alive(&self) -> bool {
+        true
+    }
 }
 
 /// The real session.
@@ -96,6 +107,10 @@ impl Remote for Live {
 
     fn sftp(&self) -> Option<Arc<Sftp>> {
         Some(self.0.clone())
+    }
+
+    fn is_alive(&self) -> bool {
+        self.0.is_alive()
     }
 }
 
@@ -151,6 +166,17 @@ pub(crate) struct DownloadRequest {
     pub dest: PathBuf,
 }
 
+/// What uploading a file takes.
+pub(crate) struct UploadRequest {
+    pub remote: Arc<dyn Remote>,
+    /// The local file to send.
+    pub local: PathBuf,
+    /// The remote folder and the name to give the file there.
+    pub folder: String,
+    pub name: String,
+    pub mode: UploadMode,
+}
+
 /// A transfer that started: its id (its events carry it) and how to stop it.
 pub(crate) struct Started {
     pub id: TransferId,
@@ -165,6 +191,29 @@ pub(crate) trait Backend: Send + Sync {
     fn list(&self, request: ListRequest, sink: PanelSink);
     /// Start a download reporting to `sink`, or say why it cannot start.
     fn download(&self, request: DownloadRequest, sink: TransferSink) -> Result<Started, String>;
+    /// Start an upload reporting to `sink`, or say why it cannot start.
+    fn upload(&self, request: UploadRequest, sink: TransferSink) -> Result<Started, String>;
+
+    /// The system's picker over `window`, several files at once: the chosen paths, or `None`
+    /// when it was cancelled. Tests answer it by hand instead.
+    fn pick_files(&self, window: window::Id) -> Task<Option<Vec<PathBuf>>> {
+        window::run(window, |w| {
+            rfd::AsyncFileDialog::new()
+                .set_title("Upload")
+                .set_parent(w)
+        })
+        .then(|dialog| {
+            Task::perform(
+                async move {
+                    dialog
+                        .pick_files()
+                        .await
+                        .map(|files| files.iter().map(|f| f.path().to_path_buf()).collect())
+                },
+                |paths| paths,
+            )
+        })
+    }
 
     /// The system's save dialog over `window`, offering `name` in `folder`: the chosen path,
     /// or `None` when it was cancelled. Tests answer it by hand instead.
@@ -286,6 +335,21 @@ impl Backend for PoolBackend {
             cancel: Arc::new(move || handle.cancel()),
         })
     }
+
+    fn upload(&self, r: UploadRequest, sink: TransferSink) -> Result<Started, String> {
+        let Some(sftp) = r.remote.sftp() else {
+            return Err("The SFTP session is not open.".into());
+        };
+        if runtime().is_none() {
+            return Err(format!("Could not start: {NO_RUNTIME}."));
+        }
+        let handle = transfer::upload(sftp, r.local, r.folder, r.name, r.mode, sink);
+        let id = handle.id();
+        Ok(Started {
+            id,
+            cancel: Arc::new(move || handle.cancel()),
+        })
+    }
 }
 
 /// `FBTERM_DEMO_FILES` (debug aid): every session opens at once in `home` and every folder
@@ -386,6 +450,17 @@ impl Backend for Demo {
 
     /// A download that stays at its start, writing nothing; its cancel works.
     fn download(&self, _r: DownloadRequest, sink: TransferSink) -> Result<Started, String> {
+        Self::idle(sink)
+    }
+
+    /// An upload that stays at its start, sending nothing; its cancel works.
+    fn upload(&self, _r: UploadRequest, sink: TransferSink) -> Result<Started, String> {
+        Self::idle(sink)
+    }
+}
+
+impl Demo {
+    fn idle(sink: TransferSink) -> Result<Started, String> {
         let id = TransferId::next();
         let _ = sink.send((
             id,
@@ -404,8 +479,10 @@ impl Backend for Demo {
 }
 
 impl Demo {
-    /// Sample transfer rows (a running and a finished download of the first two files), so a
-    /// screenshot shows the queue; nothing is written and their buttons do nothing.
+    /// Sample transfer rows (a running and a finished download of the first two files, and an
+    /// in-place replace of the first that failed), so a screenshot shows the queue; nothing
+    /// is written and their buttons do nothing (`Retry` starts an upload that stays at its
+    /// start).
     pub(crate) fn sample_rows(&self) -> Vec<TransferRow> {
         let mut files = self.entries.iter().filter(|e| downloadable(e));
         let Some(first) = files.next() else {
@@ -425,9 +502,21 @@ impl Demo {
         let mut finished = row(second, 5);
         finished.state = state::RowState::Finished {
             local: finished.local.clone(),
+            note: None,
         };
         finished.cancel = None;
-        vec![running, finished]
+        let mut failed = TransferRow::stopped(
+            plain_name(&first.name),
+            state::Direction::Upload,
+            state::RowState::Failed(format!("{MAY_BE_INCOMPLETE}.")),
+        );
+        failed.job = Some(Job::Upload {
+            local: PathBuf::from(safe_local_name(&first.name)),
+            folder: self.home.clone(),
+            name: first.name.clone(),
+            mode: UploadMode::Replace,
+        });
+        vec![running, finished, failed]
     }
 }
 
@@ -528,6 +617,20 @@ pub enum FilePanelMsg {
     CancelTransfer(TransferId),
     /// A finished download's `Show in Finder`.
     Reveal(TransferId),
+    /// The toolbar's `Upload…`: pick files to upload into the shown folder.
+    Upload(window::Id),
+    /// The `Upload…` picker closed: the chosen files, or `None` (cancelled).
+    Picked(window::Id, Option<Vec<PathBuf>>),
+    /// The OS dropped a file on this window (one event per file).
+    Dropped(window::Id, PathBuf),
+    /// The files dropped on this window together have all arrived.
+    DropsSettled(window::Id),
+    /// A failed row's `Retry`, pressed in this window.
+    RetryTransfer(window::Id, TransferId),
+    /// A row's dismiss button.
+    Dismiss(TransferId),
+    /// A quit waited long enough for cancelled transfers.
+    QuitWaited,
 }
 
 /// The keys the panel acts on when it has the keyboard.
@@ -676,8 +779,8 @@ impl App {
         if !self.windows.contains_key(&wid) {
             return Task::none();
         }
-        if self.file_panels.open.remove(&wid) {
-            self.file_panels.ui.remove(&wid);
+        if self.file_panels.is_open(wid) {
+            self.close_file_panel(wid);
         } else {
             // Shown with the shortcut or the palette: the user means to browse.
             self.file_panels.show(wid);
@@ -701,10 +804,7 @@ impl App {
             }
             FilePanelMsg::Resize(width) => self.file_panels.width = state::clamp_width(width),
             FilePanelMsg::ResizeEnd => self.save_state(),
-            FilePanelMsg::Close(wid) => {
-                self.file_panels.open.remove(&wid);
-                self.file_panels.ui.remove(&wid);
-            }
+            FilePanelMsg::Close(wid) => self.close_file_panel(wid),
             FilePanelMsg::ShowHidden(on) => {
                 self.file_panels.show_hidden = on;
                 for panel in self.file_panels.by_profile.values_mut() {
@@ -758,7 +858,7 @@ impl App {
             FilePanelMsg::Download(wid) => self.download(wid),
             FilePanelMsg::DownloadAs(wid) => return self.download_as(wid),
             FilePanelMsg::SaveChosen(wid, path) => self.save_chosen(wid, path),
-            FilePanelMsg::Transfer(id, event) => self.transfer_event(id, event),
+            FilePanelMsg::Transfer(id, event) => return self.transfer_event(id, event),
             FilePanelMsg::CancelTransfer(id) => {
                 if let Some(cancel) = self.transfer_row(id).and_then(|r| r.cancel.clone()) {
                     cancel();
@@ -769,8 +869,25 @@ impl App {
                     crate::config_files::reveal_file(path);
                 }
             }
+            FilePanelMsg::Upload(wid) => return self.pick_uploads(wid),
+            FilePanelMsg::Picked(wid, paths) => self.picked(wid, paths),
+            FilePanelMsg::Dropped(wid, path) => return self.dropped(wid, path),
+            FilePanelMsg::DropsSettled(wid) => self.drops_settled(wid),
+            FilePanelMsg::RetryTransfer(wid, id) => self.retry_transfer(wid, id),
+            FilePanelMsg::Dismiss(id) => self.dismiss(id),
+            FilePanelMsg::QuitWaited => return self.quit_if_stopped(true),
         }
         Task::none()
+    }
+
+    /// Hide `wid`'s panel; a profile no panel shows any more lets go of its finished rows.
+    fn close_file_panel(&mut self, wid: window::Id) {
+        let shown = self.shown_profile(wid);
+        self.file_panels.open.remove(&wid);
+        self.file_panels.ui.remove(&wid);
+        if let Some(profile) = shown {
+            self.forget_finished(profile);
+        }
     }
 
     /// What `Download` in `wid`'s panel would fetch: the profile, the remote path and name
@@ -836,7 +953,15 @@ impl App {
         let dest = free_name_avoiding(&folder, &name, |p| {
             writing.iter().any(|w| same_destination(w, p))
         });
-        self.start_download(profile, remote, plain_name(&name), dest);
+        self.start_job(
+            profile,
+            Job::Download {
+                remote,
+                name,
+                dest,
+                chosen: false,
+            },
+        );
     }
 
     /// `Download as…`: the save dialog over `wid`, offering the safe name in Downloads.
@@ -853,7 +978,7 @@ impl App {
             PendingSave {
                 profile,
                 remote,
-                name: plain_name(&name),
+                name,
             },
         );
         let folder = self.file_panel_work.downloads_folder();
@@ -880,13 +1005,21 @@ impl App {
             self.add_row(
                 pending.profile,
                 TransferRow::refused(
-                    pending.name,
+                    plain_name(&pending.name),
                     format!("Already downloading to {}", plain_name(&shown)),
                 ),
             );
             return;
         }
-        self.start_download(pending.profile, pending.remote, pending.name, dest);
+        self.start_job(
+            pending.profile,
+            Job::Download {
+                remote: pending.remote,
+                name: pending.name,
+                dest,
+                chosen: true,
+            },
+        );
     }
 
     fn add_row(&mut self, profile: ProfileId, row: TransferRow) {
@@ -895,46 +1028,26 @@ impl App {
         }
     }
 
-    /// Start downloading `remote` (shown as `name`) to `dest` on `profile`'s session.
-    fn start_download(&mut self, profile: ProfileId, remote: String, name: String, dest: PathBuf) {
-        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
-            return;
-        };
-        let Some(session) = panel.sftp.clone() else {
-            panel.transfers.push(TransferRow::refused(
-                name,
-                "The SFTP session is not open.".into(),
-            ));
-            return;
-        };
-        let started = self.file_panel_work.backend.download(
-            DownloadRequest {
-                remote: session,
-                path: remote,
-                dest: dest.clone(),
-            },
-            self.file_panel_work.transfer_sink.clone(),
-        );
-        panel.transfers.push(match started {
-            Ok(Started { id, cancel }) => TransferRow::download(id, name, dest, cancel),
-            Err(reason) => TransferRow::refused(name, reason),
-        });
-    }
-
-    /// A transfer reported: its row follows; a cancelled one leaves the queue.
-    fn transfer_event(&mut self, id: TransferId, event: TransferEvent) {
-        for panel in self.file_panels.by_profile.values_mut() {
+    /// A transfer reported: its row follows; a cancelled one leaves the queue. An upload that
+    /// ended may have changed the folder shown, and a quit may be waiting for it.
+    fn transfer_event(&mut self, id: TransferId, event: TransferEvent) -> Task<Message> {
+        let mut ended_upload = None;
+        for (profile, panel) in &mut self.file_panels.by_profile {
             let Some(i) = panel.transfers.iter().position(|r| r.id == id) else {
                 continue;
             };
             let row = &mut panel.transfers[i];
+            let ends = !matches!(event, TransferEvent::Progress { .. });
+            if ends && let Some(Job::Upload { folder, .. }) = &row.job {
+                ended_upload = Some((*profile, folder.clone()));
+            }
             match event {
                 TransferEvent::Progress { done, total } => {
                     row.done = done;
                     row.total = total;
                 }
-                TransferEvent::Finished { local, .. } => {
-                    row.state = state::RowState::Finished { local };
+                TransferEvent::Finished { local, note } => {
+                    row.state = state::RowState::Finished { local, note };
                     row.cancel = None;
                 }
                 TransferEvent::Failed(reason) => {
@@ -945,8 +1058,12 @@ impl App {
                     panel.transfers.remove(i);
                 }
             }
-            return;
+            break;
         }
+        if let Some((profile, folder)) = ended_upload {
+            self.uploads_ended(profile, &folder);
+        }
+        self.quit_if_stopped(false)
     }
 
     /// The profile `wid`'s panel shows, when it shows a server.
@@ -1269,9 +1386,18 @@ impl App {
                 }
                 panel.opening = None;
                 match result {
-                    Err(reason) => panel.listing = Listing::Unavailable(reason),
+                    Err(reason) => {
+                        self.run_waiting(profile, Err(&reason));
+                        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                            panel.listing = Listing::Unavailable(reason);
+                        }
+                    }
                     Ok(Opened { remote, home }) => {
                         panel.sftp = Some(remote);
+                        self.run_waiting(profile, Ok(()));
+                        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
+                            return Task::none();
+                        };
                         if let Ok(home) = &home {
                             panel.home.clone_from(home);
                         }
@@ -1315,6 +1441,9 @@ impl App {
                     }
                 };
                 panel.refresh(self.file_panels.show_hidden);
+                if let Some((wid, paths)) = self.file_panels.demo_upload.take() {
+                    self.upload_files(wid, paths);
+                }
                 // New rows: from the top, as a shorter listing may end above the offset.
                 self.list_to_top(Some(profile))
             }

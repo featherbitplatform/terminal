@@ -451,6 +451,12 @@ impl Sftp {
         self.posix_rename
     }
 
+    /// Whether the connection under the session is still up: a session on a dropped
+    /// connection answers nothing again, so it is opened anew instead.
+    pub fn is_alive(&self) -> bool {
+        self._connection.as_ref().is_none_or(|c| c.is_alive())
+    }
+
     /// Data length of one read request.
     pub(crate) fn read_len(&self) -> u32 {
         self.read_len

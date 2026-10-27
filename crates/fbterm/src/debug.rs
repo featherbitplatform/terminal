@@ -175,7 +175,9 @@ impl App {
     /// `FBTERM_DEMO_FILES=<folder>:<item>,<item>,...` (debug aid): the first window's file
     /// panel open, serving this sample listing for every SSH pane (connected or not) and every
     /// folder without touching the network, with a sample transfer queue (a running and a
-    /// finished download); see [`crate::file_panel::Demo::parse`].
+    /// finished download and a failed upload); see [`crate::file_panel::Demo::parse`]. With
+    /// `FBTERM_DEMO_UPLOAD=<name>,<name>` those names are uploaded into the first listing
+    /// shown, which raises the clash dialog for names the listing has.
     pub(crate) fn open_debug_files(&mut self) -> Task<Message> {
         let Some(spec) = debug_env("FBTERM_DEMO_FILES") else {
             return Task::none();
@@ -185,6 +187,16 @@ impl App {
         self.file_panels.demo = true;
         if let Some(&wid) = self.windows.keys().next() {
             self.file_panels.show(wid);
+            if let Some(names) = debug_env("FBTERM_DEMO_UPLOAD") {
+                let paths = names
+                    .to_string_lossy()
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(std::path::PathBuf::from)
+                    .collect();
+                self.file_panels.demo_upload = Some((wid, paths));
+            }
         }
         self.file_panel_work.backend = std::sync::Arc::new(crate::file_panel::Demo {
             home: demo.home.clone(),

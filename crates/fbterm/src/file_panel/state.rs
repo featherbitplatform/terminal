@@ -1,13 +1,13 @@
 //! The file panel's state, free of the UI: which windows show the panel, each profile's SFTP
 //! session, folder and listing, and the panel's width.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::ProfileId;
 use fbterm_session::ssh::sftp::{Entry, SortKey, sort_entries};
-use fbterm_session::ssh::transfer::TransferId;
+use fbterm_session::ssh::transfer::{TransferId, UploadMode};
 use iced::window;
 
 use super::Remote;
@@ -48,25 +48,52 @@ pub(crate) enum Listing {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Direction {
     Download,
+    Upload,
 }
 
 /// Where a transfer stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RowState {
     Running,
-    /// Done; `local` is where a download was saved.
+    /// Done; `local` is where a download was saved, `note` says how an upload replaced its
+    /// target ([`fbterm_session::ssh::transfer::REPLACED_IN_PLACE`]).
     Finished {
         local: Option<PathBuf>,
+        note: Option<String>,
     },
     /// Stopped, with the reason shown in the row.
     Failed(String),
+    /// Never started, with the note shown in the row (a folder picked or dropped).
+    Skipped(String),
 }
 
 /// Stops a running transfer.
 pub(crate) type CancelFn = Arc<dyn Fn() + Send + Sync>;
 
-/// One transfer in a profile's queue. A cancelled transfer leaves the queue; finished and
-/// failed ones stay.
+/// What a row's transfer does, so `Retry` can do it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Job {
+    /// The remote file `remote` (named `name` on the server) to `dest`. A destination the
+    /// user `chosen` with `Download as…` is used again as it is; else a retry picks a free
+    /// name in the same folder again.
+    Download {
+        remote: String,
+        name: String,
+        dest: PathBuf,
+        chosen: bool,
+    },
+    /// The local file `local` as `name` into the remote `folder`.
+    Upload {
+        local: PathBuf,
+        folder: String,
+        name: String,
+        mode: UploadMode,
+    },
+}
+
+/// One transfer in a profile's queue. A cancelled transfer leaves the queue; finished, failed
+/// and skipped ones stay until dismissed (finished and skipped ones also when no panel shows
+/// the profile any more).
 pub(crate) struct TransferRow {
     pub id: TransferId,
     /// The remote name as plain text ([`super::plain_name`]).
@@ -80,6 +107,8 @@ pub(crate) struct TransferRow {
     pub state: RowState,
     /// Stops the transfer while it runs.
     pub(crate) cancel: Option<CancelFn>,
+    /// What the transfer does, for `Retry`; `None` for a row that cannot be retried.
+    pub(crate) job: Option<Job>,
 }
 
 impl TransferRow {
@@ -94,20 +123,36 @@ impl TransferRow {
             total: None,
             state: RowState::Running,
             cancel: Some(cancel),
+            job: None,
+        }
+    }
+
+    /// An upload that started.
+    pub(crate) fn upload(id: TransferId, name: String, cancel: CancelFn) -> Self {
+        Self {
+            direction: Direction::Upload,
+            local: None,
+            ..Self::download(id, name, PathBuf::new(), cancel)
         }
     }
 
     /// A download that could not start, and why.
     pub(crate) fn refused(name: String, reason: String) -> Self {
+        Self::stopped(name, Direction::Download, RowState::Failed(reason))
+    }
+
+    /// A row for something that never ran.
+    pub(crate) fn stopped(name: String, direction: Direction, state: RowState) -> Self {
         Self {
             id: TransferId::next(),
             name,
-            direction: Direction::Download,
+            direction,
             local: None,
             done: 0,
             total: None,
-            state: RowState::Failed(reason),
+            state,
             cancel: None,
+            job: None,
         }
     }
 
@@ -118,17 +163,32 @@ impl TransferRow {
     /// The saved file a finished download can show in the file manager.
     pub(crate) fn revealable(&self) -> Option<&Path> {
         match &self.state {
-            RowState::Finished { local } => local.as_deref(),
+            RowState::Finished { local, .. } => local.as_deref(),
             _ => None,
         }
     }
 
     /// Why the transfer stopped, when it failed.
+    #[cfg(test)]
     pub(crate) fn failed(&self) -> Option<&str> {
         match &self.state {
             RowState::Failed(reason) => Some(reason),
             _ => None,
         }
+    }
+
+    /// The row's note: how a finished upload replaced its target, or why it was skipped.
+    pub(crate) fn note(&self) -> Option<&str> {
+        match &self.state {
+            RowState::Finished { note, .. } => note.as_deref(),
+            RowState::Skipped(note) => Some(note),
+            _ => None,
+        }
+    }
+
+    /// Whether `Retry` is offered: a failed transfer that can be done again.
+    pub(crate) fn retryable(&self) -> bool {
+        self.job.is_some() && matches!(self.state, RowState::Failed(_))
     }
 
     /// The local file this row is writing now, if it is a running download.
@@ -138,12 +198,25 @@ impl TransferRow {
             _ => None,
         }
     }
+
+    /// The remote name this row is writing in `folder` now, if it is a running upload.
+    pub(crate) fn uploading_into(&self, folder: &str) -> Option<&str> {
+        match (&self.job, &self.state) {
+            (
+                Some(Job::Upload {
+                    folder: f, name, ..
+                }),
+                RowState::Running,
+            ) if f == folder => Some(name),
+            _ => None,
+        }
+    }
 }
 
 /// What a `Download as…` dialog was opened for.
 pub(crate) struct PendingSave {
     pub profile: ProfileId,
-    /// The remote file's path and its name as plain text.
+    /// The remote file's path and its name on the server.
     pub remote: String,
     pub name: String,
 }
@@ -170,6 +243,8 @@ pub(crate) struct ProfilePanel {
     pub shown: Vec<usize>,
     /// Transfers of this profile's connection; they keep the session while they run.
     pub transfers: Vec<TransferRow>,
+    /// Rows whose `Retry` waits for the session to open again (their ids).
+    pub(crate) waiting: Vec<TransferId>,
     /// Counts opens and folder reads, so only the latest answer is taken.
     pub(crate) token: u64,
     /// Stops the open under way, if any: a session no panel wants any more must not go on to
@@ -190,6 +265,7 @@ impl ProfilePanel {
             selected: None,
             shown: Vec::new(),
             transfers: Vec::new(),
+            waiting: Vec::new(),
             token: 0,
             opening: None,
         }
@@ -366,6 +442,36 @@ pub(crate) struct FilePanels {
     pub demo: bool,
     /// The `Download as…` dialog open in each window (one at a time per window).
     pub saving: HashMap<window::Id, PendingSave>,
+    /// Windows with the `Upload…` picker open (one at a time per window).
+    pub picking: HashSet<window::Id>,
+    /// Files dropped on each window in the current burst, uploaded together once it settles.
+    pub dropped: HashMap<window::Id, Vec<PathBuf>>,
+    /// Each window's uploads waiting for a decision, oldest first: the front one may be
+    /// asking about a name clash.
+    pub batches: HashMap<window::Id, VecDeque<Batch>>,
+    /// Quitting once the transfers cancelled for it have stopped.
+    pub quit_when_stopped: bool,
+    /// `FBTERM_DEMO_UPLOAD` (debug aid): files uploaded in this window once a listing loads.
+    pub demo_upload: Option<(window::Id, Vec<PathBuf>)>,
+}
+
+/// Files picked or dropped together for one folder, decided one at a time.
+pub(crate) struct Batch {
+    pub profile: ProfileId,
+    pub folder: String,
+    /// The files still to decide, each with the name it gets in the folder.
+    pub items: VecDeque<(PathBuf, String)>,
+    /// The file the clash dialog asks about, and the name it would have.
+    pub asking: Option<(PathBuf, String)>,
+    /// `Apply to all` was chosen with this answer.
+    pub all: Option<AllChoice>,
+}
+
+/// An answer `Apply to all` repeats for the rest of a batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllChoice {
+    Replace,
+    Cancel,
 }
 
 impl FilePanels {
@@ -378,6 +484,11 @@ impl FilePanels {
             width: width.map_or(DEFAULT_WIDTH, clamp_width),
             demo: false,
             saving: HashMap::new(),
+            picking: HashSet::new(),
+            dropped: HashMap::new(),
+            batches: HashMap::new(),
+            quit_when_stopped: false,
+            demo_upload: None,
         }
     }
 

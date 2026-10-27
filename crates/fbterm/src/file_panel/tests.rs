@@ -8,7 +8,7 @@ use std::sync::Arc;
 use fbterm_config::{AuthMethod, Paths, Profile, ProfileId, ProfileKind, SavedState, SshProfile};
 use fbterm_session::SessionHandle;
 use fbterm_session::ssh::sftp::{Entry, EntryKind, Sftp, SftpError};
-use fbterm_session::ssh::transfer::{TransferEvent, TransferId, TransferSink};
+use fbterm_session::ssh::transfer::{TransferEvent, TransferId, TransferSink, UploadMode};
 use iced::window;
 use parking_lot::Mutex;
 
@@ -16,6 +16,7 @@ use super::{Backend, Body, FilePanelMsg, ListRequest, OpenRequest, Opened, Panel
 use crate::app::{App, DEFAULT_GRID, Delivered, Message};
 use crate::keys::Action;
 use crate::layout::{PaneId, Side};
+use crate::prompts::{Dialog, PromptMsg};
 use crate::restore_tests::{paths_with, profile};
 use crate::tabs::{Pane, Tab, TabState, WindowState};
 use crate::tiles::TilesMsg;
@@ -34,6 +35,19 @@ struct Fake {
     cancels: Arc<Mutex<Vec<TransferId>>>,
     /// Save dialogs opened: the window and the name offered.
     saves: Mutex<Vec<(window::Id, String)>>,
+    /// Uploads started: the local file, the folder, the name, the mode and the id.
+    uploads: Mutex<Vec<Uploaded>>,
+    /// `Upload…` pickers opened, by window.
+    picks: Mutex<Vec<window::Id>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Uploaded {
+    local: PathBuf,
+    folder: String,
+    name: String,
+    mode: UploadMode,
+    id: TransferId,
 }
 
 impl Backend for Fake {
@@ -71,6 +85,26 @@ impl Backend for Fake {
         })
     }
 
+    fn upload(
+        &self,
+        request: super::UploadRequest,
+        _sink: TransferSink,
+    ) -> Result<super::Started, String> {
+        let id = TransferId::next();
+        self.uploads.lock().push(Uploaded {
+            local: request.local,
+            folder: request.folder,
+            name: request.name,
+            mode: request.mode,
+            id,
+        });
+        let cancels = self.cancels.clone();
+        Ok(super::Started {
+            id,
+            cancel: Arc::new(move || cancels.lock().push(id)),
+        })
+    }
+
     fn save_dialog(
         &self,
         window: window::Id,
@@ -78,6 +112,11 @@ impl Backend for Fake {
         _folder: Option<PathBuf>,
     ) -> iced::Task<Option<PathBuf>> {
         self.saves.lock().push((window, name));
+        iced::Task::none()
+    }
+
+    fn pick_files(&self, window: window::Id) -> iced::Task<Option<Vec<PathBuf>>> {
+        self.picks.lock().push(window);
         iced::Task::none()
     }
 }
@@ -1814,4 +1853,615 @@ fn closing_the_window_forgets_its_save_dialog() {
     assert!(w.app.file_panels.saving.contains_key(&wid));
     let _ = w.app.update(Message::WindowClosed(wid));
     assert!(w.app.file_panels.saving.is_empty());
+}
+
+// ---- Uploads, the queue and closing with transfers running ----
+
+/// A session whose connection has dropped.
+struct DeadRemote;
+
+#[async_trait::async_trait]
+impl Remote for DeadRemote {
+    async fn list(&self, _path: &str) -> Result<Vec<Entry>, SftpError> {
+        Err(SftpError::Unavailable("The connection was lost.".into()))
+    }
+
+    fn sftp(&self) -> Option<Arc<Sftp>> {
+        None
+    }
+
+    fn is_alive(&self) -> bool {
+        false
+    }
+}
+
+impl World {
+    /// [`World::browsing`] with a fresh local folder holding `files` (a name ending in `/`
+    /// is a folder) to upload from.
+    fn uploading(entries: Vec<Entry>, files: &[&str]) -> (World, PathBuf) {
+        let mut w = World::browsing(entries);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        for f in files {
+            match f.strip_suffix('/') {
+                Some(folder) => std::fs::create_dir(dir.join(folder)).unwrap(),
+                None => std::fs::write(dir.join(f), "content").unwrap(),
+            }
+        }
+        w.downloads = Some(temp);
+        (w, dir)
+    }
+
+    fn pick(&mut self, paths: Vec<PathBuf>) {
+        let wid = self.wid;
+        let _ = self.msg(FilePanelMsg::Upload(wid));
+        let _ = self.msg(FilePanelMsg::Picked(wid, Some(paths)));
+    }
+
+    fn uploads(&self) -> Vec<Uploaded> {
+        self.fake.uploads.lock().clone()
+    }
+
+    fn prompt(&mut self, m: PromptMsg) {
+        let _ = self.app.update(Message::Prompt(m));
+    }
+
+    fn dialog(&self) -> Option<&Dialog> {
+        self.app.prompts.front(self.wid)
+    }
+
+    /// The clash dialog shown: its name, whether it offers `Apply to all`, and the rename
+    /// field's text when it shows one.
+    fn clash(&self) -> Option<(String, bool, Option<String>)> {
+        match self.dialog()? {
+            Dialog::Clash(c) => Some((
+                c.name.clone(),
+                c.offer_all,
+                c.rename.as_ref().map(|r| r.value.clone()),
+            )),
+            _ => None,
+        }
+    }
+
+    fn rename_problem(&self) -> Option<String> {
+        match self.dialog()? {
+            Dialog::Clash(c) => c.rename.as_ref()?.problem.clone(),
+            _ => None,
+        }
+    }
+
+    /// The close confirmation shown: how many transfers it counts.
+    fn running_asked(&self) -> Option<usize> {
+        match self.dialog()? {
+            Dialog::Transfers { count, .. } => Some(*count),
+            _ => None,
+        }
+    }
+}
+
+fn uploaded(
+    local: &std::path::Path,
+    name: &str,
+    mode: UploadMode,
+) -> (PathBuf, String, String, UploadMode) {
+    (local.to_path_buf(), "/home/user".into(), name.into(), mode)
+}
+
+fn summary(u: &[Uploaded]) -> Vec<(PathBuf, String, String, UploadMode)> {
+    u.iter()
+        .map(|u| (u.local.clone(), u.folder.clone(), u.name.clone(), u.mode))
+        .collect()
+}
+
+#[test]
+fn upload_new_files_into_current_folder() {
+    let (mut w, dir) = World::uploading(vec![file("app.log")], &["a.conf", "b.conf"]);
+    let wid = w.wid;
+    assert!(w.app.can_upload(wid));
+    let _ = w.msg(FilePanelMsg::Upload(wid));
+    assert_eq!(
+        *w.fake.picks.lock(),
+        [wid],
+        "the picker opens over this window"
+    );
+    // A second click while the picker is open opens no second one.
+    let _ = w.msg(FilePanelMsg::Upload(wid));
+    assert_eq!(w.fake.picks.lock().len(), 1);
+    // Cancelling the picker uploads nothing.
+    let _ = w.msg(FilePanelMsg::Picked(wid, None));
+    assert!(w.uploads().is_empty());
+
+    w.pick(vec![dir.join("a.conf"), dir.join("b.conf")]);
+    assert_eq!(
+        summary(&w.uploads()),
+        [
+            uploaded(&dir.join("a.conf"), "a.conf", UploadMode::New),
+            uploaded(&dir.join("b.conf"), "b.conf", UploadMode::New),
+        ]
+    );
+    assert!(w.dialog().is_none(), "no name clashes, nothing asked");
+    let rows: Vec<_> = w
+        .rows()
+        .iter()
+        .map(|r| (r.name.clone(), r.direction))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            ("a.conf".to_owned(), super::state::Direction::Upload),
+            ("b.conf".to_owned(), super::state::Direction::Upload),
+        ]
+    );
+    assert!(w.rows().iter().all(super::state::TransferRow::is_running));
+
+    // Finishing: the note shows; once no upload into the folder runs, it is read again.
+    let ids: Vec<TransferId> = w.uploads().iter().map(|u| u.id).collect();
+    let reads = w.fake.lists.lock().len();
+    w.transfer(
+        ids[0],
+        TransferEvent::Finished {
+            note: None,
+            local: None,
+        },
+    );
+    assert_eq!(w.fake.lists.lock().len(), reads, "b.conf still runs");
+    w.transfer(
+        ids[1],
+        TransferEvent::Finished {
+            note: Some("Replaced in place".into()),
+            local: None,
+        },
+    );
+    assert_eq!(w.rows()[1].note(), Some("Replaced in place"));
+    assert_eq!(
+        w.fake.lists.lock().len(),
+        reads + 1,
+        "the folder is read again"
+    );
+    assert_eq!(w.last_list(&w.db.clone()).unwrap().0, "/home/user");
+    // Uploads never claim a local destination.
+    assert!(w.rows().iter().all(|r| r.writing().is_none()));
+    let texts = drawn_texts(&w, iced::Size::new(300.0, 700.0));
+    for want in ["Upload\u{2026}", "Replaced in place"] {
+        assert!(texts.iter().any(|t| t == want), "{want} in {texts:?}");
+    }
+}
+
+#[test]
+fn clash_asks_replace_rename_cancel() {
+    let (mut w, dir) = World::uploading(
+        vec![file("app.conf"), file("other")],
+        &["app.conf", "other"],
+    );
+    let wid = w.wid;
+    let local = dir.join("app.conf");
+
+    // Replace.
+    w.pick(vec![local.clone()]);
+    assert!(
+        w.uploads().is_empty(),
+        "nothing replaced before the user says so"
+    );
+    assert_eq!(w.clash(), Some(("app.conf".into(), false, None)));
+    assert_eq!(
+        super::clash_message("app.conf", "/home/user"),
+        "\"app.conf\" already exists in /home/user."
+    );
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert!(w.dialog().is_none());
+    assert_eq!(
+        summary(&w.uploads()),
+        [uploaded(&local, "app.conf", UploadMode::Replace)]
+    );
+
+    // Cancel (Escape answers the same): nothing uploaded, no row.
+    let rows = w.rows().len();
+    w.pick(vec![local.clone()]);
+    w.prompt(PromptMsg::Cancel(wid));
+    assert!(w.dialog().is_none());
+    assert_eq!(w.uploads().len(), 1);
+    assert_eq!(w.rows().len(), rows);
+
+    // Rename: a name that is checked before it is used.
+    w.pick(vec![local.clone()]);
+    w.prompt(PromptMsg::ClashRename(wid));
+    for (typed, problem) in [
+        ("", "Type a name."),
+        ("  ", "Type a name."),
+        ("a/b.conf", "A name cannot contain /."),
+        (
+            "bell\u{7}.conf",
+            "A name cannot contain control characters.",
+        ),
+        ("..", "Choose another name."),
+    ] {
+        w.prompt(PromptMsg::ClashName(wid, typed.into()));
+        w.prompt(PromptMsg::Submit(wid));
+        assert_eq!(w.rename_problem().as_deref(), Some(problem), "{typed:?}");
+        assert_eq!(w.uploads().len(), 1, "{typed:?}");
+    }
+    w.prompt(PromptMsg::ClashName(wid, "app-new.conf".into()));
+    w.prompt(PromptMsg::Submit(wid));
+    assert!(w.dialog().is_none());
+    assert_eq!(
+        summary(&w.uploads())[1],
+        uploaded(&local, "app-new.conf", UploadMode::New)
+    );
+
+    // A new name that clashes again is asked about again.
+    w.pick(vec![local.clone()]);
+    w.prompt(PromptMsg::ClashRename(wid));
+    w.prompt(PromptMsg::ClashName(wid, "other".into()));
+    w.prompt(PromptMsg::Submit(wid));
+    assert_eq!(w.clash(), Some(("other".into(), false, None)));
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert_eq!(
+        summary(&w.uploads())[2],
+        uploaded(&local, "other", UploadMode::Replace)
+    );
+}
+
+#[test]
+fn apply_to_all_covers_remaining() {
+    let (mut w, dir) = World::uploading(
+        vec![file("a.conf"), file("b.conf"), file("c.conf")],
+        &["a.conf", "b.conf", "c.conf", "d.conf"],
+    );
+    let wid = w.wid;
+    let all: Vec<PathBuf> = ["a.conf", "b.conf", "c.conf", "d.conf"]
+        .iter()
+        .map(|n| dir.join(n))
+        .collect();
+    w.pick(all.clone());
+    assert_eq!(w.clash(), Some(("a.conf".into(), true, None)));
+    // Without `Apply to all` each clash is asked about.
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert_eq!(w.clash(), Some(("b.conf".into(), true, None)));
+    w.prompt(PromptMsg::ClashApplyAll(wid, true));
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert!(w.dialog().is_none());
+    assert_eq!(
+        summary(&w.uploads()),
+        [
+            uploaded(&all[0], "a.conf", UploadMode::Replace),
+            uploaded(&all[1], "b.conf", UploadMode::Replace),
+            uploaded(&all[2], "c.conf", UploadMode::Replace),
+            uploaded(&all[3], "d.conf", UploadMode::New),
+        ]
+    );
+
+    // Cancel for all: only the file without a clash goes.
+    let before = w.uploads().len();
+    w.pick(vec![all[0].clone(), all[1].clone(), all[3].clone()]);
+    w.prompt(PromptMsg::ClashApplyAll(wid, true));
+    w.prompt(PromptMsg::Cancel(wid));
+    assert!(w.dialog().is_none());
+    let names: Vec<String> = w.uploads()[before..]
+        .iter()
+        .map(|u| u.name.clone())
+        .collect();
+    // d.conf is uploading (from the first batch), so it clashes too and is cancelled.
+    assert!(names.is_empty(), "{names:?}");
+
+    // The last clash of a batch offers no `Apply to all`: nothing is left to apply it to.
+    w.pick(vec![dir.join("d.conf"), all[0].clone()]);
+    assert_eq!(w.clash(), Some(("d.conf".into(), true, None)));
+    w.prompt(PromptMsg::Cancel(wid));
+    assert_eq!(w.clash(), Some(("a.conf".into(), false, None)));
+    w.prompt(PromptMsg::Cancel(wid));
+    assert!(w.dialog().is_none());
+}
+
+#[test]
+fn rename_prefills_free_name() {
+    let (mut w, dir) = World::uploading(
+        vec![file("app.conf"), file("app (1).conf"), file("notes")],
+        &["app.conf", "notes"],
+    );
+    let wid = w.wid;
+    w.pick(vec![dir.join("app.conf")]);
+    w.prompt(PromptMsg::ClashRename(wid));
+    assert_eq!(
+        w.clash(),
+        Some(("app.conf".into(), false, Some("app (2).conf".into())))
+    );
+    w.prompt(PromptMsg::Submit(wid));
+    assert_eq!(w.uploads()[0].name, "app (2).conf");
+    w.pick(vec![dir.join("notes")]);
+    w.prompt(PromptMsg::ClashRename(wid));
+    assert_eq!(
+        w.clash(),
+        Some(("notes".into(), false, Some("notes (1)".into())))
+    );
+    // `app (2).conf` is uploading now: the next free name skips it.
+    w.prompt(PromptMsg::Cancel(wid));
+    w.pick(vec![dir.join("app.conf")]);
+    w.prompt(PromptMsg::ClashRename(wid));
+    assert_eq!(w.clash().and_then(|c| c.2).as_deref(), Some("app (3).conf"));
+    assert_eq!(
+        super::remote_free_name(".bashrc", |n| n == ".bashrc"),
+        ".bashrc (1)"
+    );
+    assert_eq!(
+        super::remote_free_name("logs.tar.gz", |n| n == "logs.tar.gz"),
+        "logs.tar (1).gz"
+    );
+}
+
+#[test]
+fn drop_uploads_when_panel_open_and_is_ignored_when_closed() {
+    let (mut w, dir) = World::uploading(
+        vec![file("x.conf"), file("y.conf")],
+        &["a.conf", "b.conf", "x.conf", "y.conf"],
+    );
+    let wid = w.wid;
+    let drop = |w: &mut World, paths: &[&str]| {
+        for p in paths {
+            let _ = w.msg(FilePanelMsg::Dropped(wid, dir.join(p)));
+        }
+        let _ = w.msg(FilePanelMsg::DropsSettled(wid));
+    };
+    // Several files dropped together: one batch into the current folder.
+    drop(&mut w, &["a.conf", "b.conf"]);
+    assert_eq!(
+        summary(&w.uploads()),
+        [
+            uploaded(&dir.join("a.conf"), "a.conf", UploadMode::New),
+            uploaded(&dir.join("b.conf"), "b.conf", UploadMode::New),
+        ]
+    );
+    // One batch: `Apply to all` covers them.
+    drop(&mut w, &["x.conf", "y.conf"]);
+    assert_eq!(w.clash(), Some(("x.conf".into(), true, None)));
+    w.prompt(PromptMsg::ClashApplyAll(wid, true));
+    w.prompt(PromptMsg::ClashReplace(wid));
+    assert!(w.dialog().is_none());
+    assert_eq!(w.uploads().len(), 4);
+
+    // The panel closed: drops are ignored.
+    w.toggle();
+    drop(&mut w, &["a.conf"]);
+    assert_eq!(w.uploads().len(), 4);
+    // The panel of a local pane: nowhere to upload to.
+    let local = w.local.clone();
+    w.open_tab(&local);
+    w.toggle();
+    drop(&mut w, &["a.conf"]);
+    assert_eq!(w.uploads().len(), 4);
+    assert!(w.dialog().is_none());
+}
+
+#[test]
+fn folders_are_skipped_with_note() {
+    let (mut w, dir) = World::uploading(vec![], &["conf.d/", "app.conf"]);
+    let wid = w.wid;
+    w.pick(vec![dir.join("conf.d"), dir.join("app.conf")]);
+    assert_eq!(
+        summary(&w.uploads()),
+        [uploaded(&dir.join("app.conf"), "app.conf", UploadMode::New)]
+    );
+    let skipped = &w.rows()[0];
+    assert_eq!(skipped.note(), Some("Folders are not uploaded: conf.d"));
+    assert!(!skipped.is_running());
+    // Dropped folders too.
+    let _ = w.msg(FilePanelMsg::Dropped(wid, dir.join("conf.d")));
+    let _ = w.msg(FilePanelMsg::DropsSettled(wid));
+    assert_eq!(w.uploads().len(), 1);
+    assert_eq!(
+        w.rows().last().unwrap().note(),
+        Some("Folders are not uploaded: conf.d")
+    );
+    let texts = drawn_texts(&w, iced::Size::new(300.0, 700.0));
+    assert!(
+        texts
+            .iter()
+            .any(|t| t == "Folders are not uploaded: conf.d")
+    );
+    // A skipped row is dismissed.
+    let id = w.rows()[0].id;
+    let _ = w.msg(FilePanelMsg::Dismiss(id));
+    assert!(w.rows().iter().all(|r| r.id != id));
+}
+
+#[test]
+fn quit_with_running_transfer_asks() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log"), file("db.dump")]);
+    let wid = w.wid;
+    w.select("app.log");
+    w.download();
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    assert_eq!(w.running_asked(), Some(1));
+    assert_eq!(super::running_message(1), "1 transfer is still running.");
+    assert_eq!(super::running_message(2), "2 transfers are still running.");
+    assert!(!w.app.quitting);
+    // `Keep open` keeps everything.
+    w.prompt(PromptMsg::Cancel(wid));
+    assert!(w.dialog().is_none());
+    assert!(!w.app.quitting);
+    assert!(w.fake.cancels.lock().is_empty());
+    assert!(w.rows()[0].is_running());
+    // The window's close button on the last window is a quit: asked too.
+    let _ = w.app.update(Message::CloseRequested(wid));
+    assert_eq!(w.running_asked(), Some(1));
+    w.prompt(PromptMsg::Cancel(wid));
+
+    w.select("db.dump");
+    w.download();
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    // Asked once however often Quit is pressed.
+    let _ = w.app.update(Message::Shortcut(wid, Action::Quit));
+    assert_eq!(w.running_asked(), Some(2));
+    w.prompt(PromptMsg::StopTransfers(wid));
+    assert!(w.dialog().is_none());
+    let ids: Vec<TransferId> = w.downloads().iter().map(|d| d.2).collect();
+    assert_eq!(*w.fake.cancels.lock(), ids);
+    // The app quits once the transfers have cleaned up after themselves.
+    assert!(!w.app.quitting);
+    w.transfer(ids[0], TransferEvent::Cancelled);
+    assert!(!w.app.quitting);
+    w.transfer(ids[1], TransferEvent::Cancelled);
+    assert!(w.app.quitting);
+}
+
+#[test]
+fn close_tab_with_running_transfer_asks() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log")]);
+    let wid = w.wid;
+    w.select("app.log");
+    w.download();
+    let local = w.local.clone();
+    w.open_tab(&local);
+    let tabs = |w: &World| w.app.windows[&w.wid].tabs.len();
+    assert_eq!(tabs(&w), 2);
+
+    // The tab's close button.
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Close(0)));
+    assert_eq!(w.running_asked(), Some(1));
+    assert_eq!(tabs(&w), 2);
+    w.prompt(PromptMsg::Cancel(wid));
+    assert_eq!(tabs(&w), 2, "Keep open");
+    assert!(w.rows()[0].is_running());
+    // Closing the local tab asks nothing: no transfer depends on it.
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Close(1)));
+    assert!(w.dialog().is_none());
+    assert_eq!(tabs(&w), 1);
+
+    // Another tab of the same profile keeps the connection: closing one asks nothing.
+    let db = w.db.clone();
+    w.open_tab(&db);
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Close(1)));
+    assert!(w.dialog().is_none());
+    assert_eq!(tabs(&w), 1);
+
+    // The close shortcut on the tab's last pane asks too; confirming cancels and closes.
+    w.open_tab(&local);
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Select(0)));
+    let _ = w.app.update(Message::Shortcut(wid, Action::CloseTab));
+    assert_eq!(w.running_asked(), Some(1));
+    w.prompt(PromptMsg::StopTransfers(wid));
+    let id = w.downloads()[0].2;
+    assert_eq!(*w.fake.cancels.lock(), [id]);
+    assert_eq!(tabs(&w), 1);
+    assert!(!w.app.quitting);
+
+    // A window's close button with other windows open: asked for that window.
+    let (mut w, _dir) = World::downloading(vec![file("app.log")]);
+    let wid = w.wid;
+    w.select("app.log");
+    w.download();
+    let other = window::Id::unique();
+    w.app.windows.insert(other, WindowState::new());
+    let _ = w.app.update(Message::CloseRequested(wid));
+    assert_eq!(w.running_asked(), Some(1));
+    assert!(!w.app.closing.contains(&wid));
+    w.prompt(PromptMsg::StopTransfers(wid));
+    assert!(w.app.closing.contains(&wid), "the window closes");
+    assert!(!w.app.quitting);
+}
+
+#[test]
+fn retry_after_connection_drop() {
+    let (mut w, dir) = World::downloading(vec![file("app.log")]);
+    let wid = w.wid;
+    let db = w.db.clone();
+    w.select("app.log");
+    w.download();
+    let first = w.downloads()[0].2;
+    w.transfer(
+        first,
+        TransferEvent::Failed("The connection was lost.".into()),
+    );
+    assert_eq!(w.rows()[0].failed(), Some("The connection was lost."));
+    let texts = drawn_texts(&w, iced::Size::new(300.0, 700.0));
+    assert!(texts.iter().any(|t| t == "Retry"), "{texts:?}");
+    // The connection is gone: Retry opens the session again, over this window, first.
+    w.app.file_panels.by_profile.get_mut(&db.id).unwrap().sftp = Some(Arc::new(DeadRemote));
+    let opens = w.opens(&db);
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, first));
+    assert_eq!(w.opens(&db), opens + 1);
+    assert_eq!(w.last_open(&db).unwrap().0, wid);
+    assert_eq!(w.downloads().len(), 1, "not before the session is open");
+    assert!(w.rows()[0].is_running(), "the row waits");
+    assert_eq!(w.rows().len(), 1);
+    w.answer_open(&db, "/home/user");
+    assert_eq!(w.downloads().len(), 2);
+    assert_eq!(w.downloads()[1].0, "/home/user/app.log");
+    assert_eq!(w.downloads()[1].1, dir.join("app.log"));
+    assert_eq!(w.rows().len(), 1, "the same row again");
+    assert_eq!(w.rows()[0].id, w.downloads()[1].2);
+    assert!(w.rows()[0].is_running());
+
+    // An in-place replace that failed: Retry replaces again at once on the open session.
+    let local = dir.join("app.conf");
+    std::fs::write(&local, "x").unwrap();
+    w.answer_list(&db, vec![file("app.log"), file("app.conf")]);
+    w.pick(vec![local.clone()]);
+    w.prompt(PromptMsg::ClashReplace(wid));
+    let up = w.uploads()[0].id;
+    w.transfer(up, TransferEvent::Failed("File may be incomplete.".into()));
+    let opens = w.opens(&db);
+    let _ = w.msg(FilePanelMsg::RetryTransfer(wid, up));
+    assert_eq!(w.opens(&db), opens);
+    assert_eq!(
+        summary(&w.uploads())[1],
+        uploaded(&local, "app.conf", UploadMode::Replace)
+    );
+    // A failed row is dismissed; a running one cannot be.
+    let running = w.rows()[0].id;
+    let _ = w.msg(FilePanelMsg::Dismiss(running));
+    assert!(w.rows().iter().any(|r| r.id == running));
+    let again = w.uploads()[1].id;
+    w.transfer(again, TransferEvent::Failed("Disk full.".into()));
+    let _ = w.msg(FilePanelMsg::Dismiss(again));
+    assert!(w.rows().iter().all(|r| r.id != again));
+}
+
+#[test]
+fn transfers_do_not_block_terminal_input() {
+    let mut w = world();
+    let db = w.db.clone();
+    let pane = Pane::for_profile(&db);
+    let id = pane.id;
+    w.window().push(Tab::single(pane));
+    let (handle, mut input) = SessionHandle::recording(w.app.new_terminal(DEFAULT_GRID));
+    let _ = w
+        .app
+        .update(Message::Connected(id, Delivered::new(handle), DEFAULT_GRID));
+    w.toggle();
+    w.answer_open(&db, "/home/user");
+    w.answer_list(&db, vec![file("app.conf")]);
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("big.tar");
+    std::fs::write(&local, "x").unwrap();
+    w.pick(vec![local]);
+    let up = w.uploads()[0].id;
+    assert!(w.rows()[0].is_running());
+    // Typing while the upload runs reaches the shell, between its progress reports.
+    let wid = w.wid;
+    let type_in = |w: &mut World, s: &str| {
+        let _ = w.app.update(Message::Terminal(
+            wid,
+            id,
+            fbterm_term::TerminalOutput::Input(s.as_bytes().to_vec()),
+        ));
+    };
+    type_in(&mut w, "ls\r");
+    w.transfer(
+        up,
+        TransferEvent::Progress {
+            done: 1024,
+            total: Some(1 << 30),
+        },
+    );
+    type_in(&mut w, "pwd\r");
+    assert_eq!(input.inputs(), [b"ls\r".to_vec(), b"pwd\r".to_vec()]);
+    assert!(w.rows()[0].is_running());
 }

@@ -87,6 +87,23 @@ pub(crate) enum Command {
     Close,
 }
 
+/// What a [`SessionHandle::recording`] handle was sent.
+#[doc(hidden)]
+pub struct InputLog(tokio::sync::mpsc::UnboundedReceiver<Command>);
+
+impl InputLog {
+    /// The input sent since the last call, one item per send.
+    pub fn inputs(&mut self) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        while let Ok(command) = self.0.try_recv() {
+            if let Command::Input(bytes) = command {
+                out.push(bytes);
+            }
+        }
+        out
+    }
+}
+
 /// Stops a session immediately, even if its writer is blocked.
 pub(crate) type Closer = Box<dyn Fn() + Send + Sync>;
 
@@ -125,6 +142,16 @@ impl SessionHandle {
             ended: Ended::default(),
             connection: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// [`SessionHandle::inert`] that keeps what is sent to it: what the user typed can be
+    /// read back from the [`InputLog`].
+    #[doc(hidden)]
+    pub fn recording(terminal: SharedTerminal) -> (Self, InputLog) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut handle = Self::inert(terminal);
+        handle.commands = tx;
+        (handle, InputLog(rx))
     }
 
     /// Warnings from authenticating this session's connection; empty for local sessions.
