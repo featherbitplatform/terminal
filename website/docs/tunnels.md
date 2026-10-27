@@ -64,7 +64,7 @@ When the connection under a running tunnel drops (an on-demand tunnel, or a **Wi
 
 An automatic attempt never asks you anything. If reconnecting needs you (a changed host key, a password that is not in the keychain, a key passphrase), the tunnel fails at once with `needs your input`; **Retry** then asks as a shell would.
 
-When the attempts run out, or a tunnel cannot start (the port is in use, the server refuses the forward), the tunnel turns red as `Failed: <reason>` and a banner in the focused window says `Tunnel "db" (db-host) failed: <reason>`.
+When the attempts run out, or a tunnel cannot start (the port is in use, the server refuses the forward), the tunnel turns red as `Failed: <reason>` and a banner says `Tunnel "db" (db-host) failed: <reason>`.
 
 ## In profiles.toml
 
@@ -75,7 +75,7 @@ Tunnels are `[[profiles.tunnels]]` tables placed right after their SSH profile. 
 | `name` | string | required | Name, unique within the profile. |
 | `kind` | `"local"`, `"remote"` or `"socks"` | required | What the tunnel does. |
 | `bind` | string | `"127.0.0.1"` | Address to listen on: on your machine for `local` and `socks`, on the host for `remote`. |
-| `port` | integer, `1` to `65535` | required | Port to listen on. |
+| `port` | integer, `1` to `65535`; `0` allowed for `remote` | required | Port to listen on. On a `remote` tunnel, `0` lets the server pick the port. |
 | `host` | string | required for `local` and `remote` | Target host. Seen from the profile's host for `local`, from your machine for `remote`. |
 | `host_port` | integer, `1` to `65535` | required for `local` and `remote` | Target port. |
 | `start` | `"on_demand"` or `"with_shell"` | `"on_demand"` | When it starts. The default is not written to the file. |

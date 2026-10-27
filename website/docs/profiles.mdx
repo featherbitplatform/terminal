@@ -102,6 +102,6 @@ The app validates `profiles.toml` when it loads it. Each problem is shown as a n
 | Profiles jump through each other in a loop | `profile "<name>" has a jump cycle` |
 | `host` is empty or blank | `profile "<name>" has an empty host` |
 | A tunnel has no name, or two tunnels of a profile share one | `profile "<name>" has a tunnel without a name`, `profile "<name>" has two tunnels named "<tunnel>"` |
-| A tunnel has port `0`, no target port, or an empty bind address or host | `tunnel "<tunnel>" of profile "<name>" needs a port above 0` and similar |
+| A `local` or `socks` tunnel has port `0`, a tunnel has no target port, or an empty bind address or host | `tunnel "<tunnel>" of profile "<name>" needs a port above 0` and similar |
 
 A file that is not valid TOML, or has a bad value (for example `accent = "red"`, which must be `"#rrggbb"`), is reported with its path and line number, for example `profiles.toml:12: invalid colour "red": expected "#rrggbb"`. A malformed file is never modified or overwritten, and profiles are read-only until you fix it.
