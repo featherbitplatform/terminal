@@ -8,7 +8,7 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 | License | Where it appears |
 | --- | --- |
-| Apache-2.0 | Most of the dependency tree, including `russh`, `feathercritty`, `iced` support crates and `wgpu`. |
+| Apache-2.0 | Most of the dependency tree, including `russh`, `russh-sftp` (the file panel's SFTP client), `feathercritty`, `iced` support crates and `wgpu`. |
 | MIT | The largest share of the tree, including `iced`, `tokio` and `portable-pty`; also the Lucide icons derived from Feather (see below). |
 | BSD-2-Clause | `arrayref`, `serial2`, `zerocopy`. |
 | BSD-3-Clause | `curve25519-dalek`, `ed25519-dalek`, `subtle`, `tiny-skia`, `num_enum`. |
