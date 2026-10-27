@@ -51,6 +51,7 @@ pub fn view<'a>(
             appearance(t, state, schemes, editable),
         ))
         .push(section(t, "Terminal", terminal(t, state, editable)))
+        .push(section(t, "Tunnels", tunnels(t, state, editable)))
         .push(keyboard(t, state, editable));
     let page = scrollable(
         container(container(body).max_width(CONTENT_WIDTH))
@@ -364,6 +365,34 @@ fn terminal<'a>(
         ),
         setting(t, "Redraw rate", Some(state.rate_hint()), false, rate),
     ]
+}
+
+fn tunnels<'a>(
+    t: &'static Tokens,
+    state: &'a SettingsState,
+    editable: bool,
+) -> Vec<Element<'a, Message>> {
+    let retries = row![
+        text_input("10", &state.retries_text)
+            .on_input_maybe(editable.then_some(|s| msg(SettingsMsg::RetriesText(s))))
+            .on_submit_maybe(editable.then(|| msg(SettingsMsg::RetriesSubmit)))
+            .font(MONO)
+            .size(12.5)
+            .padding(Padding::from([6.0, 10.0]))
+            .width(110)
+            .align_x(Alignment::End)
+            .style(move |_, s| ui::input_style(t, s)),
+        unit(t, "attempts"),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    vec![setting(
+        t,
+        "Reconnect attempts",
+        Some("0 turns automatic reconnecting off"),
+        false,
+        retries,
+    )]
 }
 
 /// The Scrollback row. While a lowered value waits, a warning with Apply and Cancel sits under
