@@ -25,6 +25,8 @@ use fbterm_config::{Paths, ProfileId, SecretStorage};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -42,8 +44,14 @@ pub type SecretEntry = (ProfileId, SecretKind, Zeroizing<String>);
 
 #[derive(Debug, thiserror::Error)]
 pub enum SecretError {
-    #[error("keychain error: {0}")]
+    /// The system storage refused or failed a call (access denied, a locked collection, a
+    /// cancelled prompt, ...): it exists, so Auto never leaves it for this.
+    #[error("{} error: {}", system_storage_name(), .0)]
     Backend(String),
+    /// There is no system storage at all (no Secret Service on Linux, say): the only error
+    /// that makes Auto move to the vault.
+    #[error("{} not available: {}", system_storage_name(), .0)]
+    Unavailable(String),
     #[error("stored secret map is invalid: {0}")]
     Serialization(String),
     /// The vault has not been unlocked in this session (or was locked again).
@@ -70,6 +78,30 @@ pub enum SecretError {
     /// removed from the old storage.
     #[error("The copied secrets did not read back the same.")]
     NotVerified,
+}
+
+/// What the system storage is called in messages.
+fn system_storage_name() -> &'static str {
+    if cfg!(windows) {
+        "Windows account storage"
+    } else {
+        "keychain"
+    }
+}
+
+/// One change of a batch (see [`SecretStore::apply_changes`]).
+pub enum SecretChange {
+    Set(SecretEntry),
+    /// Forget every secret of a profile.
+    Remove(ProfileId),
+    /// Forget one kind of secret of a profile.
+    RemoveKind(ProfileId, SecretKind),
+}
+
+impl SecretChange {
+    fn saves(&self) -> bool {
+        matches!(self, Self::Set(_))
+    }
 }
 
 pub trait SecretStore: Send + Sync {
@@ -113,12 +145,58 @@ pub trait SecretStore: Send + Sync {
         Ok(())
     }
 
+    /// Make several changes. The default makes them one by one and, like
+    /// [`Self::set_many`], is not atomic; the vault and the DPAPI file override it with one
+    /// write, which is all or nothing.
+    fn apply_changes(&self, changes: &[SecretChange]) -> Result<(), SecretError> {
+        for change in changes {
+            match change {
+                SecretChange::Set((id, kind, value)) => self.set(id, *kind, value)?,
+                SecretChange::Remove(id) => self.remove(id)?,
+                SecretChange::RemoveKind(id, kind) => self.remove_kind(id, *kind)?,
+            }
+        }
+        Ok(())
+    }
+
     /// Open a store that needs the user's main password (the encrypted vault). Stores
     /// without one have nothing to open and accept anything. Runs scrypt for the vault:
     /// never call it on the UI thread.
     fn unlock_vault(&self, _main_password: &str) -> Result<(), SecretError> {
         Ok(())
     }
+
+    /// Make the encrypted vault with `main_password` and leave it unlocked (for a save that
+    /// found [`SecretError::NoMainPassword`]). Stores without a vault refuse. Runs scrypt:
+    /// never on the UI thread.
+    fn create_vault(&self, _main_password: &str) -> Result<(), SecretError> {
+        Err(SecretError::Storage("This storage has no vault.".into()))
+    }
+}
+
+/// Apply `changes` to a vault-style contents map; returns whether anything changed.
+pub(crate) fn apply_to_contents(
+    contents: &mut secrets_file::Contents,
+    changes: &[SecretChange],
+) -> bool {
+    let mut changed = false;
+    for change in changes {
+        match change {
+            SecretChange::Set((id, kind, value)) => {
+                contents.insert((*id, *kind), value.clone());
+                changed = true;
+            }
+            SecretChange::Remove(id) => {
+                for kind in SecretKind::ALL {
+                    changed |= contents.remove(&(*id, kind)).is_some();
+                }
+            }
+            SecretChange::RemoveKind(id, kind) => {
+                changed |= contents.remove(&(*id, *kind)).is_some();
+            }
+        }
+    }
+    changed
 }
 
 /// The secrets of one profile; also the JSON shape stored per profile.
@@ -237,10 +315,19 @@ pub enum MainPassword {
 /// The app's secret store: the system's storage or the encrypted vault, whichever the
 /// `secret_storage` setting chose, behind one [`SecretStore`].
 ///
-/// Every call runs against the storage in use under a read lock, and a switch holds the write
-/// lock for the whole move, so a call in flight finishes before a switch starts and a call
-/// made during one waits for it. Vault calls run scrypt or wait on a write that does: callers
-/// keep every call off the UI thread.
+/// Every data call runs against the storage in use under a read lock, and a switch holds the
+/// write lock for the whole move, so a call in flight finishes before a switch starts and a
+/// call made during one waits for it. Vault calls run scrypt or wait on a write that does:
+/// callers keep every data call off the UI thread.
+///
+/// The questions the UI asks ([`Self::active`], [`Self::vault_exists`],
+/// [`Self::vault_unlocked`], [`Self::needs_main_password`]) read lock-free mirrors updated
+/// after every change, so they never wait on a switch or a vault write and never touch the
+/// disk.
+///
+/// With `"auto"`, nothing is read at startup: the first data call checks the system storage
+/// once and, if there is none at all ([`SecretError::Unavailable`]), moves to the vault and
+/// reports it through [`Self::on_auto_switch`].
 ///
 /// With the vault in use but locked, calls fail with [`SecretError::Locked`]; with no vault
 /// file yet, reads find nothing and saves fail with [`SecretError::NoMainPassword`].
@@ -249,15 +336,24 @@ pub struct SecretBackend {
     system: Box<dyn SecretStore>,
     vault: VaultStore,
     vault_path: PathBuf,
-    /// The setting at startup was `"auto"`: [`Self::detect_auto`] may move to the vault.
-    auto: bool,
+    /// Auto still has to check the system storage (on the first data call).
+    unprobed: AtomicBool,
+    /// Auto moved to the vault and the app has not taken the news yet.
+    auto_switched: AtomicBool,
+    /// Called once when Auto moves to the vault.
+    hook: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Lock-free mirrors for the UI: the storage in use (0 system, 1 vault), whether the
+    /// vault is unlocked and whether its file exists.
+    mirror_vault: AtomicBool,
+    mirror_unlocked: AtomicBool,
+    mirror_exists: AtomicBool,
     /// The memory backend's temporary folder (holding its vault), removed on drop.
     temp_dir: Option<PathBuf>,
 }
 
 impl SecretBackend {
     /// The backend for `setting` over the system storage and vault of `paths`. Nothing is
-    /// read until the first call.
+    /// read until the first data call.
     pub fn new(setting: SecretStorage, paths: &Paths) -> Self {
         Self::with_system(setting, system_store(paths), paths.vault())
     }
@@ -285,36 +381,50 @@ impl SecretBackend {
         backend
     }
 
-    /// The backend over any system store, with its vault at `vault_path`.
+    /// The backend over any system store, with its vault at `vault_path`. Only checks
+    /// whether the vault file exists.
     pub fn with_system(
         setting: SecretStorage,
         system: Box<dyn SecretStore>,
         vault_path: PathBuf,
     ) -> Self {
+        let active = Storage::for_setting(setting);
         Self {
-            active: RwLock::new(Storage::for_setting(setting)),
+            active: RwLock::new(active),
             system,
             vault: VaultStore::new(),
+            mirror_vault: AtomicBool::new(active == Storage::Vault),
+            mirror_unlocked: AtomicBool::new(false),
+            mirror_exists: AtomicBool::new(VaultStore::exists(&vault_path)),
             vault_path,
-            auto: setting == SecretStorage::Auto,
+            unprobed: AtomicBool::new(setting == SecretStorage::Auto),
+            auto_switched: AtomicBool::new(false),
+            hook: OnceLock::new(),
             temp_dir: None,
         }
     }
 
+    /// The storage in use (lock-free).
     pub fn active(&self) -> Storage {
-        *self.active.read()
+        if self.mirror_vault.load(Ordering::Acquire) {
+            Storage::Vault
+        } else {
+            Storage::System
+        }
     }
 
     pub fn vault_path(&self) -> &Path {
         &self.vault_path
     }
 
+    /// Whether the vault file exists, as of the last change made here (lock-free, no disk).
     pub fn vault_exists(&self) -> bool {
-        VaultStore::exists(&self.vault_path)
+        self.mirror_exists.load(Ordering::Acquire)
     }
 
+    /// Whether the vault is unlocked (lock-free).
     pub fn vault_unlocked(&self) -> bool {
-        self.vault.is_unlocked()
+        self.mirror_unlocked.load(Ordering::Acquire)
     }
 
     /// Whether this is the [`Self::in_memory`] backend (its vault in a temporary folder).
@@ -323,9 +433,9 @@ impl SecretBackend {
     }
 
     /// What the storage in use needs before it can save: `None` for the system storage or an
-    /// unlocked vault.
+    /// unlocked vault (lock-free).
     pub fn needs_main_password(&self) -> Option<MainPassword> {
-        if self.active() == Storage::System || self.vault.is_unlocked() {
+        if self.active() == Storage::System || self.vault_unlocked() {
             None
         } else if self.vault_exists() {
             Some(MainPassword::Unlock)
@@ -334,30 +444,51 @@ impl SecretBackend {
         }
     }
 
-    /// Auto at startup: when the system storage does not work at all (no secret service on
-    /// Linux, say), use the vault from now on. Probes once with one read; returns whether it
-    /// switched (the app then writes `"vault"` and says why once). Not for the UI thread.
-    pub fn detect_auto(&self) -> bool {
-        let mut active = self.active.write();
-        if !self.auto || *active != Storage::System {
-            return false;
-        }
-        // Only "not there at all" counts: a damaged or unreadable item is still the user's
-        // storage, and moving away from it would hide those secrets.
-        // One read of an id nothing has: every store reads its item or file for it.
-        match self.system.get(&ProfileId::new(), SecretKind::Password) {
-            Err(SecretError::Backend(e)) => {
-                tracing::warn!(error = %e, "system secret storage unavailable; using the encrypted vault");
-                *active = Storage::Vault;
-                true
-            }
-            _ => false,
-        }
+    /// Call `hook` (once) when Auto moves to the vault, from the thread of the data call that
+    /// found out. The app writes `"vault"` and says why once.
+    pub fn on_auto_switch(&self, hook: impl Fn() + Send + Sync + 'static) {
+        let _ = self.hook.set(Box::new(hook));
     }
 
-    /// Make the vault with `main_password` and leave it unlocked (no vault may exist yet).
-    pub fn create_vault(&self, main_password: &str) -> Result<(), SecretError> {
-        self.vault.create(&self.vault_path, main_password)
+    /// Whether Auto moved to the vault since the last call (true once).
+    pub fn take_auto_switched(&self) -> bool {
+        self.auto_switched.swap(false, Ordering::AcqRel)
+    }
+
+    /// Bring the mirrors in line with `active` and the vault. Called with the lock held, after
+    /// every change.
+    fn sync_mirrors(&self, active: Storage) {
+        self.mirror_vault
+            .store(active == Storage::Vault, Ordering::Release);
+        self.mirror_unlocked
+            .store(self.vault.is_unlocked(), Ordering::Release);
+        self.mirror_exists
+            .store(VaultStore::exists(&self.vault_path), Ordering::Release);
+    }
+
+    /// Auto's one check, on the first data call: when the system storage is not there at
+    /// all, use the vault from now on. A denied, locked or failing storage stays: moving
+    /// away from it would hide its secrets.
+    fn probe_once(&self) {
+        if !self.unprobed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut active = self.active.write();
+        if !self.unprobed.swap(false, Ordering::AcqRel) || *active != Storage::System {
+            return;
+        }
+        // One read of an id nothing has: every store reads its item or file for it.
+        if let Err(SecretError::Unavailable(e)) =
+            self.system.get(&ProfileId::new(), SecretKind::Password)
+        {
+            tracing::warn!(error = %e, "no system secret storage; using the encrypted vault");
+            *active = Storage::Vault;
+            self.sync_mirrors(Storage::Vault);
+            self.auto_switched.store(true, Ordering::Release);
+            if let Some(hook) = self.hook.get() {
+                hook();
+            }
+        }
     }
 
     /// `Reset vault`: delete the vault file and forget its contents and main password. The
@@ -365,8 +496,10 @@ impl SecretBackend {
     /// main password.
     pub fn reset_vault(&self) -> Result<(), SecretError> {
         // No call is in flight on the vault while it goes.
-        let _active = self.active.write();
-        self.vault.reset(&self.vault_path)
+        let active = self.active.write();
+        let result = self.vault.reset(&self.vault_path);
+        self.sync_mirrors(*active);
+        result
     }
 
     /// The store behind `storage`.
@@ -383,7 +516,7 @@ impl SecretBackend {
         if self.vault.is_unlocked() {
             return Ok(());
         }
-        let exists = self.vault_exists();
+        let exists = VaultStore::exists(&self.vault_path);
         match main_password {
             None if exists => Err(SecretError::Locked),
             None => Err(SecretError::NoMainPassword),
@@ -400,8 +533,12 @@ impl SecretBackend {
         missing: impl FnOnce() -> Result<T, SecretError>,
         op: impl FnOnce(&dyn SecretStore) -> Result<T, SecretError>,
     ) -> Result<T, SecretError> {
+        self.probe_once();
         let active = self.active.read();
-        if *active == Storage::Vault && !self.vault.is_unlocked() && !self.vault_exists() {
+        if *active == Storage::Vault
+            && !self.vault.is_unlocked()
+            && !VaultStore::exists(&self.vault_path)
+        {
             return missing();
         }
         op(self.store(*active))
@@ -415,7 +552,7 @@ impl SecretBackend {
     /// keeps everything and stays in use. Moving to the vault creates it with
     /// `main_password` when there is none, else unlocks it; moving away from a locked vault
     /// unlocks it first. A failure to clear the old storage after the move is logged (the
-    /// secrets are safe in the new one).
+    /// secrets are safe in the new one). An explicit switch settles Auto's check.
     pub fn switch_to(
         &self,
         target: Storage,
@@ -423,6 +560,20 @@ impl SecretBackend {
         ids: &[ProfileId],
     ) -> Result<(), SecretError> {
         let mut active = self.active.write();
+        self.unprobed.store(false, Ordering::Release);
+        let result = self.move_secrets(&mut active, target, main_password, ids);
+        self.sync_mirrors(*active);
+        result
+    }
+
+    /// [`Self::switch_to`] under the write lock.
+    fn move_secrets(
+        &self,
+        active: &mut Storage,
+        target: Storage,
+        main_password: Option<&str>,
+        ids: &[ProfileId],
+    ) -> Result<(), SecretError> {
         let from = *active;
         if from == target {
             return Ok(());
@@ -430,7 +581,7 @@ impl SecretBackend {
         // The vault's side first: reading from a locked vault needs it unlocked, and writing
         // to the vault needs it made or unlocked. A vault being left that was never made
         // holds nothing.
-        let old_vault_missing = from == Storage::Vault && !self.vault_exists();
+        let old_vault_missing = from == Storage::Vault && !VaultStore::exists(&self.vault_path);
         if from == Storage::Vault && !old_vault_missing {
             self.open_vault(main_password, false)?;
         }
@@ -508,13 +659,41 @@ impl SecretStore for SecretBackend {
     fn remove_many(&self, ids: &[ProfileId]) -> Result<(), SecretError> {
         self.with_active(|| Ok(()), |s| s.remove_many(ids))
     }
+    /// One write for the vault. With no vault file, removals have nothing to do and a batch
+    /// that saves needs a main password.
+    fn apply_changes(&self, changes: &[SecretChange]) -> Result<(), SecretError> {
+        self.with_active(
+            || {
+                if changes.iter().any(SecretChange::saves) {
+                    Err(SecretError::NoMainPassword)
+                } else {
+                    Ok(())
+                }
+            },
+            |s| s.apply_changes(changes),
+        )
+    }
 
     /// Unlock the vault (whether or not it is in use). An open vault accepts any answer.
+    /// Takes the read lock, so it never races `Reset vault` or a switch.
     fn unlock_vault(&self, main_password: &str) -> Result<(), SecretError> {
-        if self.vault.is_unlocked() {
-            return Ok(());
-        }
-        self.vault.unlock(&self.vault_path, main_password)
+        let active = self.active.read();
+        let result = if self.vault.is_unlocked() {
+            Ok(())
+        } else {
+            self.vault.unlock(&self.vault_path, main_password)
+        };
+        self.sync_mirrors(*active);
+        result
+    }
+
+    /// Make the vault with `main_password` and leave it unlocked (refused with
+    /// [`SecretError::VaultExists`] when there is one). Takes the read lock, like unlocking.
+    fn create_vault(&self, main_password: &str) -> Result<(), SecretError> {
+        let active = self.active.read();
+        let result = self.vault.create(&self.vault_path, main_password);
+        self.sync_mirrors(*active);
+        result
     }
 }
 
@@ -633,7 +812,7 @@ mod tests {
         struct Unavailable;
         impl SecretStore for Unavailable {
             fn get(&self, _: &ProfileId, _: SecretKind) -> Result<Option<String>, SecretError> {
-                Err(SecretError::Backend("no secret service".into()))
+                Err(SecretError::Unavailable("no secret service".into()))
             }
             fn set(&self, _: &ProfileId, _: SecretKind, _: &str) -> Result<(), SecretError> {
                 Err(SecretError::Backend("no secret service".into()))
@@ -726,24 +905,89 @@ mod tests {
             (vec![a, b, pid()], items)
         }
 
+        /// A system store over memory that counts every call and can refuse reads.
+        #[derive(Default)]
+        struct Counting {
+            inner: MemoryStore,
+            calls: AtomicUsize,
+            denied: AtomicBool,
+        }
+        impl SecretStore for Counting {
+            fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.denied.load(Ordering::SeqCst) {
+                    return Err(SecretError::Backend("access denied".into()));
+                }
+                self.inner.get(id, kind)
+            }
+            fn set(
+                &self,
+                id: &ProfileId,
+                kind: SecretKind,
+                value: &str,
+            ) -> Result<(), SecretError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.set(id, kind, value)
+            }
+            fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.remove(id)
+            }
+            fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.remove_kind(id, kind)
+            }
+        }
+
+        /// Counts the automatic-switch reports.
+        fn hooked(b: &SecretBackend) -> Arc<AtomicUsize> {
+            let fired = Arc::new(AtomicUsize::new(0));
+            let f = fired.clone();
+            b.on_auto_switch(move || {
+                f.fetch_add(1, Ordering::SeqCst);
+            });
+            fired
+        }
+
         #[test]
         fn auto_uses_keychain_when_it_works() {
             let dir = tempfile::tempdir().unwrap();
-            let system = dpapi_store(dir.path());
-            let b = backend(SecretStorage::Auto, system.clone(), dir.path());
-            assert!(!b.detect_auto(), "the system storage works");
+            let counting = Arc::new(Counting::default());
+            let b = backend(SecretStorage::Auto, counting.clone(), dir.path());
+            let fired = hooked(&b);
+            // Nothing is probed until a secret is needed, and the UI's questions probe nothing.
             assert_eq!(b.active(), Storage::System);
             assert_eq!(b.needs_main_password(), None);
+            assert!(!b.vault_exists() && !b.vault_unlocked());
+            assert_eq!(
+                counting.calls.load(Ordering::SeqCst),
+                0,
+                "no storage touched"
+            );
+
             let id = pid();
             b.set(&id, SecretKind::Password, "pw").unwrap();
+            assert!(
+                counting.calls.load(Ordering::SeqCst) >= 2,
+                "probed, then saved"
+            );
             assert_eq!(
-                system.get(&id, SecretKind::Password).unwrap().as_deref(),
+                counting.get(&id, SecretKind::Password).unwrap().as_deref(),
                 Some("pw")
             );
+            let calls = counting.calls.load(Ordering::SeqCst);
             assert_eq!(
                 b.get(&id, SecretKind::Password).unwrap().as_deref(),
                 Some("pw")
             );
+            assert_eq!(
+                counting.calls.load(Ordering::SeqCst),
+                calls + 1,
+                "probed once only"
+            );
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
+            assert!(!b.take_auto_switched());
             assert!(!b.vault_exists(), "no vault is made");
         }
 
@@ -751,22 +995,28 @@ mod tests {
         fn auto_switches_when_keychain_unavailable() {
             let dir = tempfile::tempdir().unwrap();
             let b = backend(SecretStorage::Auto, Arc::new(Unavailable), dir.path());
-            assert!(b.detect_auto());
-            assert_eq!(b.active(), Storage::Vault);
-            // No vault yet: nothing is saved, and a save needs a main password first.
-            assert_eq!(b.needs_main_password(), Some(MainPassword::Set));
+            let fired = hooked(&b);
+            assert_eq!(b.active(), Storage::System, "not probed yet");
+            // The first secret needed probes: no system storage at all, so the vault.
             let id = pid();
             assert_eq!(b.get(&id, SecretKind::Password).unwrap(), None);
+            assert_eq!(b.active(), Storage::Vault);
+            assert_eq!(fired.load(Ordering::SeqCst), 1, "reported once");
+            assert!(b.take_auto_switched());
+            assert!(!b.take_auto_switched(), "taken once");
+            // No vault yet: nothing is saved, and a save needs a main password first.
+            assert_eq!(b.needs_main_password(), Some(MainPassword::Set));
             assert!(b.entries(&[id]).unwrap().is_empty());
             b.remove(&id).unwrap();
             assert!(matches!(
                 b.set(&id, SecretKind::Password, "pw"),
                 Err(SecretError::NoMainPassword)
             ));
-            assert!(!b.detect_auto(), "probed once: already switched");
+            assert_eq!(fired.load(Ordering::SeqCst), 1, "probed once");
 
             b.create_vault(MAIN).unwrap();
             assert_eq!(b.needs_main_password(), None);
+            assert!(b.vault_exists() && b.vault_unlocked());
             b.set(&id, SecretKind::Password, "pw").unwrap();
             assert_eq!(
                 b.get(&id, SecretKind::Password).unwrap().as_deref(),
@@ -776,8 +1026,184 @@ mod tests {
             // An explicit keychain choice is kept even when the keychain fails.
             let other = tempfile::tempdir().unwrap();
             let b = backend(SecretStorage::Keychain, Arc::new(Unavailable), other.path());
-            assert!(!b.detect_auto());
+            assert!(b.get(&id, SecretKind::Password).is_err());
             assert_eq!(b.active(), Storage::System);
+        }
+
+        #[test]
+        fn auto_keeps_a_denied_or_locked_keychain() {
+            let dir = tempfile::tempdir().unwrap();
+            let counting = Arc::new(Counting::default());
+            counting.denied.store(true, Ordering::SeqCst);
+            let b = backend(SecretStorage::Auto, counting.clone(), dir.path());
+            let fired = hooked(&b);
+            // Access denied, a locked collection or a cancelled prompt is still the user's
+            // storage: no switch, so its secrets are not stranded.
+            assert!(b.get(&pid(), SecretKind::Password).is_err());
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
+            counting.denied.store(false, Ordering::SeqCst);
+            b.set(&pid(), SecretKind::Password, "pw").unwrap();
+            assert_eq!(b.active(), Storage::System, "never probed again");
+        }
+
+        /// A system store whose `entries` waits until released, after saying it started.
+        struct Stalled {
+            inner: MemoryStore,
+            entered: parking_lot::Mutex<Option<std::sync::mpsc::Sender<()>>>,
+            release: parking_lot::Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        }
+        impl SecretStore for Stalled {
+            fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError> {
+                self.inner.get(id, kind)
+            }
+            fn set(
+                &self,
+                id: &ProfileId,
+                kind: SecretKind,
+                value: &str,
+            ) -> Result<(), SecretError> {
+                self.inner.set(id, kind, value)
+            }
+            fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
+                self.inner.remove(id)
+            }
+            fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+                self.inner.remove_kind(id, kind)
+            }
+            fn entries(&self, ids: &[ProfileId]) -> Result<Vec<SecretEntry>, SecretError> {
+                if let Some(tx) = self.entered.lock().take() {
+                    let _ = tx.send(());
+                    if let Some(rx) = self.release.lock().take() {
+                        let _ = rx.recv();
+                    }
+                }
+                self.inner.entries(ids)
+            }
+        }
+
+        /// Run the UI's questions on another thread; they must answer within a second.
+        fn ui_queries_answer(
+            b: &Arc<SecretBackend>,
+        ) -> (Storage, Option<MainPassword>, bool, bool) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let b = b.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send((
+                    b.active(),
+                    b.needs_main_password(),
+                    b.vault_unlocked(),
+                    b.vault_exists(),
+                ));
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(1))
+                .expect("the UI's questions waited on a lock")
+        }
+
+        #[test]
+        fn ui_queries_never_wait_on_a_switch_or_a_vault_write() {
+            let dir = tempfile::tempdir().unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let stalled = Stalled {
+                inner: MemoryStore::new(),
+                entered: parking_lot::Mutex::new(Some(entered_tx)),
+                release: parking_lot::Mutex::new(Some(release_rx)),
+            };
+            let paths = Paths {
+                config_dir: dir.path().to_path_buf(),
+            };
+            let b = Arc::new(SecretBackend::with_system(
+                SecretStorage::Keychain,
+                Box::new(stalled),
+                paths.vault(),
+            ));
+            // A switch holds the backend's write lock while it reads the old storage.
+            let mover = b.clone();
+            let ids = vec![pid()];
+            let switch =
+                std::thread::spawn(move || mover.switch_to(Storage::Vault, Some(MAIN), &ids));
+            entered_rx.recv().unwrap();
+            assert_eq!(ui_queries_answer(&b), (Storage::System, None, false, false));
+            release_tx.send(()).unwrap();
+            switch.join().unwrap().unwrap();
+            assert_eq!(ui_queries_answer(&b), (Storage::Vault, None, true, true));
+
+            // A vault write in flight holds the vault's own lock: the questions still answer.
+            let held = b.vault.hold_for_test();
+            assert_eq!(ui_queries_answer(&b), (Storage::Vault, None, true, true));
+            drop(held);
+        }
+
+        #[test]
+        fn store_level_create_makes_the_vault_for_a_save() {
+            let dir = tempfile::tempdir().unwrap();
+            let b: Arc<dyn SecretStore> = Arc::new(backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            ));
+            let id = pid();
+            assert!(matches!(
+                b.set(&id, SecretKind::Password, "pw"),
+                Err(SecretError::NoMainPassword)
+            ));
+            b.create_vault(MAIN).unwrap();
+            assert!(matches!(
+                b.create_vault(MAIN),
+                Err(SecretError::VaultExists)
+            ));
+            b.set(&id, SecretKind::Password, "pw").unwrap();
+            // Stores without a vault refuse.
+            assert!(MemoryStore::new().create_vault(MAIN).is_err());
+        }
+
+        #[test]
+        fn changes_apply_in_one_batch() {
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            );
+            let (a, c, gone) = (pid(), pid(), pid());
+            // No vault: removals are fine, a change that saves needs a main password.
+            b.apply_changes(&[SecretChange::Remove(gone)]).unwrap();
+            assert!(matches!(
+                b.apply_changes(&[SecretChange::Set(entry(a, SecretKind::Password, "x"))]),
+                Err(SecretError::NoMainPassword)
+            ));
+            b.create_vault(MAIN).unwrap();
+            b.set_many(&[
+                entry(a, SecretKind::KeyPassphrase, "old-pp"),
+                entry(gone, SecretKind::Password, "gone-pw"),
+            ])
+            .unwrap();
+            b.apply_changes(&[
+                SecretChange::Set(entry(a, SecretKind::Password, "pw-a")),
+                SecretChange::Set(entry(c, SecretKind::Password, "pw-c")),
+                SecretChange::RemoveKind(a, SecretKind::KeyPassphrase),
+                SecretChange::Remove(gone),
+            ])
+            .unwrap();
+            let mut expected = vec![
+                (a, SecretKind::Password, "pw-a".to_owned()),
+                (c, SecretKind::Password, "pw-c".to_owned()),
+            ];
+            expected.sort();
+            assert_eq!(plain(b.entries(&[a, c, gone]).unwrap()), expected);
+            // The default (one change at a time) does the same for other stores.
+            let m = MemoryStore::new();
+            m.set(&a, SecretKind::KeyPassphrase, "old-pp").unwrap();
+            m.apply_changes(&[
+                SecretChange::Set(entry(a, SecretKind::Password, "pw-a")),
+                SecretChange::RemoveKind(a, SecretKind::KeyPassphrase),
+            ])
+            .unwrap();
+            assert_eq!(
+                plain(m.entries(&[a]).unwrap()),
+                vec![(a, SecretKind::Password, "pw-a".to_owned())]
+            );
         }
 
         #[test]

@@ -61,6 +61,11 @@ pub enum Ask {
     UnlockVault {
         reply: oneshot::Sender<Option<Zeroizing<String>>>,
     },
+    /// A remembered secret found the vault in use with no file yet: `Set a main password`.
+    /// Shown like [`Ask::UnlockVault`].
+    SetVaultPassword {
+        reply: oneshot::Sender<Option<Zeroizing<String>>>,
+    },
 }
 
 /// The key file dialog's title.
@@ -83,6 +88,9 @@ pub enum PromptEvent {
     Withdraw(PromptId),
     /// The key file chosen for `profile` logged in: remember it in the profile.
     KeyFileAccepted { profile: ProfileId, path: PathBuf },
+    /// `secret_storage = "auto"` found no system storage on the first secret needed and moved
+    /// to the vault (see `SecretBackend::on_auto_switch`).
+    StorageAutoSwitched,
 }
 
 /// Asks the user through the UI, over the window the dial belongs to.
@@ -195,6 +203,12 @@ impl Prompter for UiPrompter {
 
     async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
         self.ask(|reply| Ask::UnlockVault { reply }).await.flatten()
+    }
+
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
+        self.ask(|reply| Ask::SetVaultPassword { reply })
+            .await
+            .flatten()
     }
 }
 
@@ -354,7 +368,7 @@ impl Dialog {
                 choosing: false,
                 reply: Some(reply),
             },
-            Ask::UnlockVault { reply } => {
+            Ask::UnlockVault { reply } | Ask::SetVaultPassword { reply } => {
                 let _ = reply.send(None);
                 return None;
             }

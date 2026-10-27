@@ -474,6 +474,21 @@ impl App {
     }
 
     pub(crate) fn build(paths: Paths, memory_secrets: bool) -> (Self, Task<Message>) {
+        Self::build_with(paths, move |settings, paths| {
+            if memory_secrets {
+                SecretBackend::in_memory(settings.secret_storage)
+            } else {
+                SecretBackend::new(settings.secret_storage, paths)
+            }
+        })
+    }
+
+    /// [`Self::build`] with the secret backend `make` gives for the loaded settings. Nothing
+    /// asks the secret storage here: with `"auto"` the first secret needed checks it.
+    pub(crate) fn build_with(
+        paths: Paths,
+        make: impl FnOnce(&Settings, &Paths) -> SecretBackend,
+    ) -> (Self, Task<Message>) {
         let mut notices = Vec::new();
         let mut settings_notice = None;
         // A settings warning (a value out of range, already clamped) is shown like an error,
@@ -505,16 +520,18 @@ impl App {
         let profiles_seen = std::fs::read_to_string(paths.profiles()).ok();
         let settings_seen = std::fs::read_to_string(paths.settings()).ok();
 
-        let backend = Arc::new(if memory_secrets {
-            SecretBackend::in_memory(settings.secret_storage)
-        } else {
-            SecretBackend::new(settings.secret_storage, &paths)
-        });
+        let backend = Arc::new(make(&settings, &paths));
         let secrets: Arc<dyn SecretStore> = backend.clone();
         let known_hosts = directories::BaseDirs::new()
             .map(|d| d.home_dir().join(".ssh").join("known_hosts"))
             .unwrap_or_else(|| PathBuf::from("known_hosts"));
         let (prompt_tx, prompt_rx) = unbounded_channel();
+        // Auto checks the system storage on the first secret needed (off the UI thread): a
+        // move to the vault reaches the update loop with the prompt events.
+        let switched_tx = prompt_tx.clone();
+        backend.on_auto_switch(move || {
+            let _ = switched_tx.send(PromptEvent::StorageAutoSwitched);
+        });
         // Dials pass a prompter for their own window; this one asks over the focused window.
         let pool = Arc::new(SshPool::new(SshContext {
             known_hosts,
@@ -617,12 +634,6 @@ impl App {
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
-        // The in-memory store always works: only a real system storage is checked.
-        let detect = if memory_secrets {
-            Task::none()
-        } else {
-            app.detect_auto_storage()
-        };
         let mut task = match crate::perf::opts() {
             Some(o) => app.open_perf_tabs(o),
             None => app.restore_windows(&plan),
@@ -639,7 +650,7 @@ impl App {
         task = task.chain(app.open_debug_find());
         task = task.chain(app.open_debug_files());
         let demo_vault = app.open_debug_vault();
-        (app, Task::batch([detect, demo_vault, task]))
+        (app, Task::batch([demo_vault, task]))
     }
 
     /// The first local profile, preferring the user's login shell.

@@ -94,7 +94,11 @@ async fn off_task<T: Send + 'static>(
     let secrets = ctx.secrets.clone();
     tokio::task::spawn_blocking(move || call(secrets.as_ref()))
         .await
-        .unwrap_or_else(|e| Err(SecretError::Backend(e.to_string())))
+        .unwrap_or_else(|e| {
+            Err(SecretError::Storage(format!(
+                "The saved secrets call did not finish ({e})."
+            )))
+        })
 }
 
 /// The saved secret, if any. A locked vault is first unlocked with the main password the
@@ -126,8 +130,29 @@ async fn remember(ctx: &SshContext, profile: &Profile, kind: SecretKind, answer:
     if !answer.remember {
         return;
     }
-    let (id, value) = (profile.id, Zeroizing::new(answer.value.clone()));
-    if let Err(e) = off_task(ctx, move |s| s.set(&id, kind, &value)).await {
+    let id = profile.id;
+    let value = Zeroizing::new(answer.value.clone());
+    let save = || {
+        let value = value.clone();
+        off_task(ctx, move |s| s.set(&id, kind, &value))
+    };
+    let result = match save().await {
+        // The vault is in use and has no file yet: ask for a main password, make the vault
+        // and save again. A cancel leaves the secret unsaved.
+        Err(SecretError::NoMainPassword) => match ctx.prompter.set_vault_password().await {
+            Some(password) => match off_task(ctx, move |s| s.create_vault(&password)).await {
+                // Made meanwhile (another connect asked too): it is open now.
+                Ok(()) | Err(SecretError::VaultExists) => save().await,
+                Err(e) => Err(e),
+            },
+            None => {
+                tracing::info!(?kind, "secret not saved: no main password was set");
+                return;
+            }
+        },
+        other => other,
+    };
+    if let Err(e) = result {
         tracing::warn!(error = %e, ?kind, "cannot save secret");
     }
 }
@@ -349,10 +374,13 @@ mod tests {
 
         const MAIN: &str = "main-pw-auth-tests";
 
-        /// Answers `Unlock saved secrets` with `answer` and counts the questions.
+        /// Answers `Unlock saved secrets` with `answer` and counts the questions; answers
+        /// `Set a main password` with `set` and counts those.
         struct Unlocker {
             answer: Option<&'static str>,
             asked: AtomicUsize,
+            set: Option<&'static str>,
+            set_asked: AtomicUsize,
         }
 
         #[async_trait::async_trait]
@@ -375,6 +403,74 @@ mod tests {
                 self.asked.fetch_add(1, Ordering::SeqCst);
                 self.answer.map(|a| Zeroizing::new(a.to_owned()))
             }
+            async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
+                self.set_asked.fetch_add(1, Ordering::SeqCst);
+                self.set.map(|a| Zeroizing::new(a.to_owned()))
+            }
+        }
+
+        fn unlocker(answer: Option<&'static str>, set: Option<&'static str>) -> Arc<Unlocker> {
+            Arc::new(Unlocker {
+                answer,
+                asked: AtomicUsize::new(0),
+                set,
+                set_asked: AtomicUsize::new(0),
+            })
+        }
+
+        /// The vault selected, no vault file yet (after Auto moved or a reset).
+        fn no_vault(dir: &Path) -> Arc<SecretBackend> {
+            Arc::new(SecretBackend::with_system(
+                SecretStorage::Vault,
+                Box::new(MemoryStore::new()),
+                dir.join("secrets.fbvault"),
+            ))
+        }
+
+        fn typed(value: &str) -> crate::ssh::SecretAnswer {
+            crate::ssh::SecretAnswer {
+                value: value.into(),
+                remember: true,
+            }
+        }
+
+        #[tokio::test]
+        async fn remember_with_no_vault_sets_a_main_password() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = no_vault(dir.path());
+            let asker = unlocker(None, Some(MAIN));
+            let ctx = context(secrets.clone(), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert_eq!(asker.set_asked.load(Ordering::SeqCst), 1);
+            assert!(secrets.vault_exists() && secrets.vault_unlocked());
+            assert_eq!(
+                secrets.get(&p.id, SecretKind::Password).unwrap().as_deref(),
+                Some("typed-pw")
+            );
+            // The vault now exists: the next remember just saves.
+            remember(&ctx, &p, SecretKind::KeyPassphrase, &typed("pp")).await;
+            assert_eq!(asker.set_asked.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn cancel_set_password_leaves_the_secret_unsaved() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = no_vault(dir.path());
+            let asker = unlocker(None, None);
+            let ctx = context(secrets.clone(), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert_eq!(asker.set_asked.load(Ordering::SeqCst), 1);
+            assert!(!secrets.vault_exists());
+            assert_eq!(secrets.get(&p.id, SecretKind::Password).unwrap(), None);
+            // Nobody to ask: nothing asked, nothing saved.
+            let ctx = SshContext {
+                prompter: Arc::new(NoPrompt),
+                ..ctx
+            };
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert!(!secrets.vault_exists());
         }
 
         fn profile() -> Profile {
@@ -426,10 +522,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let p = profile();
             let secrets = locked(dir.path(), &p);
-            let asker = Arc::new(Unlocker {
-                answer: None,
-                asked: AtomicUsize::new(0),
-            });
+            let asker = unlocker(None, None);
             let ctx = context(secrets.clone(), asker.clone());
             assert_eq!(saved(&ctx, &p, SecretKind::Password).await, None);
             assert_eq!(asker.asked.load(Ordering::SeqCst), 1);
@@ -447,10 +540,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let p = profile();
             let secrets = locked(dir.path(), &p);
-            let asker = Arc::new(Unlocker {
-                answer: Some(MAIN),
-                asked: AtomicUsize::new(0),
-            });
+            let asker = unlocker(Some(MAIN), None);
             let ctx = context(secrets.clone(), asker.clone());
             assert_eq!(
                 saved(&ctx, &p, SecretKind::Password).await.as_deref(),
@@ -468,10 +558,7 @@ mod tests {
             let other = profile();
             let other_dir = tempfile::tempdir().unwrap();
             let secrets = locked(other_dir.path(), &other);
-            let wrong = Arc::new(Unlocker {
-                answer: Some("wrong"),
-                asked: AtomicUsize::new(0),
-            });
+            let wrong = unlocker(Some("wrong"), None);
             let ctx = context(secrets, wrong);
             assert_eq!(saved(&ctx, &other, SecretKind::Password).await, None);
         }

@@ -460,24 +460,302 @@ fn cancelling_the_main_password_still_saves_the_profiles() {
     assert_eq!(backend.get(&db.id, SecretKind::Password).unwrap(), None);
 }
 
+/// A system storage that counts every call, and is either there or not at all.
+#[derive(Default)]
+struct Probed {
+    inner: MemoryStore,
+    calls: std::sync::atomic::AtomicUsize,
+    missing: bool,
+    batches: std::sync::atomic::AtomicUsize,
+    single: std::sync::atomic::AtomicUsize,
+}
+
+impl Probed {
+    fn call(&self) -> Result<(), fbterm_secrets::SecretError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.missing {
+            return Err(fbterm_secrets::SecretError::Unavailable(
+                "no secret service".into(),
+            ));
+        }
+        Ok(())
+    }
+    fn alone(&self) {
+        self.single
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl SecretStore for Probed {
+    fn get(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<Option<String>, fbterm_secrets::SecretError> {
+        self.call()?;
+        self.inner.get(id, kind)
+    }
+    fn set(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+        value: &str,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.call()?;
+        self.alone();
+        self.inner.set(id, kind, value)
+    }
+    fn remove(&self, id: &ProfileId) -> Result<(), fbterm_secrets::SecretError> {
+        self.call()?;
+        self.alone();
+        self.inner.remove(id)
+    }
+    fn remove_kind(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.call()?;
+        self.alone();
+        self.inner.remove_kind(id, kind)
+    }
+    fn apply_changes(
+        &self,
+        changes: &[fbterm_secrets::SecretChange],
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.call()?;
+        self.batches
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.apply_changes(changes)
+    }
+}
+
+/// Lets a test keep looking at a store it handed to a backend.
+struct SharedProbed(Arc<Probed>);
+impl SecretStore for SharedProbed {
+    fn get(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<Option<String>, fbterm_secrets::SecretError> {
+        self.0.get(id, kind)
+    }
+    fn set(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+        value: &str,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.set(id, kind, value)
+    }
+    fn remove(&self, id: &ProfileId) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.remove(id)
+    }
+    fn remove_kind(
+        &self,
+        id: &ProfileId,
+        kind: SecretKind,
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.remove_kind(id, kind)
+    }
+    fn apply_changes(
+        &self,
+        changes: &[fbterm_secrets::SecretChange],
+    ) -> Result<(), fbterm_secrets::SecretError> {
+        self.0.apply_changes(changes)
+    }
+}
+
+/// An app over `system` (with the setting from the config folder), as `App::boot` builds
+/// it but for the store.
+fn app_over(paths: Paths, system: Arc<Probed>) -> App {
+    let (mut app, _) = App::build_with(paths, move |settings, paths| {
+        SecretBackend::with_system(
+            settings.secret_storage,
+            Box::new(SharedProbed(system)),
+            paths.vault(),
+        )
+    });
+    app.blocking_inline = true;
+    app
+}
+
+/// Deliver the events the app's prompt channel holds, as its subscription would.
+fn deliver_prompt_events(app: &mut App) {
+    let mut rx = app.prompt_rx.0.lock().take().expect("the prompt channel");
+    while let Ok(event) = rx.try_recv() {
+        let _ = app.update(Message::Prompt(PromptMsg::Event(Delivered::new(event))));
+    }
+    *app.prompt_rx.0.lock() = Some(rx);
+}
+
 #[test]
-fn auto_switch_is_said_once_and_written() {
-    let mut app = app_with(&[]);
-    let paths = app.paths.clone();
+fn building_the_app_touches_no_storage() {
+    let paths = paths_with(&[ssh("db")]);
+    let system = Arc::new(Probed::default());
+    let mut app = app_over(paths.clone(), system.clone());
+    let _ = app.update(Message::Settings(SettingsMsg::Open));
+    let _ = app.update(Message::Editor(EditorMsg::Open));
+    let _ = app.secrets_section();
+    let _ = app.storage();
+    assert_eq!(
+        system.calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "nothing asks the system storage before a secret is needed"
+    );
+    assert!(!paths.vault().exists());
+}
+
+#[test]
+fn auto_switch_is_found_on_first_use_said_once_and_written() {
+    let paths = paths_with(&[]);
+    let system = Arc::new(Probed {
+        missing: true,
+        ..Probed::default()
+    });
+    let mut app = app_over(paths.clone(), system.clone());
     let before = app.notices.len();
-    vault(&mut app, VaultMsg::AutoDetected(false));
-    assert_eq!(app.notices.len(), before);
-    vault(&mut app, VaultMsg::AutoDetected(true));
+    assert_eq!(app.storage(), Storage::System, "not probed at launch");
+    // A connect needs a saved password: the first data call finds no system storage.
+    assert_eq!(
+        app.secrets
+            .get(&ProfileId::new(), SecretKind::Password)
+            .unwrap(),
+        None
+    );
+    assert_eq!(app.storage(), Storage::Vault);
+    deliver_prompt_events(&mut app);
     assert_eq!(app.notices.len(), before + 1);
     assert!(app.visible_notices().contains(&AUTO_SWITCHED.to_owned()));
     assert_eq!(app.settings.secret_storage, SecretStorage::Vault);
     let loaded = Settings::load(&paths.settings()).unwrap();
     assert_eq!(loaded.secret_storage, SecretStorage::Vault);
+    // Said once: more data calls report nothing new.
+    let _ = app.secrets.get(&ProfileId::new(), SecretKind::Password);
+    deliver_prompt_events(&mut app);
+    assert_eq!(app.notices.len(), before + 1);
     // The next launch starts in the vault and checks nothing (it is not Auto any more).
     let (next, _) = App::build(paths.clone(), true);
     assert_eq!(next.settings.secret_storage, SecretStorage::Vault);
     assert_eq!(next.storage(), Storage::Vault);
     assert!(!next.visible_notices().contains(&AUTO_SWITCHED.to_owned()));
+}
+
+/// A connect's `Set a main password` question, as its prompter sends it.
+fn ask_set(app: &mut App, wid: window::Id) -> oneshot::Receiver<Option<Zeroizing<String>>> {
+    let (reply, answer) = oneshot::channel();
+    let event = PromptEvent::Ask {
+        id: 0,
+        window: Some(wid),
+        tunnel: None,
+        ask: Ask::SetVaultPassword { reply },
+    };
+    let _ = app.update(Message::Prompt(PromptMsg::Event(Delivered::new(event))));
+    answer
+}
+
+#[test]
+fn a_connect_remember_with_no_vault_sets_a_main_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secrets.fbvault");
+    let mut app = app_with(&[]);
+    let backend = vault_backend(&path, Arc::new(MemoryStore::new()));
+    app.use_secret_backend(backend.clone());
+    let wid = terminal_window(&mut app);
+
+    let mut answer = ask_set(&mut app, wid);
+    let d = app.vault.dialog.as_ref().expect("Set a main password");
+    assert_eq!((d.window, d.kind), (wid, Kind::Set));
+    type_password(&mut app, MAIN, true);
+    vault(&mut app, VaultMsg::Submit);
+    assert!(app.vault.dialog.is_none());
+    assert_eq!(
+        answer.try_recv().unwrap().as_deref().map(|s| s.as_str()),
+        Some(MAIN)
+    );
+    assert!(path.exists() && backend.vault_unlocked());
+}
+
+#[test]
+fn cancelling_a_connect_set_password_asks_no_more_this_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secrets.fbvault");
+    let mut app = app_with(&[]);
+    app.use_secret_backend(vault_backend(&path, Arc::new(MemoryStore::new())));
+    let wid = terminal_window(&mut app);
+    let mut answer = ask_set(&mut app, wid);
+    vault(&mut app, VaultMsg::Cancel);
+    assert_eq!(answer.try_recv().unwrap(), None);
+    let mut again = ask_set(&mut app, wid);
+    assert!(app.vault.dialog.is_none());
+    assert_eq!(again.try_recv().unwrap(), None);
+    assert!(!path.exists());
+}
+
+#[test]
+fn an_editor_save_writes_the_storage_once() {
+    let db = ssh("db");
+    let web = ssh("web");
+    let gone = ssh("gone");
+    let paths = paths_with(&[db.clone(), web.clone(), gone.clone()]);
+    let system = Arc::new(Probed::default());
+    let mut app = app_over(paths, system.clone());
+    let _ = app.update(Message::Editor(EditorMsg::Open));
+    for (id, pw) in [(db.id, "db-pw"), (web.id, "web-pw")] {
+        let _ = app.update(Message::Editor(EditorMsg::Select(id)));
+        let _ = app.update(Message::Editor(EditorMsg::Secret(Redacted(pw.into()))));
+    }
+    let _ = app.update(Message::Editor(EditorMsg::Select(gone.id)));
+    let _ = app.update(Message::Editor(EditorMsg::Delete));
+    let _ = app.update(Message::Editor(EditorMsg::Save));
+    use std::sync::atomic::Ordering::SeqCst;
+    assert_eq!(system.batches.load(SeqCst), 1, "one batch for the save");
+    assert_eq!(system.single.load(SeqCst), 0, "no change made alone");
+    assert_eq!(
+        system
+            .get(&web.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("web-pw")
+    );
+    let ed = &app.editor.as_ref().unwrap().1;
+    assert_eq!(ed.notice.as_deref(), Some("Saved"));
+    assert!(!ed.dirty);
+}
+
+#[test]
+fn switching_is_refused_while_profiles_toml_is_unreadable() {
+    let db = ssh("db");
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let dir = tempfile::tempdir().unwrap();
+    let system = Arc::new(MemoryStore::new());
+    let backend = Arc::new(SecretBackend::with_system(
+        SecretStorage::Keychain,
+        Box::new(Shared(system.clone())),
+        dir.path().join("secrets.fbvault"),
+    ));
+    app.use_secret_backend(backend.clone());
+    backend.set(&db.id, SecretKind::Password, SAVED).unwrap();
+    std::fs::write(paths.profiles(), "[[profiles]\nname = 1\n").unwrap();
+    let _ = app.update(Message::ConfigChanged(crate::watch::Changed {
+        profiles: true,
+        settings: false,
+        schemes: false,
+    }));
+    assert!(app.profiles_error.is_some());
+    settings(&mut app, SettingsMsg::Open);
+    settings(&mut app, SettingsMsg::SecretStorage(SecretStorage::Vault));
+    assert!(app.vault.dialog.is_none(), "nothing asked");
+    assert_eq!(backend.active(), Storage::System);
+    assert_eq!(
+        app.secrets_section().notice.map(|n| (n.error, n.text)),
+        Some((true, super::PROFILES_UNREADABLE.to_owned()))
+    );
+    assert_eq!(
+        system.get(&db.id, SecretKind::Password).unwrap().as_deref(),
+        Some(SAVED)
+    );
 }
 
 #[test]
@@ -492,10 +770,12 @@ fn storage_copy_names_the_storage_in_use() {
     } else {
         assert_eq!(system, "Saved in the system keychain");
     }
-    assert_eq!(
-        super::choice_label(SecretStorage::Keychain),
-        "System keychain"
-    );
+    let keychain = super::choice_label(SecretStorage::Keychain);
+    if cfg!(windows) {
+        assert_eq!(keychain, "Windows account");
+    } else {
+        assert_eq!(keychain, "System keychain");
+    }
     assert_eq!(super::choice_label(SecretStorage::Auto), "Automatic");
     assert_eq!(super::choice_label(SecretStorage::Vault), "Encrypted vault");
 }

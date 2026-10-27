@@ -74,6 +74,9 @@ struct Script {
     /// The answer to `Unlock saved secrets` (`None`: cancel), and how often it was asked.
     unlock: parking_lot::Mutex<Option<String>>,
     unlock_calls: AtomicUsize,
+    /// The answer to `Set a main password` (`None`: cancel), and how often it was asked.
+    set_password: parking_lot::Mutex<Option<String>>,
+    set_calls: AtomicUsize,
 }
 
 impl Script {
@@ -95,6 +98,8 @@ impl Script {
             accepted_keys: parking_lot::Mutex::new(vec![]),
             unlock: parking_lot::Mutex::new(None),
             unlock_calls: AtomicUsize::new(0),
+            set_password: parking_lot::Mutex::new(None),
+            set_calls: AtomicUsize::new(0),
         })
     }
     fn host_key_calls(&self) -> usize {
@@ -148,6 +153,11 @@ impl Prompter for Script {
     async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
         self.unlock_calls.fetch_add(1, Ordering::SeqCst);
         self.unlock.lock().clone().map(Zeroizing::new)
+    }
+
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
+        self.set_calls.fetch_add(1, Ordering::SeqCst);
+        self.set_password.lock().clone().map(Zeroizing::new)
     }
 }
 
@@ -613,6 +623,61 @@ async fn locked_vault_unlocks_through_the_prompter() {
     assert!(secrets.vault_unlocked());
 }
 
+/// A backend using the vault in `dir`, which has no vault file yet.
+fn vault_without_file(dir: &Path) -> Arc<SecretBackend> {
+    Arc::new(SecretBackend::with_system(
+        SecretStorage::Vault,
+        Box::new(MemoryStore::new()),
+        dir.join("secrets.fbvault"),
+    ))
+}
+
+#[tokio::test]
+async fn remember_with_no_vault_sets_a_main_password() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = vault_without_file(dir.path());
+    let script = Script::new(true, vec![answer(PASSWORD, true)]);
+    *script.set_password.lock() = Some(MAIN.into());
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.set_calls.load(Ordering::SeqCst), 1);
+    assert!(secrets.vault_exists());
+    assert_eq!(
+        secrets.get(&p.id, SecretKind::Password).unwrap().as_deref(),
+        Some(PASSWORD)
+    );
+}
+
+#[tokio::test]
+async fn cancel_set_password_does_not_save() {
+    if !enabled() {
+        return;
+    }
+    let fx = Fixture::new();
+    let dir = tempfile::tempdir().unwrap();
+    let p = profile(AuthMethod::Password);
+    let secrets = vault_without_file(dir.path());
+    let script = Script::new(true, vec![answer(PASSWORD, true)]);
+    let ctx = SshContext {
+        secrets: secrets.clone(),
+        ..fx.ctx(script.clone())
+    };
+    let handle = connect(&p, &ctx).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(script.set_calls.load(Ordering::SeqCst), 1);
+    assert!(!secrets.vault_exists());
+    assert_eq!(secrets.get(&p.id, SecretKind::Password).unwrap(), None);
+}
+
 #[tokio::test]
 async fn learned_key_is_known_to_check_host_key() {
     if !enabled() {
@@ -756,6 +821,10 @@ mod pool {
     #[async_trait]
     impl Prompter for TrustAll {
         async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
             None
         }
 
@@ -1268,6 +1337,10 @@ mod pool {
             None
         }
 
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
         async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
             None
         }
@@ -1478,6 +1551,10 @@ mod access {
     #[async_trait]
     impl Prompter for TrustAny {
         async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            None
+        }
+
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
             None
         }
 

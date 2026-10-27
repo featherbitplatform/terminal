@@ -12,6 +12,7 @@ use crate::file_panel::ClashAnswer;
 use crate::prompts::{
     Ask, Clash, Dialog, PromptEvent, PromptId, PromptMsg, Rename, key_file_title,
 };
+use crate::saved_secrets::Kind;
 use crate::tunnels::NO_WINDOW;
 
 impl App {
@@ -272,7 +273,16 @@ impl App {
                     window,
                     ask: Ask::UnlockVault { reply },
                     ..
-                }) => self.connect_unlock(window, reply),
+                }) => self.connect_vault_question(window, reply, Kind::Unlock),
+                Some(PromptEvent::Ask {
+                    window,
+                    ask: Ask::SetVaultPassword { reply },
+                    ..
+                }) => self.connect_vault_question(window, reply, Kind::Set),
+                Some(PromptEvent::StorageAutoSwitched) => {
+                    self.storage_auto_switched();
+                    Task::none()
+                }
                 Some(PromptEvent::Ask {
                     id,
                     window,

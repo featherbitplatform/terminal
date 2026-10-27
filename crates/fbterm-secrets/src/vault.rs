@@ -40,7 +40,7 @@ const NOT_WRITTEN: &str = "The vault could not be written.";
 const NOT_DELETED: &str = "The vault could not be deleted.";
 
 /// What exists only while the vault is unlocked.
-struct Unlocked {
+pub(crate) struct Unlocked {
     path: PathBuf,
     /// Kept to re-encrypt on every write.
     password: Zeroizing<String>,
@@ -121,6 +121,13 @@ impl VaultStore {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(vault_err(NOT_DELETED)),
         }
+    }
+
+    /// Hold the vault's lock, as a write in flight does (tests of callers that must not
+    /// wait on it).
+    #[cfg(test)]
+    pub(crate) fn hold_for_test(&self) -> parking_lot::MutexGuard<'_, Option<Unlocked>> {
+        self.state.lock()
     }
 
     #[cfg(test)]
@@ -207,6 +214,11 @@ impl SecretStore for VaultStore {
             }
             !items.is_empty()
         })
+    }
+
+    /// All of `changes` in one re-encryption and one file write (none if nothing changes).
+    fn apply_changes(&self, changes: &[crate::SecretChange]) -> Result<(), SecretError> {
+        self.update(|c| crate::apply_to_contents(c, changes))
     }
 
     /// Every secret of `ids` in one re-encryption and one file write (none if they hold
@@ -508,6 +520,37 @@ mod tests {
         assert_eq!(store.writes(), 2, "one re-encryption for the whole batch");
         let ids: Vec<_> = items.iter().map(|(id, _, _)| *id).collect();
         assert_eq!(store.entries(&ids).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn apply_changes_writes_the_file_once() {
+        let (_dir, path, id) = fixture_dir();
+        let store = VaultStore::new();
+        store.unlock(&path, MAIN).unwrap();
+        let other = ProfileId::new();
+        let writes = store.writes();
+        store
+            .apply_changes(&[
+                crate::SecretChange::Set(entry(other, SecretKind::Password, "o")),
+                crate::SecretChange::Set(entry(id, SecretKind::KeyPassphrase, "pp")),
+                crate::SecretChange::RemoveKind(id, SecretKind::Password),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.writes(),
+            writes + 1,
+            "one re-encryption for the batch"
+        );
+        assert_eq!(store.get(&id, SecretKind::Password).unwrap(), None);
+        assert_eq!(
+            store.get(&other, SecretKind::Password).unwrap().as_deref(),
+            Some("o")
+        );
+        // Nothing to change: nothing written.
+        store
+            .apply_changes(&[crate::SecretChange::Remove(ProfileId::new())])
+            .unwrap();
+        assert_eq!(store.writes(), writes + 1);
     }
 
     #[test]

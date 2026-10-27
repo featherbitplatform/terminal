@@ -1326,6 +1326,11 @@ mod tests {
             self.0.store(true, Ordering::SeqCst);
             None
         }
+
+        async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+            self.0.store(true, Ordering::SeqCst);
+            None
+        }
     }
 
     #[tokio::test]

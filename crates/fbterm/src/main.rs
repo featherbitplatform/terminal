@@ -34,7 +34,7 @@
 //!   and key files on, and import shows a sample archive built in memory (its key folder in
 //!   the temporary folder).
 //! - `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword`: show a sample
-//!   connection or main password dialog in the first
+//!   connection or main password dialog (`setpassword` only with `FBTERM_SECRETS=memory`) in the first
 //!   window (nothing waits for the answer).
 //! - `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close`: keep that tab-bar button's
 //!   tooltip showing (for screenshots; `close` is the first tab's).

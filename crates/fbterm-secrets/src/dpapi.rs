@@ -162,6 +162,11 @@ impl<C: Codec> SecretStore for CodecStore<C> {
             .collect())
     }
 
+    /// All of `changes` in one file write (none if nothing changes).
+    fn apply_changes(&self, changes: &[crate::SecretChange]) -> Result<(), SecretError> {
+        self.update(|c| crate::apply_to_contents(c, changes))
+    }
+
     /// All of `items` in one file write.
     fn set_many(&self, items: &[SecretEntry]) -> Result<(), SecretError> {
         if items.is_empty() {

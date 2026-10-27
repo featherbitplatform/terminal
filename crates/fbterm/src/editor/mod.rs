@@ -14,7 +14,7 @@ use fbterm_config::{
     AccentStyle, AuthMethod, ConfigError, LocalProfile, Profile, ProfileId, ProfileKind,
     ProfileStore, Rgb, SshProfile, StartMode, TunnelDef, TunnelKind, ValidationError,
 };
-use fbterm_secrets::{SecretKind, SecretStore};
+use fbterm_secrets::{SecretChange, SecretKind, SecretStore, Zeroizing};
 
 use crate::redact::Redacted;
 
@@ -944,18 +944,26 @@ impl EditorState {
 /// How each secret change of a save went (errors as sentences, never secret values).
 pub type SecretResults = Vec<(SecretOp, Result<(), String>)>;
 
-/// Make the secret changes of a save, in order. May reach the vault: never on the UI thread.
+/// Make the secret changes of a save as one batch ([`SecretStore::apply_changes`]: one
+/// vault write), in order. Every change gets the batch's outcome: the vault's batch is all or
+/// nothing, and on a failure the drafts keep their typed secrets and deleted profiles are
+/// retried, so saving again is safe. May reach the vault: never on the UI thread.
 pub fn run_secret_ops(secrets: &dyn SecretStore, ops: Vec<SecretOp>) -> SecretResults {
-    ops.into_iter()
-        .map(|op| {
-            let result = match &op {
-                SecretOp::Set { id, kind, value } => secrets.set(id, *kind, &value.0),
-                SecretOp::RemoveKind { id, kind } => secrets.remove_kind(id, *kind),
-                SecretOp::Remove(id) => secrets.remove(id),
-            };
-            (op, result.map_err(|e| e.to_string()))
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    let changes: Vec<SecretChange> = ops
+        .iter()
+        .map(|op| match op {
+            SecretOp::Set { id, kind, value } => {
+                SecretChange::Set((*id, *kind, Zeroizing::new(value.0.clone())))
+            }
+            SecretOp::RemoveKind { id, kind } => SecretChange::RemoveKind(*id, *kind),
+            SecretOp::Remove(id) => SecretChange::Remove(*id),
         })
-        .collect()
+        .collect();
+    let result = secrets.apply_changes(&changes).map_err(|e| e.to_string());
+    ops.into_iter().map(|op| (op, result.clone())).collect()
 }
 
 fn kind_name(kind: SecretKind) -> &'static str {

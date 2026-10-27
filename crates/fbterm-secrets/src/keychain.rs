@@ -26,8 +26,23 @@ struct OsBlob {
 
 impl OsBlob {
     fn entry(&self) -> Result<keyring::Entry, SecretError> {
-        keyring::Entry::new(&self.service, &self.account)
-            .map_err(|e| SecretError::Backend(e.to_string()))
+        keyring::Entry::new(&self.service, &self.account).map_err(keychain_error)
+    }
+}
+
+/// A keyring error as ours. Only "there is no secret service at all" is
+/// [`SecretError::Unavailable`] (Auto may then move to the vault): on Linux a platform
+/// failure (no D-Bus session or Secret Service) or no store at all. Denied, locked or
+/// cancelled access is [`SecretError::Backend`], and so is every platform failure on macOS,
+/// where a user's "Deny" arrives as one and the keychain always exists.
+pub(crate) fn keychain_error(e: keyring::Error) -> SecretError {
+    let text = e.to_string();
+    match e {
+        keyring::Error::NoDefaultStore => SecretError::Unavailable(text),
+        keyring::Error::PlatformFailure(_) if !cfg!(target_os = "macos") => {
+            SecretError::Unavailable(text)
+        }
+        _ => SecretError::Backend(text),
     }
 }
 
@@ -36,13 +51,11 @@ impl BlobBackend for OsBlob {
         match self.entry()?.get_password() {
             Ok(blob) => Ok(Some(blob)),
             Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(SecretError::Backend(e.to_string())),
+            Err(e) => Err(keychain_error(e)),
         }
     }
     fn store(&self, blob: &str) -> Result<(), SecretError> {
-        self.entry()?
-            .set_password(blob)
-            .map_err(|e| SecretError::Backend(e.to_string()))
+        self.entry()?.set_password(blob).map_err(keychain_error)
     }
 }
 
@@ -176,5 +189,35 @@ impl SecretStore for KeychainStore {
             map.entry(id.to_string()).or_default().set(*kind, value);
         }
         self.commit(&mut guard, map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn platform(msg: &str) -> keyring::Error {
+        keyring::Error::PlatformFailure(Box::new(std::io::Error::other(msg.to_owned())))
+    }
+
+    #[test]
+    fn only_a_missing_service_is_unavailable() {
+        // Denied, locked or cancelled access: the storage is there.
+        let denied = keyring::Error::NoStorageAccess(Box::new(std::io::Error::other("locked")));
+        assert!(matches!(keychain_error(denied), SecretError::Backend(_)));
+        assert!(matches!(
+            keychain_error(keyring::Error::NoDefaultStore),
+            SecretError::Unavailable(_)
+        ));
+        let failure = keychain_error(platform("no secret service"));
+        if cfg!(target_os = "macos") {
+            // macOS reports a user's "Deny" as a platform failure, and always has a keychain.
+            assert!(matches!(failure, SecretError::Backend(_)), "{failure:?}");
+        } else {
+            assert!(
+                matches!(failure, SecretError::Unavailable(_)),
+                "{failure:?}"
+            );
+        }
     }
 }

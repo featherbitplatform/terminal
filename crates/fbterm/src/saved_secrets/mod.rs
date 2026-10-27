@@ -33,6 +33,10 @@ pub const SET_TITLE: &str = "Set a main password";
 pub const RESET_TITLE: &str = "Reset vault";
 pub const MISMATCH: &str = "The passwords do not match.";
 pub const EMPTY: &str = "Type a main password.";
+/// A move asked for while `profiles.toml` does not load: the ids of the profiles are not
+/// known, so their secrets cannot be found.
+pub const PROFILES_UNREADABLE: &str =
+    "Saved secrets cannot move while profiles.toml cannot be read. Fix it first.";
 
 /// Where saved secrets are kept, as the notes under secret fields say it.
 pub fn storage_note(storage: Storage) -> &'static str {
@@ -70,6 +74,9 @@ pub fn moved_text(to: Storage) -> String {
 pub fn choice_label(choice: SecretStorage) -> &'static str {
     match choice {
         SecretStorage::Auto => "Automatic",
+        // On Windows the system storage is a DPAPI file for the user's account, not a
+        // keychain (owner decision on DPAPI; label approved by the controller).
+        SecretStorage::Keychain if cfg!(windows) => "Windows account",
         SecretStorage::Keychain => "System keychain",
         SecretStorage::Vault => "Encrypted vault",
     }
@@ -78,8 +85,6 @@ pub fn choice_label(choice: SecretStorage) -> &'static str {
 /// What the main password dialogs and the storage jobs report.
 #[derive(Debug, Clone)]
 pub enum VaultMsg {
-    /// Startup: the Auto probe finished; whether it moved to the vault.
-    AutoDetected(bool),
     Password(Redacted),
     Confirm(Redacted),
     /// Enter, or the dialog's main button.
@@ -233,6 +238,9 @@ pub struct VaultUi {
     /// The user cancelled `Unlock saved secrets` for a connect: later connects stop asking
     /// this session (they ask for their secret as if none were saved).
     pub declined: bool,
+    /// The user cancelled a connect's `Set a main password`: later remembered secrets are
+    /// not saved this session without asking again.
+    pub set_declined: bool,
     /// Connects waiting for the vault to open.
     waiters: Vec<oneshot::Sender<Option<Zeroizing<String>>>>,
     /// A switch running without a dialog.
@@ -261,18 +269,24 @@ impl VaultUi {
         self.seq
     }
 
-    /// A connect asks to unlock. `locked`: whether the vault is still locked.
-    pub fn ask_unlock(
+    /// A connect asks to unlock (`Kind::Unlock`) or to set a main password (`Kind::Set`).
+    /// `needed`: whether the vault still needs that.
+    pub fn ask(
         &mut self,
         reply: oneshot::Sender<Option<Zeroizing<String>>>,
-        locked: bool,
+        kind: Kind,
+        needed: bool,
     ) -> Asked {
-        if !locked {
-            // Opened meanwhile (by another connect, or Settings): any answer does.
+        if !needed {
+            // Opened or made meanwhile (by another connect, or Settings): any answer does.
             let _ = reply.send(Some(Zeroizing::default()));
             return Asked::Answered;
         }
-        if self.declined {
+        let declined = match kind {
+            Kind::Set => self.set_declined,
+            _ => self.declined,
+        };
+        if declined {
             let _ = reply.send(None);
             return Asked::Answered;
         }

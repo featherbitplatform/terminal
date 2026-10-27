@@ -87,6 +87,10 @@ impl Prompter for TrustAny {
         None
     }
 
+    async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+        None
+    }
+
     async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
         None
     }

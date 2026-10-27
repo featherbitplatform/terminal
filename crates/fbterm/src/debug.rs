@@ -176,7 +176,8 @@ impl App {
         let backend = self.backend.clone();
         self.run_blocking(
             move || {
-                if let Err(e) = backend.create_vault("demo") {
+                if let Err(e) = fbterm_secrets::SecretStore::create_vault(backend.as_ref(), "demo")
+                {
                     tracing::warn!(error = %e, "demo vault not made");
                 }
             },
@@ -375,6 +376,11 @@ impl App {
                 reply: tokio::sync::oneshot::channel().0,
             },
             // The main password dialogs, as a connect and Settings show them.
+            // `setpassword` would really move secrets: only over the in-memory backend.
+            "setpassword" if !self.backend.is_in_memory() => {
+                tracing::warn!("FBTERM_DEMO_PROMPT=setpassword needs FBTERM_SECRETS=memory");
+                return Task::none();
+            }
             "unlock" | "setpassword" => {
                 let (kind, purpose) = if kind == "unlock" {
                     (

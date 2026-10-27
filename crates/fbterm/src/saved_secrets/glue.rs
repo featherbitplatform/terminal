@@ -29,28 +29,16 @@ impl App {
         }
     }
 
-    /// Startup, with `secret_storage = "auto"`: check once, off the UI thread, whether the
-    /// system storage works at all.
-    pub(crate) fn detect_auto_storage(&mut self) -> Task<Message> {
-        if self.settings.secret_storage != SecretStorage::Auto {
-            return Task::none();
+    /// Auto found no system storage on the first secret needed and moved to the vault:
+    /// write `"vault"` and say why, once.
+    pub(crate) fn storage_auto_switched(&mut self) {
+        if self.backend.take_auto_switched() {
+            self.auto_switched();
         }
-        let backend = self.backend.clone();
-        self.run_blocking(
-            move || backend.detect_auto(),
-            |_| false,
-            |switched| Message::Vault(VaultMsg::AutoDetected(switched)),
-        )
     }
 
     pub(crate) fn vault_msg(&mut self, msg: VaultMsg) -> Task<Message> {
         match msg {
-            VaultMsg::AutoDetected(switched) => {
-                if switched {
-                    self.auto_switched();
-                }
-                Task::none()
-            }
             VaultMsg::Password(typed) => {
                 if let Some(d) = self.vault.dialog.as_mut().filter(|d| d.busy.is_none()) {
                     d.password = Zeroizing::new(typed.0);
@@ -193,7 +181,9 @@ impl App {
                     backend.switch_to(target, Some(password.as_str()), &ids)
                 })
             }
-            (_, Kind::Set) => self.vault_job(seq, move || backend.create_vault(&password)),
+            (_, Kind::Set) => self.vault_job(seq, move || {
+                fbterm_secrets::SecretStore::create_vault(backend.as_ref(), &password)
+            }),
             (_, _) => self.vault_job(seq, move || {
                 fbterm_secrets::SecretStore::unlock_vault(backend.as_ref(), &password)
             }),
@@ -216,9 +206,13 @@ impl App {
         let unlocked = self.backend.vault_unlocked();
         if matches!(d.purpose, Purpose::Connect) && !done {
             // Cancelled for a connect: connects stop asking this session.
-            self.vault.declined = true;
+            match d.kind {
+                Kind::Set => self.vault.set_declined = true,
+                _ => self.vault.declined = true,
+            }
         }
-        let password = (unlocked && d.kind == Kind::Unlock).then_some(&d.password);
+        let typed = matches!(d.kind, Kind::Unlock | Kind::Set);
+        let password = (unlocked && typed).then_some(&d.password);
         let fallback = unlocked.then(Zeroizing::default);
         self.vault.answer_waiters(password.or(fallback.as_ref()));
         match d.purpose {
@@ -311,6 +305,13 @@ impl App {
         {
             return Task::none();
         }
+        if self.profiles_error.is_some() {
+            self.vault.notice = Some(SectionNotice {
+                error: true,
+                text: super::PROFILES_UNREADABLE.into(),
+            });
+            return Task::none();
+        }
         self.vault.notice = None;
         let target = Storage::for_setting(choice);
         if target == self.storage() {
@@ -355,22 +356,28 @@ impl App {
         self.open_vault_dialog(wid, Kind::Reset, Purpose::Reset)
     }
 
-    /// A connect found the vault locked and asks to unlock it (over `window`, else the
-    /// focused terminal window).
-    pub(crate) fn connect_unlock(
+    /// A connect found the vault locked (`Kind::Unlock`) or missing when remembering a
+    /// secret (`Kind::Set`) and asks the user (over `window`, else the focused terminal
+    /// window).
+    pub(crate) fn connect_vault_question(
         &mut self,
         window: Option<window::Id>,
         reply: oneshot::Sender<Option<Zeroizing<String>>>,
+        kind: Kind,
     ) -> Task<Message> {
-        let locked = self.backend.needs_main_password() == Some(MainPassword::Unlock);
-        match self.vault.ask_unlock(reply, locked) {
+        let need = self.backend.needs_main_password();
+        let needed = match kind {
+            Kind::Set => need == Some(MainPassword::Set),
+            _ => need == Some(MainPassword::Unlock),
+        };
+        match self.vault.ask(reply, kind, needed) {
             Asked::Answered | Asked::Joined => Task::none(),
             Asked::Show => {
                 let target = window
                     .filter(|w| self.windows.contains_key(w))
                     .or_else(|| self.focused_window());
                 match target {
-                    Some(w) => self.open_vault_dialog(w, Kind::Unlock, Purpose::Connect),
+                    Some(w) => self.open_vault_dialog(w, kind, Purpose::Connect),
                     None => {
                         self.vault.answer_waiters(None);
                         Task::none()

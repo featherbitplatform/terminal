@@ -112,6 +112,13 @@ pub trait Prompter: Send + Sync {
     /// until the user unlocks from Settings or an export.
     async fn unlock_vault(&self) -> Option<Zeroizing<String>>;
 
+    /// Saved secrets use the encrypted vault and it does not exist yet (after fbterm moved to
+    /// it on its own, or a `Reset vault`), and the user asked to remember a secret: ask for a
+    /// new main password (`Set a main password`, typed twice). The connect makes the vault
+    /// with the answer and saves. `None` means cancelled, or nobody can be asked: the secret
+    /// is not saved.
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>>;
+
     /// Whether this prompter can reach a person at all. `false` for [`NoPrompt`]: a connect
     /// that would have needed a question then fails with [`SshError::NeedsInput`].
     fn can_ask(&self) -> bool {
@@ -145,6 +152,10 @@ impl Prompter for NoPrompt {
     }
 
     async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+        None
+    }
+
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
         None
     }
 
@@ -684,6 +695,11 @@ impl Prompter for ClockedPrompter {
         self.inner.unlock_vault().await
     }
 
+    async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
+        let _paused = self.clock.pause();
+        self.inner.set_vault_password().await
+    }
+
     fn can_ask(&self) -> bool {
         self.inner.can_ask()
     }
@@ -952,6 +968,10 @@ mod tests {
             None
         }
         async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+        async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
             tokio::time::sleep(self.0).await;
             None
         }
