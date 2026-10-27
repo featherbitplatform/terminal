@@ -733,6 +733,16 @@ impl Chrome {
 
     /// `base` with this platform's title-bar treatment applied.
     pub fn window_settings(self, base: window::Settings) -> window::Settings {
+        // Linux desktops match a window to its desktop entry (`fbterm.desktop`, installed by
+        // the packages) by this id: the Wayland app id and the X11 window class.
+        #[cfg(target_os = "linux")]
+        let base = window::Settings {
+            platform_specific: window::settings::PlatformSpecific {
+                application_id: LINUX_APP_ID.to_owned(),
+                ..base.platform_specific
+            },
+            ..base
+        };
         #[cfg(target_os = "macos")]
         if self == Self::Unified {
             return window::Settings {
@@ -763,6 +773,10 @@ impl Chrome {
         base
     }
 }
+
+/// The Linux application id: the basename of the packages' desktop entry `fbterm.desktop`.
+#[cfg(target_os = "linux")]
+const LINUX_APP_ID: &str = "fbterm";
 
 /// The chrome in use, which can switch between [`Chrome::Drawn`] and [`Chrome::Native`]
 /// while fbterm runs (Linux: the `window_decorations` setting, or a desktop that refuses
@@ -1718,6 +1732,15 @@ mod tests {
         assert!(quit_key_wanted(0));
         assert!(!quit_key_wanted(1));
         assert!(!quit_key_wanted(3));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_windows_carry_the_desktop_entry_id() {
+        for c in [Chrome::Drawn, Chrome::Native] {
+            let s = c.window_settings(window::Settings::default());
+            assert_eq!(s.platform_specific.application_id, "fbterm");
+        }
     }
 
     #[cfg(target_os = "macos")]

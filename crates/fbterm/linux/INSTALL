@@ -1,0 +1,23 @@
+featherbit terminal (fbterm) for Linux
+
+This archive holds the same files as the .deb and .rpm packages:
+
+  bin/fbterm                                  the program
+  share/applications/fbterm.desktop           the app launcher entry
+  share/icons/hicolor/<size>/apps/fbterm.png  the icon (32 to 512 px)
+
+Install for your user only:
+
+  install -Dm755 bin/fbterm ~/.local/bin/fbterm
+  cp -r share/applications share/icons ~/.local/share/
+
+Or for every user:
+
+  sudo install -Dm755 bin/fbterm /usr/local/bin/fbterm
+  sudo cp -r share/applications share/icons /usr/local/share/
+
+fbterm needs a desktop session (Wayland or X11) with Vulkan or OpenGL (EGL)
+graphics, and the xkbcommon library. Saved passwords use the desktop's
+Secret Service when one is running; otherwise fbterm offers an encrypted vault.
+
+Check the install with: fbterm --version
