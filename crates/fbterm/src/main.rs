@@ -47,6 +47,13 @@
 //!   any system, for screenshots.
 //!
 //! `fbterm --version` prints `fbterm <version>` and exits.
+//!
+//! Windows release builds are GUI programs (no console window opens next to the app when it
+//! starts from the Start menu), so their `--version` line reaches a pipe or a file, e.g.
+//! `fbterm --version | more`, but not a console window directly.
+
+// Debug builds keep the console for their log output.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod actions;
 mod app;

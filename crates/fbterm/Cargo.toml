@@ -58,6 +58,11 @@ libc = "0.2"
 windows-sys = { workspace = true, features = ["Win32_Graphics_Dwm"] }
 raw-window-handle = "0.6"
 
+# The icon and version information in fbterm.exe (build.rs); without the default `toml`
+# feature it reads nothing but cargo's environment and adds only `version_check`.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.34", default-features = false }
+
 # Linux packages, built by dev/package-linux.sh (cargo-deb and cargo-generate-rpm) in an
 # almalinux:9 container: glibc 2.34, the oldest of the supported systems (RHEL 9; Ubuntu 22.04
 # has 2.35, Debian 12 2.36), so the binary asks for no newer glibc symbol than 2.34. It links
@@ -122,3 +127,11 @@ dbus-libs = "*"
 vulkan-loader = "*"
 mesa-libEGL = "*"
 libwayland-egl = "*"
+
+# Windows installer, built by dev/package-windows.ps1 with cargo-wix (the version pinned in
+# .github/workflows/release.yml) from wix/main.wxs. The upgrade code there is fixed forever
+# (every release shares it, so a newer one replaces an older one); it is recorded here too
+# for `cargo wix print wxs`. The installed exe carries its icon and version information
+# from build.rs.
+[package.metadata.wix]
+upgrade-guid = "D2F13F2B-68C8-4ED4-9953-D6E612A1FA8D"

@@ -64,6 +64,9 @@ bash dev/make-icns.sh [mark.png]         # regenerate crates/fbterm/macos/fbterm
 bash dev/package-linux.sh <version> <x86_64|aarch64>   # .deb, .rpm, .tar.gz into target/dist/ (Linux, native arch; needs cargo-deb, cargo-generate-rpm)
 bash dev/smoke-linux.sh <deb|rpm|tar.gz> target/dist <version>   # install, run --version, remove (as root, in a clean container)
 bash dev/make-linux-icons.sh [mark.png]  # regenerate crates/fbterm/linux/icons/ (needs Pillow)
+pwsh dev/package-windows.ps1 <version>   # .msi into target/dist/ (Windows x86-64; needs cargo-wix and WiX Toolset v3)
+pwsh dev/smoke-windows.ps1 target/dist <version>   # install, run --version, uninstall keeps the config, reinstall (as admin, clean machine)
+bash dev/make-windows-icon.sh [mark.png] # regenerate crates/fbterm/windows/fbterm.ico (needs Pillow)
 cd website && npm start                  # docs dev server; `npm run build` builds (fails on broken links)
 ```
 
@@ -77,6 +80,7 @@ cd website && npm start                  # docs dev server; `npm run build` buil
 
 - Windows CI clippy fails on imports and helpers used only by `#[cfg(unix)]` tests; gate them with the same `cfg`.
 - Linux packages are built in an `almalinux:9` container (glibc 2.34, RHEL 9's), not Debian 12: a Debian 12 build links `hypotf@GLIBC_2.35` and the `.rpm` then refuses to install on RHEL 9. `dev/package-linux.sh` refuses a binary that needs a glibc symbol newer than 2.34. The binary links only glibc and libgcc; winit, wgpu and rfd open the rest at run time (list in the `[package.metadata.deb]` comment of `crates/fbterm/Cargo.toml`); recheck with `strings` on the release binary after dependency upgrades.
+- Windows release builds are GUI-subsystem programs (`windows_subsystem` in `main.rs`, release only), so no console window opens beside the app; their stdout reaches only a pipe or file (`fbterm --version | more`), and any child process they start needs `CREATE_NO_WINDOW` or it flashes a console. `build.rs` embeds the icon and version information with `winresource` (Windows hosts only). The `.msi` (`crates/fbterm/wix/main.wxs`) keeps one UpgradeCode forever; never change it.
 - `hdiutil create` fails locally on macOS 27 ("Resource busy"); `dev/package-macos.sh` falls back to `diskutil image create` locally, CI uses `hdiutil` only.
 - Redraw contract: call `take_dirty` before locking the terminal to draw; hidden tabs, and every tab of a window that cannot be seen (`visibility.rs`), leave `Dirty` pending until they are shown. Every message redraws every window, so output `Dirty` is paced before it reaches the update loop (`pacing.rs`, at most `max_fps` per second: the setting, default `OUTPUT_FPS` = 60, or the fastest display with `"display"` via `display_rate.rs`; read live from the shared `OutputRate`); never add a periodic subscription or redraw loop that keeps running without new output or input (debug aids aside).
 - `feathercritty` is a git dependency pinned by `rev` in the root `Cargo.toml` (its changes from upstream are listed in its README; `deny.toml` allows git sources from `github.com/featherbitplatform` only). To change emulation code: commit in the feathercritty repo (`../feathercritty`, Conventional Commits, notice line at the top of each file it modifies), push, wait for its CI, then bump the `rev` here and run the checks. For local development, point Cargo at the working copy with a `[patch."https://github.com/featherbitplatform/feathercritty"]` entry `feathercritty = { path = "../feathercritty" }` in the root `Cargo.toml`; never commit it.
