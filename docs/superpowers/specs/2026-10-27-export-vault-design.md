@@ -35,11 +35,13 @@ shared archive, is asked for their own password on first connect, and has the sa
    clashes with **Skip / Overwrite / Keep both**, choose where key files go (default `~/.ssh/`,
    written readable only by the user), and the imported profiles point to them.
 5. **Secret storage:**
-   - The system's secure storage (macOS Keychain, Windows Credential Manager, Linux Secret
-     Service) is the default where it works well.
-   - fbterm switches to the **vault** on its own where it doesn't: no secret service available,
-     or the secrets no longer fit the platform's limits (Windows caps a stored credential at
-     about 2.5 KB, and fbterm keeps all secrets in one entry).
+   - The system's secure storage is the default: macOS Keychain, Linux Secret Service, and on
+     Windows a file in the config directory encrypted with DPAPI for the user's Windows account
+     (`secrets.dpapi`). *(Owner decision, 2026-10-27: Credential Manager caps a stored credential
+     at about 2.5 KB and fbterm keeps all secrets in one entry, so Windows uses DPAPI instead; it
+     has no size limit and needs no main password.)*
+   - fbterm switches to the **vault** on its own where the system storage doesn't work (for
+     example no secret service on Linux).
    - In Settings the user can **choose the vault** on any machine. Switching either way moves
      the saved secrets across.
 
@@ -81,8 +83,7 @@ scheme ids are rewired to the imported or kept profiles and schemes.
   from the keychain into the vault, then removes them from the keychain. Choosing the keychain
   again moves them back after unlocking the vault.
 - When fbterm switches to the vault on its own, it says why once (`The system keychain is not
-  available` or `Saved secrets no longer fit the system keychain`) and asks the user to set a
-  main password the next time a secret is saved.
+  available`) and asks the user to set a main password the next time a secret is saved.
 - *(my guess, approved)* A forgotten main password can't be recovered: `Reset vault` deletes the
   saved secrets (after a confirmation) and keeps the profiles.
 - *(my guess, approved)* The main password and archive passwords are separate.
@@ -136,6 +137,4 @@ scheme ids are rewired to the imported or kept profiles and schemes.
 - Archive internal layout (e.g. a TOML manifest plus files in a tar inside `age`), versioning
   scheme, file name defaults.
 - How the vault's main password prompt reuses the existing prompt dialogs.
-- Detecting "doesn't fit": measuring the serialized size against each platform's limit before
-  writing, with a margin.
 - Dialog layouts for export, import preview and the Settings storage section.

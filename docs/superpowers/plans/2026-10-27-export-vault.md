@@ -21,7 +21,7 @@
 - Jump-chain profiles of selected profiles are always included; tunnels and `color_scheme` travel with profiles; user schemes used by exported profiles are included.
 - Import: matches by id, then by name; choices `Skip` (default), `Overwrite`, `Keep both`; Overwrite replaces only what the archive carries (a shared import keeps local secrets and key paths); Keep both gives a new id and the name `{name} (imported)`; references inside the archive follow Keep both copies and point at existing profiles on Skip; invalid results (not SSH, jump cycle) show on that profile and block it. Key files go to a chosen folder (default `~/.ssh/`) with mode `0600`; identical existing files are reused, different same-named files get a new name; nothing on disk is replaced silently. Schemes: same id and content reused, else imported with a new id and name `{name} (imported)`.
 - Key profiles without a key path connect by asking the user to pick a key file (`Choose the private key for {profile}`), remembered in the profile.
-- Secret storage setting `secret_storage = "auto" | "keychain" | "vault"` (default `"auto"`). Auto uses the keychain where it works; switches to the vault when the keychain is unavailable or the serialized secrets exceed the platform limit (Windows: 2400 bytes, keeping a margin under the 2560-byte cap); an automatic switch writes `"vault"` and says once `The system keychain is not available, so saved secrets now use an encrypted vault.` or `Saved secrets no longer fit the system keychain, so they now use an encrypted vault.` Switching moves every secret; a failed read of the old storage cancels the switch and removes nothing.
+- Secret storage setting `secret_storage = "auto" | "keychain" | "vault"` (default `"auto"`). "keychain" means the system storage: macOS Keychain, Linux Secret Service, and on Windows a DPAPI-encrypted file `<config>/secrets.dpapi` (owner decision 2026-10-27; Credential Manager is not used). Auto uses the system storage where it works and switches to the vault when it is unavailable; an automatic switch writes `"vault"` and says once `The system keychain is not available, so saved secrets now use an encrypted vault.` There is no size-based switch. Switching moves every secret; a failed read of the old storage cancels the switch and removes nothing.
 - Vault: `<config>/secrets.fbvault`, `age`-encrypted TOML; unlocked once per app session on first need with `Unlock saved secrets` (main password); setting it asks twice (`Set a main password`); `Reset vault` deletes saved secrets after confirmation (`Delete all saved passwords and passphrases? Profiles are kept.`) and keeps profiles; cancelling unlock makes that connection ask for its secret as if none were saved.
 - Copy: palette actions `Export profiles…`, `Import profiles…`; editor footer buttons `Export…`, `Import…`; export kinds `Full (for your own machines)` and `Shared (no secrets, for teammates)`; Settings section `Saved secrets` with choices `Automatic`, `System keychain`, `Encrypted vault` and button `Reset vault`.
 - Users who never use these features see no change.
@@ -116,6 +116,19 @@
 - [ ] **Step 4: Run** the gates — Expected: PASS.
 - [ ] **Step 5: Commit** `feat(secrets): encrypted vault store`.
 
+### Task 6b: Windows system storage with DPAPI
+
+**Files:**
+- Create: `crates/fbterm-secrets/src/dpapi.rs` (`#[cfg(windows)]`); Modify: `lib.rs`, `keychain.rs` (remove the size check), `paths.rs` (`Paths::dpapi()` = `<config>/secrets.dpapi`), workspace `Cargo.toml` (`windows-sys` with the `Win32_Security_Cryptography` and `Win32_Foundation` features, a version already in the lockfile), `LICENSES.md`
+
+**Interfaces:**
+- Produces: `pub struct DpapiStore` implementing `SecretStore` (get/set/remove/remove_kind/entries/set_many) over a TOML map (`format = 1`) protected with `CryptProtectData`/`CryptUnprotectData` (`CRYPTPROTECT_UI_FORBIDDEN`, fixed app entropy), atomic writes (part file, flush, rename), bounded reads, `Zeroizing` buffers, `LocalFree` on every output blob; a pure `Codec` seam so the TOML map, atomic write and error mapping are unit-tested on every platform with a fake codec, and the DPAPI round trip is tested on Windows CI. The system-storage constructor returns `DpapiStore` on Windows and the keyring store elsewhere. `keychain_blob_bytes`/`keychain_fits` are removed.
+- [ ] **Step 1: Failing tests**: `dpapi_map_round_trip` (fake codec), `dpapi_write_is_atomic`, `dpapi_corrupt_file_is_refused`, `dpapi_file_never_contains_plaintext` (Windows), `dpapi_real_round_trip` (Windows).
+- [ ] **Step 2: Run** — Expected: FAIL.
+- [ ] **Step 3: Implement.** Only the DPAPI calls are `unsafe`, each with `// SAFETY:`.
+- [ ] **Step 4: Run** the gates and Windows CI — Expected: PASS.
+- [ ] **Step 5: Commit** `feat(secrets): DPAPI system storage on Windows`.
+
 ### Task 7: Choosing and switching storage
 
 **Files:**
@@ -123,7 +136,7 @@
 
 **Interfaces:**
 - Produces: `SecretBackend::new(mode, paths)`, `switch_to(mode, main_password: Option<&str>) -> Result<(), SecretError>` (copy every entry, verify, then remove from the old storage; any read failure aborts with nothing removed), automatic switch detection on startup and on a `set` that would exceed the limit; `Prompter::unlock_vault(&self) -> Option<Zeroizing<String>>` with the unlock dialog; Settings `Saved secrets` section with the three choices (switching asks for or sets the main password), `Reset vault` with confirmation; the editor's notes under secret fields say where secrets are kept.
-- [ ] **Step 1: Failing tests**: `auto_uses_keychain_when_it_works`, `auto_switches_when_keychain_unavailable`, `auto_switches_when_secrets_too_large`, `switch_to_vault_moves_everything`, `switch_back_to_keychain_moves_everything`, `switch_aborts_when_old_store_unreadable`, `locked_vault_asks_once_per_session`, `cancel_unlock_asks_for_password_instead`, `reset_vault_keeps_profiles`, `settings_section_switches_storage`.
+- [ ] **Step 1: Failing tests**: `auto_uses_keychain_when_it_works`, `auto_switches_when_keychain_unavailable`, `switch_to_vault_moves_everything`, `switch_back_to_keychain_moves_everything`, `switch_aborts_when_old_store_unreadable`, `locked_vault_asks_once_per_session`, `cancel_unlock_asks_for_password_instead`, `reset_vault_keeps_profiles`, `settings_section_switches_storage`.
 - [ ] **Step 2: Run** — Expected: FAIL.
 - [ ] **Step 3: Implement.**
 - [ ] **Step 4: Run** the gates — Expected: PASS.
