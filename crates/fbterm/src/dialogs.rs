@@ -1,12 +1,15 @@
 //! The app side of the profile editor window and the connection dialogs.
 
+use std::path::{Path, PathBuf};
+
+use fbterm_config::{AuthMethod, ProfileId, ProfileKind};
 use iced::{Task, window};
 
 use crate::app::{App, Message, load_profiles};
 use crate::chrome::Chrome;
 use crate::editor::{EditorMsg, EditorState, SaveError};
 use crate::file_panel::ClashAnswer;
-use crate::prompts::{Clash, Dialog, PromptEvent, PromptMsg, Rename};
+use crate::prompts::{Clash, Dialog, PromptEvent, PromptId, PromptMsg, Rename, key_file_title};
 use crate::tunnels::NO_WINDOW;
 
 impl App {
@@ -244,6 +247,10 @@ impl App {
                     Some(w) => self.focus_prompt(w),
                     None => Task::none(),
                 },
+                Some(PromptEvent::KeyFileAccepted { profile, path }) => {
+                    self.remember_key_file(profile, path);
+                    Task::none()
+                }
                 None => Task::none(),
             },
             PromptMsg::Trust(w) => {
@@ -359,7 +366,57 @@ impl App {
                 Task::none()
             }
             PromptMsg::Copy(s) => iced::clipboard::write(s),
+            PromptMsg::ChooseKey(w) => {
+                let profile = match self.prompts.front(w) {
+                    Some(Dialog::KeyFile { profile, .. }) => profile.clone(),
+                    _ => return Task::none(),
+                };
+                match self.prompts.choose_key(w) {
+                    Some(id) => key_file_picker(w, id, key_file_title(&profile)),
+                    None => Task::none(),
+                }
+            }
+            PromptMsg::KeyChosen(w, id, path) => {
+                self.prompts.key_chosen(w, id, path);
+                self.focus_prompt(w)
+            }
         }
+    }
+
+    /// A connection logged in with the key file the user chose for key profile `id`, which
+    /// named none: write it into the profile, so later connections use it without asking.
+    /// Only an empty path is filled. When `profiles.toml` cannot be written (it failed to load,
+    /// or the write fails), the path is kept in memory for this session only.
+    pub(crate) fn remember_key_file(&mut self, id: ProfileId, path: PathBuf) {
+        let Some(profile) = self.profiles.profiles.iter_mut().find(|p| p.id == id) else {
+            return;
+        };
+        let ProfileKind::Ssh(ssh) = &mut profile.kind else {
+            return;
+        };
+        let AuthMethod::Key { path: slot, .. } = &mut ssh.auth else {
+            return;
+        };
+        if slot.is_some() {
+            return;
+        }
+        *slot = Some(path.clone());
+        if self.profiles_error.is_none() {
+            let file = self.paths.profiles();
+            match self.profiles.save(&file) {
+                // Our own write is not an edit to pick up again.
+                Ok(()) => self.profiles_seen = std::fs::read_to_string(&file).ok(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "chosen key file kept for this session only");
+                }
+            }
+        } else {
+            tracing::info!("profiles.toml is not loaded: chosen key file kept for this session");
+        }
+        if let Some((_, ed)) = &mut self.editor {
+            ed.key_file_remembered(id, &path);
+        }
+        self.profiles_changed();
     }
 
     /// Focus whatever input `w` now shows on top: the dialog's field, else the palette's.
@@ -394,5 +451,169 @@ impl App {
             self.prompts.push(w, None, Dialog::Changed { host, port });
         }
         Task::none()
+    }
+}
+
+/// Where the key file picker opens: `~/.ssh`, else the home folder.
+fn key_file_start(home: Option<&Path>) -> Option<PathBuf> {
+    let home = home?;
+    let ssh = home.join(".ssh");
+    Some(if ssh.is_dir() {
+        ssh
+    } else {
+        home.to_path_buf()
+    })
+}
+
+/// The system's file picker for key file question `id`, over window `w` (a sheet on macOS),
+/// opening in `~/.ssh`. Its answer comes back as [`PromptMsg::KeyChosen`].
+fn key_file_picker(w: window::Id, id: PromptId, title: String) -> Task<Message> {
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    let start = key_file_start(home.as_deref());
+    window::run(w, move |handle| {
+        let dialog = rfd::AsyncFileDialog::new().set_title(title);
+        match start {
+            Some(dir) => dialog.set_directory(dir),
+            None => dialog,
+        }
+        .set_parent(handle)
+    })
+    .then(move |dialog| {
+        Task::perform(
+            async move { dialog.pick_file().await.map(|f| f.path().to_path_buf()) },
+            move |path| Message::Prompt(PromptMsg::KeyChosen(w, id, path)),
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use fbterm_config::{AuthMethod, Profile, ProfileId, ProfileKind, ProfileStore, SshProfile};
+
+    use super::key_file_start;
+    use crate::app::{App, Delivered, Message};
+    use crate::editor::{DraftKind, EditorMsg};
+    use crate::prompts::{PromptEvent, PromptMsg};
+    use crate::restore_tests::paths_with;
+
+    fn keyless(name: &str) -> Profile {
+        Profile {
+            id: ProfileId::new(),
+            name: name.into(),
+            group: None,
+            accent: None,
+            accent_style: Default::default(),
+            color_scheme: None,
+            kind: ProfileKind::Ssh(SshProfile {
+                host: "127.0.0.1".into(),
+                port: 1,
+                user: "user".into(),
+                auth: AuthMethod::Key {
+                    path: None,
+                    passphrase: false,
+                },
+                jump: vec![],
+                tunnels: vec![],
+            }),
+        }
+    }
+
+    fn key_path(store: &ProfileStore, id: ProfileId) -> Option<PathBuf> {
+        match &store.get(id).unwrap().kind {
+            ProfileKind::Ssh(SshProfile {
+                auth: AuthMethod::Key { path, .. },
+                ..
+            }) => path.clone(),
+            _ => panic!("key profile"),
+        }
+    }
+
+    fn accepted(app: &mut App, profile: ProfileId, path: &Path) {
+        let _ = app.update(Message::Prompt(PromptMsg::Event(Delivered::new(
+            PromptEvent::KeyFileAccepted {
+                profile,
+                path: path.to_path_buf(),
+            },
+        ))));
+    }
+
+    #[test]
+    fn accepted_key_file_is_remembered_in_profiles_toml() {
+        let p = keyless("db");
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths.clone(), true);
+        let _ = app.update(Message::Editor(EditorMsg::Open));
+        let chosen = PathBuf::from("/keys/id_ed25519");
+        accepted(&mut app, p.id, &chosen);
+
+        assert_eq!(key_path(&app.profiles, p.id), Some(chosen.clone()));
+        let on_disk = ProfileStore::load(&paths.profiles()).unwrap();
+        assert_eq!(key_path(&on_disk, p.id), Some(chosen.clone()));
+        // The editor shows it, with nothing left to save.
+        let ed = &app.editor.as_ref().unwrap().1;
+        let DraftKind::Ssh(d) = &ed.draft(p.id).unwrap().kind else {
+            panic!("ssh")
+        };
+        assert_eq!(d.key_path, "/keys/id_ed25519");
+        assert!(!ed.dirty);
+        // Our own write is not picked up as a hand edit.
+        assert_eq!(
+            app.profiles_seen,
+            std::fs::read_to_string(paths.profiles()).ok()
+        );
+
+        // A path the profile has meanwhile is never replaced.
+        accepted(&mut app, p.id, Path::new("/keys/other"));
+        assert_eq!(key_path(&app.profiles, p.id), Some(chosen));
+    }
+
+    #[test]
+    fn read_only_profiles_keep_the_key_file_for_this_session_only() {
+        let p = keyless("db");
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths.clone(), true);
+        // profiles.toml no longer loads: the app works on the last good profiles and never
+        // writes the file.
+        let broken = "[[profiles]\nname = 1\n";
+        std::fs::write(paths.profiles(), broken).unwrap();
+        let _ = app.update(Message::ConfigChanged(crate::watch::Changed {
+            profiles: true,
+            settings: false,
+            schemes: false,
+        }));
+        assert!(app.profiles_error.is_some());
+        let chosen = PathBuf::from("/keys/id_ed25519");
+        accepted(&mut app, p.id, &chosen);
+        assert_eq!(key_path(&app.profiles, p.id), Some(chosen));
+        assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), broken);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unwritable_profiles_keep_the_key_file_for_this_session_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let p = keyless("db");
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths.clone(), true);
+        let before = std::fs::read_to_string(paths.profiles()).unwrap();
+        let dir = paths.config_dir.clone();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let chosen = PathBuf::from("/keys/id_ed25519");
+        accepted(&mut app, p.id, &chosen);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(key_path(&app.profiles, p.id), Some(chosen));
+        assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    }
+
+    #[test]
+    fn key_file_picker_starts_in_dot_ssh_or_home() {
+        let home = std::env::temp_dir().join(format!("fbterm-home-{}", ProfileId::new()));
+        std::fs::create_dir_all(&home).unwrap();
+        assert_eq!(key_file_start(Some(&home)), Some(home.clone()));
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        assert_eq!(key_file_start(Some(&home)), Some(home.join(".ssh")));
+        assert_eq!(key_file_start(None), None);
     }
 }

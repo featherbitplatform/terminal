@@ -19,17 +19,64 @@ use crate::AuthWarning;
 /// Prompts per secret before giving up.
 const MAX_PROMPTS: usize = 3;
 
+/// What a successful authentication turned up.
+pub(super) struct Authenticated {
+    /// Something the user should hear about (an RSA user key).
+    pub warning: Option<AuthWarning>,
+    /// The key file the user chose for a key profile that names none.
+    pub chosen_key: Option<PathBuf>,
+}
+
+impl From<Option<AuthWarning>> for Authenticated {
+    fn from(warning: Option<AuthWarning>) -> Self {
+        Self {
+            warning,
+            chosen_key: None,
+        }
+    }
+}
+
 pub(super) async fn authenticate(
     handle: &mut Handle<ClientHandler>,
     profile: &Profile,
     ssh: &SshProfile,
     ctx: &SshContext,
-) -> Result<Option<AuthWarning>, SshError> {
+) -> Result<Authenticated, SshError> {
     match &ssh.auth {
-        AuthMethod::Password => password(handle, profile, ssh, ctx).await.map(|()| None),
-        AuthMethod::Key { path, .. } => key(handle, profile, ssh, ctx, path).await,
-        AuthMethod::Agent => agent(handle, profile, ssh).await,
+        AuthMethod::Password => password(handle, profile, ssh, ctx)
+            .await
+            .map(|()| None.into()),
+        AuthMethod::Key {
+            path: Some(path), ..
+        } => key(handle, profile, ssh, ctx, path).await.map(Into::into),
+        AuthMethod::Key { path: None, .. } => chosen_key(handle, profile, ssh, ctx).await,
+        AuthMethod::Agent => agent(handle, profile, ssh).await.map(Into::into),
     }
+}
+
+/// A key profile that names no key file yet: ask the user for one, log in with it like a
+/// configured key, and once the server accepted it tell the prompter, which remembers it in
+/// the profile. A connect that cannot ask (automatic reconnects) needs the user at once.
+async fn chosen_key(
+    handle: &mut Handle<ClientHandler>,
+    profile: &Profile,
+    ssh: &SshProfile,
+    ctx: &SshContext,
+) -> Result<Authenticated, SshError> {
+    if !ctx.prompter.can_ask() {
+        return Err(SshError::NeedsInput);
+    }
+    let path = ctx
+        .prompter
+        .ask_key_file(&profile.name)
+        .await
+        .ok_or(SshError::Cancelled)?;
+    let warning = key(handle, profile, ssh, ctx, &path).await?;
+    ctx.prompter.key_file_accepted(profile.id, &path);
+    Ok(Authenticated {
+        warning,
+        chosen_key: Some(path),
+    })
 }
 
 fn failed(profile: &Profile) -> SshError {

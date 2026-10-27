@@ -62,7 +62,7 @@ fn key_profile(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
             port: PORT,
             user: USER.into(),
             auth: AuthMethod::Key {
-                path: keys_dir().join("fb_test_ed25519"),
+                path: Some(keys_dir().join("fb_test_ed25519")),
                 passphrase: false,
             },
             jump,
@@ -76,6 +76,10 @@ struct TrustAny;
 
 #[async_trait]
 impl Prompter for TrustAny {
+    async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
     async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
         true
     }
@@ -793,6 +797,10 @@ struct TypesPassword(AtomicUsize);
 
 #[async_trait]
 impl Prompter for TypesPassword {
+    async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
     async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
         true
     }
@@ -902,7 +910,7 @@ async fn retries_run_out_then_fail() {
     let proxy = Proxy::new().await;
     let mut w = World::new();
     let auth = AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519"),
+        path: Some(keys_dir().join("fb_test_ed25519")),
         passphrase: false,
     };
     let p = w.add_via_proxy("proxied", &proxy, auth);
@@ -947,7 +955,7 @@ async fn zero_retries_fail_at_once() {
     let proxy = Proxy::new().await;
     let mut w = World::new();
     let auth = AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519"),
+        path: Some(keys_dir().join("fb_test_ed25519")),
         passphrase: false,
     };
     let p = w.add_via_proxy("proxied", &proxy, auth);
@@ -1011,7 +1019,7 @@ async fn stop_while_reconnecting_ends_promptly() {
     let proxy = Proxy::new().await;
     let mut w = World::new();
     let auth = AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519"),
+        path: Some(keys_dir().join("fb_test_ed25519")),
         passphrase: false,
     };
     let p = w.add_via_proxy("proxied", &proxy, auth);
@@ -1045,7 +1053,7 @@ async fn fixed_port_remote_forward_survives_reconnect() {
     let proxy = Proxy::new().await;
     let mut w = World::new();
     let auth = AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519"),
+        path: Some(keys_dir().join("fb_test_ed25519")),
         passphrase: false,
     };
     let p = w.add_via_proxy("proxied", &proxy, auth);
@@ -1109,7 +1117,7 @@ async fn refused_re_forward_fails_with_its_reason_when_retries_run_out() {
     let proxy = Proxy::new().await;
     let mut w = World::new();
     let auth = AuthMethod::Key {
-        path: keys_dir().join("fb_test_ed25519"),
+        path: Some(keys_dir().join("fb_test_ed25519")),
         passphrase: false,
     };
     let p = w.add_via_proxy("proxied", &proxy, auth);

@@ -1302,6 +1302,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Prompter for Asked {
+        async fn ask_key_file(&self, _: &str) -> Option<std::path::PathBuf> {
+            self.0.store(true, Ordering::SeqCst);
+            None
+        }
+
         async fn confirm_host_key(&self, _: &str, _: u16, _: &str) -> bool {
             self.0.store(true, Ordering::SeqCst);
             false

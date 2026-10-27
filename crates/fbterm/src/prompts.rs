@@ -1,5 +1,6 @@
 //! Connection prompts: the [`Prompter`] that asks through the UI, and the per-window queue of
-//! dialogs it feeds (trust this host?, changed host key, password or passphrase), and the app's
+//! dialogs it feeds (trust this host?, changed host key, password or passphrase, which key
+//! file), and the app's
 //! own questions in the same queue (closing a split tab, an upload's name clash, closing while
 //! transfers run).
 //!
@@ -9,9 +10,11 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fbterm_config::ProfileId;
 use fbterm_secrets::SecretKind;
 use fbterm_session::ssh::tunnel::TunnelKey;
 use fbterm_session::ssh::{Prompter, SecretAnswer};
@@ -48,6 +51,16 @@ pub enum Ask {
         retry: bool,
         reply: oneshot::Sender<Option<SecretAnswer>>,
     },
+    /// A key profile names no key file yet: which one?
+    KeyFile {
+        profile: String,
+        reply: oneshot::Sender<Option<PathBuf>>,
+    },
+}
+
+/// The key file dialog's title.
+pub fn key_file_title(profile: &str) -> String {
+    format!("Choose the private key for {profile}")
 }
 
 /// What a [`UiPrompter`] tells the update loop.
@@ -63,6 +76,8 @@ pub enum PromptEvent {
     },
     /// The asker stopped waiting (answered, or its dial was given up).
     Withdraw(PromptId),
+    /// The key file chosen for `profile` logged in: remember it in the profile.
+    KeyFileAccepted { profile: ProfileId, path: PathBuf },
 }
 
 /// Asks the user through the UI, over the window the dial belongs to.
@@ -156,6 +171,22 @@ impl Prompter for UiPrompter {
         .await
         .flatten()
     }
+
+    async fn ask_key_file(&self, profile: &str) -> Option<PathBuf> {
+        self.ask(|reply| Ask::KeyFile {
+            profile: profile.to_owned(),
+            reply,
+        })
+        .await
+        .flatten()
+    }
+
+    fn key_file_accepted(&self, profile: ProfileId, path: &Path) {
+        let _ = self.tx.send(PromptEvent::KeyFileAccepted {
+            profile,
+            path: path.to_path_buf(),
+        });
+    }
 }
 
 /// Prompt events, delivered to the update loop by one subscription.
@@ -202,6 +233,11 @@ pub enum PromptMsg {
     ClashName(window::Id, String),
     /// `Cancel transfers and close` in the close confirmation.
     StopTransfers(window::Id),
+    /// The key file dialog's `Choose…`: open the system's file picker.
+    ChooseKey(window::Id),
+    /// The picker of key file question `id` closed: the chosen file, or `None` (cancelled,
+    /// the question stays).
+    KeyChosen(window::Id, PromptId, Option<PathBuf>),
 }
 
 /// An upload whose name exists in its folder: `"{name}" already exists in {folder}.`
@@ -265,6 +301,13 @@ pub enum Dialog {
         reply: Option<oneshot::Sender<Option<SecretAnswer>>>,
         input: iced::widget::Id,
     },
+    /// Which key file for a key profile that names none: `Choose…` or `Cancel`.
+    KeyFile {
+        profile: String,
+        /// The file picker is open (`Choose…` is disabled meanwhile).
+        choosing: bool,
+        reply: Option<oneshot::Sender<Option<PathBuf>>>,
+    },
 }
 
 impl Dialog {
@@ -295,6 +338,11 @@ impl Dialog {
                 reply: Some(reply),
                 input: iced::widget::Id::unique(),
             },
+            Ask::KeyFile { profile, reply } => Self::KeyFile {
+                profile,
+                choosing: false,
+                reply: Some(reply),
+            },
         }
     }
 
@@ -323,6 +371,11 @@ impl Dialog {
                 }
             }
             Self::Secret { reply, .. } => {
+                if let Some(r) = reply {
+                    let _ = r.send(None);
+                }
+            }
+            Self::KeyFile { reply, .. } => {
                 if let Some(r) = reply {
                     let _ = r.send(None);
                 }
@@ -426,6 +479,50 @@ impl PromptQueues {
             }) = self.pop(window)
         {
             let _ = r.send(Some(SecretAnswer { value, remember }));
+        }
+    }
+
+    /// `Choose…` in the shown key file dialog: the question's id, for the picker's answer
+    /// ([`Self::key_chosen`]). `None` when no key file dialog shows or its picker is open.
+    pub fn choose_key(&mut self, window: window::Id) -> Option<PromptId> {
+        let p = self.0.get_mut(&window)?.front_mut()?;
+        match &mut p.dialog {
+            Dialog::KeyFile { choosing, .. } if !*choosing => {
+                *choosing = true;
+                p.id
+            }
+            _ => None,
+        }
+    }
+
+    /// The picker of key file question `id` closed with `path`: a file answers the question
+    /// (wherever it waits), `None` leaves it open to choose again or cancel. A question
+    /// answered or withdrawn meanwhile is not touched.
+    pub fn key_chosen(&mut self, window: window::Id, id: PromptId, path: Option<PathBuf>) {
+        let Some(q) = self.0.get_mut(&window) else {
+            return;
+        };
+        let Some(pos) = q.iter().position(|p| p.id == Some(id)) else {
+            return;
+        };
+        match path {
+            Some(path) => {
+                if let Some(Pending {
+                    dialog: Dialog::KeyFile { reply: Some(r), .. },
+                    ..
+                }) = q.remove(pos)
+                {
+                    let _ = r.send(Some(path));
+                }
+                if q.is_empty() {
+                    self.0.remove(&window);
+                }
+            }
+            None => {
+                if let Dialog::KeyFile { choosing, .. } = &mut q[pos].dialog {
+                    *choosing = false;
+                }
+            }
         }
     }
 
@@ -568,7 +665,7 @@ mod tests {
                 q.ask(w, id, ask);
                 id
             }
-            PromptEvent::Withdraw(_) => panic!("expected an ask"),
+            _ => panic!("expected an ask"),
         }
     }
 
@@ -668,7 +765,7 @@ mod tests {
         let id = queue(&mut rx, &mut q, w).await;
         match rx.recv().await.unwrap() {
             PromptEvent::Withdraw(gone) => assert_eq!(gone, id),
-            PromptEvent::Ask { .. } => panic!("expected a withdraw"),
+            _ => panic!("expected a withdraw"),
         }
         assert_eq!(q.withdraw(id), Some(w));
         assert!(q.is_empty());
@@ -695,6 +792,63 @@ mod tests {
             q.submit(w);
         });
         assert_eq!(answer.unwrap().value, "pw");
+    }
+
+    #[tokio::test]
+    async fn key_file_choice_reaches_the_dial() {
+        let (tx, mut rx) = unbounded_channel();
+        let p = UiPrompter::new(None, tx);
+        let w = wid();
+        let mut q = PromptQueues::default();
+        let chosen = PathBuf::from("/keys/id_ed25519");
+        let (answer, ()) = tokio::join!(p.ask_key_file("db"), async {
+            let id = queue(&mut rx, &mut q, w).await;
+            let Some(Dialog::KeyFile { profile, .. }) = q.front(w) else {
+                panic!("key file dialog")
+            };
+            assert_eq!(key_file_title(profile), "Choose the private key for db");
+            q.submit(w); // Enter does nothing here: the file comes from the picker.
+            assert_eq!(q.choose_key(w), Some(id));
+            assert_eq!(q.choose_key(w), None, "one picker at a time");
+            // The picker was cancelled: the question stays, and can be chosen again.
+            q.key_chosen(w, id, None);
+            assert!(matches!(q.front(w), Some(Dialog::KeyFile { .. })));
+            assert_eq!(q.choose_key(w), Some(id));
+            q.key_chosen(w, id, Some(chosen.clone()));
+        });
+        assert_eq!(answer, Some(chosen));
+        assert!(q.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelled_key_file_question_answers_none() {
+        let (tx, mut rx) = unbounded_channel();
+        let p = UiPrompter::new(None, tx);
+        let w = wid();
+        let mut q = PromptQueues::default();
+        let (answer, ()) = tokio::join!(p.ask_key_file("db"), async {
+            let id = queue(&mut rx, &mut q, w).await;
+            q.choose_key(w);
+            q.cancel(w);
+            // A picker answering after the question went changes nothing.
+            q.key_chosen(w, id, Some(PathBuf::from("/late")));
+        });
+        assert_eq!(answer, None);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn accepted_key_file_is_reported_to_the_app() {
+        let (tx, mut rx) = unbounded_channel();
+        let p = UiPrompter::new(None, tx);
+        let id = ProfileId::new();
+        p.key_file_accepted(id, Path::new("/keys/id_ed25519"));
+        match rx.try_recv().unwrap() {
+            PromptEvent::KeyFileAccepted { profile, path } => {
+                assert_eq!((profile, path), (id, PathBuf::from("/keys/id_ed25519")));
+            }
+            _ => panic!("expected the accepted key file"),
+        }
     }
 
     #[test]

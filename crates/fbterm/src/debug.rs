@@ -252,7 +252,7 @@ impl App {
         Task::batch([search, focus])
     }
 
-    /// `FBTERM_DEMO_PROMPT=hostkey|password|changed` (debug aid): show a sample dialog in the
+    /// `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed` (debug aid): show a sample dialog in the
     /// first window. Nothing waits for its answer.
     pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {
         let Some(kind) = debug_env("FBTERM_DEMO_PROMPT") else {
@@ -272,6 +272,10 @@ impl App {
                 profile: "bastion".into(),
                 kind: SecretKind::Password,
                 retry: true,
+                reply: tokio::sync::oneshot::channel().0,
+            },
+            "keyfile" => Ask::KeyFile {
+                profile: "bastion".into(),
                 reply: tokio::sync::oneshot::channel().0,
             },
             "changed" => {

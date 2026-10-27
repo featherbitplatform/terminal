@@ -32,12 +32,12 @@ pub mod tunnel;
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use fbterm_config::{Profile, ProfileKind, SshProfile, ValidationError};
+use fbterm_config::{Profile, ProfileId, ProfileKind, SshProfile, ValidationError};
 use fbterm_secrets::{SecretKind, SecretStore};
 use parking_lot::Mutex;
 use russh::client::{self, DisconnectReason, Handle, Msg, Session};
@@ -96,6 +96,15 @@ pub trait Prompter: Send + Sync {
         retry: bool,
     ) -> Option<SecretAnswer>;
 
+    /// Ask which private key file to use for a key profile that names none yet. `None`
+    /// means the user cancelled (or nobody can be asked).
+    async fn ask_key_file(&self, profile_name: &str) -> Option<PathBuf>;
+
+    /// The key file the user chose for `profile` (with [`Prompter::ask_key_file`]) was
+    /// accepted by the server: the app remembers it in the profile. Never called before the
+    /// key logged in, nor for a key file the profile already names.
+    fn key_file_accepted(&self, _profile: ProfileId, _path: &Path) {}
+
     /// Whether this prompter can reach a person at all. `false` for [`NoPrompt`]: a connect
     /// that would have needed a question then fails with [`SshError::NeedsInput`].
     fn can_ask(&self) -> bool {
@@ -121,6 +130,10 @@ impl Prompter for NoPrompt {
         _kind: SecretKind,
         _retry: bool,
     ) -> Option<SecretAnswer> {
+        None
+    }
+
+    async fn ask_key_file(&self, _profile_name: &str) -> Option<PathBuf> {
         None
     }
 
@@ -646,6 +659,15 @@ impl Prompter for ClockedPrompter {
         self.inner.ask_secret(profile_name, kind, retry).await
     }
 
+    async fn ask_key_file(&self, profile_name: &str) -> Option<PathBuf> {
+        let _paused = self.clock.pause();
+        self.inner.ask_key_file(profile_name).await
+    }
+
+    fn key_file_accepted(&self, profile: ProfileId, path: &Path) {
+        self.inner.key_file_accepted(profile, path);
+    }
+
     fn can_ask(&self) -> bool {
         self.inner.can_ask()
     }
@@ -715,6 +737,9 @@ pub(crate) struct Hop {
     pub ended: watch::Receiver<bool>,
     /// Set when authentication succeeded in a way the user should hear about.
     pub warning: Option<AuthWarning>,
+    /// The key file the user chose for a key profile that named none (see
+    /// [`Prompter::ask_key_file`]).
+    pub chosen_key: Option<PathBuf>,
 }
 
 /// Run SSH over `stream` to the host of `profile`: verify its host key and authenticate.
@@ -772,7 +797,10 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     )
     .await??;
     clock.restart();
-    let warning = bounded(
+    let auth::Authenticated {
+        warning,
+        chosen_key,
+    } = bounded(
         &clock,
         limit,
         || {
@@ -790,6 +818,7 @@ async fn connect_hop_within<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         lost,
         ended,
         warning,
+        chosen_key,
     })
 }
 
@@ -893,6 +922,11 @@ mod tests {
 
     #[async_trait]
     impl Prompter for Slow {
+        async fn ask_key_file(&self, _: &str) -> Option<PathBuf> {
+            tokio::time::sleep(self.0).await;
+            None
+        }
+
         async fn confirm_host_key(&self, _: &str, _: u16, _: &str) -> bool {
             tokio::time::sleep(self.0).await;
             true

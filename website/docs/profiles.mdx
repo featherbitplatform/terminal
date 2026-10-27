@@ -67,7 +67,10 @@ Without an accent, both look the same: a plain tab. The tint follows the backgro
 | `auth = { type = "password" }` | Ask for a password. The app can store it in the keychain. |
 | `auth = { type = "key", path = "~/.ssh/id_ed25519" }` | Use a private key file. A leading `~` is your home directory. |
 | `auth = { type = "key", path = "~/.ssh/id_ed25519", passphrase = true }` | Same, and the key has a passphrase. `passphrase` defaults to `false`. |
+| `auth = { type = "key" }` | A private key file not chosen yet. Connecting asks you to choose it (`Choose the private key for {profile}`, opening in `~/.ssh`), and once it logs in the file is written into the profile as its `path`. |
 | `auth = { type = "agent" }` | Use the running SSH agent. |
+
+In the profile editor, leaving the private key field empty saves a key profile without a `path`. If `profiles.toml` cannot be written (it failed to load, or the folder is read-only), the chosen file is used until the app quits and asked for again next time. Automatic reconnects and tunnels restarting in the background never ask: they stop with "needs your input" until you connect the profile once yourself.
 
 When a login uses an RSA private key (from a key file or the SSH agent), the profile editor and the tab show a one-line warning suggesting an ed25519 key (`ssh-keygen -t ed25519`); the connection still works. Verifying a server's RSA host key does not warn.
 

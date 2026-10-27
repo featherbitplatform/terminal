@@ -341,9 +341,13 @@ impl Draft {
             ProfileKind::Ssh(s) => {
                 let (auth, key_path, key_passphrase) = match &s.auth {
                     AuthMethod::Password => (AuthChoice::Password, String::new(), false),
-                    AuthMethod::Key { path, passphrase } => {
-                        (AuthChoice::Key, path.display().to_string(), *passphrase)
-                    }
+                    AuthMethod::Key { path, passphrase } => (
+                        AuthChoice::Key,
+                        path.as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        *passphrase,
+                    ),
                     AuthMethod::Agent => (AuthChoice::Agent, String::new(), false),
                 };
                 DraftKind::Ssh(SshDraft {
@@ -388,8 +392,11 @@ impl Draft {
                 user: s.user.trim().to_owned(),
                 auth: match s.auth {
                     AuthChoice::Password => AuthMethod::Password,
+                    // No path yet: connecting asks for the key file and remembers it.
                     AuthChoice::Key => AuthMethod::Key {
-                        path: PathBuf::from(s.key_path.trim()),
+                        path: Some(s.key_path.trim())
+                            .filter(|p| !p.is_empty())
+                            .map(PathBuf::from),
                         passphrase: s.key_passphrase,
                     },
                     AuthChoice::Agent => AuthMethod::Agent,
@@ -522,6 +529,22 @@ impl EditorState {
         }
         let rsa = key_file_is_rsa(&path);
         self.key_check = Some((path, rsa));
+    }
+
+    /// A connection remembered the key file chosen for key profile `id` (already saved in the
+    /// profiles): its draft shows it, unless a path was typed there meanwhile.
+    pub fn key_file_remembered(&mut self, id: ProfileId, path: &Path) {
+        if let Some(DraftKind::Ssh(s)) = self
+            .drafts
+            .iter_mut()
+            .find(|d| d.id == id)
+            .map(|d| &mut d.kind)
+            && s.auth == AuthChoice::Key
+            && s.key_path.trim().is_empty()
+        {
+            s.key_path = path.display().to_string();
+        }
+        self.refresh_key_check();
     }
 
     /// Whether the selected draft uses a key file that is an RSA private key.

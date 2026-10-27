@@ -37,6 +37,10 @@ struct TrustAny;
 
 #[async_trait::async_trait]
 impl Prompter for TrustAny {
+    async fn ask_key_file(&self, _profile_name: &str) -> Option<std::path::PathBuf> {
+        None
+    }
+
     async fn confirm_host_key(&self, _host: &str, _port: u16, _fp: &str) -> bool {
         true
     }
@@ -59,7 +63,7 @@ fn profile() -> Profile {
             port: 2222,
             user: "fb".into(),
             auth: AuthMethod::Key {
-                path: key,
+                path: Some(key),
                 passphrase: false,
             },
             jump: vec![],

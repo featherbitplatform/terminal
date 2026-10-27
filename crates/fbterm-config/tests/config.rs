@@ -55,7 +55,7 @@ fn round_trip_profiles_toml() {
     let mut key = ssh("key", vec![]);
     if let ProfileKind::Ssh(s) = &mut key.kind {
         s.auth = AuthMethod::Key {
-            path: "/k".into(),
+            path: Some("/k".into()),
             passphrase: true,
         };
     }
@@ -67,6 +67,69 @@ fn round_trip_profiles_toml() {
     assert!(!text.contains("password"));
     assert!(text.contains("#ab0cff"));
     assert_eq!(ProfileStore::load(&path).unwrap(), store);
+}
+
+#[test]
+fn key_without_path_round_trips() {
+    let path = tmp("profiles.toml");
+    let mut key = ssh("shared", vec![]);
+    if let ProfileKind::Ssh(s) = &mut key.kind {
+        s.auth = AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        };
+    }
+    let store = ProfileStore {
+        profiles: vec![key],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("path"), "no path is written: {text}");
+    assert!(text.contains("type = \"key\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+    // Written again, the file is byte for byte the same.
+    store.save(&path).unwrap();
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+}
+
+#[test]
+fn old_key_profiles_load() {
+    let path = tmp("profiles.toml");
+    let old = "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nport = 22\nuser = \"u\"\njump = []\n\n[profiles.auth]\ntype = \"key\"\npath = \"~/.ssh/id_ed25519\"\npassphrase = true\n";
+    std::fs::write(&path, old).unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: Some("~/.ssh/id_ed25519".into()),
+            passphrase: true,
+        }
+    );
+    // Saved again, an old file keeps its path.
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("path = \"~/.ssh/id_ed25519\""), "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
+    // A key profile written by hand without a path loads with none.
+    std::fs::write(
+        &path,
+        "[[profiles]]\nid = \"67e55044-10b1-426f-9247-bb680e5fe0c8\"\nname = \"a\"\nkind = \"ssh\"\nhost = \"h\"\nuser = \"u\"\nauth = { type = \"key\" }\n",
+    )
+    .unwrap();
+    let store = ProfileStore::load(&path).unwrap();
+    let ProfileKind::Ssh(s) = &store.profiles[0].kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        }
+    );
 }
 
 #[test]

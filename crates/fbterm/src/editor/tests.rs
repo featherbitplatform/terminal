@@ -429,7 +429,7 @@ fn secrets_of_an_auth_no_longer_used_are_removed() {
     let key = ssh_with(
         "key",
         AuthMethod::Key {
-            path: "~/.ssh/id_ed25519".into(),
+            path: Some("~/.ssh/id_ed25519".into()),
             passphrase: true,
         },
     );
@@ -489,6 +489,83 @@ fn debug_output_never_shows_a_typed_secret() {
 }
 
 #[test]
+fn empty_key_path_saves_as_none() {
+    let key = ssh_with(
+        "key",
+        AuthMethod::Key {
+            path: Some("~/.ssh/id_ed25519".into()),
+            passphrase: false,
+        },
+    );
+    let mut store = ProfileStore {
+        profiles: vec![key.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(key.id));
+    ed.update(EditorMsg::KeyPath("   ".into()));
+    let path = file();
+    ed.save(&mut store, &path).unwrap();
+    let ProfileKind::Ssh(s) = &store.get(key.id).unwrap().kind else {
+        panic!("ssh")
+    };
+    assert_eq!(
+        s.auth,
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        }
+    );
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("path"), "{text}");
+    // Loaded back, the draft shows an empty field, and saving again keeps it so.
+    let (ed, _) = editor(&store);
+    let DraftKind::Ssh(d) = &ed.draft(key.id).unwrap().kind else {
+        panic!("ssh")
+    };
+    assert_eq!(d.key_path, "");
+    assert_eq!(d.auth, AuthChoice::Key);
+}
+
+#[test]
+fn remembered_key_file_fills_an_empty_field_only() {
+    let key = ssh_with(
+        "key",
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        },
+    );
+    let typed = ssh_with(
+        "typed",
+        AuthMethod::Key {
+            path: None,
+            passphrase: false,
+        },
+    );
+    let store = ProfileStore {
+        profiles: vec![key.clone(), typed.clone()],
+    };
+    let (mut ed, _) = editor(&store);
+    ed.update(EditorMsg::Select(typed.id));
+    ed.update(EditorMsg::KeyPath("~/.ssh/mine".into()));
+    ed.dirty = false;
+    let chosen = PathBuf::from("/keys/id_ed25519");
+    ed.key_file_remembered(key.id, &chosen);
+    ed.key_file_remembered(typed.id, &chosen);
+    let path_of = |ed: &EditorState, id| match &ed.draft(id).unwrap().kind {
+        DraftKind::Ssh(s) => s.key_path.clone(),
+        DraftKind::Local(_) => panic!("ssh"),
+    };
+    assert_eq!(path_of(&ed, key.id), "/keys/id_ed25519");
+    assert_eq!(
+        path_of(&ed, typed.id),
+        "~/.ssh/mine",
+        "a typed path is kept"
+    );
+    assert!(!ed.dirty, "the saved profiles already have it");
+}
+
+#[test]
 fn rsa_key_file_shows_a_warning_that_follows_the_path() {
     let dir = std::env::temp_dir().join(format!("fbterm-keys-{}", ProfileId::new()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -504,7 +581,7 @@ fn rsa_key_file_shows_a_warning_that_follows_the_path() {
     let p = ssh_with(
         "k",
         AuthMethod::Key {
-            path: rsa.clone(),
+            path: Some(rsa.clone()),
             passphrase: false,
         },
     );
@@ -531,7 +608,7 @@ fn rsa_warning_does_not_outlive_the_selected_profile() {
     let a = ssh_with(
         "a",
         AuthMethod::Key {
-            path: rsa,
+            path: Some(rsa),
             passphrase: false,
         },
     );
