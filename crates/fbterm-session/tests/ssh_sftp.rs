@@ -396,6 +396,17 @@ async fn timed_events(rx: &mut Events, id: TransferId) -> Vec<(Instant, Transfer
     events
 }
 
+/// Wait until transfer `id` reports bytes moved (a progress event with `done > 0`).
+async fn until_moving(rx: &mut Events, id: TransferId) {
+    loop {
+        match next_event(rx, id).await {
+            Some(TransferEvent::Progress { done, .. }) if done > 0 => return,
+            Some(TransferEvent::Progress { .. }) => {}
+            other => panic!("the transfer ended before moving any data: {other:?}"),
+        }
+    }
+}
+
 async fn events(rx: &mut Events, id: TransferId) -> Vec<TransferEvent> {
     timed_events(rx, id)
         .await
@@ -549,7 +560,9 @@ async fn cancel_download_leaves_nothing() {
     let local = tempfile::tempdir().unwrap();
     let (tx, mut rx) = unbounded_channel();
     let handle = download(sftp, format!("{dir}/big"), local.path().join("big"), tx);
-    let first = next_event(&mut rx, handle.id()).await;
+    // Cancel mid-transfer, once data has reached the part file.
+    until_moving(&mut rx, handle.id()).await;
+    let part_before = local_names(local.path());
     handle.cancel();
     handle.cancel();
     let rest = events(&mut rx, handle.id()).await;
@@ -557,10 +570,7 @@ async fn cancel_download_leaves_nothing() {
     remove(&shell, &dir).await;
     shell.close();
 
-    assert!(
-        matches!(first, Some(TransferEvent::Progress { done: 0, .. })),
-        "{first:?}"
-    );
+    assert_eq!(part_before, [".big.fbterm-part"]);
     assert_eq!(last(&rest), &TransferEvent::Cancelled);
     assert_eq!(
         rest.iter()
@@ -734,6 +744,45 @@ async fn replace_without_folder_write_writes_in_place() {
 }
 
 #[tokio::test]
+async fn replace_onto_a_link_keeps_the_link() {
+    if !enabled() {
+        return;
+    }
+    let w = World::new();
+    let shell = w.shell(w.bastion).await;
+    let dir = fixture(&shell, "link", "printf old > real && ln -s real link").await;
+    let local = tempfile::tempdir().unwrap();
+    let path = local.path().join("link");
+    std::fs::write(&path, b"through-the-link").unwrap();
+
+    let sftp = Arc::new(w.sftp(w.bastion).await);
+    let (tx, mut rx) = unbounded_channel();
+    let handle = upload(
+        sftp,
+        path,
+        dir.clone(),
+        "link".into(),
+        UploadMode::Replace,
+        tx,
+    );
+    let got = events(&mut rx, handle.id()).await;
+    let target = shell_line(&shell, "LINK", &format!("readlink '{dir}/link'")).await;
+    let text = shell_line(&shell, "TEXT", &format!("cat '{dir}/real'")).await;
+    remove(&shell, &dir).await;
+    shell.close();
+
+    assert_eq!(
+        last(&got),
+        &TransferEvent::Finished {
+            note: Some(REPLACED_IN_PLACE.into()),
+            local: None,
+        }
+    );
+    assert_eq!(target, "real", "the link is still a link to the same file");
+    assert_eq!(text, "through-the-link");
+}
+
+#[tokio::test]
 async fn connection_drop_fails_upload_and_keeps_target() {
     if !enabled() {
         return;
@@ -758,7 +807,8 @@ async fn connection_drop_fails_upload_and_keeps_target() {
         UploadMode::Replace,
         tx,
     );
-    let first = next_event(&mut rx, handle.id()).await;
+    // Cut mid-write, once data has reached the server.
+    until_moving(&mut rx, handle.id()).await;
     proxy.cut();
     let started = Instant::now();
     let rest = events(&mut rx, handle.id()).await;
@@ -767,14 +817,10 @@ async fn connection_drop_fails_upload_and_keeps_target() {
     remove(&shell, &dir).await;
     shell.close();
 
-    assert!(
-        matches!(first, Some(TransferEvent::Progress { done: 0, .. })),
-        "{first:?}"
+    assert_eq!(
+        last(&rest),
+        &TransferEvent::Failed("The SFTP session has ended.".into())
     );
-    match last(&rest) {
-        TransferEvent::Failed(m) => assert!(!m.is_empty()),
-        other => panic!("{other:?}"),
-    }
     assert!(took < Duration::from_secs(20), "the failure took {took:?}");
     assert_eq!(kept, "keep");
 }

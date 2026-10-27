@@ -15,16 +15,26 @@
 //!   when complete. [`UploadMode::New`] never replaces anything (the rename refuses an
 //!   existing name). [`UploadMode::Replace`] first gives the part file the existing file's
 //!   owner and group (when the server allows it) and mode, then renames it over the target
-//!   with `posix-rename@openssh.com`. Without that extension, or when the folder cannot take
-//!   the part file, it writes the existing file in place and finishes with the note
-//!   [`REPLACED_IN_PLACE`]; a failed or cancelled in-place write fails with a reason starting
-//!   with [`MAY_BE_INCOMPLETE`]. A new file gets the server's default permissions.
+//!   with `posix-rename@openssh.com`. Without that extension, when the folder cannot take
+//!   the part file, or when the server refuses that rename as not permitted (the part file is
+//!   then removed and the upload starts over from zero), it writes the existing file in place
+//!   and finishes with the note [`REPLACED_IN_PLACE`]; a failed or cancelled in-place write
+//!   fails with a reason starting with [`MAY_BE_INCOMPLETE`]. Replacing a symbolic link always
+//!   writes the file it ends at in place, so the link stays a link. A new file gets the
+//!   server's default permissions.
+//! - A file already called `.<name>.fbterm-part` in the target folder is taken for a leftover
+//!   of an earlier upload and removed.
+//!
+//! Cancelling never abandons a request that changes the server (creating or emptying a file,
+//! renaming) or hands out a handle: such a request is awaited to its answer (bounded), and the
+//! cancel is acted on after it, cleaning up what it did. A cancel that arrives once the final
+//! rename has been sent is too late: the transfer reports [`TransferEvent::Finished`].
 //!
 //! Names never leave their folder: upload names with `/`, control characters, `.` or `..` are
 //! refused, and local names come from [`safe_local_name`].
 
 use std::future::Future;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,12 +43,12 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::stream::{FuturesOrdered, FuturesUnordered};
 use russh_sftp::protocol::FileAttributes;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::Cancel;
 use super::sftp::{CLOSE_WAIT, EntryKind, Sftp, SftpError, join, kind_of_mode};
+use super::{Cancel, HOP_TIMEOUT};
 
 /// The note of a finished upload that wrote over the existing file instead of replacing it.
 pub const REPLACED_IN_PLACE: &str = "Replaced in place";
@@ -55,6 +65,9 @@ const IN_FLIGHT_BYTES: u64 = 512 * 1024;
 const MAX_REQUESTS: u64 = 16;
 /// The name a part file adds after the dotted name of the file it becomes.
 const PART_SUFFIX: &str = ".fbterm-part";
+/// How long a request that must not be abandoned may take (it has the session's own request
+/// timeout too; this only bounds a server that never answers at all).
+const SETTLE_WAIT: Duration = Duration::from_secs(HOP_TIMEOUT.as_secs() + 5);
 /// The name used for a download whose remote name leaves nothing usable.
 const FALLBACK_NAME: &str = "download";
 
@@ -279,6 +292,12 @@ impl Progress {
         self.emit(now);
     }
 
+    /// Start over from zero (the same total), reported at once.
+    fn restart(&mut self, now: Instant) {
+        self.done = 0;
+        self.emit(now);
+    }
+
     /// `done` bytes have moved; reported now unless an event went out less than an interval
     /// ago (then [`Progress::due`] says when).
     fn set(&mut self, done: u64, now: Instant) {
@@ -337,6 +356,26 @@ impl Run {
                 biased;
                 () = self.cancel.cancelled() => return Err(Stop::Cancelled),
                 value = &mut fut => return Ok(value),
+                () = sleep_until(due) => self.progress.flush(Instant::now()),
+            }
+        }
+    }
+
+    /// Await `fut` to its end even when the transfer is cancelled meanwhile: for requests that
+    /// change the server or hand out a handle, whose effect must be known before cleaning up.
+    /// The caller checks for a cancel afterwards. Bounded by [`SETTLE_WAIT`].
+    async fn settle<T>(&mut self, fut: impl Future<Output = T>) -> Result<T, Stop> {
+        let fut = tokio::time::timeout(SETTLE_WAIT, fut);
+        tokio::pin!(fut);
+        loop {
+            let due = self.progress.due();
+            tokio::select! {
+                biased;
+                value = &mut fut => {
+                    return value.map_err(|_| {
+                        Stop::Failed("The server did not answer in time.".into())
+                    });
+                }
                 () = sleep_until(due) => self.progress.flush(Instant::now()),
             }
         }
@@ -417,7 +456,11 @@ async fn run_download(
     let part = dest.with_file_name(part_name(&file_name.to_string_lossy()));
     run.progress.start(Some(entry.size), Instant::now());
 
-    let handle = run.step(sftp.open_read(remote)).await??;
+    let handle = run.settle(sftp.open_read(remote)).await??;
+    if run.cancel.is_cancelled() {
+        close_quietly(sftp, &handle, remote).await;
+        return Err(Stop::Cancelled);
+    }
     let mut file = match create_local_part(&part).await {
         Ok(file) => file,
         Err(stop) => {
@@ -492,10 +535,11 @@ async fn fetch(
         let Some((offset, read)) = run.step(pending.next()).await? else {
             break;
         };
-        let Some(data) = read?.filter(|d| !d.is_empty()) else {
+        let Some(mut data) = read?.filter(|d| !d.is_empty()) else {
             break;
         };
-        debug_assert_eq!(offset, done);
+        // Never trust the server with more than was asked for.
+        data.truncate(chunk as usize);
         file.write_all(&data)
             .await
             .map_err(|e| local_error("write", part, &e))?;
@@ -506,7 +550,8 @@ async fn fetch(
         while done < end {
             let want = u32::try_from(end - done).unwrap_or(chunk);
             match run.step(sftp.read(handle, remote, done, want)).await?? {
-                Some(more) if !more.is_empty() => {
+                Some(mut more) if !more.is_empty() => {
+                    more.truncate(want as usize);
                     file.write_all(&more)
                         .await
                         .map_err(|e| local_error("write", part, &e))?;
@@ -574,6 +619,8 @@ async fn run_upload(
     let up = Upload {
         sftp,
         local,
+        folder,
+        name,
         target: &target,
         part: &part,
     };
@@ -594,7 +641,8 @@ async fn run_upload(
             )));
         }
         EntryKind::Link { .. } => {
-            // Replacing the link itself would turn it into a file: write what it ends at.
+            // Renaming over the link would turn it into a file: write what it ends at in
+            // place, so the link stays a link to the same file.
             let end = run.step(sftp.stat_attrs(&target)).await??;
             if kind_of_mode(end.permissions) != EntryKind::File {
                 return Err(Stop::Failed(format!(
@@ -627,18 +675,46 @@ async fn run_upload(
 struct Upload<'a> {
     sftp: &'a Sftp,
     local: &'a Path,
+    folder: &'a str,
+    name: &'a str,
     target: &'a str,
     part: &'a str,
 }
 
+/// How filling the part file ended.
+enum PartEnd {
+    /// Renamed to the target: done.
+    Renamed,
+    /// Complete and closed, but the server would not rename it over the target.
+    RenameDenied,
+}
+
 impl Upload<'_> {
-    /// Create the part file (one left over from an earlier run is removed first). The inner
-    /// error is the server's answer, for the caller to judge.
+    /// The clash message for this upload's name.
+    fn clash(&self) -> Stop {
+        Stop::Failed(format!(
+            "\"{}\" already exists in {}.",
+            self.name, self.folder
+        ))
+    }
+
+    /// Create the part file `.<name>.fbterm-part`. Anything already there under that name is
+    /// taken for a leftover of an earlier upload and removed first. The inner error is the
+    /// server's answer, for the caller to judge. A cancel during the create is acted on once
+    /// the server answered: a part file it made is closed and removed.
     async fn create_part(&self, run: &mut Run) -> Result<Result<String, SftpError>, Stop> {
         if let Err(e @ SftpError::Unavailable(_)) = run.step(self.sftp.remove(self.part)).await? {
             return Err(e.into());
         }
-        run.step(self.sftp.create_new(self.part)).await
+        let created = run.settle(self.sftp.create_new(self.part)).await?;
+        if run.cancel.is_cancelled() {
+            if let Ok(handle) = &created {
+                close_quietly(self.sftp, handle, self.part).await;
+                remove_quietly(self.sftp, self.part).await;
+            }
+            return Err(Stop::Cancelled);
+        }
+        Ok(created)
     }
 
     /// Fill the open part file, give it `keep`'s owner and mode, and rename it to the target
@@ -652,17 +728,31 @@ impl Upload<'_> {
         keep: Option<FileAttributes>,
     ) -> Result<TransferEvent, Stop> {
         let mut open = Some(handle);
-        let result = self.fill_part(run, file, &mut open, keep.as_ref()).await;
-        if result.is_err() {
-            if let Some(handle) = open {
-                close_quietly(self.sftp, &handle, self.part).await;
+        match self.fill_part(run, file, &mut open, keep.as_ref()).await {
+            Ok(PartEnd::Renamed) => Ok(TransferEvent::Finished {
+                note: None,
+                local: None,
+            }),
+            Ok(PartEnd::RenameDenied) => {
+                // The folder will not let this entry be replaced: start over in place.
+                remove_quietly(self.sftp, self.part).await;
+                if run.cancel.is_cancelled() {
+                    return Err(Stop::Cancelled);
+                }
+                file.seek(SeekFrom::Start(0))
+                    .await
+                    .map_err(|e| local_error("read", self.local, &e))?;
+                run.progress.restart(Instant::now());
+                self.in_place(run, file).await
             }
-            remove_quietly(self.sftp, self.part).await;
+            Err(stop) => {
+                if let Some(handle) = open {
+                    close_quietly(self.sftp, &handle, self.part).await;
+                }
+                remove_quietly(self.sftp, self.part).await;
+                Err(stop)
+            }
         }
-        result.map(|()| TransferEvent::Finished {
-            note: None,
-            local: None,
-        })
     }
 
     async fn fill_part(
@@ -671,7 +761,7 @@ impl Upload<'_> {
         file: &mut tokio::fs::File,
         open: &mut Option<String>,
         keep: Option<&FileAttributes>,
-    ) -> Result<(), Stop> {
+    ) -> Result<PartEnd, Stop> {
         let sftp = self.sftp;
         let handle = open.clone().unwrap_or_default();
         if let Some(keep) = keep {
@@ -703,24 +793,54 @@ impl Upload<'_> {
         if run.cancel.is_cancelled() {
             return Err(Stop::Cancelled);
         }
+        // From here on a cancel is too late: the rename is awaited to its answer.
         if keep.is_some() {
-            run.step(sftp.posix_rename(self.part, self.target))
-                .await??;
+            match run
+                .settle(sftp.posix_rename(self.part, self.target))
+                .await?
+            {
+                Ok(()) => Ok(PartEnd::Renamed),
+                Err(SftpError::Denied(_)) => Ok(PartEnd::RenameDenied),
+                Err(e) => Err(e.into()),
+            }
         } else {
-            run.step(sftp.rename(self.part, self.target)).await??;
+            match run.settle(sftp.rename(self.part, self.target)).await? {
+                Ok(()) => Ok(PartEnd::Renamed),
+                Err(e @ SftpError::Unavailable(_)) => Err(e.into()),
+                // Lost a race: something took the name since it was checked.
+                Err(e) => match run.settle(sftp.lstat_attrs(self.target)).await? {
+                    Ok(_) => Err(self.clash()),
+                    Err(_) => Err(e.into()),
+                },
+            }
         }
-        Ok(())
     }
 
-    /// Write the existing target in place (it keeps its inode, owner and mode). Once it is
-    /// opened, any stop says the file may be incomplete.
+    /// Write the existing target in place (it keeps its inode, owner and mode). Once the
+    /// open (which empties it) has been sent, any stop says the file may be incomplete.
     async fn in_place(
         &self,
         run: &mut Run,
         file: &mut tokio::fs::File,
     ) -> Result<TransferEvent, Stop> {
         let sftp = self.sftp;
-        let handle = run.step(sftp.open_truncate(self.target)).await??;
+        if run.cancel.is_cancelled() {
+            return Err(Stop::Cancelled);
+        }
+        let incomplete = |reason: String| Stop::Failed(format!("{MAY_BE_INCOMPLETE}. {reason}"));
+        let handle = match run.settle(sftp.open_truncate(self.target)).await {
+            Ok(Ok(handle)) => handle,
+            // The server may or may not have emptied the file before the session went.
+            Ok(Err(e @ SftpError::Unavailable(_))) => return Err(incomplete(e.to_string())),
+            // Refused: the file was not touched.
+            Ok(Err(e)) => return Err(e.into()),
+            Err(Stop::Failed(reason)) => return Err(incomplete(reason)),
+            Err(Stop::Cancelled) => return Err(Stop::Failed(format!("{MAY_BE_INCOMPLETE}."))),
+        };
+        if run.cancel.is_cancelled() {
+            close_quietly(sftp, &handle, self.target).await;
+            return Err(Stop::Failed(format!("{MAY_BE_INCOMPLETE}.")));
+        }
         let written = match send(run, sftp, &handle, self.target, file, self.local).await {
             Ok(()) => run
                 .step(sftp.close(&handle, self.target))
@@ -737,9 +857,7 @@ impl Upload<'_> {
                 local: None,
             }),
             Err(Stop::Cancelled) => Err(Stop::Failed(format!("{MAY_BE_INCOMPLETE}."))),
-            Err(Stop::Failed(reason)) => {
-                Err(Stop::Failed(format!("{MAY_BE_INCOMPLETE}. {reason}")))
-            }
+            Err(Stop::Failed(reason)) => Err(incomplete(reason)),
         }
     }
 }

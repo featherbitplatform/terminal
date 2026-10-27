@@ -411,6 +411,149 @@ async fn failed_upload_removes_its_part_file() {
     assert_eq!(server.open_handles(), 0);
 }
 
+/// Start an upload of `content` as `/up/{name}` and cancel it `after` its first event.
+async fn cancelled_upload(
+    server: &fake::Server,
+    content: &[u8],
+    name: &str,
+    after: Duration,
+) -> Vec<TransferEvent> {
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_file(dir.path(), content);
+    let sftp = Arc::new(fake::session(server.clone()).await);
+    let (tx, mut rx) = unbounded_channel();
+    let handle = upload(
+        sftp,
+        local,
+        "/up".into(),
+        name.into(),
+        UploadMode::Replace,
+        tx,
+    );
+    let first = next(&mut rx, handle.id()).await;
+    assert!(
+        matches!(first, Some(TransferEvent::Progress { done: 0, .. })),
+        "{first:?}"
+    );
+    tokio::time::sleep(after).await;
+    handle.cancel();
+    all(&mut rx, handle.id()).await
+}
+
+#[tokio::test]
+async fn cancel_during_in_place_open_says_the_file_may_be_incomplete() {
+    // The open (which empties the target) is answered late; the cancel lands meanwhile.
+    let server = fake::Server::new(false);
+    server.put_dir("/up");
+    server.put("/up/conf", b"old content", 0o644);
+    server.set_open_delay(Duration::from_millis(300));
+    let events = cancelled_upload(&server, b"new", "conf", Duration::from_millis(50)).await;
+    assert_eq!(
+        last(&events),
+        &TransferEvent::Failed(format!("{MAY_BE_INCOMPLETE}."))
+    );
+    assert_eq!(server.open_handles(), 0);
+    assert_eq!(server.names("/up"), ["conf"]);
+}
+
+#[tokio::test]
+async fn cancel_during_part_create_removes_the_part_file() {
+    let server = fake::Server::new(true);
+    server.put_dir("/up");
+    server.put("/up/conf", b"keep", 0o644);
+    server.set_open_delay(Duration::from_millis(300));
+    let events = cancelled_upload(&server, b"new", "conf", Duration::from_millis(50)).await;
+    // Whatever the server still had in hand has landed by now.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(last(&events), &TransferEvent::Cancelled);
+    assert_eq!(server.names("/up"), ["conf"]);
+    assert_eq!(server.get("/up/conf"), Some(b"keep".to_vec()));
+    assert_eq!(server.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn cancel_after_the_rename_reports_finished() {
+    // The rename is done at once but answered late; the cancel lands while it is answered.
+    let server = fake::Server::new(true);
+    server.put_dir("/up");
+    server.put("/up/conf", b"old", 0o640);
+    server.set_rename_delay(Duration::from_millis(400));
+    let events = cancelled_upload(&server, b"new", "conf", Duration::from_millis(150)).await;
+    assert_eq!(
+        last(&events),
+        &TransferEvent::Finished {
+            note: None,
+            local: None,
+        }
+    );
+    assert_eq!(server.get("/up/conf"), Some(b"new".to_vec()));
+    assert_eq!(server.names("/up"), ["conf"]);
+}
+
+#[tokio::test]
+async fn refused_rename_falls_back_to_in_place() {
+    let server = fake::Server::new(true);
+    server.put_dir("/up");
+    server.put("/up/conf", b"old", 0o640);
+    server.deny_posix_rename();
+    let dir = tempfile::tempdir().unwrap();
+    let content = pattern(80_000);
+    let local = local_file(dir.path(), &content);
+    let events = run_upload(&server, &local, "conf", UploadMode::Replace).await;
+    assert_eq!(
+        last(&events),
+        &TransferEvent::Finished {
+            note: Some(REPLACED_IN_PLACE.into()),
+            local: None,
+        }
+    );
+    // The row restarts from zero for the second pass.
+    let restarts = events
+        .iter()
+        .filter(|e| matches!(e, TransferEvent::Progress { done: 0, .. }))
+        .count();
+    assert_eq!(restarts, 2, "{events:?}");
+    assert_eq!(server.get("/up/conf"), Some(content));
+    assert_eq!(server.mode("/up/conf"), Some(0o640));
+    assert_eq!(server.names("/up"), ["conf"]);
+    assert_eq!(server.open_handles(), 0);
+}
+
+#[tokio::test]
+async fn overlong_reads_are_cut_to_what_was_asked() {
+    let content = pattern(200_000);
+    let server = fake::Server::new(true);
+    server.put("/r/data.bin", &content, 0o644);
+    server.set_extra_read_bytes(100);
+    let sftp = Arc::new(fake::session(server).await);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("data.bin");
+    let (tx, mut rx) = unbounded_channel();
+    let handle = download(sftp, "/r/data.bin".into(), dest.clone(), tx);
+    let events = all(&mut rx, handle.id()).await;
+    assert!(
+        matches!(last(&events), TransferEvent::Finished { .. }),
+        "{events:?}"
+    );
+    assert_eq!(std::fs::read(&dest).unwrap(), content);
+}
+
+#[tokio::test]
+async fn new_upload_losing_the_rename_race_gets_the_clash_copy() {
+    let server = fake::Server::new(true);
+    server.put_dir("/up");
+    server.clash_on_rename();
+    let dir = tempfile::tempdir().unwrap();
+    let local = local_file(dir.path(), b"mine");
+    let events = run_upload(&server, &local, "late.txt", UploadMode::New).await;
+    assert_eq!(
+        last(&events),
+        &TransferEvent::Failed("\"late.txt\" already exists in /up.".into())
+    );
+    assert_eq!(server.get("/up/late.txt"), Some(b"theirs".to_vec()));
+    assert_eq!(server.names("/up"), ["late.txt"]);
+}
+
 /// An in-memory SFTP server with just enough of a file system for transfers.
 mod fake {
     use std::collections::{BTreeMap, HashMap};
@@ -445,6 +588,11 @@ mod fake {
         deny_create_in: Option<String>,
         fail_writes: bool,
         posix_renames: usize,
+        open_delay: Option<Duration>,
+        rename_delay: Option<Duration>,
+        deny_posix_rename: bool,
+        extra_read_bytes: usize,
+        clash_on_rename: bool,
     }
 
     #[derive(Clone)]
@@ -549,6 +697,31 @@ mod fake {
             self.fs.lock().fail_writes = true;
         }
 
+        /// Every open (and create) answers only after `delay`.
+        pub fn set_open_delay(&self, delay: Duration) {
+            self.fs.lock().open_delay = Some(delay);
+        }
+
+        /// Every rename answers only after `delay` (done at once, answered late).
+        pub fn set_rename_delay(&self, delay: Duration) {
+            self.fs.lock().rename_delay = Some(delay);
+        }
+
+        /// `posix-rename@openssh.com` is offered but refused with permission denied.
+        pub fn deny_posix_rename(&self) {
+            self.fs.lock().deny_posix_rename = true;
+        }
+
+        /// Reads answer `extra` bytes more than asked for (a broken server).
+        pub fn set_extra_read_bytes(&self, extra: usize) {
+            self.fs.lock().extra_read_bytes = extra;
+        }
+
+        /// Another writer creates the target just before a plain rename, which then fails.
+        pub fn clash_on_rename(&self) {
+            self.fs.lock().clash_on_rename = true;
+        }
+
         fn attrs(&self, path: &str) -> Result<FileAttributes, StatusReply> {
             let fs = self.fs.lock();
             let (mode, size) = match fs.nodes.get(path) {
@@ -614,6 +787,10 @@ mod fake {
             pflags: OpenFlags,
             attrs: FileAttributes,
         ) -> Result<Handle, Self::Error> {
+            let delay = self.fs.lock().open_delay;
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             let mut fs = self.fs.lock();
             let exists = fs.nodes.contains_key(&filename);
             if pflags.contains(OpenFlags::CREATE) && !exists {
@@ -673,7 +850,7 @@ mod fake {
             if start >= data.len() {
                 return Err(StatusCode::Eof.into());
             }
-            let mut end = data.len().min(start + len as usize);
+            let mut end = data.len().min(start + len as usize + fs.extra_read_bytes);
             if let Some(cap) = fs.short_reads {
                 end = end.min(start + cap);
             }
@@ -748,15 +925,30 @@ mod fake {
             oldpath: String,
             newpath: String,
         ) -> Result<Status, Self::Error> {
-            let mut fs = self.fs.lock();
-            if fs.nodes.contains_key(&newpath) {
-                return Err(StatusCode::Failure.into());
+            let delay = {
+                let mut fs = self.fs.lock();
+                if fs.clash_on_rename {
+                    fs.nodes.insert(
+                        newpath.clone(),
+                        Node::File {
+                            data: b"theirs".to_vec(),
+                            mode: DEFAULT_MODE,
+                        },
+                    );
+                }
+                if fs.nodes.contains_key(&newpath) {
+                    return Err(StatusCode::Failure.into());
+                }
+                let node = fs
+                    .nodes
+                    .remove(&oldpath)
+                    .ok_or(StatusReply::from(StatusCode::NoSuchFile))?;
+                fs.nodes.insert(newpath, node);
+                fs.rename_delay
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
             }
-            let node = fs
-                .nodes
-                .remove(&oldpath)
-                .ok_or(StatusReply::from(StatusCode::NoSuchFile))?;
-            fs.nodes.insert(newpath, node);
             Ok(ok(id))
         }
 
@@ -773,13 +965,22 @@ mod fake {
             let (Some(from), Some(to)) = (read_string(&mut rest), read_string(&mut rest)) else {
                 return Err(StatusCode::BadMessage.into());
             };
-            let mut fs = self.fs.lock();
-            let node = fs
-                .nodes
-                .remove(&from)
-                .ok_or(StatusReply::from(StatusCode::NoSuchFile))?;
-            fs.nodes.insert(to, node);
-            fs.posix_renames += 1;
+            let delay = {
+                let mut fs = self.fs.lock();
+                if fs.deny_posix_rename {
+                    return Err(StatusCode::PermissionDenied.into());
+                }
+                let node = fs
+                    .nodes
+                    .remove(&from)
+                    .ok_or(StatusReply::from(StatusCode::NoSuchFile))?;
+                fs.nodes.insert(to, node);
+                fs.posix_renames += 1;
+                fs.rename_delay
+            };
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
             Ok(Packet::Status(ok(id)))
         }
     }
