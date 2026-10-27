@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -176,6 +176,8 @@ impl ProfileStore {
     }
 
     pub fn validate(&self) -> Vec<ValidationError> {
+        let index: HashMap<ProfileId, &Profile> = self.profiles.iter().map(|p| (p.id, p)).collect();
+        let cycles = self.reaches_cycle(&index);
         let mut errors = Vec::new();
         let mut seen = HashSet::new();
         let mut reported = HashSet::new();
@@ -240,7 +242,7 @@ impl ProfileStore {
                 }
             }
             for &j in &ssh.jump {
-                match self.get(j) {
+                match index.get(&j).copied() {
                     None => errors.push(ValidationError::MissingJump {
                         profile: p.name.clone(),
                         missing: j,
@@ -254,16 +256,77 @@ impl ProfileStore {
                     Some(_) => {}
                 }
             }
-            if matches!(
-                self.jump_chain(p.id),
-                Err(ValidationError::JumpCycle { .. })
-            ) {
+            if cycles.contains(&p.id) {
                 errors.push(ValidationError::JumpCycle {
                     profile: p.name.clone(),
                 });
             }
         }
         errors
+    }
+
+    /// The SSH profiles whose jump chain reaches a cycle (through hops that exist and are SSH
+    /// profiles). An iterative depth-first search with white, grey and black states, linear in
+    /// profiles plus jumps: hand-edited files and imported archives can hold any shape, so no
+    /// recursion and no repeated walks.
+    fn reaches_cycle(&self, index: &HashMap<ProfileId, &Profile>) -> HashSet<ProfileId> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum State {
+            White,
+            Grey,
+            Black,
+        }
+        let hops = |id: ProfileId| -> &[ProfileId] {
+            match index.get(&id).map(|p| &p.kind) {
+                Some(ProfileKind::Ssh(ssh)) => &ssh.jump,
+                _ => &[],
+            }
+        };
+        let is_ssh =
+            |id: &ProfileId| matches!(index.get(id).map(|p| &p.kind), Some(ProfileKind::Ssh(_)));
+        let mut state: HashMap<ProfileId, State> = HashMap::new();
+        let mut bad: HashSet<ProfileId> = HashSet::new();
+        for root in &self.profiles {
+            if !is_ssh(&root.id) || state.get(&root.id).is_some_and(|s| *s != State::White) {
+                continue;
+            }
+            // (profile, index of the next hop to look at)
+            let mut stack = vec![(root.id, 0usize)];
+            state.insert(root.id, State::Grey);
+            while let Some(top) = stack.last_mut() {
+                let (id, next) = *top;
+                let Some(&hop) = hops(id).get(next) else {
+                    stack.pop();
+                    state.insert(id, State::Black);
+                    if bad.contains(&id)
+                        && let Some((parent, _)) = stack.last()
+                    {
+                        bad.insert(*parent);
+                    }
+                    continue;
+                };
+                top.1 += 1;
+                if !is_ssh(&hop) {
+                    continue;
+                }
+                match state.get(&hop).copied().unwrap_or(State::White) {
+                    State::White => {
+                        state.insert(hop, State::Grey);
+                        stack.push((hop, 0));
+                    }
+                    // Back to a profile on the current path: a cycle.
+                    State::Grey => {
+                        bad.insert(id);
+                    }
+                    State::Black => {
+                        if bad.contains(&hop) {
+                            bad.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+        bad
     }
 
     /// Hops to traverse before reaching `id`, in connection order (target

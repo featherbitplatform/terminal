@@ -975,3 +975,65 @@ fn blank_target_port_blocks_save() {
     store.profiles[0] = p;
     assert!(store.validate().is_empty());
 }
+
+#[test]
+fn cycle_errors_name_each_profile_that_reaches_the_cycle() {
+    let mut a = ssh("a", vec![]);
+    let b = ssh("b", vec![a.id]);
+    if let ProfileKind::Ssh(s) = &mut a.kind {
+        s.jump = vec![b.id];
+    }
+    let c = ssh("c", vec![a.id]);
+    let mut selfish = ssh("self", vec![]);
+    if let ProfileKind::Ssh(s) = &mut selfish.kind {
+        s.jump = vec![selfish.id];
+    }
+    let fine = ssh("fine", vec![]);
+    let store = ProfileStore {
+        profiles: vec![c, a, b, selfish, fine],
+    };
+    let cycle = |n: &str| ValidationError::JumpCycle {
+        profile: n.to_string(),
+    };
+    assert_eq!(
+        store.validate(),
+        vec![cycle("c"), cycle("a"), cycle("b"), cycle("self")]
+    );
+    assert_eq!(cycle("a").to_string(), "profile \"a\" has a jump cycle");
+}
+
+#[test]
+fn validate_is_linear_for_diamonds_and_long_chains() {
+    use std::time::{Duration, Instant};
+    // Each level jumps through the previous one twice: a naive walk takes 2^40 steps.
+    let mut diamond = vec![ssh("d0", vec![])];
+    for i in 1..=40 {
+        let prev = diamond[i - 1].id;
+        diamond.push(ssh(&format!("d{i}"), vec![prev, prev]));
+    }
+    // A chain far deeper than the stack allows recursion for, ending in a cycle.
+    let mut chain = vec![ssh("c0", vec![])];
+    for i in 1..10_000 {
+        let prev = chain[i - 1].id;
+        chain.push(ssh(&format!("c{i}"), vec![prev]));
+    }
+    let last = chain[9_999].id;
+    if let ProfileKind::Ssh(s) = &mut chain[0].kind {
+        s.jump = vec![last];
+    }
+    for (profiles, cycles) in [(diamond, 0), (chain, 10_000)] {
+        let store = ProfileStore { profiles };
+        let start = Instant::now();
+        let errors = store.validate();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+        let found = errors
+            .iter()
+            .filter(|e| matches!(e, ValidationError::JumpCycle { .. }))
+            .count();
+        assert_eq!(found, cycles);
+    }
+}
