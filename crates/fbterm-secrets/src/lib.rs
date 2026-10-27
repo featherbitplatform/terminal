@@ -283,6 +283,9 @@ pub fn system_store(paths: &Paths) -> Box<dyn SecretStore> {
     }
 }
 
+/// How long Auto waits before looking again at a system storage that seemed missing.
+pub const PROBE_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Which storage holds saved secrets now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Storage {
@@ -338,6 +341,8 @@ pub struct SecretBackend {
     vault_path: PathBuf,
     /// Auto still has to check the system storage (on the first data call).
     unprobed: AtomicBool,
+    /// How long Auto waits before looking again at a storage that seemed missing.
+    probe_retry: std::time::Duration,
     /// Auto moved to the vault and the app has not taken the news yet.
     auto_switched: AtomicBool,
     /// Called once when Auto moves to the vault.
@@ -398,10 +403,18 @@ impl SecretBackend {
             mirror_exists: AtomicBool::new(VaultStore::exists(&vault_path)),
             vault_path,
             unprobed: AtomicBool::new(setting == SecretStorage::Auto),
+            probe_retry: PROBE_RETRY,
             auto_switched: AtomicBool::new(false),
             hook: OnceLock::new(),
             temp_dir: None,
         }
+    }
+
+    /// Wait `delay` (instead of [`PROBE_RETRY`]) before Auto looks again at a storage that
+    /// seemed missing (tests use none).
+    pub fn with_probe_retry_delay(mut self, delay: std::time::Duration) -> Self {
+        self.probe_retry = delay;
+        self
     }
 
     /// The storage in use (lock-free).
@@ -477,10 +490,16 @@ impl SecretBackend {
         if !self.unprobed.swap(false, Ordering::AcqRel) || *active != Storage::System {
             return;
         }
-        // One read of an id nothing has: every store reads its item or file for it.
-        if let Err(SecretError::Unavailable(e)) =
-            self.system.get(&ProfileId::new(), SecretKind::Password)
-        {
+        // One read of an id nothing has: every store reads its item or file for it. A storage
+        // that seems missing gets one more look a moment later (a keyring daemon started on
+        // demand at login can miss the first call).
+        let look = || self.system.get(&ProfileId::new(), SecretKind::Password);
+        let mut result = look();
+        if matches!(result, Err(SecretError::Unavailable(_))) {
+            std::thread::sleep(self.probe_retry);
+            result = look();
+        }
+        if let Err(SecretError::Unavailable(e)) = result {
             tracing::warn!(error = %e, "no system secret storage; using the encrypted vault");
             *active = Storage::Vault;
             self.sync_mirrors(Storage::Vault);
@@ -892,6 +911,7 @@ mod tests {
                 config_dir: dir.to_path_buf(),
             };
             SecretBackend::with_system(setting, Box::new(Shared(system)), paths.vault())
+                .with_probe_retry_delay(std::time::Duration::ZERO)
         }
 
         /// Two profiles' secrets: a password, and a password plus a passphrase.
@@ -1030,6 +1050,52 @@ mod tests {
             assert_eq!(b.active(), Storage::System);
         }
 
+        /// A system storage missing for its first `n` reads, then there.
+        struct LateService {
+            inner: MemoryStore,
+            missing_for: AtomicUsize,
+        }
+        impl SecretStore for LateService {
+            fn get(&self, id: &ProfileId, kind: SecretKind) -> Result<Option<String>, SecretError> {
+                let left = self.missing_for.load(Ordering::SeqCst);
+                if left > 0 {
+                    self.missing_for.store(left - 1, Ordering::SeqCst);
+                    return Err(SecretError::Unavailable("starting".into()));
+                }
+                self.inner.get(id, kind)
+            }
+            fn set(
+                &self,
+                id: &ProfileId,
+                kind: SecretKind,
+                value: &str,
+            ) -> Result<(), SecretError> {
+                self.inner.set(id, kind, value)
+            }
+            fn remove(&self, id: &ProfileId) -> Result<(), SecretError> {
+                self.inner.remove(id)
+            }
+            fn remove_kind(&self, id: &ProfileId, kind: SecretKind) -> Result<(), SecretError> {
+                self.inner.remove_kind(id, kind)
+            }
+        }
+
+        #[test]
+        fn auto_checks_again_before_switching() {
+            let dir = tempfile::tempdir().unwrap();
+            let late = Arc::new(LateService {
+                inner: MemoryStore::new(),
+                missing_for: AtomicUsize::new(1),
+            });
+            let b = backend(SecretStorage::Auto, late, dir.path());
+            let fired = hooked(&b);
+            // Missing at the first look, there a moment later: a slow start, not a missing
+            // service. The storage stays.
+            b.set(&pid(), SecretKind::Password, "pw").unwrap();
+            assert_eq!(b.active(), Storage::System);
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
+        }
+
         #[test]
         fn auto_keeps_a_denied_or_locked_keychain() {
             let dir = tempfile::tempdir().unwrap();
@@ -1133,6 +1199,19 @@ mod tests {
             let held = b.vault.hold_for_test();
             assert_eq!(ui_queries_answer(&b), (Storage::Vault, None, true, true));
             drop(held);
+        }
+
+        #[test]
+        fn store_level_create_refuses_an_empty_main_password() {
+            let dir = tempfile::tempdir().unwrap();
+            let b = backend(
+                SecretStorage::Vault,
+                Arc::new(MemoryStore::new()),
+                dir.path(),
+            );
+            assert!(b.create_vault("").is_err());
+            assert!(!b.vault_exists() && !b.vault_unlocked());
+            assert!(!b.vault_path().exists());
         }
 
         #[test]

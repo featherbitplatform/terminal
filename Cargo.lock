@@ -1500,6 +1500,7 @@ dependencies = [
  "fbterm-config",
  "keyring",
  "parking_lot",
+ "secret-service",
  "serde",
  "serde_json",
  "tempfile",
@@ -1508,6 +1509,7 @@ dependencies = [
  "tracing",
  "uuid",
  "windows-sys 0.61.2",
+ "zbus",
  "zeroize",
 ]
 

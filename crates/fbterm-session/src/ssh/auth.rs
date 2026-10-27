@@ -140,6 +140,9 @@ async fn remember(ctx: &SshContext, profile: &Profile, kind: SecretKind, answer:
         // The vault is in use and has no file yet: ask for a main password, make the vault
         // and save again. A cancel leaves the secret unsaved.
         Err(SecretError::NoMainPassword) => match ctx.prompter.set_vault_password().await {
+            // An empty answer: no longer needed (made meanwhile). Never make a vault with an
+            // empty main password; just save once more, and if that fails it is not saved.
+            Some(password) if password.is_empty() => save().await,
             Some(password) => match off_task(ctx, move |s| s.create_vault(&password)).await {
                 // Made meanwhile (another connect asked too): it is open now.
                 Ok(()) | Err(SecretError::VaultExists) => save().await,
@@ -381,6 +384,9 @@ mod tests {
             asked: AtomicUsize,
             set: Option<&'static str>,
             set_asked: AtomicUsize,
+            /// Makes this vault (main password `MAIN`) before answering `Set`, as Settings or
+            /// another connect would meanwhile.
+            made_meanwhile: Option<Arc<SecretBackend>>,
         }
 
         #[async_trait::async_trait]
@@ -405,6 +411,9 @@ mod tests {
             }
             async fn set_vault_password(&self) -> Option<Zeroizing<String>> {
                 self.set_asked.fetch_add(1, Ordering::SeqCst);
+                if let Some(b) = &self.made_meanwhile {
+                    b.create_vault(MAIN).unwrap();
+                }
                 self.set.map(|a| Zeroizing::new(a.to_owned()))
             }
         }
@@ -415,6 +424,7 @@ mod tests {
                 asked: AtomicUsize::new(0),
                 set,
                 set_asked: AtomicUsize::new(0),
+                made_meanwhile: None,
             })
         }
 
@@ -451,6 +461,50 @@ mod tests {
             // The vault now exists: the next remember just saves.
             remember(&ctx, &p, SecretKind::KeyPassphrase, &typed("pp")).await;
             assert_eq!(asker.set_asked.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn an_empty_set_answer_never_makes_a_vault() {
+            // The app answers "" when Set is no longer needed; with no vault after all,
+            // nothing is made (a vault anyone could open) and the secret is not saved.
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = no_vault(dir.path());
+            let asker = unlocker(None, Some(""));
+            let ctx = context(secrets.clone(), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert_eq!(asker.set_asked.load(Ordering::SeqCst), 1);
+            assert!(!secrets.vault_path().exists());
+            assert!(!secrets.vault_exists() && !secrets.vault_unlocked());
+            assert_eq!(secrets.get(&p.id, SecretKind::Password).unwrap(), None);
+        }
+
+        #[tokio::test]
+        async fn set_no_longer_needed_saves_into_the_vault_made_meanwhile() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = no_vault(dir.path());
+            let asker = Arc::new(Unlocker {
+                answer: None,
+                asked: AtomicUsize::new(0),
+                set: Some(""),
+                set_asked: AtomicUsize::new(0),
+                made_meanwhile: Some(secrets.clone()),
+            });
+            let ctx = context(secrets.clone(), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert_eq!(asker.set_asked.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                secrets.get(&p.id, SecretKind::Password).unwrap().as_deref(),
+                Some("typed-pw")
+            );
+            // The vault is the one made meanwhile, with its own main password.
+            let fresh = fbterm_secrets::VaultStore::new();
+            fresh.unlock(secrets.vault_path(), MAIN).unwrap();
+            assert_eq!(
+                fresh.get(&p.id, SecretKind::Password).unwrap().as_deref(),
+                Some("typed-pw")
+            );
         }
 
         #[tokio::test]

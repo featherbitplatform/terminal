@@ -38,6 +38,7 @@ const TOO_HARD: &str = "This vault takes too much work to open on this computer.
 const NOT_READ: &str = "The vault could not be read.";
 const NOT_WRITTEN: &str = "The vault could not be written.";
 const NOT_DELETED: &str = "The vault could not be deleted.";
+const EMPTY_PASSWORD: &str = "The main password cannot be empty.";
 
 /// What exists only while the vault is unlocked.
 pub(crate) struct Unlocked {
@@ -71,6 +72,10 @@ impl VaultStore {
     /// Make a new, empty vault at `path` encrypted with `password` and leave it unlocked.
     /// Refuses with [`SecretError::VaultExists`] when something is already at `path`.
     pub fn create(&self, path: &Path, password: &str) -> Result<(), SecretError> {
+        // A vault anyone could open is no vault.
+        if password.is_empty() {
+            return Err(vault_err(EMPTY_PASSWORD));
+        }
         if Self::exists(path) {
             return Err(SecretError::VaultExists);
         }
@@ -490,6 +495,18 @@ mod tests {
             assert!(matches!(err, SecretError::Vault(_)), "{err:?}");
             assert!(!err.to_string().contains(SECRET));
         }
+    }
+
+    #[test]
+    fn create_refuses_an_empty_main_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secrets.fbvault");
+        let store = VaultStore::new();
+        let err = store.create(&path, "").unwrap_err();
+        assert!(matches!(err, SecretError::Vault(_)), "{err:?}");
+        assert_eq!(err.to_string(), "The main password cannot be empty.");
+        assert!(!path.exists(), "no vault anyone could open");
+        assert!(!store.is_unlocked());
     }
 
     #[test]

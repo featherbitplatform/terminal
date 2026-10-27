@@ -24,6 +24,12 @@ toml.workspace = true
 # Windows uses DPAPI instead, so the keyring crate is not built there.
 keyring.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Only to tell "no Secret Service at all" from other failures in the errors keyring passes
+# on (it boxes them). The versions keyring already uses; no features of our own.
+secret-service = { version = "5.2.0", default-features = false }
+zbus = { version = "5.19.0", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 # DPAPI (CryptProtectData/CryptUnprotectData, LocalFree) for the Windows system storage.
 windows-sys.workspace = true
