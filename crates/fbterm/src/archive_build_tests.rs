@@ -202,7 +202,7 @@ fn broken_jump_chains_still_export() {
     assert_eq!(s.jump, vec![b.id, missing, hop.id]);
     assert_eq!(
         warnings,
-        vec!["Local profiles are not part of a shared archive, so hop were left out.".to_string()]
+        vec!["Local profiles are not part of a shared archive, so hop was left out.".to_string()]
     );
 }
 

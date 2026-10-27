@@ -66,8 +66,9 @@ pub(crate) fn build(
             return Err(NO_SSH.into());
         }
         if !local_names.is_empty() {
+            let verb = if local_names.len() == 1 { "was" } else { "were" };
             warnings.push(format!(
-                "Local profiles are not part of a shared archive, so {} were left out.",
+                "Local profiles are not part of a shared archive, so {} {verb} left out.",
                 local_names.join(", ")
             ));
         }

@@ -276,6 +276,10 @@ impl App {
                 self.focus_prompt(w)
             }
             PromptMsg::Submit(w) => {
+                // Enter in the key file dialog is `Choose…`.
+                if let Some(Dialog::KeyFile { .. }) = self.prompts.front(w) {
+                    return self.prompt_msg(PromptMsg::ChooseKey(w));
+                }
                 if let Some(Dialog::Clash(clash)) = self.prompts.front(w) {
                     if clash.rename.is_some() {
                         return self.clash_rename_submit(w);
@@ -386,7 +390,8 @@ impl App {
     /// A connection logged in with the key file the user chose for key profile `id`, which
     /// named none: write it into the profile, so later connections use it without asking.
     /// Only an empty path is filled. When `profiles.toml` cannot be written (it failed to load,
-    /// or the write fails), the path is kept in memory for this session only.
+    /// it was edited on disk since we last read or wrote it, or the write fails), the path is
+    /// kept in memory for this session only.
     pub(crate) fn remember_key_file(&mut self, id: ProfileId, path: PathBuf) {
         let Some(profile) = self.profiles.profiles.iter_mut().find(|p| p.id == id) else {
             return;
@@ -401,8 +406,13 @@ impl App {
             return;
         }
         *slot = Some(path.clone());
-        if self.profiles_error.is_none() {
-            let file = self.paths.profiles();
+        let file = self.paths.profiles();
+        if self.profiles_error.is_some() {
+            tracing::info!("profiles.toml is not loaded: chosen key file kept for this session");
+        } else if std::fs::read_to_string(&file).ok() != self.profiles_seen {
+            // Edited on disk and not reloaded yet: writing would overwrite that edit.
+            tracing::info!("profiles.toml changed on disk: chosen key file kept for this session");
+        } else {
             match self.profiles.save(&file) {
                 // Our own write is not an edit to pick up again.
                 Ok(()) => self.profiles_seen = std::fs::read_to_string(&file).ok(),
@@ -410,8 +420,6 @@ impl App {
                     tracing::warn!(error = %e, "chosen key file kept for this session only");
                 }
             }
-        } else {
-            tracing::info!("profiles.toml is not loaded: chosen key file kept for this session");
         }
         if let Some((_, ed)) = &mut self.editor {
             ed.key_file_remembered(id, &path);
@@ -605,6 +613,50 @@ mod tests {
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(key_path(&app.profiles, p.id), Some(chosen));
         assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    }
+
+    #[test]
+    fn a_hand_edit_racing_the_key_file_is_kept() {
+        let p = keyless("db");
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths.clone(), true);
+        // profiles.toml was edited by hand and the watcher has not reported it yet.
+        let edited = format!(
+            "# edited by hand\n{}",
+            std::fs::read_to_string(paths.profiles()).unwrap()
+        );
+        std::fs::write(paths.profiles(), &edited).unwrap();
+        let chosen = PathBuf::from("/keys/id_ed25519");
+        accepted(&mut app, p.id, &chosen);
+        // The path is used for this session; the hand edit is not overwritten.
+        assert_eq!(key_path(&app.profiles, p.id), Some(chosen));
+        assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), edited);
+    }
+
+    #[test]
+    fn enter_in_the_key_file_dialog_chooses() {
+        use crate::prompts::Dialog;
+        let p = keyless("db");
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths, true);
+        let w = iced::window::Id::unique();
+        app.prompts.push(
+            w,
+            Some(7),
+            Dialog::KeyFile {
+                profile: "db".into(),
+                choosing: false,
+                reply: None,
+            },
+        );
+        let _ = app.update(Message::Prompt(PromptMsg::Submit(w)));
+        assert!(
+            matches!(
+                app.prompts.front(w),
+                Some(Dialog::KeyFile { choosing: true, .. })
+            ),
+            "Enter opens the picker, like Choose"
+        );
     }
 
     #[test]

@@ -1001,3 +1001,36 @@ fn has_keys_counts_only_keys_imported_profiles_use() {
     set_choice(&mut p, 0, Choice::Skip);
     assert!(!p.has_keys);
 }
+
+#[test]
+fn a_jump_through_an_entry_left_out_names_it() {
+    // The hop is in the archive but blocked (empty host): its dependent says so by name.
+    let mut hop = ssh("hop", AuthMethod::Agent, Vec::new());
+    if let ProfileKind::Ssh(s) = &mut hop.kind {
+        s.host = String::new();
+    }
+    let db = ssh("db", AuthMethod::Agent, vec![hop.id]);
+    let a = archive(ArchiveKind::Full, &[&hop, &db]);
+    let local_store = store(&[]);
+    let mut p = plan(&local_store, &a, &no_schemes()).unwrap();
+    let errors: Vec<_> = p.entries.iter().map(|e| e.error.as_deref()).collect();
+    assert_eq!(
+        errors,
+        vec![
+            Some("Its host is empty."),
+            Some("It jumps through hop, which is not imported."),
+        ]
+    );
+
+    // A new hop set to Skip is not imported either.
+    let good_hop = ssh("hop", AuthMethod::Agent, Vec::new());
+    let db = ssh("db", AuthMethod::Agent, vec![good_hop.id]);
+    let a = archive(ArchiveKind::Full, &[&good_hop, &db]);
+    p = plan(&local_store, &a, &no_schemes()).unwrap();
+    assert_eq!(p.entries[1].error, None);
+    set_choice(&mut p, 0, Choice::Skip);
+    assert_eq!(
+        p.entries[1].error.as_deref(),
+        Some("It jumps through hop, which is not imported.")
+    );
+}

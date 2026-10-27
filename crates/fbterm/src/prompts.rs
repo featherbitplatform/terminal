@@ -807,7 +807,7 @@ mod tests {
                 panic!("key file dialog")
             };
             assert_eq!(key_file_title(profile), "Choose the private key for db");
-            q.submit(w); // Enter does nothing here: the file comes from the picker.
+            q.submit(w); // Not an answer: the app turns Enter into Choose (see `dialogs.rs`).
             assert_eq!(q.choose_key(w), Some(id));
             assert_eq!(q.choose_key(w), None, "one picker at a time");
             // The picker was cancelled: the question stays, and can be chosen again.

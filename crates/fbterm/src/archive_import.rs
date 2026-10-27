@@ -491,7 +491,7 @@ fn resolve(local: &ProfileStore, entries: &[ImportEntry], kind: ArchiveKind) -> 
         }
 
         let (store, finals) = build(local, entries, &blocked, &index, kind);
-        let round = Round::new(entries, &store, &finals);
+        let round = Round::new(entries, &index, &store, &finals);
         let mut newly = Vec::new();
         for error in store.validate() {
             for (i, why) in round.culprits(&error, &baseline) {
@@ -521,7 +521,7 @@ fn resolve(local: &ProfileStore, entries: &[ImportEntry], kind: ArchiveKind) -> 
             }
             for &i in &dependents[k] {
                 if blocked[i].is_none() && entries[i].choice != Choice::Skip {
-                    blocked[i] = Some(MISSING.to_string());
+                    blocked[i] = Some(not_imported(&entries[k].incoming.name));
                     newly.push(i);
                 }
             }
@@ -660,10 +660,17 @@ struct Round<'a> {
     untouched: HashMap<&'a str, &'a [ProfileId]>,
     /// Importing entries that replace a local profile, by its id.
     replacements: Vec<(ProfileId, usize)>,
+    /// The name of each archived profile, by its archived id.
+    archived: HashMap<ProfileId, &'a str>,
 }
 
 impl<'a> Round<'a> {
-    fn new(entries: &[ImportEntry], store: &'a ProfileStore, finals: &[Option<ProfileId>]) -> Self {
+    fn new(
+        entries: &'a [ImportEntry],
+        index: &HashMap<ProfileId, usize>,
+        store: &'a ProfileStore,
+        finals: &[Option<ProfileId>],
+    ) -> Self {
         let entry_of: HashMap<ProfileId, usize> = finals
             .iter()
             .enumerate()
@@ -693,10 +700,15 @@ impl<'a> Round<'a> {
                     .map(|id| (id, i))
             })
             .collect();
+        let archived = index
+            .iter()
+            .map(|(id, &i)| (*id, entries[i].incoming.name.as_str()))
+            .collect();
         Self {
             by_name,
             untouched,
             replacements,
+            archived,
         }
     }
 
@@ -713,7 +725,15 @@ impl<'a> Round<'a> {
             .get(name)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let why = message(error);
+        let why = match error {
+            // A jump left pointing at an archived profile that is not imported (skipped
+            // without a local match).
+            ValidationError::MissingJump { missing, .. } => match self.archived.get(missing) {
+                Some(hop) => not_imported(hop),
+                None => message(error),
+            },
+            _ => message(error),
+        };
 
         if let ValidationError::DuplicateName(_) = error {
             // Against a local profile every importing one is wrong; among imported ones the
@@ -763,6 +783,12 @@ fn error_profile(error: &ValidationError) -> &str {
         | ValidationError::EmptyTunnelBind { profile, .. }
         | ValidationError::EmptyTunnelHost { profile, .. } => profile,
     }
+}
+
+/// Why an entry jumping through the archived profile `hop` is blocked when `hop` is skipped
+/// without a local match, or blocked itself.
+fn not_imported(hop: &str) -> String {
+    format!("It jumps through {}, which is not imported.", shown(hop))
 }
 
 /// A validation error as a sentence about the entry it blocks.
