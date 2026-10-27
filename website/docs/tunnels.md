@@ -29,9 +29,9 @@ Open the profile editor, pick an SSH profile and use the **Tunnels** section: **
 | Mode | Behavior |
 | --- | --- |
 | **On demand** (default) | Starts only when you switch it on, in the Tunnels window or from the palette, and runs until you switch it off. With no shell of the profile open it opens a connection of its own, with the same host key and password prompts a shell would show. |
+| **With the shell** | Starts when the profile's first shell (tab or pane) connects and stops when the last shell of that profile closes or disconnects. While it waits for a shell it shows `Starts with the shell`. When a disconnected shell is reconnected, the tunnel starts again. |
 
 A tunnel switched on from the Tunnels window asks its questions (host key, password) in the terminal window you used last, which comes to the front. With no terminal window open, a tunnel that needs to ask fails with `Open a terminal window to answer the sign-in question`.
-| **With the shell** | Starts when the profile's first shell (tab or pane) connects and stops when the last shell of that profile closes or disconnects. While it waits for a shell it shows `Starts with the shell`. When a disconnected shell is reconnected, the tunnel starts again. |
 
 Details for **With the shell** tunnels:
 
