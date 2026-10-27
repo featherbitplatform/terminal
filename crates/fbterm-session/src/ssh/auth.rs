@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use fbterm_config::{AuthMethod, Profile, SshProfile};
+use fbterm_secrets::archive::MAX_KEY_BYTES;
 use fbterm_secrets::{SecretError, SecretKind, SecretStore, Zeroizing};
 use russh::client::Handle;
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg};
@@ -212,6 +213,29 @@ fn expand_home(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
+/// Refuse to read `path` as a private key unless it is a regular file (after following
+/// links) of at most [`MAX_KEY_BYTES`]: a device, a pipe or a huge file would hang the
+/// connect or fill memory, whether the path came from an imported archive or a hand edit. A
+/// file that cannot be looked at is left to the loader, which says it cannot load it.
+fn check_key_file(path: &Path) -> Result<(), SshError> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(());
+    };
+    if !meta.is_file() {
+        return Err(SshError::KeyFile(format!(
+            "The key file {} is not a regular file.",
+            path.display()
+        )));
+    }
+    if meta.len() > MAX_KEY_BYTES {
+        return Err(SshError::KeyFile(format!(
+            "The key file {} is too large to be a private key.",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Load the key file; `Ok(None)` means it needs a (different) passphrase.
 fn load(path: &Path, passphrase: Option<&str>) -> Result<Option<PrivateKey>, SshError> {
     match russh::keys::load_secret_key(path, passphrase) {
@@ -233,6 +257,7 @@ async fn unlock(
     profile: &Profile,
     ctx: &SshContext,
 ) -> Result<(PrivateKey, Option<SecretAnswer>), SshError> {
+    check_key_file(path)?;
     if let Some(k) = load(path, None)? {
         return Ok((k, None));
     }
@@ -699,6 +724,54 @@ mod tests {
                 Some("typed")
             );
         }
+    }
+
+    #[test]
+    fn only_a_regular_file_of_key_size_is_read_as_a_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("id_test");
+        std::fs::write(&key, b"-----BEGIN OPENSSH PRIVATE KEY-----\n").unwrap();
+        assert!(check_key_file(&key).is_ok());
+        // A folder is not a key file.
+        let e = check_key_file(dir.path()).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "The key file {} is not a regular file.",
+                dir.path().display()
+            )
+        );
+        // Over 1 MiB: not a private key, and never read.
+        let big = dir.path().join("big");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(fbterm_secrets::archive::MAX_KEY_BYTES + 1)
+            .unwrap();
+        let e = check_key_file(&big).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            format!(
+                "The key file {} is too large to be a private key.",
+                big.display()
+            )
+        );
+        // A missing file is left to the key loader, which says it cannot load it.
+        assert!(check_key_file(&dir.path().join("missing")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn devices_and_links_to_them_are_not_key_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_key_file(Path::new("/dev/zero")).is_err());
+        // A link is followed: a link to a device is refused, a link to a key is fine.
+        let to_dev = dir.path().join("to_dev");
+        std::os::unix::fs::symlink("/dev/zero", &to_dev).unwrap();
+        assert!(check_key_file(&to_dev).is_err());
+        let key = dir.path().join("id_test");
+        std::fs::write(&key, b"key").unwrap();
+        let to_key = dir.path().join("to_key");
+        std::os::unix::fs::symlink(&key, &to_key).unwrap();
+        assert!(check_key_file(&to_key).is_ok());
     }
 
     #[test]

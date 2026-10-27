@@ -220,6 +220,10 @@ pub enum SshError {
     Jump(ValidationError),
     #[error("ssh error: {0}")]
     Protocol(String),
+    /// A key file that must not be read as a private key (not a regular file, too large):
+    /// a plain sentence naming it.
+    #[error("{0}")]
+    KeyFile(String),
     /// A connect made without prompts ([`NoPrompt`]) needed the user: an unknown host key or
     /// a secret that is not saved.
     #[error("needs your input")]
@@ -242,6 +246,7 @@ impl SshError {
             Self::Connect(e) => Self::Connect(std::io::Error::new(e.kind(), e.to_string())),
             Self::Jump(e) => Self::Jump(e.clone()),
             Self::Protocol(m) => Self::Protocol(m.clone()),
+            Self::KeyFile(m) => Self::KeyFile(m.clone()),
             Self::NeedsInput => Self::NeedsInput,
         }
     }
