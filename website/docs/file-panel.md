@@ -25,7 +25,7 @@ The panel uses the profile's shared connection (and its [jump hosts](profiles#ju
 
 A profile's panel starts in the server's home folder. The folder you were in is kept for each profile until you quit the app, so switching between panes and tabs of different servers returns to where you were.
 
-When you open the panel, the keyboard goes to it. A click in the terminal or moving to another pane gives it back, and so does `Escape` (when the filter has text, the first `Escape` clears the filter and the next one gives the keyboard back); a click in the panel takes it again. While the panel has the keyboard, keys go to the panel only and never to the terminal.
+When you open the panel, the keyboard goes to it. A click in the terminal or moving to another pane gives it back, and so does `Escape` (when the filter has text, the first `Escape` clears the filter, even while you are typing in it, and the next one gives the keyboard back); a click in the panel takes it again. While the panel has the keyboard, keys go to the panel only and never to the terminal.
 
 ## Browsing
 
@@ -36,14 +36,14 @@ When you open the panel, the keyboard goes to it. A click in the terminal or mov
 - **Show hidden files** (names starting with a dot) is on by default. Turn it off and the choice is remembered for every panel.
 - **Errors** (a folder you cannot read, a dropped connection) appear in the panel with **Retry**, which reopens the session if it is gone and reads the folder again.
 
-File names are shown as plain text. A name that contains control characters or invisible text-direction characters has each of them shown as `?`, so a name cannot disguise itself. A folder is read in the background (`Loading…`) and only the rows on screen are drawn. A folder with more than 100,000 entries is not listed in full: the panel shows `This folder has too many entries to list.`
+File names are shown as plain text. A name that contains control characters or invisible text-direction characters has each of them shown as `?`, so a name cannot disguise itself. A folder is read in the background (`Loading…`) and only the rows on screen are drawn. A folder with more than 100,000 entries is not listed in full: the panel shows `This folder has too many entries to list.` A folder whose names and link targets add up to more than 64 MB is not listed either: `This folder has too much data to list.`
 
 ## Downloading
 
 Select a file and use the toolbar:
 
-- **Download** saves into your Downloads folder (your home folder when there is no Downloads folder; with neither, the row says `No Downloads folder was found.`). If the name is taken it picks a free one: `report.pdf`, then `report (1).pdf`, `report (2).pdf` and so on. It never replaces anything.
-- **Download as…** opens the system's save dialog, offering the remote name, so you pick the folder and name.
+- **Download** saves into your Downloads folder (your home folder when there is no Downloads folder; with neither, the row says `No Downloads folder was found.`). If the name is taken it picks a free one: `report.pdf`, then `report (1).pdf`, `report (2).pdf` and so on. It never replaces anything, not even a file that something else saves under that name while the download runs: the download then takes the next free name, and its row shows where it went.
+- **Download as…** opens the system's save dialog, offering the remote name, so you pick the folder and name. A file you chose to replace there is replaced when the download completes.
 
 A link to a file downloads the file it points to. Folders, special files (devices, sockets) and links that point nowhere cannot be downloaded. A file that grows or shrinks while it downloads is not an error; you get what the server sent until the end of the file.
 
@@ -87,13 +87,13 @@ Transfers belong to the connection, not to the panel: hiding the panel, switchin
 
 ### Closing with transfers running
 
-Closing the last tab or pane of a profile while it has transfers running, closing a window the same way, or quitting asks first: `3 transfers are still running.` (`1 transfer is still running.`) with **Cancel transfers and close** and **Keep open**. Cancelling stops them and removes their part files; quitting waits briefly for that cleanup. While another tab of the same profile stays open, closing a tab does not ask, because the transfers keep running there.
+Closing the last tab or pane of a profile while it has transfers running, closing a window the same way, or quitting asks first: `3 transfers are still running.` (`1 transfer is still running.`) with **Cancel transfers and close** and **Keep open**. Cancelling stops them and removes their part files; quitting waits briefly for that cleanup. A replace that is writing over the existing file in place (see [Uploading](#uploading)) has no part file: the question then adds `Some files being replaced may be left incomplete.`, and cancelling it leaves that file partly written. The quit question appears in the window you are using (or the last terminal window) and brings that window forward. While another tab of the same profile stays open, closing a tab does not ask, because the transfers keep running there.
 
 On macOS, `Cmd+Q` asks as well while transfers run. Two limits apply: choosing **Quit** in the app menu with the mouse quits at once without asking, and with every window minimised `Cmd+Q` does nothing until a window is shown again. `Cmd+Q` is also ignored while a dialog is already open.
 
 ## Safety
 
-The panel acts only on your clicks and keys. A program running in the terminal, locally or on the server, can never open the panel, start a transfer or make this machine write a file. Names never leave their folder: a remote name is made safe before it is used locally, and an upload name with `/` or control characters is refused.
+The panel acts only on your clicks and keys. A program running in the terminal, locally or on the server, can never open the panel, start a transfer or make this machine write a file. Names never leave their folder: a remote name is made safe before it is used locally (path separators, control characters and the invisible or text-direction characters the panel shows as `?` become `_`), and an upload name with `/` or control characters is refused.
 
 ## Limits
 
