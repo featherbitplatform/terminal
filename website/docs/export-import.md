@@ -66,7 +66,7 @@ Overwrite replaces only what the archive carries:
 
 - A shared archive carries no secrets and no key paths, so overwriting keeps your saved password, your saved passphrase and your key path.
 - A full archive without key files carries key paths that mean nothing on this machine, so overwriting keeps your local key path.
-- A key path from an archive is used only when it is an absolute path on this computer or starts with `~/`. Network shares (`\\server\share\...`, `//server/share/...`), devices (`/dev/...`, `\\.\...`), paths with `..` and relative paths are dropped: that profile asks you to choose its key file the first time you connect. A preview row shows `Key file` and the path when the profile keeps one from the archive.
+- A key path from an archive is used only when it is an absolute path on this computer or starts with `~/`. Network shares and other Windows namespaces (`\\server\share\...`, `//server/share/...`, `\\?\...`, `\??\...`), device and process folders (`/dev/...`, `/proc/...`, in any letter case, and `\\.\...`), paths with `..` and relative paths are dropped: that profile asks you to choose its key file the first time you connect. Whatever the path, connecting only reads a key file that is a regular file of at most 1 MB. A preview row shows `Key file` and the path when the profile keeps one from the archive.
 - A full archive with the key file replaces the path with the file the import writes.
 
 A row whose result would be invalid is marked in red with the reason and cannot be imported until you change its choice: it is not an SSH profile, its jump chain loops back to itself or goes through more than 32 jump hosts, it jumps through a profile that is neither in the archive nor here, a profile with that name already exists, and so on. Color schemes in the archive are listed too: a scheme you already have with the same id and content is reused, and one that clashes is added with a new id and the name `{name} (imported)`.
@@ -83,7 +83,7 @@ The saved passwords and passphrases of a full archive are stored where you keep 
 
 - While the profile editor has unsaved changes the import is refused (`The profile editor has unsaved changes. Save or discard them before importing.`); save or discard them first.
 - While the profile editor is still saving the import is refused too (`The profile editor is still saving. Wait for it to finish before importing.`).
-- While a connection's main password dialog is open, an import or full export that needs the vault says `Finish unlocking saved secrets first.` (or `Finish setting the main password first.`) and waits for you to answer that dialog.
+- While a connection's main password dialog is open, an import or full export that needs the vault shows the notice `Finish unlocking saved secrets first.` (or `Finish setting the main password first.`) and does nothing yet; answer that dialog, then export or import again.
 - While profiles are read-only because `profiles.toml` could not be read, nothing can be imported until the file is fixed.
 
 The import writes key files, then color schemes, then `profiles.toml`, then secrets. If a step fails, the window says which, and later steps are not run.

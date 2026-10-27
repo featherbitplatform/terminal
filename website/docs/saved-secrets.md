@@ -38,11 +38,11 @@ Switching is refused while `profiles.toml` cannot be read (`Saved secrets cannot
 
 Notes under the password fields and the **Remember** checkbox in prompts name the storage in use, for example `Remember in the encrypted vault`.
 
-While a connection's **Unlock saved secrets** (or **Set a main password**) is open, switching storage and **Reset vault** wait: Settings says `Finish unlocking saved secrets first.` (or `Finish setting the main password first.`). A save in the profile editor that needs the vault says the same and keeps your edits unsaved until you answer that dialog.
+While a connection's **Unlock saved secrets** (or **Set a main password**) is open, switching storage and **Reset vault** do nothing yet: Settings shows the notice `Finish unlocking saved secrets first.` (or `Finish setting the main password first.`). Answer that dialog, then choose again. A save in the profile editor that needs the vault shows the same notice and keeps your edits unsaved; answer the dialog, then save again.
 
 ## When a secret cannot be saved
 
-If a password or passphrase you asked to remember cannot be saved (the keychain refused, the vault stayed locked, the storage failed), the connection still goes ahead and the app says so once per session, naming the storage, for example `Your password could not be saved in the system keychain, so fbterm will ask for it next time.` Declining **Set a main password** is your choice and is not reported.
+If a password or passphrase you asked to remember cannot be saved (the keychain refused, the vault stayed locked, the storage failed), the connection still goes ahead and the app says so once per session, naming the storage, for example `Your password could not be saved in the system keychain, so fbterm will ask for it next time.` (on Windows, `could not be saved for your Windows account`) Declining **Set a main password** is your choice and is not reported.
 
 A key passphrase remembered when you connect also marks the profile's key as having a passphrase (`passphrase = true` in `profiles.toml`), so the profile editor and full exports know a passphrase is saved for it.
 
