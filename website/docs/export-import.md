@@ -19,7 +19,7 @@ The window lists every profile, grouped, all checked. Uncheck what you do not wa
 | | **Full (for your own machines)** | **Shared (no secrets, for teammates)** |
 | --- | --- | --- |
 | Profiles | Local and SSH | SSH only |
-| Saved passwords and key passphrases | Yes, always | Never |
+| Saved passwords and key passphrases | Yes, always (a key profile's saved passphrase travels even when the profile does not say its key has one) | Never |
 | Private key files | Only if you check **Include private key files** | Never |
 | Private key paths | Kept | Removed; each person points the profile at their own key |
 | Tunnels, color scheme choice and the color schemes of yours that profiles use | Yes | Yes |
@@ -66,6 +66,7 @@ Overwrite replaces only what the archive carries:
 
 - A shared archive carries no secrets and no key paths, so overwriting keeps your saved password, your saved passphrase and your key path.
 - A full archive without key files carries key paths that mean nothing on this machine, so overwriting keeps your local key path.
+- A key path from an archive is used only when it is an absolute path on this computer or starts with `~/`. Network shares (`\\server\share\...`, `//server/share/...`), devices (`/dev/...`, `\\.\...`), paths with `..` and relative paths are dropped: that profile asks you to choose its key file the first time you connect. A preview row shows `Key file` and the path when the profile keeps one from the archive.
 - A full archive with the key file replaces the path with the file the import writes.
 
 A row whose result would be invalid is marked in red with the reason and cannot be imported until you change its choice: it is not an SSH profile, its jump chain loops back to itself or goes through more than 32 jump hosts, it jumps through a profile that is neither in the archive nor here, a profile with that name already exists, and so on. Color schemes in the archive are listed too: a scheme you already have with the same id and content is reused, and one that clashes is added with a new id and the name `{name} (imported)`.
@@ -76,11 +77,13 @@ When the archive carries key files for profiles you import, a **Key files** sect
 
 ### Saved secrets
 
-The saved passwords and passphrases of a full archive are stored where you keep [saved secrets](saved-secrets). With the encrypted vault in use, the import asks for the main password first when the vault is locked, or asks you to set a main password when there is no vault yet.
+The saved passwords and passphrases of a full archive are stored where you keep [saved secrets](saved-secrets). With the encrypted vault in use, the import asks for the main password first when the vault is locked, or asks you to set a main password when there is no vault yet. With **Automatic** storage not checked yet in this session, the import checks it first, so a machine with no system storage moves to the vault and asks for a main password before anything is written. A key profile that receives a passphrase is marked as having one.
 
 ### When import is not available
 
 - While the profile editor has unsaved changes the import is refused (`The profile editor has unsaved changes. Save or discard them before importing.`); save or discard them first.
+- While the profile editor is still saving the import is refused too (`The profile editor is still saving. Wait for it to finish before importing.`).
+- While a connection's main password dialog is open, an import or full export that needs the vault says `Finish unlocking saved secrets first.` (or `Finish setting the main password first.`) and waits for you to answer that dialog.
 - While profiles are read-only because `profiles.toml` could not be read, nothing can be imported until the file is fixed.
 
 The import writes key files, then color schemes, then `profiles.toml`, then secrets. If a step fails, the window says which, and later steps are not run.

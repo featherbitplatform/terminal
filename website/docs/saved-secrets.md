@@ -18,7 +18,7 @@ The system storage holds every secret as one item (service `fbterm`, account `se
 
 Automatic uses the system storage. The one exception is a machine that has no system storage at all, which only happens on Linux, on a desktop without a Secret Service; macOS and Windows never switch by themselves. There the app switches to the vault, once: it writes `secret_storage = "vault"`, says `The system keychain is not available, so saved secrets now use an encrypted vault.` and asks you to set a main password when you next save a secret.
 
-The app only looks at the system storage when a secret is first needed, so launching it never prompts. A storage that exists but refuses (access denied, a locked keychain, a cancelled prompt) never makes Automatic switch, because that would hide the secrets already in it; the connection asks for its password as if none were saved.
+The app only looks at the system storage when a secret is first needed, so launching it never prompts. A storage that exists but refuses or fails (access denied, a locked keychain, a cancelled prompt, a keyring service slow to start at login) never makes Automatic switch, because that would hide the secrets already in it; the connection asks for its password as if none were saved. Choosing **System keychain** or **Encrypted vault** yourself ends Automatic's check: an explicit choice is never switched by the app.
 
 ## The encrypted vault
 
@@ -37,6 +37,14 @@ Choosing another storage in Settings moves every saved secret. The secrets are w
 Switching is refused while `profiles.toml` cannot be read (`Saved secrets cannot move while profiles.toml cannot be read. Fix it first.`), because the profiles are how the app finds the secrets to move.
 
 Notes under the password fields and the **Remember** checkbox in prompts name the storage in use, for example `Remember in the encrypted vault`.
+
+While a connection's **Unlock saved secrets** (or **Set a main password**) is open, switching storage and **Reset vault** wait: Settings says `Finish unlocking saved secrets first.` (or `Finish setting the main password first.`). A save in the profile editor that needs the vault says the same and keeps your edits unsaved until you answer that dialog.
+
+## When a secret cannot be saved
+
+If a password or passphrase you asked to remember cannot be saved (the keychain refused, the vault stayed locked, the storage failed), the connection still goes ahead and the app says so once per session, naming the storage, for example `Your password could not be saved in the system keychain, so fbterm will ask for it next time.` Declining **Set a main password** is your choice and is not reported.
+
+A key passphrase remembered when you connect also marks the profile's key as having a passphrase (`passphrase = true` in `profiles.toml`), so the profile editor and full exports know a passphrase is saved for it.
 
 ## Editing the setting by hand
 

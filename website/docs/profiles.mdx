@@ -74,7 +74,7 @@ In the profile editor, leaving the private key field empty saves a key profile w
 
 When a login uses an RSA private key (from a key file or the SSH agent), the profile editor and the tab show a one-line warning suggesting an ed25519 key (`ssh-keygen -t ed25519`); the connection still works. Verifying a server's RSA host key does not warn.
 
-The file never contains a password or a passphrase. The `passphrase = true` flag only records that the key has one. The values themselves are kept where [saved secrets](saved-secrets) live (the system keychain or an encrypted vault), or asked for when you connect.
+The file never contains a password or a passphrase. The `passphrase = true` flag only records that the key has one; it is set for you when you connect, type the key's passphrase and ask to remember it. The values themselves are kept where [saved secrets](saved-secrets) live (the system keychain or an encrypted vault), or asked for when you connect.
 
 ### Host keys
 
