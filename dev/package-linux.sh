@@ -34,8 +34,8 @@ linux="crates/fbterm/linux"
 
 # Debian and RPM sort "~" before anything, so a pre-release precedes its release; RPM versions
 # may not contain "-".
-deb_version="${version/-/\~}"
-rpm_version="${version/-/\~}"
+deb_version="${version//-/\~}"
+rpm_version="${version//-/\~}"
 
 cargo build --locked --release -p fbterm
 bin="$target/release/fbterm"

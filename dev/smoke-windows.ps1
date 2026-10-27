@@ -2,7 +2,8 @@
 # per-machine install, `fbterm --version`, the Start menu shortcut, a silent uninstall that
 # keeps the user's config folder, then a reinstall and a final uninstall.
 # Run as administrator on a clean machine (a CI runner): it installs into Program Files and
-# writes a sample settings file into the current user's real fbterm config folder.
+# writes a sample settings file into the current user's real fbterm config folder, so it
+# refuses to run unless $env:CI is set or that folder holds no settings.toml or secrets.dpapi.
 # Usage: pwsh dev/smoke-windows.ps1 <dist-dir> <version> [<msiexec-log-dir>]
 param(
     [Parameter(Mandatory = $true)][string]$Dist,
@@ -26,6 +27,13 @@ $exe = Join-Path $installDir 'fbterm.exe'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\featherbit terminal.lnk'
 # fbterm's config folder (fbterm-config's Paths: directories' ProjectDirs "io.featherbit.fbterm").
 $configDir = Join-Path $env:APPDATA 'featherbit\fbterm\config'
+$settings = Join-Path $configDir 'settings.toml'
+$secrets = Join-Path $configDir 'secrets.dpapi'
+# Step 2 overwrites these two files: never on a machine where someone uses fbterm.
+$hadConfig = (Test-Path $settings) -or (Test-Path $secrets)
+if ($hadConfig -and -not $env:CI) {
+    throw "$configDir holds a real fbterm config (settings.toml or secrets.dpapi); run this on a CI runner or a clean machine"
+}
 New-Item -ItemType Directory -Force $Logs | Out-Null
 
 # msiexec, silent, with a verbose log; stops on any result but success.
@@ -84,8 +92,6 @@ Assert-Installed
 
 # 2. The user's settings, and a stand-in for saved secrets, as fbterm would write them.
 New-Item -ItemType Directory -Force $configDir | Out-Null
-$settings = Join-Path $configDir 'settings.toml'
-$secrets = Join-Path $configDir 'secrets.dpapi'
 Set-Content -Path $settings -Value "# smoke test`nfont_size = 15.0`n" -NoNewline
 Set-Content -Path $secrets -Value 'smoke test' -NoNewline
 $settingsHash = (Get-FileHash $settings).Hash
@@ -104,5 +110,7 @@ Assert-Installed
 Invoke-Msiexec '/x' 'uninstall-2.log'
 Assert-Removed
 if (-not (Test-Path $settings)) { throw "the second uninstall removed $settings" }
+# The sample files are the script's own unless they were there before (CI only): remove them.
+if (-not $hadConfig) { Remove-Item -Force $settings, $secrets }
 
 Write-Output "smoke ok: $name.msi on $((Get-CimInstance Win32_OperatingSystem).Caption)"

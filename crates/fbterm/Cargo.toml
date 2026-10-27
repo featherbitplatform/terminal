@@ -122,6 +122,8 @@ libXcursor = "*"
 libXi = "*"
 libxcb = "*"
 dbus-libs = "*"
+# Owns the /usr/share/icons/hicolor folders the icons go in, so removal leaves none behind.
+hicolor-icon-theme = "*"
 
 [package.metadata.generate-rpm.recommends]
 vulkan-loader = "*"

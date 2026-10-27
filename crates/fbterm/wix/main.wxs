@@ -48,6 +48,8 @@
         <!--
           A newer version replaces an older one. Same-version upgrades are allowed so a
           release replaces its own pre-release (MSI compares only X.Y.Z).
+          light reports warning ICE61 for AllowSameVersionUpgrades. It is expected: the same-version
+          upgrade is the point, so leave it.
         -->
         <MajorUpgrade
             Schedule='afterInstallInitialize'
