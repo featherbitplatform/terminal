@@ -1126,3 +1126,105 @@ fn chains_longer_than_32_hops_are_refused() {
         start.elapsed()
     );
 }
+
+#[test]
+fn duplicate_copies_every_field_but_id_and_name_right_after_the_original() {
+    let mut full = ssh("db", vec![]);
+    let hop = ssh("bastion", vec![]);
+    full.group = Some("prod".into());
+    full.accent = Some(Rgb { r: 1, g: 2, b: 3 });
+    full.accent_style = AccentStyle::Tab;
+    full.color_scheme = Some("solar".into());
+    if let ProfileKind::Ssh(s) = &mut full.kind {
+        s.port = 2222;
+        s.auth = AuthMethod::Key {
+            path: Some("/k/id".into()),
+            passphrase: true,
+        };
+        s.jump = vec![hop.id];
+        s.tunnels = vec![TunnelDef {
+            name: "web".into(),
+            kind: TunnelKind::Local {
+                bind: "127.0.0.1".into(),
+                port: 8080,
+                host: "localhost".into(),
+                host_port: 80,
+            },
+            start: StartMode::default(),
+        }];
+    }
+    let mut shell = local("zsh");
+    if let ProfileKind::Local(l) = &mut shell.kind {
+        l.cwd = Some("/tmp".into());
+        l.env.insert("A".into(), "1".into());
+    }
+    let mut store = ProfileStore {
+        profiles: vec![hop.clone(), full.clone(), shell.clone()],
+    };
+
+    let id = store.duplicate(full.id).expect("a copy");
+    assert_ne!(id, full.id);
+    let names: Vec<&str> = store.profiles.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["bastion", "db", "db copy", "zsh"]);
+    let copy = store.get(id).unwrap();
+    assert_eq!(
+        Profile {
+            id: full.id,
+            name: full.name.clone(),
+            ..copy.clone()
+        },
+        full
+    );
+
+    let local_id = store.duplicate(shell.id).unwrap();
+    let copy = store.get(local_id).unwrap();
+    assert_eq!(copy.name, "zsh copy");
+    assert_eq!(copy.kind, shell.kind);
+    assert_eq!(
+        (copy.group.clone(), copy.accent),
+        (shell.group, shell.accent)
+    );
+    assert!(store.validate().is_empty());
+}
+
+#[test]
+fn duplicate_names_count_up_until_unique() {
+    let a = ssh("a", vec![]);
+    let mut store = ProfileStore {
+        profiles: vec![a.clone(), ssh("a copy", vec![]), ssh("a copy 3", vec![])],
+    };
+    let first = store.duplicate(a.id).unwrap();
+    assert_eq!(store.get(first).unwrap().name, "a copy 2");
+    let second = store.duplicate(a.id).unwrap();
+    assert_eq!(store.get(second).unwrap().name, "a copy 4");
+    // Newest copy first, right after the original.
+    let names: Vec<&str> = store.profiles.iter().map(|p| p.name.as_str()).collect();
+    assert_eq!(names, ["a", "a copy 4", "a copy 2", "a copy", "a copy 3"]);
+    // A copy of a copy.
+    let third = store.duplicate(first).unwrap();
+    assert_eq!(store.get(third).unwrap().name, "a copy 2 copy");
+    assert!(store.validate().is_empty());
+}
+
+#[test]
+fn duplicate_of_an_unknown_profile_changes_nothing() {
+    let mut store = ProfileStore {
+        profiles: vec![ssh("a", vec![])],
+    };
+    let before = store.clone();
+    assert_eq!(store.duplicate(ProfileId::new()), None);
+    assert_eq!(store, before);
+}
+
+#[test]
+fn duplicate_profile_action_is_named_and_unbound_by_default() {
+    use fbterm_config::keys::{Action, default_chord};
+    assert_eq!(
+        Action::from_name("duplicate_profile"),
+        Some(Action::DuplicateProfile)
+    );
+    assert!(Action::ALL.contains(&Action::DuplicateProfile));
+    assert_eq!(Action::DuplicateProfile.title(), "Duplicate profile");
+    assert_eq!(default_chord(true, Action::DuplicateProfile), None);
+    assert_eq!(default_chord(false, Action::DuplicateProfile), None);
+}

@@ -334,14 +334,14 @@ fn form<'a>(
     let mut col = column![
         section(t, "General"),
         row![
-            container(field(
-                t,
-                "Name",
-                "Profile name",
-                &d.name,
-                false,
-                on(EditorMsg::Name)
-            ))
+            container(
+                column![
+                    ui::label(t, "Name"),
+                    input(t, "Profile name", &d.name, false, on(EditorMsg::Name))
+                        .id(state.name_input.clone())
+                ]
+                .spacing(6)
+            )
             .width(Length::FillPortion(3)),
             container(field(
                 t,
@@ -518,6 +518,13 @@ fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Ele
                 "Delete",
                 (editable && has_selection).then(|| msg(EditorMsg::Delete)),
                 ui::danger_ghost
+            ),
+            ui::text_button(
+                t,
+                "Duplicate",
+                (editable && has_selection && state.saving.is_none())
+                    .then(|| msg(EditorMsg::Duplicate)),
+                ui::ghost
             ),
             ui::text_button(t, "Export\u{2026}", Some(msg(EditorMsg::Export)), ui::ghost),
             ui::text_button(t, "Import\u{2026}", Some(msg(EditorMsg::Import)), ui::ghost),
