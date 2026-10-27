@@ -1280,6 +1280,7 @@ dependencies = [
  "png",
  "read-fonts 0.41.0",
  "rfd",
+ "tempfile",
  "tokio",
  "toml",
  "tracing",

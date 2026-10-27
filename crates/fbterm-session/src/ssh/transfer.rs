@@ -180,7 +180,8 @@ pub fn free_name(dir: &Path, name: &str) -> PathBuf {
 }
 
 /// [`free_name`], also skipping every path `reserved` claims: names that other downloads
-/// still running are about to write, though nothing is there yet.
+/// still running are about to write, though nothing is there yet (callers compare with
+/// [`same_destination`]).
 pub fn free_name_avoiding(dir: &Path, name: &str, reserved: impl Fn(&Path) -> bool) -> PathBuf {
     let name = safe_local_name(name);
     let taken = |p: &Path| reserved(p) || p.symlink_metadata().is_ok();
@@ -200,6 +201,19 @@ pub fn free_name_avoiding(dir: &Path, name: &str, reserved: impl Fn(&Path) -> bo
         })
         .find(|p| !taken(p))
         .expect("some numbered name is free")
+}
+
+/// Whether two local destinations may be the same file: the same folder, and names equal
+/// ignoring case. Case-insensitive disks (the default on macOS and Windows) hold one file for
+/// both; on other disks treating them as one only skips a name, which is harmless.
+pub fn same_destination(a: &Path, b: &Path) -> bool {
+    a.parent() == b.parent()
+        && match (a.file_name(), b.file_name()) {
+            (Some(x), Some(y)) => {
+                x.to_string_lossy().to_lowercase() == y.to_string_lossy().to_lowercase()
+            }
+            _ => a == b,
+        }
 }
 
 /// `remote` (a remote file name) as a local file name: path separators and control

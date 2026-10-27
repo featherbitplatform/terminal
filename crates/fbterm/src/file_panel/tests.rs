@@ -128,6 +128,8 @@ fn folder(name: &str) -> Entry {
 }
 
 struct World {
+    /// The Downloads stand-in of [`World::downloading`], removed with the world.
+    downloads: Option<tempfile::TempDir>,
     app: App,
     fake: Arc<Fake>,
     wid: window::Id,
@@ -152,6 +154,7 @@ fn world_at(paths: Paths, db: Profile, web: Profile, local: Profile) -> World {
     app.windows.insert(wid, WindowState::new());
     app.focused = Some(wid);
     World {
+        downloads: None,
         app,
         fake,
         wid,
@@ -1462,18 +1465,15 @@ fn navigating_while_the_session_opens_keeps_that_open() {
 
 // ---- Downloads ----
 
-/// A fresh folder standing in for Downloads: tests never write to the real one.
-fn downloads_dir() -> PathBuf {
-    let d = std::env::temp_dir().join(format!("fbterm-downloads-test-{}", ProfileId::new()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
-}
-
 impl World {
     /// [`World::browsing`] with Downloads at a fresh temporary folder.
     fn downloading(entries: Vec<Entry>) -> (World, PathBuf) {
         let mut w = World::browsing(entries);
-        let dir = downloads_dir();
+        // A fresh folder standing in for Downloads (tests never write to the real one),
+        // removed when the world goes.
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().to_path_buf();
+        w.downloads = Some(temp);
         w.app.file_panel_work.downloads = Some(dir.clone());
         (w, dir)
     }
@@ -1763,4 +1763,55 @@ fn transfer_rows_show_progress_and_their_actions() {
         1,
         "only the running row can be cancelled"
     );
+}
+
+#[test]
+fn names_differing_only_in_case_never_share_a_destination() {
+    // A case-insensitive disk (the default on macOS and Windows) holds one file for both.
+    let (mut w, dir) = World::downloading(vec![file("App.log"), file("app.log")]);
+    w.select("App.log");
+    w.download();
+    w.select("app.log");
+    w.download();
+    assert_eq!(w.downloads()[0].1, dir.join("App.log"));
+    assert_eq!(w.downloads()[1].1, dir.join("app (1).log"));
+    // `Download as…` onto a running destination in another case: refused.
+    w.download_as();
+    w.choose(Some(dir.join("APP.LOG")));
+    assert_eq!(w.downloads().len(), 2);
+    assert_eq!(
+        w.rows().last().unwrap().failed(),
+        Some("Already downloading to APP.LOG")
+    );
+}
+
+#[test]
+fn download_needs_the_selection_on_screen() {
+    let (mut w, _dir) = World::downloading(vec![file(".env"), file("app.log")]);
+    let wid = w.wid;
+    w.select(".env");
+    assert!(w.app.can_download(wid));
+    // The filter hides it: nothing the user cannot see is downloaded.
+    let _ = w.msg(FilePanelMsg::Filter(wid, "app".into()));
+    assert!(!w.app.can_download(wid));
+    w.download();
+    w.download_as();
+    assert!(w.downloads().is_empty());
+    assert!(w.fake.saves.lock().is_empty());
+    // So does turning hidden files off.
+    let _ = w.msg(FilePanelMsg::Filter(wid, String::new()));
+    assert!(w.app.can_download(wid));
+    let _ = w.msg(FilePanelMsg::ShowHidden(false));
+    assert!(!w.app.can_download(wid));
+}
+
+#[test]
+fn closing_the_window_forgets_its_save_dialog() {
+    let (mut w, _dir) = World::downloading(vec![file("app.log")]);
+    let wid = w.wid;
+    w.select("app.log");
+    w.download_as();
+    assert!(w.app.file_panels.saving.contains_key(&wid));
+    let _ = w.app.update(Message::WindowClosed(wid));
+    assert!(w.app.file_panels.saving.is_empty());
 }

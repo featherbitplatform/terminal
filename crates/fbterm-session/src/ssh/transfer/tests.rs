@@ -97,6 +97,30 @@ fn free_name_skips_reserved_names() {
 }
 
 #[test]
+fn destinations_clash_ignoring_case() {
+    let d = Path::new("/home/user/Downloads");
+    assert!(same_destination(&d.join("App.log"), &d.join("app.log")));
+    assert!(same_destination(&d.join("README"), &d.join("readme")));
+    assert!(!same_destination(
+        &d.join("app.log"),
+        &d.join("app (1).log")
+    ));
+    assert!(!same_destination(
+        &d.join("app.log"),
+        &Path::new("/tmp").join("app.log")
+    ));
+    // Free names skip a reserved name in any case.
+    let dir = tempfile::tempdir().unwrap();
+    let reserved = [dir.path().join("README")];
+    assert_eq!(
+        free_name_avoiding(dir.path(), "readme", |p| reserved
+            .iter()
+            .any(|r| same_destination(r, p))),
+        dir.path().join("readme (1)")
+    );
+}
+
+#[test]
 fn download_name_is_sanitized() {
     assert_eq!(safe_local_name("plain.txt"), "plain.txt");
     assert_eq!(safe_local_name(".hidden"), ".hidden");

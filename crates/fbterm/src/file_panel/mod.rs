@@ -63,6 +63,7 @@ use fbterm_config::{ProfileId, ProfileKind, ProfileStore};
 use fbterm_session::ssh::sftp::{Entry, Sftp, SftpError, SortKey, sort_entries};
 use fbterm_session::ssh::transfer::{
     self, TransferEvent, TransferId, TransferSink, free_name_avoiding, safe_local_name,
+    same_destination,
 };
 use fbterm_session::ssh::{Prompter, SshError, SshPool};
 use iced::futures::Stream;
@@ -773,7 +774,7 @@ impl App {
     }
 
     /// What `Download` in `wid`'s panel would fetch: the profile, the remote path and name
-    /// of the selected file (or link to a file), while its session is open.
+    /// of the selected file (or link to a file) while it is shown and its session is open.
     fn download_target(&self, wid: window::Id) -> Option<(ProfileId, String, String)> {
         let profile = self.shown_profile(wid)?;
         let panel = self.file_panels.by_profile.get(&profile)?;
@@ -782,8 +783,11 @@ impl App {
             return None;
         };
         let selected = panel.selected.as_deref()?;
-        let entry = entries
+        // Only an entry on screen: one the filter or `Show hidden files` hides stays put.
+        let entry = panel
+            .shown
             .iter()
+            .map(|&i| &entries[i])
             .find(|e| e.name == selected && downloadable(e))?;
         Some((
             profile,
@@ -829,7 +833,9 @@ impl App {
             return;
         };
         let writing = self.writing();
-        let dest = free_name_avoiding(&folder, &name, |p| writing.iter().any(|w| w == p));
+        let dest = free_name_avoiding(&folder, &name, |p| {
+            writing.iter().any(|w| same_destination(w, p))
+        });
         self.start_download(profile, remote, plain_name(&name), dest);
     }
 
@@ -866,7 +872,7 @@ impl App {
         let Some(dest) = path else {
             return;
         };
-        if self.writing().contains(&dest) {
+        if self.writing().iter().any(|w| same_destination(w, &dest)) {
             let shown = dest.file_name().map_or_else(
                 || dest.display().to_string(),
                 |n| n.to_string_lossy().into(),

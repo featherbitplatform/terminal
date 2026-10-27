@@ -877,6 +877,8 @@ impl App {
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
                 self.file_panels.ui.remove(&id);
+                // A save dialog it had open answers nothing now.
+                self.file_panels.saving.remove(&id);
                 if self.carry.is_some_and(|(w, _)| w == id) {
                     self.carry = None;
                     self.hover = None;

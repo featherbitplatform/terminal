@@ -30,6 +30,8 @@ png = { workspace = true }
 feathercritty = { workspace = true }
 toml = { workspace = true }
 read-fonts = "=0.41.0"
+# Temporary folders that remove themselves (already in the lockfile through fbterm-session).
+tempfile = "3"
 # A headless renderer for driving widgets through `Widget::update` in tests (the version iced uses).
 iced_tiny_skia = "=0.14.1"
 
