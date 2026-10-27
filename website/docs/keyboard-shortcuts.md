@@ -10,7 +10,22 @@ These are the defaults. Every application shortcut can be changed or removed in 
 
 Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings.
 
-On macOS the shortcuts use `Cmd`, and `Option` only for moving between panes; never `Ctrl`. Copy and paste are handled by the terminal view and are not in this table. Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
+On macOS the shortcuts use `Cmd`, and `Option` only for moving between panes; never `Ctrl`. Copy and paste are handled by the terminal view, see [Copy and paste](#copy-and-paste). Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
+
+## Copy and paste
+
+Select text by dragging with the mouse (double-click selects a word, triple-click a line, `Shift`+click extends the selection).
+
+| Action | macOS | Linux and Windows |
+| --- | --- | --- |
+| Copy the selection | `Cmd+C` | `Ctrl+Shift+C` |
+| Paste | `Cmd+V` | `Ctrl+Shift+V` |
+
+On Linux and Windows `Ctrl+C` is not copy: it goes to the program as usual (it interrupts the running command in a shell). A paste into a program that asked for bracketed paste is sent bracketed, so a shell does not run pasted lines on its own.
+
+**Right-click** (Linux and Windows): on a selection it copies it to the clipboard and clears the selection. With nothing selected it opens a small menu at the pointer with **Copy** (disabled, as nothing is selected) and **Paste**, which pastes exactly like `Ctrl+Shift+V`. `Up` and `Down` move in the menu, `Enter` chooses, and `Escape`, a click outside it, switching to another window or resizing the window close it. When the program in the pane uses the mouse itself (an editor or a system monitor with mouse support), a plain right-click goes to the program; hold `Shift` while right-clicking to copy or open the menu instead. On macOS right-click does nothing in the terminal. Only your own right-click does any of this; nothing a program prints can open the menu or touch the clipboard.
+
+These shortcuts cannot be changed; Settings lists them under **Fixed** at the end of the **Keyboard** section.
 
 ## Windows and tabs
 
@@ -141,12 +156,13 @@ Open Settings (`Cmd+,` on macOS, `Ctrl+,` on Linux and Windows, or the gear butt
 - **Already in use:** if another action has that shortcut, the row names it and offers **Take over** (the other action is then left without a shortcut) or **Cancel**. Two actions never share a shortcut.
 - **Not allowed:** a shortcut needs `Cmd`, `Ctrl` or `Alt` (`Option`), except `F1` to `F12`, which work alone. Plain letters, `Enter`, `Tab` and `Escape` cannot be shortcuts on their own, and `Escape` never can.
 - **Reserved:** keys that already do something outside this list cannot be taken: copy and paste in the terminal (`Cmd+C` and `Cmd+V` on macOS, `Ctrl+Shift+C` and `Ctrl+Shift+V` elsewhere), the scrollback keys (`Shift+PageUp`, `Shift+PageDown`, `Shift+Home`, `Shift+End`, and `Cmd+Home`, `Cmd+End` on macOS), Save in the profile editor (exactly `Cmd+S`, `Ctrl+S` elsewhere; with `Shift` or `Alt` added it is free to use) and, on macOS, `Cmd+Q` (Quit) and the app menu's `Cmd+H` (Hide) and `Cmd+Option+H` (Hide Others). The row says what uses the key.
+- **Fixed shortcuts:** the end of the list, under **Fixed**, shows the shortcuts that cannot be changed, each marked `Fixed`: copy, paste, the scrollback keys, Save, and on macOS Hide and Hide others. Their shortcuts are not buttons and cannot be recorded.
 - **Quit on macOS** is always `Cmd+Q`, so its row is fixed. While file transfers are running, the key goes through the app's own Quit, which first asks whether to cancel them; this needs a window in front, so with every window minimised `Cmd+Q` does nothing until one is shown again. With no transfers running, `Cmd+Q` quits at once from the app menu, as in any app. Choosing **Quit** in the app menu with the mouse always quits at once.
 - **Taken from programs:** a shortcut that programs in the terminal would normally receive works, but its row shows a warning saying what is lost when that is known (for example ``Ctrl+R is reverse search in bash and zsh``). On macOS that is any shortcut without `Cmd`. On Linux and Windows it is `Ctrl` with a letter (without `Shift`), `Ctrl` with a few symbols, arrows and editing keys, any `Alt` shortcut (Meta in bash, zsh and emacs) and `F` keys on their own.
 - **Remove one:** the `x` that appears when you point at a row leaves the action without a shortcut (it stays in the palette).
 - **Go back:** a changed row has a reset button that restores its default, and **Restore defaults** restores them all.
 
-Changes apply at once in every window, the palette and the tooltips, and are saved to `settings.toml`. The keys inside the palette, the find bar and the find-in-all-tabs box (`Enter`, `Shift+Enter`, `Escape`, `Up`, `Down`, `Ctrl+P`, `Ctrl+N`) stay as they are; the find bar's next and previous match shortcuts (`Cmd+G`, `Cmd+Shift+G`) can be changed like the others and still act only while the bar is open. `Cmd+S` in the profile editor and copy and paste are not in the list.
+Changes apply at once in every window, the palette and the tooltips, and are saved to `settings.toml`. The keys inside the palette, the find bar and the find-in-all-tabs box (`Enter`, `Shift+Enter`, `Escape`, `Up`, `Down`, `Ctrl+P`, `Ctrl+N`) stay as they are; the find bar's next and previous match shortcuts (`Cmd+G`, `Cmd+Shift+G`) can be changed like the others and still act only while the bar is open. `Cmd+S` in the profile editor, copy and paste and the scrollback keys are listed under **Fixed** and cannot be changed.
 
 ### The `[keys]` table
 
