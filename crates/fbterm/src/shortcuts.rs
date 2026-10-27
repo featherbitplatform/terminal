@@ -442,6 +442,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        crate::key_log::shortcuts(self.window, event, shell.is_event_captured());
         if let Event::Keyboard(keyboard::Event::KeyPressed {
             key,
             modified_key,

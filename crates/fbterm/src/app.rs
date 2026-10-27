@@ -829,6 +829,10 @@ impl App {
             subs.push(iced::time::every(Duration::from_millis(1500)).map(|_| Message::Shoot));
         }
         subs.push(window::resize_events().map(|(id, size)| Message::WindowResized(id, size)));
+        if crate::key_log::enabled() && self.recording_window().is_some() {
+            // Debug aid, only while a shortcut is recorded: log what the windows receive.
+            subs.push(iced::event::listen_with(crate::key_log::listen));
+        }
         if self.move_watch.watching() {
             // Only while a move or resize request is watched (at most `ANSWER_TIME`).
             subs.push(iced::event::listen_with(crate::move_watch::watch_event));
@@ -841,6 +845,14 @@ impl App {
             .map(Message::ConfigChanged),
         );
         Subscription::batch(subs)
+    }
+
+    /// The Settings window while it records a shortcut.
+    fn recording_window(&self) -> Option<window::Id> {
+        self.settings_win
+            .as_ref()
+            .filter(|(_, state)| state.recording.is_some())
+            .map(|(id, _)| *id)
     }
 
     fn first_window_ready(&self) -> bool {
@@ -866,6 +878,7 @@ impl App {
         self.sync_file_panels();
         self.sync_context_menu();
         self.sync_quit_key();
+        crate::key_log::set_recording(self.recording_window());
         match self.sync_panel_focus() {
             Some(unfocus) => Task::batch([task, unfocus]),
             None => task,
