@@ -12,7 +12,7 @@ use crate::editor::EditorMsg;
 use crate::file_panel::{FilePanelMsg, PanelKey};
 use crate::find::FindMsg;
 use crate::find::all::FindAllMsg;
-use crate::keys::{self, Action, Bindings};
+use crate::keys::{self, Action, Bindings, Press};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
 use crate::saved_secrets::VaultMsg;
@@ -113,14 +113,10 @@ fn find_all_key(key: &keyboard::Key, mods: keyboard::Modifiers) -> Option<FindAl
 }
 
 /// The find-bar message a key means while the bar is open.
-fn find_bar_key(
-    bindings: &Bindings,
-    key: &keyboard::Key,
-    mods: keyboard::Modifiers,
-    text: Option<&str>,
-) -> Option<FindMsg> {
+fn find_bar_key(bindings: &Bindings, press: &Press, text: Option<&str>) -> Option<FindMsg> {
     use keyboard::key::Named;
-    match keys::shortcut(bindings, key, mods, text) {
+    let (key, mods) = (&press.key, press.mods);
+    match keys::shortcut(bindings, &press.chord_key, press.chord_mods, text) {
         Some(Action::FindNext) => return Some(FindMsg::Next),
         Some(Action::FindPrevious) => return Some(FindMsg::Previous),
         _ => {}
@@ -144,18 +140,20 @@ pub(crate) struct Shortcuts<'a> {
 
 /// What a key press means to a [`Shortcuts`] wrapper in `mode` over window `w`:
 /// `Some(Some(msg))` publish and stop it, `Some(None)` stop it, `None` let it through.
-fn key_message(
+fn press_message(
     bindings: &Bindings,
     mode: Mode,
     w: window::Id,
-    key: &keyboard::Key,
-    mods: keyboard::Modifiers,
+    press: &Press,
     repeat: bool,
     text: Option<&str>,
 ) -> Option<Option<Message>> {
     use keyboard::key::Named;
+    // Named keys (Escape, Enter, arrows) as reported; chords from the press's chord key.
+    let (key, mods) = (&press.key, press.mods);
     // The find-bar keys act only in the bar (`Mode::Find`); elsewhere they reach the terminal.
-    let shortcut = keys::shortcut(bindings, key, mods, text).filter(|a| !a.is_find_navigation());
+    let shortcut = keys::shortcut(bindings, &press.chord_key, press.chord_mods, text)
+        .filter(|a| !a.is_find_navigation());
     match mode {
         Mode::Normal => shortcut.map(|action| {
             // Holding a key repeats tab switching and zooming only.
@@ -174,15 +172,15 @@ fn key_message(
         Mode::Palette => palette_key(key, mods).map(|m| Some(Message::Palette(w, m))),
         Mode::FindAll => find_all_key(key, mods).map(|m| Some(Message::FindAll(w, m))),
         Mode::Menu => Some(crate::context_menu::menu_key(key).map(|m| Message::ContextMenu(w, m))),
-        Mode::Find => match find_bar_key(bindings, key, mods, text) {
+        Mode::Find => match find_bar_key(bindings, press, text) {
             Some(m) => Some(Some(Message::Find(w, m))),
-            None => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
+            None => press_message(bindings, Mode::Normal, w, press, repeat, text),
         },
         Mode::Panel => match key {
             keyboard::Key::Named(Named::Escape) if !repeat => Some(Some(Message::FilePanel(
                 FilePanelMsg::Key(w, PanelKey::Escape),
             ))),
-            _ => key_message(bindings, Mode::Normal, w, key, mods, repeat, text),
+            _ => press_message(bindings, Mode::Normal, w, press, repeat, text),
         },
         Mode::Prompt => match key {
             keyboard::Key::Named(Named::Escape) => {
@@ -291,22 +289,44 @@ fn key_message(
             )),
             _ => None,
         }),
-        Mode::Recording => Some(recording_key(key, mods, repeat)),
+        Mode::Recording => Some(recording_key(press, repeat)),
     }
+}
+
+/// [`press_message`] for a press whose chord is its key, as reported.
+#[cfg(test)]
+fn key_message(
+    bindings: &Bindings,
+    mode: Mode,
+    w: window::Id,
+    key: &keyboard::Key,
+    mods: keyboard::Modifiers,
+    repeat: bool,
+    text: Option<&str>,
+) -> Option<Option<Message>> {
+    press_message(
+        bindings,
+        mode,
+        w,
+        &Press::plain(key.clone(), mods),
+        repeat,
+        text,
+    )
 }
 
 /// What a key press means to the chord recorder: plain Escape cancels, a modifier alone or a
 /// held key does nothing yet, anything else is the chord (or a key that cannot be one).
-fn recording_key(key: &keyboard::Key, mods: keyboard::Modifiers, repeat: bool) -> Option<Message> {
+fn recording_key(press: &Press, repeat: bool) -> Option<Message> {
     use keyboard::key::Named;
-    if repeat || keys::is_modifier(key) {
+    if repeat || keys::is_modifier(&press.key) {
         return None;
     }
-    if matches!(key, keyboard::Key::Named(Named::Escape)) && mods.is_empty() {
+    if matches!(press.key, keyboard::Key::Named(Named::Escape)) && press.mods.is_empty() {
         return Some(Message::Settings(SettingsMsg::CancelRecording));
     }
     Some(Message::Settings(SettingsMsg::Pressed(keys::press_chord(
-        key, mods,
+        &press.chord_key,
+        press.chord_mods,
     ))))
 }
 
@@ -424,17 +444,25 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
     ) {
         if let Event::Keyboard(keyboard::Event::KeyPressed {
             key,
+            modified_key,
+            physical_key,
+            location,
             modifiers,
             repeat,
             text,
-            ..
         }) = event
-            && let Some(msg) = key_message(
+            && let Some(msg) = press_message(
                 self.bindings,
                 self.mode,
                 self.window,
-                key,
-                *modifiers,
+                &Press::new(
+                    key,
+                    modified_key,
+                    *physical_key,
+                    *location,
+                    *modifiers,
+                    keys::num_lock(),
+                ),
                 *repeat,
                 text.as_deref(),
             )
@@ -1260,6 +1288,33 @@ mod tests {
         assert!(matches!(
             key_message(&b, Mode::Recording, w, &a, none, true, None),
             Some(None)
+        ));
+    }
+
+    #[test]
+    fn windows_numpad_digits_with_shift_record_and_match_as_digits() {
+        use keyboard::key::{Code, Named, Physical};
+        let b = Bindings::defaults(false);
+        let w = window::Id::unique();
+        // Ctrl+Shift+Numpad1 with Num Lock on, as Windows reports it: End, Shift released.
+        let end = keyboard::Key::Named(Named::End);
+        let press = Press::new(
+            &end,
+            &end,
+            Physical::Code(Code::Numpad1),
+            keyboard::Location::Numpad,
+            keyboard::Modifiers::CTRL,
+            Some(true),
+        );
+        let Some(Some(Message::Settings(SettingsMsg::Pressed(Some(c))))) =
+            press_message(&b, Mode::Recording, w, &press, false, None)
+        else {
+            panic!("the press is recorded");
+        };
+        assert_eq!(c.label(false), "Ctrl+Shift+1");
+        assert!(matches!(
+            press_message(&b, Mode::Normal, w, &press, false, None),
+            Some(Some(Message::Shortcut(_, Action::SelectTab(1))))
         ));
     }
 }
