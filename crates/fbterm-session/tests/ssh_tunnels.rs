@@ -1058,8 +1058,9 @@ async fn fixed_port_remote_forward_survives_reconnect() {
             let _ = s.shutdown().await;
         }
     });
-    // A fixed server port, distinct per test run.
-    let fixed = 40000 + u16::try_from(std::process::id() % 10000).unwrap();
+    // A fixed server port, distinct per test run, below the server's ephemeral range
+    // (32768-60999 on Linux), so no outgoing connection there can hold it.
+    let fixed = 20000 + u16::try_from(std::process::id() % 10000).unwrap();
     let remote = TunnelKind::Remote {
         bind: HOST.into(),
         port: fixed,
@@ -1075,9 +1076,10 @@ async fn fixed_port_remote_forward_survives_reconnect() {
     e.up().await;
     assert_eq!(t.port(), Some(fixed));
 
-    // The link drops here while the server's old session keeps the port for 2.5 s more: the
-    // first attempt (after 1 s) is refused, the second (after 2 s more) gets the port back.
-    proxy.cut_here(Duration::from_millis(2500));
+    // The link drops here while the server's old session keeps the port for 2 s more: the
+    // first attempt (after 1 s) is refused, the second (after 2 s more) gets the port back,
+    // each a second away from the port's release.
+    proxy.cut_here(Duration::from_secs(2));
     assert_eq!(
         next_state(&mut e).await,
         TunnelState::Reconnecting { attempt: 1, max: 5 }
@@ -1111,7 +1113,8 @@ async fn refused_re_forward_fails_with_its_reason_when_retries_run_out() {
         passphrase: false,
     };
     let p = w.add_via_proxy("proxied", &proxy, auth);
-    let fixed = 50000 + u16::try_from(std::process::id() % 10000).unwrap();
+    // Fixed, per run and below the server's ephemeral range, apart from the test above.
+    let fixed = 30000 + u16::try_from(std::process::id() % 10000).unwrap();
     let remote = TunnelKind::Remote {
         bind: HOST.into(),
         port: fixed,
