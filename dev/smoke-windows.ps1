@@ -90,27 +90,33 @@ if (Test-Path $installDir) { throw "$installDir exists before the install; run o
 Invoke-Msiexec '/i' 'install.log'
 Assert-Installed
 
-# 2. The user's settings, and a stand-in for saved secrets, as fbterm would write them.
-New-Item -ItemType Directory -Force $configDir | Out-Null
-Set-Content -Path $settings -Value "# smoke test`nfont_size = 15.0`n" -NoNewline
-Set-Content -Path $secrets -Value 'smoke test' -NoNewline
-$settingsHash = (Get-FileHash $settings).Hash
+# 2-4 write sample config files; they are the script's own unless they were there before
+# (CI only), so they are removed however the steps end.
+try {
+    # 2. The user's settings, and a stand-in for saved secrets, as fbterm would write them.
+    New-Item -ItemType Directory -Force $configDir | Out-Null
+    Set-Content -Path $settings -Value "# smoke test`nfont_size = 15.0`n" -NoNewline
+    Set-Content -Path $secrets -Value 'smoke test' -NoNewline
+    $settingsHash = (Get-FileHash $settings).Hash
 
-# 3. Uninstall: the program goes, the config folder stays untouched.
-Invoke-Msiexec '/x' 'uninstall.log'
-Assert-Removed
-foreach ($f in @($settings, $secrets)) {
-    if (-not (Test-Path $f)) { throw "uninstall removed $f" }
+    # 3. Uninstall: the program goes, the config folder stays untouched.
+    Invoke-Msiexec '/x' 'uninstall.log'
+    Assert-Removed
+    foreach ($f in @($settings, $secrets)) {
+        if (-not (Test-Path $f)) { throw "uninstall removed $f" }
+    }
+    if ((Get-FileHash $settings).Hash -ne $settingsHash) { throw "uninstall changed $settings" }
+
+    # 4. Reinstall over the kept config, then remove again.
+    Invoke-Msiexec '/i' 'reinstall.log'
+    Assert-Installed
+    Invoke-Msiexec '/x' 'uninstall-2.log'
+    Assert-Removed
+    if (-not (Test-Path $settings)) { throw "the second uninstall removed $settings" }
+} finally {
+    if (-not $hadConfig) {
+        Remove-Item -Force -ErrorAction SilentlyContinue $settings, $secrets
+    }
 }
-if ((Get-FileHash $settings).Hash -ne $settingsHash) { throw "uninstall changed $settings" }
-
-# 4. Reinstall over the kept config, then remove again.
-Invoke-Msiexec '/i' 'reinstall.log'
-Assert-Installed
-Invoke-Msiexec '/x' 'uninstall-2.log'
-Assert-Removed
-if (-not (Test-Path $settings)) { throw "the second uninstall removed $settings" }
-# The sample files are the script's own unless they were there before (CI only): remove them.
-if (-not $hadConfig) { Remove-Item -Force $settings, $secrets }
 
 Write-Output "smoke ok: $name.msi on $((Get-CimInstance Win32_OperatingSystem).Caption)"

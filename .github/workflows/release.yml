@@ -233,46 +233,86 @@ jobs:
           path: ${{ runner.temp }}/fbterm-msi-logs
 
   # One release with every system's files, published only when every build and every smoke
-  # test passed: any failing job skips this one, so nothing is published.
+  # test passed: any failing job skips this one, so nothing is published. Only a tag push
+  # publishes; a manual run on a tag builds and tests, never re-publishes. The release is
+  # made as a draft, gets all 16 files, and only then is published, so a failed upload never
+  # leaves a half-published release; a re-run first removes the draft a failed run left.
   publish:
     name: publish release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [deny, release-version-check, package, linux, linux-smoke, windows, windows-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       VERSION: ${{ needs.package.outputs.version }}
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # Put above the generated notes.
+      NOTES: >-
+        Downloads for macOS (universal `.dmg`), Linux (`.deb`, `.rpm` and `.tar.gz` for x86_64
+        and aarch64) and Windows (x86_64 `.msi`), each with its `.sha256` checksum. Install
+        steps: [macOS](https://featherbitplatform.github.io/terminal/install-macos),
+        [Linux](https://featherbitplatform.github.io/terminal/install-linux),
+        [Windows](https://featherbitplatform.github.io/terminal/install-windows).
     steps:
       - uses: actions/download-artifact@v4
         with:
           pattern: fbterm-*
           merge-multiple: true
           path: dist
-      - name: List files
-        run: ls -l dist
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: |
-            dist/fbterm-${{ env.VERSION }}-macos-universal.dmg
-            dist/fbterm-${{ env.VERSION }}-macos-universal.dmg.sha256
-            dist/fbterm-${{ env.VERSION }}-linux-x86_64.deb
-            dist/fbterm-${{ env.VERSION }}-linux-x86_64.deb.sha256
-            dist/fbterm-${{ env.VERSION }}-linux-x86_64.rpm
-            dist/fbterm-${{ env.VERSION }}-linux-x86_64.rpm.sha256
-            dist/fbterm-${{ env.VERSION }}-linux-x86_64.tar.gz
-            dist/fbterm-${{ env.VERSION }}-linux-x86_64.tar.gz.sha256
-            dist/fbterm-${{ env.VERSION }}-linux-aarch64.deb
-            dist/fbterm-${{ env.VERSION }}-linux-aarch64.deb.sha256
-            dist/fbterm-${{ env.VERSION }}-linux-aarch64.rpm
-            dist/fbterm-${{ env.VERSION }}-linux-aarch64.rpm.sha256
-            dist/fbterm-${{ env.VERSION }}-linux-aarch64.tar.gz
-            dist/fbterm-${{ env.VERSION }}-linux-aarch64.tar.gz.sha256
-            dist/fbterm-${{ env.VERSION }}-windows-x86_64.msi
-            dist/fbterm-${{ env.VERSION }}-windows-x86_64.msi.sha256
-          # Put above the generated notes.
-          body: |
-            Downloads for macOS (universal `.dmg`), Linux (`.deb`, `.rpm` and `.tar.gz` for x86_64 and aarch64) and Windows (x86_64 `.msi`), each with its `.sha256` checksum. Install steps: [macOS](https://featherbitplatform.github.io/terminal/install-macos), [Linux](https://featherbitplatform.github.io/terminal/install-linux), [Windows](https://featherbitplatform.github.io/terminal/install-windows).
-          generate_release_notes: true
-          prerelease: ${{ contains(env.VERSION, '-') }}
-          fail_on_unmatched_files: true
+      - name: Check every file is here
+        run: |
+          set -euo pipefail
+          ls -l dist
+          cat > "$RUNNER_TEMP/release-files" <<EOF
+          dist/fbterm-$VERSION-macos-universal.dmg
+          dist/fbterm-$VERSION-macos-universal.dmg.sha256
+          dist/fbterm-$VERSION-linux-x86_64.deb
+          dist/fbterm-$VERSION-linux-x86_64.deb.sha256
+          dist/fbterm-$VERSION-linux-x86_64.rpm
+          dist/fbterm-$VERSION-linux-x86_64.rpm.sha256
+          dist/fbterm-$VERSION-linux-x86_64.tar.gz
+          dist/fbterm-$VERSION-linux-x86_64.tar.gz.sha256
+          dist/fbterm-$VERSION-linux-aarch64.deb
+          dist/fbterm-$VERSION-linux-aarch64.deb.sha256
+          dist/fbterm-$VERSION-linux-aarch64.rpm
+          dist/fbterm-$VERSION-linux-aarch64.rpm.sha256
+          dist/fbterm-$VERSION-linux-aarch64.tar.gz
+          dist/fbterm-$VERSION-linux-aarch64.tar.gz.sha256
+          dist/fbterm-$VERSION-windows-x86_64.msi
+          dist/fbterm-$VERSION-windows-x86_64.msi.sha256
+          EOF
+          missing=0
+          while read -r file; do
+            if [ ! -s "$file" ]; then
+              echo "::error::missing or empty: $file"
+              missing=1
+            fi
+          done < "$RUNNER_TEMP/release-files"
+          [ "$(wc -l < "$RUNNER_TEMP/release-files")" -eq 16 ]
+          exit "$missing"
+      - name: Remove a draft a failed run left
+        run: |
+          set -euo pipefail
+          gh api --paginate "repos/$GH_REPO/releases" \
+            --jq '.[] | select(.draft and .tag_name == env.TAG) | .id' |
+            while read -r id; do
+              echo "deleting the draft release $id for $TAG"
+              gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            done
+      - name: Create the release as a draft
+        run: |
+          set -euo pipefail
+          prerelease=()
+          if [[ "$VERSION" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" \
+            --notes "$NOTES" --generate-notes "${prerelease[@]}"
+      - name: Upload the files
+        run: |
+          set -euo pipefail
+          mapfile -t files < "$RUNNER_TEMP/release-files"
+          gh release upload "$TAG" "${files[@]}"
+      - name: Publish the release
+        run: gh release edit "$TAG" --draft=false
