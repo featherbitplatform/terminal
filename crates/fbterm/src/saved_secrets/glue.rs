@@ -37,6 +37,18 @@ impl App {
         }
     }
 
+    /// A secret the user asked to remember could not be saved: say so once a session (the
+    /// failure itself is logged where it happened).
+    pub(crate) fn secret_not_saved(&mut self, kind: fbterm_secrets::SecretKind) {
+        if self.vault.not_saved_said {
+            return;
+        }
+        self.vault.not_saved_said = true;
+        self.notices
+            .push(super::not_saved_text(kind, self.storage()));
+        self.notices_dismissed = false;
+    }
+
     pub(crate) fn vault_msg(&mut self, msg: VaultMsg) -> Task<Message> {
         match msg {
             VaultMsg::Password(typed) => {
@@ -73,6 +85,10 @@ impl App {
 
     /// Set `secret_storage` in memory, in the Settings window and in `settings.toml`.
     fn write_secret_storage(&mut self, choice: SecretStorage) {
+        if choice != SecretStorage::Auto {
+            // An explicit choice is never switched over by Auto's check.
+            self.backend.settle_auto();
+        }
         self.settings.secret_storage = choice;
         if let Some((_, state)) = &mut self.settings_win {
             state.values.secret_storage = choice;
@@ -300,9 +316,15 @@ impl App {
         let wid = *wid;
         if state.read_only.is_some()
             || self.vault.section_busy()
-            || self.vault.dialog.is_some()
             || choice == self.settings.secret_storage
         {
+            return Task::none();
+        }
+        if let Some(text) = self.vault.dialog_open() {
+            self.vault.notice = Some(SectionNotice {
+                error: true,
+                text: text.into(),
+            });
             return Task::none();
         }
         if self.profiles_error.is_some() {
@@ -350,6 +372,13 @@ impl App {
         };
         let wid = *wid;
         if self.vault.section_busy() || !self.backend.vault_exists() {
+            return Task::none();
+        }
+        if let Some(text) = self.vault.dialog_open() {
+            self.vault.notice = Some(SectionNotice {
+                error: true,
+                text: text.into(),
+            });
             return Task::none();
         }
         self.vault.notice = None;

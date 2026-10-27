@@ -70,6 +70,27 @@ pub fn moved_text(to: Storage) -> String {
     format!("Saved secrets moved to {}.", place(to))
 }
 
+/// Said once a session when a secret the user asked to remember could not be saved.
+pub fn not_saved_text(kind: fbterm_secrets::SecretKind, storage: Storage) -> String {
+    let what = match kind {
+        fbterm_secrets::SecretKind::Password => "password",
+        fbterm_secrets::SecretKind::KeyPassphrase => "key passphrase",
+    };
+    format!(
+        "Your {what} could not be saved in {}, so fbterm will ask for it next time.",
+        place(storage)
+    )
+}
+
+/// A request for a main password dialog while another one is open: finish that first.
+pub fn dialog_open_text(open: Kind) -> &'static str {
+    match open {
+        Kind::Set => "Finish setting the main password first.",
+        Kind::Reset => "Finish resetting the vault first.",
+        Kind::Unlock => "Finish unlocking saved secrets first.",
+    }
+}
+
 /// The label of a `Saved secrets` choice.
 pub fn choice_label(choice: SecretStorage) -> &'static str {
     match choice {
@@ -249,6 +270,8 @@ pub struct VaultUi {
     pub notice: Option<SectionNotice>,
     /// The `FBTERM_DEMO_VAULT` debug aid is making its vault: a screenshot waits.
     pub demo_pending: bool,
+    /// A failed save of a remembered secret was already reported this session.
+    pub not_saved_said: bool,
     seq: u64,
 }
 
@@ -308,6 +331,11 @@ impl VaultUi {
     /// Whether connects are waiting.
     pub fn has_waiters(&self) -> bool {
         self.waiters.iter().any(|w| !w.is_closed())
+    }
+
+    /// What to say instead of opening a second main password dialog, while one is open.
+    pub fn dialog_open(&self) -> Option<&'static str> {
+        self.dialog.as_ref().map(|d| dialog_open_text(d.kind))
     }
 
     /// Whether a move or reset runs.

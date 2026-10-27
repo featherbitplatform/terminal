@@ -105,6 +105,16 @@ pub trait Prompter: Send + Sync {
     /// key logged in, nor for a key file the profile already names.
     fn key_file_accepted(&self, _profile: ProfileId, _path: &Path) {}
 
+    /// A typed key passphrase for `profile` was accepted (the server logged in with the key)
+    /// and saved because the user asked to remember it: the app marks the profile's key as
+    /// having a passphrase, so exports and the editor know a passphrase is saved for it.
+    fn passphrase_remembered(&self, _profile: ProfileId) {}
+
+    /// A secret the user asked to remember could not be saved (the storage refused or
+    /// failed, or the vault stayed locked): the app says so, once a session. Not called when
+    /// the user declined to set a main password, which is their choice.
+    fn secret_not_saved(&self, _kind: SecretKind) {}
+
     /// Saved secrets are in the encrypted vault and it is locked: ask for its main password
     /// (`Unlock saved secrets`). The connect unlocks the vault with the answer. `None` means
     /// cancelled, or nobody can be asked: the connect then asks for its secret as if none
@@ -688,6 +698,14 @@ impl Prompter for ClockedPrompter {
 
     fn key_file_accepted(&self, profile: ProfileId, path: &Path) {
         self.inner.key_file_accepted(profile, path);
+    }
+
+    fn passphrase_remembered(&self, profile: ProfileId) {
+        self.inner.passphrase_remembered(profile);
+    }
+
+    fn secret_not_saved(&self, kind: SecretKind) {
+        self.inner.secret_not_saved(kind);
     }
 
     async fn unlock_vault(&self) -> Option<Zeroizing<String>> {

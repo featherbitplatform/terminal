@@ -92,6 +92,7 @@ impl App {
         let path = self.paths.profiles();
         let refused = self.profiles_error.is_some();
         let need = self.backend.needs_main_password();
+        let dialog_open = self.vault.dialog_open();
         let Some((wid, ed)) = &mut self.editor else {
             return Task::none();
         };
@@ -108,6 +109,12 @@ impl App {
             && let Some(need) = need
             && ed.needs_vault(&self.profiles, need)
         {
+            // Another main password dialog is open (a connect's): finish it first, nothing
+            // is written meanwhile and the drafts stay.
+            if let Some(text) = dialog_open {
+                ed.notice = Some(text.into());
+                return Task::none();
+            }
             return self.ask_main_password(
                 wid,
                 need,
@@ -331,6 +338,14 @@ impl App {
                     self.remember_key_file(profile, path);
                     Task::none()
                 }
+                Some(PromptEvent::PassphraseRemembered { profile }) => {
+                    self.remember_passphrase_flag(profile);
+                    Task::none()
+                }
+                Some(PromptEvent::SecretNotSaved { kind }) => {
+                    self.secret_not_saved(kind);
+                    Task::none()
+                }
                 None => Task::none(),
             },
             PromptMsg::Trust(w) => {
@@ -469,42 +484,78 @@ impl App {
 
     /// A connection logged in with the key file the user chose for key profile `id`, which
     /// named none: write it into the profile, so later connections use it without asking.
-    /// Only an empty path is filled. When `profiles.toml` cannot be written (it failed to load,
-    /// it was edited on disk since we last read or wrote it, or the write fails), the path is
-    /// kept in memory for this session only.
+    /// Only an empty path is filled. When `profiles.toml` cannot be written, the path is kept
+    /// in memory for this session only (see [`Self::change_key_auth`]).
     pub(crate) fn remember_key_file(&mut self, id: ProfileId, path: PathBuf) {
+        let changed = self.change_key_auth(id, "chosen key file", |slot, _| {
+            if slot.is_some() {
+                return false;
+            }
+            *slot = Some(path.clone());
+            true
+        });
+        if changed && let Some((_, ed)) = &mut self.editor {
+            ed.key_file_remembered(id, &path);
+        }
+    }
+
+    /// A connection logged in with key profile `id` and saved the passphrase the user typed
+    /// for its key: mark the key as having a passphrase (when it was not), so a full export
+    /// carries it and the editor removes it when the key stops needing one. Written like a
+    /// remembered key file.
+    pub(crate) fn remember_passphrase_flag(&mut self, id: ProfileId) {
+        let changed = self.change_key_auth(id, "key passphrase flag", |_, flag| {
+            if *flag {
+                return false;
+            }
+            *flag = true;
+            true
+        });
+        if changed && let Some((_, ed)) = &mut self.editor {
+            ed.passphrase_remembered(id);
+        }
+    }
+
+    /// Change key profile `id`'s key settings with `change` (its key path and passphrase
+    /// flag; it returns whether it changed anything) and write `profiles.toml`. When the file
+    /// cannot be written (it failed to load, it was edited on disk since we last read or
+    /// wrote it, or the write fails), the change is kept in memory for this session only.
+    /// Returns whether anything changed.
+    fn change_key_auth(
+        &mut self,
+        id: ProfileId,
+        what: &str,
+        change: impl FnOnce(&mut Option<PathBuf>, &mut bool) -> bool,
+    ) -> bool {
         let Some(profile) = self.profiles.profiles.iter_mut().find(|p| p.id == id) else {
-            return;
+            return false;
         };
         let ProfileKind::Ssh(ssh) = &mut profile.kind else {
-            return;
+            return false;
         };
-        let AuthMethod::Key { path: slot, .. } = &mut ssh.auth else {
-            return;
+        let AuthMethod::Key { path, passphrase } = &mut ssh.auth else {
+            return false;
         };
-        if slot.is_some() {
-            return;
+        if !change(path, passphrase) {
+            return false;
         }
-        *slot = Some(path.clone());
         let file = self.paths.profiles();
         if self.profiles_error.is_some() {
-            tracing::info!("profiles.toml is not loaded: chosen key file kept for this session");
+            tracing::info!(what, "profiles.toml is not loaded: kept for this session");
         } else if std::fs::read_to_string(&file).ok() != self.profiles_seen {
             // Edited on disk and not reloaded yet: writing would overwrite that edit.
-            tracing::info!("profiles.toml changed on disk: chosen key file kept for this session");
+            tracing::info!(what, "profiles.toml changed on disk: kept for this session");
         } else {
             match self.profiles.save(&file) {
                 // Our own write is not an edit to pick up again.
                 Ok(()) => self.profiles_seen = std::fs::read_to_string(&file).ok(),
                 Err(e) => {
-                    tracing::warn!(error = %e, "chosen key file kept for this session only");
+                    tracing::warn!(error = %e, what, "kept for this session only");
                 }
             }
         }
-        if let Some((_, ed)) = &mut self.editor {
-            ed.key_file_remembered(id, &path);
-        }
         self.profiles_changed();
+        true
     }
 
     /// Focus whatever input `w` now shows on top: the dialog's field, else the palette's.
@@ -710,6 +761,71 @@ mod tests {
         accepted(&mut app, p.id, &chosen);
         // The path is used for this session; the hand edit is not overwritten.
         assert_eq!(key_path(&app.profiles, p.id), Some(chosen));
+        assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), edited);
+    }
+
+    fn passphrase_flag(store: &ProfileStore, id: ProfileId) -> bool {
+        match &store.get(id).unwrap().kind {
+            ProfileKind::Ssh(SshProfile {
+                auth: AuthMethod::Key { passphrase, .. },
+                ..
+            }) => *passphrase,
+            _ => panic!("key profile"),
+        }
+    }
+
+    fn passphrase_remembered(app: &mut App, profile: ProfileId) {
+        let _ = app.update(Message::Prompt(PromptMsg::Event(Delivered::new(
+            PromptEvent::PassphraseRemembered { profile },
+        ))));
+    }
+
+    #[test]
+    fn a_remembered_passphrase_marks_the_key_as_having_one() {
+        let mut p = keyless("db");
+        if let ProfileKind::Ssh(ssh) = &mut p.kind {
+            ssh.auth = AuthMethod::Key {
+                path: Some(PathBuf::from("/keys/id_ed25519")),
+                passphrase: false,
+            };
+        }
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths.clone(), true);
+        let _ = app.update(Message::Editor(EditorMsg::Open));
+        passphrase_remembered(&mut app, p.id);
+        assert!(passphrase_flag(&app.profiles, p.id));
+        let on_disk = ProfileStore::load(&paths.profiles()).unwrap();
+        assert!(passphrase_flag(&on_disk, p.id));
+        assert_eq!(
+            key_path(&on_disk, p.id),
+            Some(PathBuf::from("/keys/id_ed25519"))
+        );
+        // The editor shows it, with nothing left to save, and a later save keeps it.
+        let ed = &app.editor.as_ref().unwrap().1;
+        let DraftKind::Ssh(d) = &ed.draft(p.id).unwrap().kind else {
+            panic!("ssh")
+        };
+        assert!(d.key_passphrase);
+        assert!(!ed.dirty);
+        assert_eq!(
+            app.profiles_seen,
+            std::fs::read_to_string(paths.profiles()).ok()
+        );
+    }
+
+    #[test]
+    fn read_only_profiles_keep_the_passphrase_flag_for_this_session_only() {
+        let p = keyless("db");
+        let paths = paths_with(std::slice::from_ref(&p));
+        let (mut app, _) = App::build(paths.clone(), true);
+        // A hand edit not picked up yet is never overwritten.
+        let edited = format!(
+            "# edited by hand\n{}",
+            std::fs::read_to_string(paths.profiles()).unwrap()
+        );
+        std::fs::write(paths.profiles(), &edited).unwrap();
+        passphrase_remembered(&mut app, p.id);
+        assert!(passphrase_flag(&app.profiles, p.id));
         assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), edited);
     }
 

@@ -77,6 +77,8 @@ struct Script {
     /// The answer to `Set a main password` (`None`: cancel), and how often it was asked.
     set_password: parking_lot::Mutex<Option<String>>,
     set_calls: AtomicUsize,
+    /// Profiles reported with a remembered key passphrase.
+    remembered: parking_lot::Mutex<Vec<ProfileId>>,
 }
 
 impl Script {
@@ -100,6 +102,7 @@ impl Script {
             unlock_calls: AtomicUsize::new(0),
             set_password: parking_lot::Mutex::new(None),
             set_calls: AtomicUsize::new(0),
+            remembered: parking_lot::Mutex::new(vec![]),
         })
     }
     fn host_key_calls(&self) -> usize {
@@ -148,6 +151,10 @@ impl Prompter for Script {
         self.accepted_keys
             .lock()
             .push((profile, path.to_path_buf()));
+    }
+
+    fn passphrase_remembered(&self, profile: ProfileId) {
+        self.remembered.lock().push(profile);
     }
 
     async fn unlock_vault(&self) -> Option<Zeroizing<String>> {
@@ -302,6 +309,30 @@ async fn key_auth_prompts_for_passphrase_and_remembers() {
             .as_deref(),
         Some(KEY_PASSPHRASE)
     );
+}
+
+#[tokio::test]
+async fn a_remembered_passphrase_is_reported_even_when_not_flagged() {
+    if !enabled() {
+        return;
+    }
+    // The profile does not say its key has a passphrase; the key does, and the user types
+    // it with Remember on: the app hears about it (it then sets the flag).
+    let fx = Fixture::new();
+    let p = profile(AuthMethod::Key {
+        path: Some(keys_dir().join("fb_test_ed25519_pass")),
+        passphrase: false,
+    });
+    let script = Script::new(true, vec![answer(KEY_PASSPHRASE, true)]);
+    let handle = connect(&p, &fx.ctx(script.clone())).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert_eq!(*script.remembered.lock(), vec![p.id]);
+    // Typed without Remember: nothing saved, nothing reported.
+    let fx = Fixture::new();
+    let script = Script::new(true, vec![answer(KEY_PASSPHRASE, false)]);
+    let handle = connect(&p, &fx.ctx(script.clone())).await.unwrap();
+    assert_echo_ok(&handle).await;
+    assert!(script.remembered.lock().is_empty());
 }
 
 #[tokio::test]

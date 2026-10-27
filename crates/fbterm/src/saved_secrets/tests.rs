@@ -809,3 +809,133 @@ fn a_hand_edit_of_secret_storage_waits_for_the_next_launch() {
     assert_eq!(app.settings.secret_storage, SecretStorage::Auto);
     assert_eq!(app.storage(), Storage::System, "nothing moved");
 }
+
+#[test]
+fn an_explicit_keychain_choice_is_never_switched_over() {
+    // Automatic, nothing checked yet, no system storage on this machine: the user picks the
+    // system keychain on purpose. The first secret needed must not move to the vault.
+    let paths = paths_with(&[]);
+    let system = Arc::new(Probed {
+        missing: true,
+        ..Probed::default()
+    });
+    let mut app = app_over(paths.clone(), system);
+    settings(&mut app, SettingsMsg::Open);
+    settings(
+        &mut app,
+        SettingsMsg::SecretStorage(SecretStorage::Keychain),
+    );
+    assert_eq!(app.settings.secret_storage, SecretStorage::Keychain);
+    assert!(
+        app.secrets
+            .get(&ProfileId::new(), SecretKind::Password)
+            .is_err()
+    );
+    deliver_prompt_events(&mut app);
+    assert_eq!(app.storage(), Storage::System);
+    assert_eq!(app.settings.secret_storage, SecretStorage::Keychain);
+    assert!(!app.visible_notices().contains(&AUTO_SWITCHED.to_owned()));
+    assert_eq!(
+        Settings::load(&paths.settings()).unwrap().secret_storage,
+        SecretStorage::Keychain
+    );
+}
+
+fn not_saved(app: &mut App, kind: SecretKind) {
+    let event = PromptEvent::SecretNotSaved { kind };
+    let _ = app.update(Message::Prompt(PromptMsg::Event(Delivered::new(event))));
+}
+
+#[test]
+fn a_failed_remember_is_said_once_a_session() {
+    let mut app = app_with(&[ssh("db")]);
+    let before = app.notices.len();
+    not_saved(&mut app, SecretKind::Password);
+    let said = super::not_saved_text(SecretKind::Password, app.storage());
+    assert!(
+        said.starts_with("Your password could not be saved in ")
+            && said.ends_with(", so fbterm will ask for it next time."),
+        "{said}"
+    );
+    assert!(app.visible_notices().contains(&said));
+    not_saved(&mut app, SecretKind::Password);
+    not_saved(&mut app, SecretKind::KeyPassphrase);
+    assert_eq!(app.notices.len(), before + 1, "once a session");
+    assert_eq!(
+        super::not_saved_text(SecretKind::KeyPassphrase, Storage::Vault),
+        "Your key passphrase could not be saved in the encrypted vault, so fbterm will ask \
+         for it next time."
+    );
+}
+
+#[test]
+fn requests_while_a_connects_unlock_dialog_is_open_say_so() {
+    let db = ssh("db");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secrets.fbvault");
+    make_vault(&path, db.id);
+    let mut app = app_with(std::slice::from_ref(&db));
+    let paths = app.paths.clone();
+    let backend = vault_backend(&path, Arc::new(MemoryStore::new()));
+    app.use_secret_backend(backend.clone());
+    app.settings.secret_storage = SecretStorage::Vault;
+    let wid = terminal_window(&mut app);
+    let mut waiting = ask_unlock(&mut app, wid);
+    assert!(app.vault.dialog.is_some());
+    const BUSY: &str = "Finish unlocking saved secrets first.";
+
+    // Settings: a storage choice and Reset vault say why nothing happens.
+    settings(&mut app, SettingsMsg::Open);
+    settings(
+        &mut app,
+        SettingsMsg::SecretStorage(SecretStorage::Keychain),
+    );
+    assert_eq!(
+        app.secrets_section().notice.map(|n| n.text).as_deref(),
+        Some(BUSY)
+    );
+    assert_eq!(app.settings.secret_storage, SecretStorage::Vault);
+    app.vault.notice = None;
+    settings(&mut app, SettingsMsg::ResetVault);
+    assert_eq!(
+        app.secrets_section().notice.map(|n| n.text).as_deref(),
+        Some(BUSY)
+    );
+    assert!(path.exists());
+    let d = app.vault.dialog.as_ref().unwrap();
+    assert!(matches!(d.purpose, Purpose::Connect), "still the connect's");
+
+    // The editor: a save that needs the vault writes nothing and keeps the drafts.
+    let profiles_before = std::fs::read_to_string(paths.profiles()).unwrap();
+    let _ = app.update(Message::Editor(EditorMsg::Open));
+    let _ = app.update(Message::Editor(EditorMsg::Select(db.id)));
+    let _ = app.update(Message::Editor(EditorMsg::Name("db-renamed".into())));
+    let _ = app.update(Message::Editor(EditorMsg::Secret(Redacted(
+        "new-pw".into(),
+    ))));
+    let _ = app.update(Message::Editor(EditorMsg::Save));
+    let ed = &app.editor.as_ref().unwrap().1;
+    assert_eq!(ed.notice.as_deref(), Some(BUSY));
+    assert!(ed.dirty && ed.saving.is_none());
+    assert_eq!(
+        std::fs::read_to_string(paths.profiles()).unwrap(),
+        profiles_before
+    );
+    assert!(matches!(
+        app.vault.dialog.as_ref().unwrap().purpose,
+        Purpose::Connect
+    ));
+
+    // Unlocked: the connect goes on, and the save works.
+    type_password(&mut app, MAIN, false);
+    vault(&mut app, VaultMsg::Submit);
+    assert!(waiting.try_recv().unwrap().is_some());
+    let _ = app.update(Message::Editor(EditorMsg::Save));
+    assert_eq!(
+        backend
+            .get(&db.id, SecretKind::Password)
+            .unwrap()
+            .as_deref(),
+        Some("new-pw")
+    );
+}

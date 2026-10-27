@@ -88,6 +88,11 @@ pub enum PromptEvent {
     Withdraw(PromptId),
     /// The key file chosen for `profile` logged in: remember it in the profile.
     KeyFileAccepted { profile: ProfileId, path: PathBuf },
+    /// A typed key passphrase for `profile` was accepted and saved: mark its key as having
+    /// a passphrase.
+    PassphraseRemembered { profile: ProfileId },
+    /// A secret the user asked to remember could not be saved: say so, once a session.
+    SecretNotSaved { kind: SecretKind },
     /// `secret_storage = "auto"` found no system storage on the first secret needed and moved
     /// to the vault (see `SecretBackend::on_auto_switch`).
     StorageAutoSwitched,
@@ -199,6 +204,14 @@ impl Prompter for UiPrompter {
             profile,
             path: path.to_path_buf(),
         });
+    }
+
+    fn passphrase_remembered(&self, profile: ProfileId) {
+        let _ = self.tx.send(PromptEvent::PassphraseRemembered { profile });
+    }
+
+    fn secret_not_saved(&self, kind: SecretKind) {
+        let _ = self.tx.send(PromptEvent::SecretNotSaved { kind });
     }
 
     async fn unlock_vault(&self) -> Option<Zeroizing<String>> {

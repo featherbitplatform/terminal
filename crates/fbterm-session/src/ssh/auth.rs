@@ -125,7 +125,9 @@ async fn saved(ctx: &SshContext, profile: &Profile, kind: SecretKind) -> Option<
     }
 }
 
-/// Save an accepted secret if the user asked to.
+/// Save an accepted secret if the user asked to. A saved key passphrase is reported to the
+/// prompter (the app marks the profile's key as having one); a save that fails is reported
+/// too (the app says so once), but not a declined `Set a main password`.
 async fn remember(ctx: &SshContext, profile: &Profile, kind: SecretKind, answer: &SecretAnswer) {
     if !answer.remember {
         return;
@@ -155,8 +157,15 @@ async fn remember(ctx: &SshContext, profile: &Profile, kind: SecretKind, answer:
         },
         other => other,
     };
-    if let Err(e) = result {
-        tracing::warn!(error = %e, ?kind, "cannot save secret");
+    match result {
+        Ok(()) if kind == SecretKind::KeyPassphrase => {
+            ctx.prompter.passphrase_remembered(profile.id);
+        }
+        Ok(()) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, ?kind, "cannot save secret");
+            ctx.prompter.secret_not_saved(kind);
+        }
     }
 }
 
@@ -387,6 +396,10 @@ mod tests {
             /// Makes this vault (main password `MAIN`) before answering `Set`, as Settings or
             /// another connect would meanwhile.
             made_meanwhile: Option<Arc<SecretBackend>>,
+            /// Remembered secrets that could not be saved, by kind.
+            not_saved: parking_lot::Mutex<Vec<SecretKind>>,
+            /// Profiles whose key passphrase was remembered.
+            remembered: parking_lot::Mutex<Vec<ProfileId>>,
         }
 
         #[async_trait::async_trait]
@@ -416,6 +429,12 @@ mod tests {
                 }
                 self.set.map(|a| Zeroizing::new(a.to_owned()))
             }
+            fn secret_not_saved(&self, kind: SecretKind) {
+                self.not_saved.lock().push(kind);
+            }
+            fn passphrase_remembered(&self, profile: ProfileId) {
+                self.remembered.lock().push(profile);
+            }
         }
 
         fn unlocker(answer: Option<&'static str>, set: Option<&'static str>) -> Arc<Unlocker> {
@@ -425,6 +444,8 @@ mod tests {
                 set,
                 set_asked: AtomicUsize::new(0),
                 made_meanwhile: None,
+                not_saved: parking_lot::Mutex::default(),
+                remembered: parking_lot::Mutex::default(),
             })
         }
 
@@ -490,6 +511,8 @@ mod tests {
                 set: Some(""),
                 set_asked: AtomicUsize::new(0),
                 made_meanwhile: Some(secrets.clone()),
+                not_saved: parking_lot::Mutex::default(),
+                remembered: parking_lot::Mutex::default(),
             });
             let ctx = context(secrets.clone(), asker.clone());
             remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
@@ -525,6 +548,46 @@ mod tests {
             };
             remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
             assert!(!secrets.vault_exists());
+        }
+
+        #[tokio::test]
+        async fn a_failed_save_is_reported_and_a_decline_is_not() {
+            // The vault is in use and locked (the user declined Unlock earlier): the save
+            // fails, and the user hears about it.
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let secrets = locked(dir.path(), &p);
+            let asker = unlocker(None, None);
+            let ctx = context(secrets.clone(), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert_eq!(*asker.not_saved.lock(), vec![SecretKind::Password]);
+            assert!(asker.remembered.lock().is_empty());
+            // Declining `Set a main password` is the user's choice: nothing to report.
+            let other = tempfile::tempdir().unwrap();
+            let asker = unlocker(None, None);
+            let ctx = context(no_vault(other.path()), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert!(asker.not_saved.lock().is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_saved_passphrase_is_reported_for_the_profile() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = profile();
+            let asker = unlocker(None, Some(MAIN));
+            let ctx = context(no_vault(dir.path()), asker.clone());
+            remember(&ctx, &p, SecretKind::Password, &typed("typed-pw")).await;
+            assert!(asker.remembered.lock().is_empty(), "passwords need no flag");
+            remember(&ctx, &p, SecretKind::KeyPassphrase, &typed("pp")).await;
+            assert_eq!(*asker.remembered.lock(), vec![p.id]);
+            assert!(asker.not_saved.lock().is_empty());
+            // Not asked to remember: nothing saved, nothing reported.
+            let answer = crate::ssh::SecretAnswer {
+                value: "pp".into(),
+                remember: false,
+            };
+            remember(&ctx, &p, SecretKind::KeyPassphrase, &answer).await;
+            assert_eq!(asker.remembered.lock().len(), 1);
         }
 
         fn profile() -> Profile {

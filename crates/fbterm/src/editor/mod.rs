@@ -572,6 +572,20 @@ impl EditorState {
         self.refresh_key_check();
     }
 
+    /// A connection saved the key passphrase of key profile `id` (the profile is already
+    /// marked as having one): its draft says so too, so a later save does not remove it.
+    pub fn passphrase_remembered(&mut self, id: ProfileId) {
+        if let Some(DraftKind::Ssh(s)) = self
+            .drafts
+            .iter_mut()
+            .find(|d| d.id == id)
+            .map(|d| &mut d.kind)
+            && s.auth == AuthChoice::Key
+        {
+            s.key_passphrase = true;
+        }
+    }
+
     /// Whether the selected draft uses a key file that is an RSA private key.
     pub fn selected_key_is_rsa(&self) -> bool {
         let path = match self.selected_draft().map(|d| &d.kind) {
