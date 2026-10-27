@@ -10,7 +10,7 @@ use fbterm_config::{
 use fbterm_secrets::{MemoryStore, SecretBackend, SecretKind, SecretStore};
 use iced::window;
 
-use super::duplicate::{DIRTY, DUPLICATED, LOCKED, NO_PROFILE, READ_ONLY};
+use super::duplicate::{DIRTY, DUPLICATED, GONE, LOCKED, NO_PROFILE, READ_ONLY, SAVING};
 use super::{DraftKind, EditorMsg};
 use crate::app::{App, Message};
 use crate::keys::Action;
@@ -309,9 +309,96 @@ fn the_action_from_a_terminal_window_duplicates_the_focused_panes_profile() {
     assert!(app.editor.is_none());
     let _ = app.update(Message::Shortcut(wid, Action::DuplicateProfile));
     let copy = copy_of(&on_disk(&app), &b, "b copy");
+    let state = ed(&app);
+    assert_eq!(state.selected, Some(copy), "the editor opens on the copy");
+    assert_eq!(state.notice.as_deref(), Some(DUPLICATED));
+
+    // With unsaved changes in the open editor, the action from the terminal window is
+    // refused there (the editor is raised to say so) and nothing is written.
+    editor(&mut app, EditorMsg::Host("edited.example.com".into()));
+    let before = std::fs::read_to_string(app.paths.profiles()).unwrap();
+    let _ = app.update(Message::Shortcut(wid, Action::DuplicateProfile));
+    assert_eq!(
+        std::fs::read_to_string(app.paths.profiles()).unwrap(),
+        before
+    );
     let ed = ed(&app);
-    assert_eq!(ed.selected, Some(copy), "the editor opens on the copy");
-    assert_eq!(ed.notice.as_deref(), Some(DUPLICATED));
+    assert_eq!(ed.notice.as_deref(), Some(DIRTY));
+    assert!(ed.dirty, "the edits are kept");
+}
+
+#[test]
+fn the_action_from_a_terminal_window_never_copies_the_editors_selection() {
+    let a = ssh("a", AuthMethod::Agent);
+    let b = ssh("b", AuthMethod::Agent);
+    let mut app = app_with(&[a.clone(), b.clone()]);
+    editor(&mut app, EditorMsg::Open);
+    editor(&mut app, EditorMsg::Select(b.id));
+    let before = std::fs::read_to_string(app.paths.profiles()).unwrap();
+    let wid = window::Id::unique();
+    let mut w = WindowState::new();
+    // The focused pane's profile is no longer saved.
+    w.push(Tab::single(Pane::new(ProfileId::new(), "gone", None)));
+    app.windows.insert(wid, w);
+    let _ = app.update(Message::Shortcut(wid, Action::DuplicateProfile));
+    assert_eq!(
+        std::fs::read_to_string(app.paths.profiles()).unwrap(),
+        before,
+        "b, selected in the editor, is not copied"
+    );
+    let ed = ed(&app);
+    assert_eq!(ed.notice.as_deref(), Some(NO_PROFILE));
+    assert_eq!(ed.selected, Some(b.id));
+}
+
+#[test]
+fn a_second_duplicate_waits_for_the_first_ones_secrets() {
+    let a = ssh("a", AuthMethod::Password);
+    let mut app = app_with(std::slice::from_ref(&a));
+    app.secrets.set(&a.id, SecretKind::Password, PW).unwrap();
+    // The secret copy stays in flight: background work is not run here.
+    app.blocking_inline = false;
+    editor(&mut app, EditorMsg::Open);
+    editor(&mut app, EditorMsg::Select(a.id));
+    editor(&mut app, EditorMsg::Duplicate);
+    assert!(ed(&app).saving.is_some());
+    editor(&mut app, EditorMsg::Select(a.id));
+    editor(&mut app, EditorMsg::Duplicate);
+    assert_eq!(&names(&on_disk(&app))[..2], ["a", "a copy"]);
+    assert!(!names(&on_disk(&app)).contains(&"a copy 2"));
+    assert_eq!(ed(&app).notice.as_deref(), Some(SAVING));
+}
+
+#[test]
+fn a_profile_gone_while_unlocking_is_not_copied_and_says_so() {
+    let a = ssh("a", AuthMethod::Password);
+    let b = ssh("b", AuthMethod::Agent);
+    let mut app = app_with(&[a.clone(), b.clone()]);
+    let dir = tempfile::tempdir().unwrap();
+    let backend = locked_vault(&dir.path().join("secrets.fbvault"), a.id);
+    app.use_secret_backend(backend);
+    editor(&mut app, EditorMsg::Open);
+    editor(&mut app, EditorMsg::Select(a.id));
+    editor(&mut app, EditorMsg::Duplicate);
+    assert!(app.vault.dialog.is_some());
+    // profiles.toml loses `a` on disk meanwhile, and is reloaded.
+    let without_a = ProfileStore {
+        profiles: vec![b.clone()],
+    };
+    without_a.save(&app.paths.profiles()).unwrap();
+    let _ = app.update(Message::ConfigChanged(crate::watch::Changed {
+        profiles: true,
+        settings: false,
+        schemes: false,
+    }));
+    assert!(app.profiles.get(a.id).is_none());
+    let before = std::fs::read_to_string(app.paths.profiles()).unwrap();
+    let _ = app.update(Message::Vault(VaultMsg::Cancel));
+    assert_eq!(
+        std::fs::read_to_string(app.paths.profiles()).unwrap(),
+        before
+    );
+    assert_eq!(ed(&app).notice.as_deref(), Some(GONE));
 }
 
 #[test]

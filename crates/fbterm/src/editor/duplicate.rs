@@ -20,6 +20,7 @@ pub const DIRTY: &str = "Unsaved changes: save or discard them before duplicatin
 pub const SAVING: &str = "Still saving: wait for it to finish before duplicating.";
 pub const READ_ONLY: &str = "profiles.toml failed to load: fix it and reload before duplicating";
 pub const LOCKED: &str = "Duplicated without its saved secrets: they are locked.";
+pub const GONE: &str = "The profile no longer exists.";
 pub const NO_PROFILE: &str = "Select a profile, then choose Duplicate.";
 
 /// The kinds of saved secret `p`'s login uses (and a copy of it takes along).
@@ -57,21 +58,19 @@ pub fn copy_secrets(
 }
 
 impl App {
-    /// The `Duplicate profile` action. In the profile editor it copies the selected profile;
-    /// elsewhere the focused pane's profile, opening (or raising) the editor on the copy.
+    /// The `Duplicate profile` action. In the profile editor (or with no terminal window) it
+    /// copies the selected profile; from a terminal window only the focused pane's profile,
+    /// opening (or raising) the editor on the copy. A pane whose profile is not saved copies
+    /// nothing: the editor says why, and its selection is never copied instead.
     pub(crate) fn duplicate_action(&mut self, from: Option<window::Id>) -> Task<Message> {
         let in_editor = from.is_some() && from == self.editor_window();
-        let pane_profile = self
-            .focused_window()
-            .and_then(|w| self.windows.get(&w))
-            .and_then(|w| w.active_tab())
-            .map(|t| t.focused_pane().profile)
-            .filter(|id| self.profiles.get(*id).is_some());
-        let selected = self.editor.as_ref().and_then(|(_, ed)| ed.selected);
-        let target = if in_editor {
-            selected
-        } else {
-            pane_profile.or(selected)
+        let terminal = self.focused_window().and_then(|w| self.windows.get(&w));
+        let target = match terminal {
+            Some(w) if !in_editor => w
+                .active_tab()
+                .map(|t| t.focused_pane().profile)
+                .filter(|id| self.profiles.get(*id).is_some()),
+            _ => self.editor.as_ref().and_then(|(_, ed)| ed.selected),
         };
         let open = self.open_editor();
         let Some(id) = target else {
@@ -108,6 +107,8 @@ impl App {
             return Task::none();
         }
         let Some(original) = self.profiles.get(id) else {
+            // Deleted or reloaded away meanwhile (while the main password was asked).
+            ed.notice = Some(GONE.into());
             return Task::none();
         };
         let kinds = secret_kinds(original);
