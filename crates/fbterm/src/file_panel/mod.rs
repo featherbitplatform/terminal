@@ -597,14 +597,15 @@ impl App {
         panel.filter.clear();
         panel.selected = select;
         panel.shown.clear();
-        let has_session = panel.sftp.is_some();
-        if has_session {
+        if panel.sftp.is_some() {
             self.read_folder(profile);
-        } else {
+        } else if matches!(panel.listing, Listing::Failed(_) | Listing::Unavailable(_)) {
             // The session is gone (the folder's error said so): open it again, over this
             // window, for the new folder rather than leave the old error under the new path.
             self.reopen(profile, wid);
         }
+        // Otherwise a session is being opened (it lists `panel.folder` once open, and may be
+        // asking a sign-in question that a restart would drop), or none is wanted yet.
         for ui in self.file_panels.ui.values_mut() {
             ui.editing = None;
         }

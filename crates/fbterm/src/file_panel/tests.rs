@@ -1404,3 +1404,26 @@ fn navigating_without_a_session_reopens_it() {
     w.answer_open(&db, "/home/user");
     assert_eq!(w.last_list(&db).unwrap().0, "/var/log");
 }
+
+#[test]
+fn navigating_while_the_session_opens_keeps_that_open() {
+    let mut w = World::browsing(vec![folder("logs")]);
+    let (wid, db) = (w.wid, w.db.clone());
+    let (folder, token) = w.last_list(&db).unwrap();
+    w.event(PanelEvent::Listed {
+        profile: db.id,
+        token,
+        folder,
+        result: Err(SftpError::Unavailable("The connection was lost.".into())),
+    });
+    let _ = w.msg(FilePanelMsg::Retry(wid));
+    assert_eq!(w.opens(&db), 2);
+    // The open under way (which may be asking a sign-in question) is not restarted: it
+    // lists the new folder when it opens.
+    let _ = w.msg(FilePanelMsg::Navigate(wid, "/var/log".into()));
+    assert_eq!(w.opens(&db), 2, "no second open");
+    assert_eq!(w.folder_of(&db), "/var/log");
+    assert_eq!(w.shows().as_deref(), Some("loading"));
+    w.answer_open(&db, "/home/user");
+    assert_eq!(w.last_list(&db).unwrap().0, "/var/log");
+}
