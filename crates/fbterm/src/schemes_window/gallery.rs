@@ -202,7 +202,8 @@ fn failure_line(reason: &str) -> String {
     format!("{LOAD_FAILED}: {reason}")
 }
 
-/// The window's state for a fetched catalog: loaded, or the line to show.
+/// The window's state for a fetched catalog: loaded, or the line to show (also for a catalog
+/// whose every theme was skipped).
 fn load_result(result: Result<Vec<u8>, String>) -> GalleryLoad {
     let bytes = match result {
         Ok(b) => b,
@@ -215,6 +216,11 @@ fn load_result(result: Result<Vec<u8>, String>) -> GalleryLoad {
         Ok(catalog) => {
             for skipped in &catalog.skipped {
                 tracing::info!(theme = %skipped, "gallery theme skipped");
+            }
+            if catalog.themes.is_empty() && !catalog.skipped.is_empty() {
+                // Every theme was refused: say so instead of "No themes match."
+                tracing::info!("theme gallery has no usable themes");
+                return GalleryLoad::Failed(failure_line("no usable themes"));
             }
             tracing::info!(themes = catalog.themes.len(), "theme gallery loaded");
             GalleryLoad::Loaded(catalog)

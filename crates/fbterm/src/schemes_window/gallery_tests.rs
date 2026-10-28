@@ -217,9 +217,13 @@ fn bad_catalog_shows_error_and_keeps_installed() {
     );
     assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), before);
     assert_eq!(app.schemes.get("gallery-x"), Some(&before));
-    // A catalog with only bad themes is the same line, not a crash.
+    // A catalog whose every theme was skipped is a failure line, not "No themes match."
     refresh_with(&mut app, catalog(&[entry("Bad Id", 1, "#101010", false)]));
-    assert!(matches!(win(&app).gallery, GalleryLoad::Loaded(ref c) if c.themes.is_empty()));
+    assert_eq!(
+        failed(&app),
+        "Couldn't load the theme gallery: no usable themes"
+    );
+    assert_eq!(app.schemes.get("gallery-x"), Some(&before));
 }
 
 #[test]
@@ -348,6 +352,108 @@ fn update_of_edited_asks() {
     // A choice with no question pending does nothing.
     let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Replace));
     assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), edited_v1());
+}
+
+/// Update of `x` from v1 to v2 asks, and leaves the file as it was until answered, when the
+/// installed v1 had `edit` applied on this machine (colors untouched).
+fn assert_update_asks_after(edit: impl FnOnce(&mut Scheme)) {
+    let mut installed = installed_form(&catalog(&[entry("x", 1, "#101010", false)]));
+    edit(&mut installed);
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&installed));
+    let _ = open_gallery(&mut app, catalog(&[entry("x", 2, "#203040", false)]));
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), installed);
+}
+
+#[test]
+fn update_after_font_edit_asks() {
+    assert_update_asks_after(|s| s.font_family = Some("Geist Mono".into()));
+    assert_update_asks_after(|s| s.font_size = Some(16.0));
+}
+
+#[test]
+fn update_after_rename_asks() {
+    assert_update_asks_after(|s| s.name = "My Theme x".into());
+}
+
+/// A `gallery-x` file carrying an untouched install of `x` v1, as a shared copy would.
+fn shared_gallery_file(app: &App) -> (std::path::PathBuf, Scheme) {
+    let theirs = installed_form(&catalog(&[entry("x", 1, "#101010", false)]));
+    assert!(theirs.gallery.is_some());
+    let dir = app.paths.schemes().parent().unwrap().join("scratch");
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("gallery-x.toml");
+    fbterm_config::schemes::write_file(&src, &theirs).unwrap();
+    (src, theirs)
+}
+
+#[test]
+fn imported_gallery_file_counts_as_edited() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let (src, theirs) = shared_gallery_file(&app);
+    let _ = send(&mut app, SchemesMsg::Open);
+    let read = read_file(&src).map_err(|e| e.to_string());
+    let _ = send(&mut app, SchemesMsg::ImportRead(Box::new(read)));
+    // Imported under its id with the credit, but without the `[gallery]` block.
+    let saved = read_file(&file(&app, "gallery-x")).unwrap();
+    assert_eq!(saved.colors, theirs.colors);
+    assert_eq!(saved.credit, theirs.credit);
+    assert!(saved.gallery.is_none());
+    // So Update asks before replacing it.
+    let _ = open_gallery(&mut app, catalog(&[entry("x", 2, "#203040", false)]));
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+
+    // Replacing an existing `gallery-x` drops the block too.
+    let installed = installed_form(&catalog(&[entry("x", 1, "#101010", false)]));
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&installed));
+    let (src, _) = shared_gallery_file(&app);
+    let _ = send(&mut app, SchemesMsg::Open);
+    let read = read_file(&src).map_err(|e| e.to_string());
+    let _ = send(&mut app, SchemesMsg::ImportRead(Box::new(read)));
+    assert!(win(&app).import.is_some());
+    let _ = send(
+        &mut app,
+        SchemesMsg::ImportChoice(super::ImportChoice::Replace),
+    );
+    assert!(
+        read_file(&file(&app, "gallery-x"))
+            .unwrap()
+            .gallery
+            .is_none()
+    );
+}
+
+#[test]
+fn single_file_export_keeps_credit_and_strips_gallery() {
+    let installed = installed_form(&catalog(&[entry("x", 1, "#101010", false)]));
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&installed));
+    let _ = send(&mut app, SchemesMsg::Open);
+    let _ = send(&mut app, SchemesMsg::Select("gallery-x".into()));
+    let out = app
+        .paths
+        .schemes()
+        .parent()
+        .unwrap()
+        .join("exported-x.toml");
+    let _ = send(&mut app, SchemesMsg::Exported(Some(out.clone())));
+    assert_eq!(win(&app).notice.as_deref(), Some("Exported"));
+    let text = std::fs::read_to_string(&out).unwrap();
+    assert!(
+        text.contains("[credit]") && !text.contains("[gallery]"),
+        "{text}"
+    );
+    let back = read_file(&out).unwrap();
+    assert_eq!(back.credit, installed.credit);
+    assert_eq!(back.colors, installed.colors);
+    // The installed file keeps its block.
+    assert!(
+        read_file(&file(&app, "gallery-x"))
+            .unwrap()
+            .gallery
+            .is_some()
+    );
 }
 
 #[test]

@@ -958,13 +958,16 @@ fn plan_schemes(
     let mut dropped = HashSet::new();
     // The name of the first copy of each id.
     let mut seen: HashMap<&str, &str> = HashMap::new();
-    // An archive is outside input: a `[gallery]` block that disagrees with its id is dropped.
+    // An archive is outside input. A `[gallery]` block is only ever written by Install on
+    // this machine, so an archived copy of a gallery theme counts as edited (Update asks);
+    // a `[credit]` that could hide or reorder text is dropped, the colors stay.
     let sanitized: Vec<Scheme> = archive
         .schemes
         .iter()
         .cloned()
         .map(|mut s| {
-            schemes::sanitize_gallery(&mut s);
+            s.gallery = None;
+            schemes::sanitize_credit(&mut s);
             s
         })
         .collect();
@@ -996,7 +999,6 @@ fn plan_schemes(
                 id: schemes::new_user_id(),
                 name: format!("{} (imported)", s.name),
                 builtin: false,
-                gallery: None,
                 ..s.clone()
             })
             .map(|scheme| SchemeEntry {
@@ -1032,10 +1034,13 @@ fn valid_scheme(scheme: Scheme) -> Option<Scheme> {
 
 /// Same id and content (a loaded user scheme is never built-in).
 fn same_scheme(mine: &Scheme, theirs: &Scheme) -> bool {
+    // The `[gallery]` block is local bookkeeping that archives never carry: an archived copy
+    // of a gallery theme installed here, unchanged, is the same scheme.
     !mine.builtin
         && mine
             == &Scheme {
                 builtin: false,
+                gallery: mine.gallery.clone(),
                 ..theirs.clone()
             }
 }

@@ -9,7 +9,8 @@
 use serde::Deserialize;
 
 use crate::schemes::{
-    ColorsFile, Credit, GALLERY_PREFIX, GalleryInfo, Scheme, colors_hash, is_edited, is_valid_user,
+    ColorsFile, Credit, GALLERY_PREFIX, GalleryInfo, Scheme, install_hash, is_edited,
+    is_unsafe_char, is_valid_user, unsafe_credit_field,
 };
 
 /// The one place the catalog is fetched from.
@@ -199,19 +200,6 @@ fn truncate_reason(why: &str) -> String {
     }
 }
 
-/// Whether `c` must never appear in a displayed string: control characters and the
-/// invisible or bidi formatting characters that can disguise text.
-fn is_unsafe_char(c: char) -> bool {
-    c.is_control()
-        || matches!(
-            c,
-            '\u{200B}'..='\u{200F}'
-                | '\u{202A}'..='\u{202E}'
-                | '\u{2066}'..='\u{2069}'
-                | '\u{FEFF}'
-        )
-}
-
 /// A `license_file` of the form `LICENSES/<name>`, the name of `[A-Za-z0-9._-]` with no `..`.
 fn is_license_file(path: &str) -> bool {
     path.strip_prefix("LICENSES/").is_some_and(|name| {
@@ -276,16 +264,16 @@ fn theme_from(value: &toml::Value) -> Result<CatalogTheme, String> {
             "{field} is longer than {MAX_FIELD_CHARS} characters"
         ));
     }
-    // Only the description may span lines; nothing may hide or reorder text.
-    let unsafe_field = credit_fields
-        .into_iter()
-        .chain([("name", &entry.name)])
-        .chain(entry.font_family.as_ref().map(|f| ("font_family", f)))
-        .find(|(field, text)| {
-            text.chars()
-                .any(|c| is_unsafe_char(c) && !(*field == "description" && c == '\n'))
-        });
-    if let Some((field, _)) = unsafe_field {
+    // Only the description may span lines; nothing may hide or reorder text. The credit
+    // rule is the one scheme files and archives get too.
+    let unsafe_field = unsafe_credit_field(&credit).or_else(|| {
+        [("name", &entry.name)]
+            .into_iter()
+            .chain(entry.font_family.as_ref().map(|f| ("font_family", f)))
+            .find(|(_, text)| text.chars().any(is_unsafe_char))
+            .map(|(field, _)| field)
+    });
+    if let Some(field) = unsafe_field {
         return Err(format!("{field} has control or invisible characters"));
     }
     if !LICENSES.contains(&credit.license.as_str()) {
@@ -301,21 +289,21 @@ fn theme_from(value: &toml::Value) -> Result<CatalogTheme, String> {
         return Err("credit url is not https://".into());
     }
 
-    let colors = entry.colors.into();
-    let scheme = Scheme {
+    let mut scheme = Scheme {
         id: format!("{GALLERY_PREFIX}{}", entry.id),
         name: entry.name,
-        colors,
+        colors: entry.colors.into(),
         font_family: entry.font_family,
         font_size: entry.font_size,
         credit: Some(credit),
-        gallery: Some(GalleryInfo {
-            id: entry.id.clone(),
-            version: entry.version,
-            colors_hash: colors_hash(&colors),
-        }),
+        gallery: None,
         builtin: false,
     };
+    scheme.gallery = Some(GalleryInfo {
+        id: entry.id.clone(),
+        version: entry.version,
+        colors_hash: install_hash(&scheme),
+    });
     if !is_valid_user(&scheme) {
         return Err("not a valid color scheme".into());
     }
@@ -522,7 +510,7 @@ derived = false
             Some(GalleryInfo {
                 id: "one-dark".into(),
                 version: 1,
-                colors_hash: colors_hash(&one.scheme.colors),
+                colors_hash: install_hash(&one.scheme),
             })
         );
         assert!(is_valid_user(&one.scheme));
@@ -736,6 +724,12 @@ derived = false
             "a\u{200b}b",
             "\u{feff}a",
             "a\u{2066}b",
+            "a\u{2060}b",
+            "soft\u{00AD}hyphen",
+            "a\u{061C}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+            "a\u{180E}b",
         ] {
             let toml_str = toml::Value::String(bad.into()).to_string();
             assert_skipped("a", "name = \"Theme a\"", &format!("name = {toml_str}"));

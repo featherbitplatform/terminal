@@ -325,9 +325,11 @@ impl App {
         let Some((_, state)) = &mut self.schemes_win else {
             return Task::none();
         };
-        let Some(scheme) = state.selected_draft().cloned() else {
+        let Some(mut scheme) = state.selected_draft().cloned() else {
             return Task::none();
         };
+        // Install bookkeeping stays local, as in profile archives; the credit travels.
+        scheme.gallery = None;
         match write_file(&path, &scheme) {
             Ok(()) => {
                 tracing::info!(id = %scheme.id, "scheme exported");
@@ -376,10 +378,13 @@ impl App {
             }
         };
         state.error = None;
-        fbterm_config::schemes::sanitize_gallery(&mut scheme);
+        // A `[gallery]` block is only ever written by Install on this machine: an imported
+        // copy, even of a gallery theme, counts as edited, so Update asks before replacing it.
+        scheme.gallery = None;
+        // `read_file` drops an unsafe `[credit]` already; checked again for any other source.
+        fbterm_config::schemes::sanitize_credit(&mut scheme);
         if BUILTIN_IDS.contains(&scheme.id.as_str()) || !is_plain_id(&scheme.id) {
             scheme.id = new_user_id();
-            scheme.gallery = None;
         } else if let Some(existing) = self
             .schemes
             .get(&scheme.id)
@@ -410,7 +415,6 @@ impl App {
             ImportChoice::Replace => {}
             ImportChoice::KeepBoth => {
                 scheme.id = new_user_id();
-                scheme.gallery = None;
                 scheme.name = format!("{} (imported)", scheme.name.trim());
             }
         }

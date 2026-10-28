@@ -861,6 +861,86 @@ fn archived_schemes_get_the_scheme_file_rules() {
     assert_eq!(written, vec!["user-ok"]);
 }
 
+/// `id` as installed from the gallery: credit and a matching, untouched `[gallery]` block.
+fn gallery_scheme(id: &str) -> Scheme {
+    let mut s = user_scheme(&format!("gallery-{id}"), "Nord");
+    s.credit = Some(schemes::Credit {
+        project: "Nord".into(),
+        author: "Someone".into(),
+        url: "https://example.org/nord".into(),
+        license: "MIT".into(),
+        copyright: "Copyright (c) 2026 Someone".into(),
+        license_file: "LICENSES/nord-MIT.txt".into(),
+        description: "A theme.".into(),
+        derived: false,
+    });
+    s.gallery = Some(schemes::GalleryInfo {
+        id: id.into(),
+        version: 1,
+        colors_hash: schemes::install_hash(&s),
+    });
+    assert!(!schemes::is_edited(&s));
+    s
+}
+
+#[test]
+fn archived_gallery_schemes_count_as_edited() {
+    // A crafted archive carries a matching `[gallery]` block: it is dropped all the same.
+    let theirs = gallery_scheme("nord");
+    let mut p1 = ssh("p1", AuthMethod::Agent, Vec::new());
+    p1.color_scheme = Some(theirs.id.clone());
+    let mut a = archive(ArchiveKind::Full, &[&p1]);
+    a.schemes = vec![theirs.clone()];
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    assert_eq!(p.schemes.len(), 1);
+    assert_eq!(p.schemes[0].outcome, SchemeOutcome::Imported);
+    let imported = &p.schemes[0].scheme;
+    assert_eq!(imported.id, "gallery-nord");
+    assert_eq!(imported.credit, theirs.credit);
+    assert!(imported.gallery.is_none());
+    assert!(schemes::is_edited(imported));
+    let dir = key_dir();
+    let applied = apply(&p, &a, &ProfileStore::default(), dir.path(), false).unwrap();
+    assert!(applied.scheme_writes.iter().all(|s| s.gallery.is_none()));
+
+    // The same theme installed here, unchanged: the local one (with its block) is reused,
+    // not copied, since archives never carry the block.
+    let (_dir, local) = schemes_with(&[&theirs]);
+    assert!(local.get("gallery-nord").unwrap().gallery.is_some());
+    let exported = Scheme {
+        gallery: None,
+        ..theirs.clone()
+    };
+    a.schemes = vec![exported];
+    let p = plan(&ProfileStore::default(), &a, &local).unwrap();
+    assert_eq!(p.schemes[0].outcome, SchemeOutcome::Reused);
+    assert!(p.schemes[0].scheme.gallery.is_some());
+
+    // A changed copy of it is a renamed copy without the block.
+    let mut changed = theirs.clone();
+    changed.colors.background.r ^= 0x10;
+    a.schemes = vec![changed];
+    let p = plan(&ProfileStore::default(), &a, &local).unwrap();
+    assert_eq!(p.schemes[0].outcome, SchemeOutcome::Renamed);
+    assert!(p.schemes[0].scheme.gallery.is_none());
+}
+
+#[test]
+fn archived_unsafe_credit_is_dropped() {
+    let mut theirs = gallery_scheme("nord");
+    theirs.credit.as_mut().unwrap().project = "No\u{202E}rd".into();
+    let mut ok = user_scheme("user-ok", "Fine");
+    ok.credit = gallery_scheme("other").credit;
+    let mut a = archive(ArchiveKind::Full, &[]);
+    a.schemes = vec![theirs.clone(), ok.clone()];
+    let p = plan(&ProfileStore::default(), &a, &no_schemes()).unwrap();
+    let ids: Vec<_> = p.schemes.iter().map(|s| s.scheme.id.as_str()).collect();
+    assert_eq!(ids, vec!["gallery-nord", "user-ok"]);
+    assert!(p.schemes[0].scheme.credit.is_none());
+    assert_eq!(p.schemes[0].scheme.colors, theirs.colors);
+    assert_eq!(p.schemes[1].scheme.credit, ok.credit);
+}
+
 #[test]
 fn read_only_profiles_refuse_the_import() {
     let db = ssh("db", AuthMethod::Agent, Vec::new());

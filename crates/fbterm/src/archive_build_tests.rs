@@ -562,7 +562,7 @@ fn exported_scheme_keeps_credit_and_drops_gallery() {
     s.gallery = Some(schemes::GalleryInfo {
         id: "nord".into(),
         version: 1,
-        colors_hash: schemes::colors_hash(&s.colors),
+        colors_hash: schemes::install_hash(&s),
     });
     schemes::save_user(dir.path(), &s).unwrap();
     let (set, errors) = SchemeSet::load(dir.path());
