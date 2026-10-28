@@ -69,10 +69,25 @@ struct ReleaseJson {
 }
 
 /// A release tag (`v1.2.3`, or `1.2.3`) as a version; `None` for anything else, and for
-/// prerelease versions (`v1.2.3-rc.1`), which the check never offers.
+/// prerelease versions (`v1.2.3-rc.1`), which the check never offers. Build metadata
+/// (`+...`) is dropped: it never makes a release newer.
 pub fn tag_version(tag: &str) -> Option<Version> {
-    let v = Version::parse(tag.trim().strip_prefix('v').unwrap_or(tag.trim())).ok()?;
+    let mut v = Version::parse(tag.trim().strip_prefix('v').unwrap_or(tag.trim())).ok()?;
+    v.build = semver::BuildMetadata::EMPTY;
     v.pre.is_empty().then_some(v)
+}
+
+/// Whether `url` may be the download link: [`RELEASES_PREFIX`] followed only by plain path
+/// characters (`A-Z a-z 0-9 . _ / -`), with no `..` and no empty segment, so it cannot leave
+/// fbterm's release pages (no query, fragment, escapes or backslashes).
+pub fn release_link_ok(url: &str) -> bool {
+    url.strip_prefix(RELEASES_PREFIX).is_some_and(|rest| {
+        rest.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+            && !rest.contains("..")
+            && !rest.starts_with('/')
+            && !rest.contains("//")
+    })
 }
 
 /// The release in `json`: `None` for a draft, a prerelease or a tag that is no plain version.
@@ -87,15 +102,21 @@ pub fn parse_release(json: &[u8]) -> Result<Option<Available>, String> {
     };
     let url = release
         .html_url
-        .filter(|u| u.starts_with(RELEASES_PREFIX) && !u.contains(char::is_whitespace))
+        .filter(|u| release_link_ok(u))
         .unwrap_or_else(|| FALLBACK_URL.to_owned());
     Ok(Some(Available { version, url }))
 }
 
-/// `release` if it is newer than `current` (this build's version).
+/// `release` if it is newer than `current` (this build's version); build metadata on either
+/// side is ignored.
 pub fn newer(current: &str, release: Option<Available>) -> Option<Available> {
-    let current = Version::parse(current).ok()?;
-    release.filter(|r| r.version > current)
+    let mut current = Version::parse(current).ok()?;
+    current.build = semver::BuildMetadata::EMPTY;
+    release.filter(|r| {
+        let mut v = r.version.clone();
+        v.build = semver::BuildMetadata::EMPTY;
+        v > current
+    })
 }
 
 /// One check: fetch the latest release with `fetch` (url, headers, size cap) and compare it
@@ -201,7 +222,10 @@ impl App {
     }
 
     /// Whether the first-launch question should be shown now: never answered, not asked yet
-    /// this run, a run that keeps state, and no other question up in any window.
+    /// this run, a run that keeps state, startup settled (no pane still connecting, since a
+    /// connecting pane may still ask for a host key or password), and no other question up
+    /// or queued in any window. Re-evaluated after every update, so a session changing state
+    /// or a prompt closing brings it on without any timer.
     fn update_question_due(&self) -> bool {
         self.ask_updates
             && !self.update_asked
@@ -210,6 +234,12 @@ impl App {
             && self.prompts.is_empty()
             && self.vault.dialog.is_none()
             && !self.windows.is_empty()
+            && !self.windows.values().any(|w| {
+                w.tabs
+                    .iter()
+                    .flat_map(|t| &t.panes)
+                    .any(|p| p.state == crate::tabs::TabState::Connecting)
+            })
     }
 
     /// Show the first-launch question over a terminal window if it is due (called after every
@@ -315,6 +345,13 @@ mod tests {
         assert_eq!(tag_version("v1.2"), None);
         assert_eq!(tag_version(""), None);
         assert!(newer("garbage", release("v9.9.9")).is_none());
+        assert!(
+            newer("0.4.0", release("v0.4.0+1")).is_none(),
+            "build metadata"
+        );
+        assert!(newer("0.4.0+abc", release("v0.4.0")).is_none());
+        assert!(newer("0.4.0+abc", release("v0.4.1+2")).is_some());
+        assert_eq!(tag_version("v0.4.0+1"), Version::parse("0.4.0").ok());
     }
 
     #[test]
@@ -339,6 +376,14 @@ mod tests {
             "https://evil.example/featherbitplatform/terminal/releases/tag/v0.5.0",
             "http://github.com/featherbitplatform/terminal/releases/tag/v0.5.0",
             "https://github.com/someone/terminal/releases/tag/v0.5.0",
+            "https://github.com/featherbitplatform/terminal/releases/../../other/x",
+            "https://github.com/featherbitplatform/terminal/releases/%2e%2e/%2E%2E/other",
+            "https://github.com/featherbitplatform/terminal/releases/tag/v0.5.0?x=1",
+            "https://github.com/featherbitplatform/terminal/releases/tag/v0.5.0#x",
+            // A JSON-escaped backslash.
+            "https://github.com/featherbitplatform/terminal/releases/a\\\\x",
+            "https://github.com/featherbitplatform/terminal/releases//evil",
+            "https://github.com/featherbitplatform/terminal/releases/tag/v 0.5.0",
         ] {
             let json = RELEASE.replace(
                 "https://github.com/featherbitplatform/terminal/releases/tag/v0.5.0",
@@ -352,6 +397,42 @@ mod tests {
             parse_release(json.as_bytes()).unwrap().unwrap().url,
             FALLBACK_URL
         );
+    }
+
+    #[test]
+    fn plain_release_links_are_kept() {
+        assert!(release_link_ok(
+            "https://github.com/featherbitplatform/terminal/releases/tag/v0.5.0"
+        ));
+        assert!(release_link_ok(FALLBACK_URL));
+    }
+
+    #[test]
+    fn the_question_waits_for_startup_connections() {
+        use crate::tabs::TabState;
+        let (mut app, _, wid) = app_with(None);
+        let set = |app: &mut App, state: TabState| {
+            let pane = &mut app.windows.get_mut(&wid).unwrap().tabs[0].panes[0];
+            pane.state = state;
+        };
+        set(&mut app, TabState::Connecting);
+        nudge(&mut app);
+        assert!(
+            app.prompts.front(wid).is_none(),
+            "a pane is still connecting"
+        );
+        // It asks for a password: still not.
+        let tab = app.windows[&wid].tabs[0].id;
+        app.prompts
+            .push(wid, None, Dialog::CloseTab { tab, panes: 2 });
+        set(&mut app, TabState::Connected);
+        nudge(&mut app);
+        assert!(matches!(
+            app.prompts.front(wid),
+            Some(Dialog::CloseTab { .. })
+        ));
+        let _ = app.update(Message::Prompt(PromptMsg::Cancel(wid)));
+        assert!(asking(&app, wid), "asked once startup settled");
     }
 
     #[test]

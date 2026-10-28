@@ -4,8 +4,10 @@
 //!
 //! [`get`] fetches a fixed `https://` URL with rustls certificate verification against the
 //! bundled webpki roots (no OpenSSL, no system library), a whole-request timeout of
-//! [`TIMEOUT`], and a cap on the response size. Redirects are followed only within the same
-//! host and only over HTTPS. It blocks: call it on the blocking pool (or a thread of its own),
+//! [`TIMEOUT`], and a cap on the response size. Redirects are followed only over HTTPS and
+//! only to the start URL's exact host and port, compared as written: a start URL with an
+//! explicit `:443` refuses a redirect to the same host without the port (and the other way
+//! round), so write URLs the way the server redirects (normally without a port). It blocks: call it on the blocking pool (or a thread of its own),
 //! never on the UI thread.
 
 use std::time::Duration;
@@ -69,7 +71,8 @@ fn https_host(url: &str) -> Option<String> {
 }
 
 /// Where a redirect from `host` to `location` goes, if it stays on `host` over HTTPS: an
-/// absolute `https://` URL on the same host, or a path on it (`/...`).
+/// absolute `https://` URL on the same host and port as written (`host` includes any port),
+/// or a path on it (`/...`).
 fn same_host_redirect(host: &str, location: &str) -> Option<String> {
     if location.starts_with("//") {
         return same_host_redirect(host, &format!("https:{location}"));
@@ -118,6 +121,11 @@ mod tests {
         assert_eq!(same_host_redirect(host, "//evil.example/x"), None);
         assert_eq!(same_host_redirect(host, "http://api.github.com/x"), None);
         assert_eq!(same_host_redirect(host, "relative/path"), None);
+        // Host and port compare as written.
+        assert_eq!(
+            same_host_redirect("api.github.com:443", "https://api.github.com/x"),
+            None
+        );
     }
 
     #[test]
