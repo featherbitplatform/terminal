@@ -79,14 +79,27 @@ pub enum TerminalOutput {
     Copy(String),
     /// An OSC 8 hyperlink was activated (Cmd+click on macOS, Ctrl+click elsewhere).
     OpenUrl(String),
-    /// The user right-clicked with nothing selected (Windows and Linux, see
-    /// [`RIGHT_CLICK_MENU`]): show the context menu at this point of the window.
-    ContextMenu(iced::Point),
+    /// The user right-clicked (see [`RightClick`]): show the context menu at this point of
+    /// the window, its Copy enabled when `can_copy` (a selection is there to copy).
+    ContextMenu { at: iced::Point, can_copy: bool },
 }
 
-/// Whether a right-click the program does not take copies the selection, or opens the
-/// context menu when nothing is selected: on Windows and Linux. macOS keeps right-click as is.
-pub const RIGHT_CLICK_MENU: bool = !cfg!(target_os = "macos");
+/// What a right-click the program does not take does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RightClick {
+    /// Copy the selection and clear it; with nothing selected, open the context menu
+    /// (Windows and Linux).
+    CopyOrMenu,
+    /// Open the context menu, keeping the selection (macOS).
+    Menu,
+}
+
+/// This platform's right-click: the menu on macOS, copy-or-menu on Windows and Linux.
+pub const RIGHT_CLICK: RightClick = if cfg!(target_os = "macos") {
+    RightClick::Menu
+} else {
+    RightClick::CopyOrMenu
+};
 
 /// A terminal view. Locks `term` only while drawing or handling an event.
 pub fn terminal_view<'a, Message: 'a>(
@@ -261,7 +274,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
             bounds,
             grid,
             cursor,
-            right_click_menu: RIGHT_CLICK_MENU,
+            right_click: RIGHT_CLICK,
         };
         let effect = state.input.handle(&ctx, event, clipboard, &mut out);
         for o in out {
