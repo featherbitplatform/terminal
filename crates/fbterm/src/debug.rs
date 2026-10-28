@@ -187,11 +187,31 @@ impl App {
     }
 
     /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
-    /// value selects the scheme of that name.
+    /// value selects the scheme of that name. With `FBTERM_DEMO_GALLERY=1`, the window shows
+    /// its gallery with a sample catalog (one theme to install, one installed, one with an
+    /// update, one withdrawn), never fetched. With `FBTERM_CONFIG_DIR` set as well, the
+    /// installed ones are written to that folder's `schemes/` first; without it nothing is
+    /// written and every row offers Install.
     pub(crate) fn open_debug_schemes(&mut self) -> Task<Message> {
         let Some(value) = debug_env("FBTERM_OPEN_SCHEMES") else {
             return Task::none();
         };
+        let demo = debug_env("FBTERM_DEMO_GALLERY").is_some();
+        let mut task = Task::none();
+        if demo {
+            let (catalog, installed) = crate::schemes_window::gallery::demo_catalog();
+            // Installed copies only in a config folder chosen for the run, never the real one.
+            if std::env::var_os("FBTERM_CONFIG_DIR").is_some() {
+                let dir = self.paths.schemes();
+                for s in &installed {
+                    if let Err(e) = fbterm_config::schemes::save_user(&dir, s) {
+                        tracing::warn!(error = %e, "demo gallery scheme not written");
+                    }
+                }
+                task = self.reload_schemes();
+            }
+            self.gallery_catalog = Some(catalog);
+        }
         let value = value.to_string_lossy();
         let select = self
             .schemes
@@ -199,7 +219,11 @@ impl App {
             .iter()
             .find(|s| s.name == value)
             .map(|s| s.id.clone());
-        self.open_schemes(select)
+        let task = task.chain(self.open_schemes(select));
+        if demo && let Some((_, state)) = &mut self.schemes_win {
+            state.showing_gallery = true;
+        }
+        task
     }
 
     /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the Tunnels window at startup.

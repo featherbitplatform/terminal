@@ -4,12 +4,15 @@
 
 use std::sync::Arc;
 
-use fbterm_config::catalog::{CATALOG_URL, MAX_CATALOG_BYTES, parse_catalog};
+use fbterm_config::catalog::{CATALOG_URL, Catalog, MAX_CATALOG_BYTES, parse_catalog};
 use fbterm_config::schemes::{Scheme, read_file};
 use iced::Task;
 use parking_lot::Mutex;
 
-use super::gallery::{GalleryIo, GalleryLoad, UpdateChoice};
+use super::gallery::{
+    EDITED_HERE, GalleryIo, GalleryLoad, GalleryRow, NO_LONGER_OFFERED, RowButton, UpdateChoice,
+    credit_line, gallery_rows,
+};
 use super::{Entry, SchemesMsg, SchemesState};
 use crate::app::{App, Message};
 use crate::schemes_tests::{app_with, rgb, style, with_scheme};
@@ -546,4 +549,197 @@ fn unsaved_draft_of_gallery_scheme_asks() {
     assert_eq!(win(&app).draft("gallery-x"), Some(&new));
     assert_eq!(win(&app).hex_text(Entry::Background), "#203040");
     assert!(!win(&app).renaming);
+}
+
+/// A catalog entry with its own name, variant, credit project and author.
+fn named(id: &str, name: &str, dark: bool, project: &str, author: &str) -> String {
+    entry(id, 1, "#101010", false)
+        .replace(
+            &format!("name = \"Theme {id}\""),
+            &format!("name = \"{name}\""),
+        )
+        .replace(
+            "variant = \"dark\"",
+            if dark {
+                "variant = \"dark\""
+            } else {
+                "variant = \"light\""
+            },
+        )
+        .replace(
+            &format!("project = \"Project {id}\""),
+            &format!("project = \"{project}\""),
+        )
+        .replace("author = \"Someone\"", &format!("author = \"{author}\""))
+}
+
+fn row_ids(rows: &[GalleryRow]) -> Vec<&str> {
+    rows.iter().map(|r| r.id.as_str()).collect()
+}
+
+/// Four themes: two dark, two light, with distinct names, projects and authors.
+fn four() -> Catalog {
+    parse_catalog(&catalog(&[
+        named("pine", "pine Night", true, "Forest Colors", "Ada Grey"),
+        named("dune", "Dune", false, "Desert Set", "Bo Lane"),
+        named("ash", "Ash", true, "Embers", "Cy Moss"),
+        named("oat", "oat Milk", false, "Breakfast", "Dee Park"),
+    ]))
+    .unwrap()
+}
+
+#[test]
+fn gallery_rows_sorted_by_name_ignoring_case() {
+    let (app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let rows = gallery_rows(&four(), &app.schemes, "", None);
+    assert_eq!(row_ids(&rows), ["ash", "dune", "oat", "pine"]);
+    let ash = &rows[0];
+    assert_eq!(ash.name, "Ash");
+    assert_eq!(ash.credit_line, "Embers by Cy Moss, MIT");
+    assert_eq!(ash.link.as_deref(), Some("https://example.org/ash"));
+    assert!(ash.dark);
+    assert_eq!(ash.button, Some(RowButton::Install));
+    assert_eq!(ash.note, None);
+    assert_eq!(ash.colors.background, rgb(0x101010));
+}
+
+#[test]
+fn gallery_filter_matches_name_project_and_author() {
+    let (app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let cat = four();
+    let ids = |filter: &str, variant| {
+        row_ids(&gallery_rows(&cat, &app.schemes, filter, variant))
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    // Name, case-insensitive, trimmed.
+    assert_eq!(ids("  NIGHT ", None), ["pine"]);
+    // Credit project.
+    assert_eq!(ids("desert", None), ["dune"]);
+    // Credit author.
+    assert_eq!(ids("dee p", None), ["oat"]);
+    // Anything else matches nothing.
+    assert!(ids("zzz", None).is_empty());
+    assert!(ids("MIT", None).is_empty(), "the license is not searched");
+    // Dark or light, with and without text.
+    assert_eq!(ids("", Some(true)), ["ash", "pine"]);
+    assert_eq!(ids("", Some(false)), ["dune", "oat"]);
+    assert_eq!(ids("embers", Some(false)), Vec::<String>::new());
+}
+
+#[test]
+fn gallery_row_buttons_follow_install_state() {
+    let v1 = catalog(&[entry("x", 1, "#101010", false)]);
+    let old = installed_form(&v1);
+    let same = installed_form(&catalog(&[entry("y", 1, "#101010", false)]));
+    let gone = installed_form(&catalog(&[entry("w", 1, "#101010", false)]));
+    let (app, _, _, _) = app_with(&[profile("a")], "", &[old, same, gone]);
+    let cat = parse_catalog(&catalog(&[
+        entry("x", 2, "#203040", false),
+        entry("y", 1, "#101010", false),
+        entry("z", 1, "#101010", false),
+        entry("w", 3, "#101010", true),
+        entry("v", 1, "#101010", true),
+    ]))
+    .unwrap();
+    let rows = gallery_rows(&cat, &app.schemes, "", None);
+    let by = |id: &str| rows.iter().find(|r| r.id == id);
+    assert_eq!(by("x").unwrap().button, Some(RowButton::Update));
+    assert_eq!(by("y").unwrap().button, Some(RowButton::Installed));
+    assert_eq!(by("z").unwrap().button, Some(RowButton::Install));
+    let w = by("w").unwrap();
+    assert_eq!(w.button, None);
+    assert_eq!(w.note, Some(NO_LONGER_OFFERED));
+    assert_eq!(NO_LONGER_OFFERED, "No longer offered");
+    assert!(by("v").is_none(), "withdrawn and not installed: hidden");
+    assert!(rows.iter().all(|r| r.id == "w" || r.note.is_none()));
+}
+
+#[test]
+fn credit_line_and_scheme_credit() {
+    let v1 = catalog(&[entry("x", 1, "#101010", false)]);
+    let installed = installed_form(&v1);
+    let credit = installed.credit.clone().unwrap();
+    assert_eq!(credit_line(&credit), "Project x by Someone, MIT");
+    // A gallery id without its credit block takes the loaded catalog's credit.
+    let bare = Scheme {
+        credit: None,
+        gallery: None,
+        ..installed.clone()
+    };
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&bare));
+    let _ = send(&mut app, SchemesMsg::Open);
+    assert_eq!(win(&app).credit_of(&bare), None, "no catalog loaded: none");
+    let _ = open_gallery(&mut app, v1);
+    assert_eq!(win(&app).credit_of(&bare), Some(&credit));
+    assert_eq!(win(&app).credit_of(&installed), Some(&credit));
+}
+
+#[test]
+fn gallery_search_and_variant_live_in_the_window() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let _ = send(&mut app, SchemesMsg::Open);
+    // Filters work on a read-only (built-in) selection too, and keep the last notice.
+    win_mut(&mut app).notice = Some("Installed \"X\"".into());
+    let _ = send(&mut app, SchemesMsg::GalleryQuery("dune".into()));
+    let _ = send(&mut app, SchemesMsg::GalleryVariant(Some(false)));
+    assert_eq!(win(&app).gallery_query, "dune");
+    assert_eq!(win(&app).gallery_variant, Some(false));
+    assert!(win(&app).notice.is_some());
+    // Picking a scheme in the list leaves the gallery for the editor.
+    let _ = send(&mut app, SchemesMsg::ShowGallery(true));
+    assert!(win(&app).showing_gallery);
+    let first = win(&app).drafts()[1].id.clone();
+    let _ = send(&mut app, SchemesMsg::Select(first.clone()));
+    assert!(!win(&app).showing_gallery);
+    assert_eq!(win(&app).selected, first);
+}
+
+fn win_mut(app: &mut App) -> &mut SchemesState {
+    &mut app.schemes_win.as_mut().expect("schemes window open").1
+}
+
+#[test]
+fn edited_update_question_names_the_theme() {
+    let v2 = catalog(&[entry("x", 2, "#203040", false)]);
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[edited_v1()]);
+    let _ = open_gallery(&mut app, v2);
+    assert_eq!(win(&app).update_question(), None);
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(
+        win(&app).update_question(),
+        Some(("Update \"Theme x\"?".to_owned(), EDITED_HERE))
+    );
+    assert_eq!(EDITED_HERE, "You changed this theme on this machine.");
+}
+
+#[test]
+fn demo_gallery_shows_every_row_kind() {
+    let (catalog, installed) = super::gallery::demo_catalog();
+    assert!(catalog.skipped.is_empty(), "{:?}", catalog.skipped);
+    let (app, _, _, _) = app_with(&[profile("a")], "", &installed);
+    let rows = gallery_rows(&catalog, &app.schemes, "", None);
+    let kinds: Vec<_> = rows
+        .iter()
+        .map(|r| (r.name.as_str(), r.button, r.note))
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("Dusk", Some(RowButton::Install), None),
+            ("Lagoon", Some(RowButton::Installed), None),
+            ("Meadow", Some(RowButton::Update), None),
+            ("Slate", None, Some(NO_LONGER_OFFERED)),
+        ]
+    );
+    assert!(rows.iter().any(|r| !r.dark));
+    // Readable sample themes, so a screenshot shows no contrast hint.
+    for t in &catalog.themes {
+        assert!(
+            fbterm_config::schemes::contrast_ok(&t.scheme.colors),
+            "{} misses the contrast bar",
+            t.id
+        );
+    }
 }

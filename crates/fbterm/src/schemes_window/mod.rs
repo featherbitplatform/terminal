@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use fbterm_config::Rgb;
-use fbterm_config::schemes::{Scheme, SchemeColors, SchemeSet, contrast_ok, new_user_id};
+use fbterm_config::schemes::{Credit, Scheme, SchemeColors, SchemeSet, contrast_ok, new_user_id};
 use fbterm_term::{ColorScheme, GridSize, Selection, SharedTerminal, Terminal, TerminalStyle};
 use parking_lot::Mutex;
 
@@ -183,44 +183,24 @@ pub enum SchemesMsg {
     /// Something the preview terminal reported (only a resize matters).
     Preview(fbterm_term::TerminalOutput),
     /// Show (true) or leave the gallery; showing it fetches the catalog when none is loaded.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "sent by the gallery view, which comes next")
-    )]
     ShowGallery(bool),
     /// Fetch the catalog again (also the Retry after a failure).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "sent by the gallery view, which comes next")
-    )]
     RefreshGallery,
     /// The catalog as fetched on the blocking pool, with the fetch's generation (only the
     /// latest fetch's result is used).
     GalleryFetched(u64, Result<Vec<u8>, String>),
     /// Install the catalog theme with this id.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "sent by the gallery view, which comes next")
-    )]
     Install(String),
     /// Update the installed copy of the catalog theme with this id.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "sent by the gallery view, which comes next")
-    )]
     Update(String),
     /// The answer to the question about updating an edited theme.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "sent by the gallery view, which comes next")
-    )]
     UpdateChoice(UpdateChoice),
     /// A credit's project link, for the system browser (`https://` only).
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "sent by the gallery view, which comes next")
-    )]
     OpenCreditLink(String),
+    /// The gallery's search text, as typed.
+    GalleryQuery(String),
+    /// The gallery's variant filter: dark (`Some(true)`), light or all (`None`).
+    GalleryVariant(Option<bool>),
 }
 
 /// The delete question for a scheme, with how many profiles use it.
@@ -349,6 +329,10 @@ pub struct SchemesState {
     pub showing_gallery: bool,
     /// The catalog id of an edited theme whose update is being asked about.
     pub pending_update: Option<String>,
+    /// The gallery's search text: name, credit project or author.
+    pub gallery_query: String,
+    /// The gallery's variant filter: dark (`Some(true)`), light or all (`None`).
+    pub gallery_variant: Option<bool>,
 }
 
 impl SchemesState {
@@ -370,6 +354,8 @@ impl SchemesState {
             gallery: GalleryLoad::Idle,
             showing_gallery: false,
             pending_update: None,
+            gallery_query: String::new(),
+            gallery_variant: None,
         };
         let first = state
             .drafts
@@ -404,6 +390,37 @@ impl SchemesState {
     /// Whether the selected scheme can be changed (a user scheme).
     pub fn editable(&self) -> bool {
         self.selected_draft().is_some_and(|s| !s.builtin)
+    }
+
+    /// Who made `scheme`'s colors: its own credit, or for a `gallery-` scheme without one,
+    /// the loaded catalog's credit for that theme.
+    pub fn credit_of<'a>(&'a self, scheme: &'a Scheme) -> Option<&'a Credit> {
+        scheme.credit.as_ref().or_else(|| {
+            let id = fbterm_config::schemes::gallery_id(scheme)?;
+            match &self.gallery {
+                GalleryLoad::Loaded(c) => c
+                    .themes
+                    .iter()
+                    .find(|t| t.id == id)
+                    .and_then(|t| t.scheme.credit.as_ref()),
+                _ => None,
+            }
+        })
+    }
+
+    /// The question about updating an edited theme, while it is asked: its title and line.
+    pub fn update_question(&self) -> Option<(String, &'static str)> {
+        let id = self.pending_update.as_deref()?;
+        let name = match &self.gallery {
+            GalleryLoad::Loaded(c) => c
+                .themes
+                .iter()
+                .find(|t| t.id == id)
+                .map(|t| t.scheme.name.trim().to_owned()),
+            _ => None,
+        }
+        .unwrap_or_else(|| id.to_owned());
+        Some((format!("Update \"{name}\"?"), gallery::EDITED_HERE))
     }
 
     /// Whether the scheme `id` has edits not saved yet (or was never saved).
@@ -516,13 +533,24 @@ impl SchemesState {
     /// Apply a message that only edits the window's state; the app's messages are ignored here.
     /// Edits of a built-in scheme are refused.
     pub fn update(&mut self, msg: SchemesMsg) {
-        if !matches!(msg, SchemesMsg::Preview(_)) {
-            self.notice = None;
+        match msg {
+            // Filtering the gallery keeps the last outcome line.
+            SchemesMsg::GalleryQuery(query) => {
+                self.gallery_query = query;
+                return;
+            }
+            SchemesMsg::GalleryVariant(variant) => {
+                self.gallery_variant = variant;
+                return;
+            }
+            SchemesMsg::Preview(_) => {}
+            _ => self.notice = None,
         }
         match msg {
             SchemesMsg::Select(id) => {
                 if self.draft(&id).is_some() {
                     self.error = None;
+                    self.showing_gallery = false;
                     self.select(id);
                 }
             }

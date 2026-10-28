@@ -10,7 +10,7 @@ use fbterm_config::catalog::{
     CATALOG_URL, Catalog, CatalogError, CatalogTheme, MAX_CATALOG_BYTES, Status, parse_catalog,
     status,
 };
-use fbterm_config::schemes::{Scheme, new_user_id, save_user};
+use fbterm_config::schemes::{Credit, Scheme, SchemeColors, SchemeSet, new_user_id, save_user};
 use iced::Task;
 
 use super::SchemesMsg;
@@ -29,25 +29,110 @@ pub enum GalleryLoad {
     Loading,
     Loaded(Catalog),
     /// The one line to show instead of the catalog.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "shown by the gallery view, which comes next")
-    )]
     Failed(String),
 }
 
 /// The answer to an Update (or Install) over a scheme the user edited.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "answered in the gallery view, which comes next")
-)]
 pub enum UpdateChoice {
     /// Replace my changes.
     Replace,
     /// Install as a copy: a new user scheme with the new colors and the credit.
     Copy,
     Cancel,
+}
+
+/// The line of the question about updating a theme edited here.
+pub const EDITED_HERE: &str = "You changed this theme on this machine.";
+
+/// The note on a withdrawn theme that is still installed.
+pub const NO_LONGER_OFFERED: &str = "No longer offered";
+
+/// The action a gallery row offers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowButton {
+    Install,
+    /// Installed at the catalog's version: shown, not pressable.
+    Installed,
+    Update,
+}
+
+/// One theme as the gallery lists it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GalleryRow {
+    /// The catalog id.
+    pub id: String,
+    pub name: String,
+    /// `"<project> by <author>, <license>"`.
+    pub credit_line: String,
+    /// The credit's project page, when it may be opened.
+    pub link: Option<String>,
+    /// `variant = "dark"`.
+    pub dark: bool,
+    pub button: Option<RowButton>,
+    pub note: Option<&'static str>,
+    pub colors: SchemeColors,
+}
+
+/// A credit as one line: `"<project> by <author>, <license>"`.
+pub fn credit_line(credit: &Credit) -> String {
+    format!(
+        "{} by {}, {}",
+        credit.project.trim(),
+        credit.author.trim(),
+        credit.license.trim()
+    )
+}
+
+/// The rows of `catalog` against the `installed` schemes, sorted by name (ignoring case).
+/// `filter` keeps the themes whose name, credit project or credit author contains it
+/// (ignoring case and surrounding spaces); `variant` keeps only dark (`Some(true)`) or light
+/// (`Some(false)`) themes. A withdrawn theme shows only while installed, with a note.
+pub fn gallery_rows(
+    catalog: &Catalog,
+    installed: &SchemeSet,
+    filter: &str,
+    variant: Option<bool>,
+) -> Vec<GalleryRow> {
+    let needle = filter.trim().to_lowercase();
+    let matches = |t: &CatalogTheme| {
+        needle.is_empty()
+            || std::iter::once(t.scheme.name.as_str())
+                .chain(
+                    t.scheme
+                        .credit
+                        .iter()
+                        .flat_map(|c| [c.project.as_str(), c.author.as_str()]),
+                )
+                .any(|field| field.to_lowercase().contains(&needle))
+    };
+    let mut rows: Vec<GalleryRow> = catalog
+        .themes
+        .iter()
+        .filter(|t| variant.is_none_or(|dark| t.dark == dark) && matches(t))
+        .filter_map(|t| {
+            let (button, note) = match status(t, installed.get(&t.scheme.id)) {
+                Status::Withdrawn { installed: false } => return None,
+                Status::Withdrawn { installed: true } => (None, Some(NO_LONGER_OFFERED)),
+                Status::Available => (Some(RowButton::Install), None),
+                Status::Installed => (Some(RowButton::Installed), None),
+                Status::Update { .. } => (Some(RowButton::Update), None),
+            };
+            let credit = t.scheme.credit.as_ref();
+            Some(GalleryRow {
+                id: t.id.clone(),
+                name: t.scheme.name.trim().to_owned(),
+                credit_line: credit.map(credit_line).unwrap_or_default(),
+                link: credit.map(|c| c.url.clone()).filter(|u| credit_link_ok(u)),
+                dark: t.dark,
+                button,
+                note,
+                colors: t.scheme.colors,
+            })
+        })
+        .collect();
+    rows.sort_by_cached_key(|r| (r.name.to_lowercase(), r.id.clone()));
+    rows
 }
 
 /// A blocking catalog fetch: `(url, size cap)` to the body.
@@ -335,4 +420,115 @@ impl App {
             tracing::warn!(%url, "credit link not opened: not an https link");
         }
     }
+}
+
+/// One theme of the demo catalog: neutral sample colors and credit.
+fn demo_theme(
+    id: &str,
+    name: &str,
+    version: u32,
+    withdrawn: bool,
+    (dark, fg, bg, ansi): (bool, &str, &str, [&str; 16]),
+) -> String {
+    const KEYS: [&str; 16] = [
+        "black",
+        "red",
+        "green",
+        "yellow",
+        "blue",
+        "magenta",
+        "cyan",
+        "white",
+        "bright_black",
+        "bright_red",
+        "bright_green",
+        "bright_yellow",
+        "bright_blue",
+        "bright_magenta",
+        "bright_cyan",
+        "bright_white",
+    ];
+    let variant = if dark { "dark" } else { "light" };
+    let mut out = format!(
+        "\n[[themes]]\nid = \"{id}\"\nname = \"{name}\"\nversion = {version}\n\
+         variant = \"{variant}\"\nwithdrawn = {withdrawn}\n\n[themes.colors]\n\
+         foreground = \"{fg}\"\nbackground = \"{bg}\"\ncursor = \"{}\"\nselection = \"{}\"\n",
+        ansi[12],
+        if dark { ansi[0] } else { ansi[7] }
+    );
+    for (key, value) in KEYS.iter().zip(ansi) {
+        out.push_str(&format!("{key} = \"{value}\"\n"));
+    }
+    out.push_str(
+        "\n[themes.credit]\nproject = \"Sample Themes\"\nauthor = \"Example Author\"\n\
+         url = \"https://example.org/sample-themes\"\nlicense = \"MIT\"\n\
+         copyright = \"Copyright (c) 2026 Example Author\"\n\
+         license_file = \"LICENSES/sample-themes-MIT.txt\"\n\
+         description = \"A sample theme.\"\nderived = false\n",
+    );
+    out
+}
+
+/// The `FBTERM_DEMO_GALLERY` scene: a catalog of four sample themes and the installed schemes
+/// that give one row of each kind (Install, Installed, Update, and a withdrawn theme still
+/// installed).
+pub fn demo_catalog() -> (Catalog, Vec<Scheme>) {
+    let lagoon = (
+        true,
+        "#d8dee6",
+        "#14191f",
+        [
+            "#262d36", "#e06c6c", "#7cc48a", "#e0b35c", "#6aa6e0", "#b48ee0", "#5cc4c4", "#c8ced6",
+            "#5a6470", "#f08a8a", "#98d8a4", "#f0c87a", "#8cbcf0", "#c8a8f0", "#80d8d8", "#eef2f6",
+        ],
+    );
+    let meadow = (
+        false,
+        "#2e3a2f",
+        "#f6f4ec",
+        [
+            "#3a3a3a", "#b4403c", "#2e6e38", "#7c5c0c", "#2f6aa8", "#8a4aa0", "#1e6c6c", "#d8d4c8",
+            "#7a7a72", "#a8423c", "#36763e", "#82620e", "#2c64a0", "#7e4494", "#24706e", "#fbfaf4",
+        ],
+    );
+    let slate = (
+        true,
+        "#e4e4ea",
+        "#1c1d22",
+        [
+            "#2c2d34", "#d4605c", "#8ab870", "#d8a850", "#7090d0", "#a080c8", "#60a8b8", "#c4c4cc",
+            "#5c5e68", "#e47c78", "#a4cc8c", "#e8be6c", "#8ca8e0", "#b89ad8", "#7cc0cc", "#f2f2f6",
+        ],
+    );
+    let dusk = (
+        true,
+        "#ecdcd0",
+        "#221a1e",
+        [
+            "#342a30", "#e0705c", "#a4b86c", "#e8a85c", "#7c94c8", "#c486b0", "#74b0a8", "#d4c4bc",
+            "#66585e", "#f08c78", "#bccc88", "#f4c07c", "#98acd8", "#d4a0c4", "#90c8c0", "#f8ece4",
+        ],
+    );
+    let catalog = |meadow_version: u32, all: bool| {
+        let mut text = String::from("format = 1\n");
+        text.push_str(&demo_theme("lagoon", "Lagoon", 1, false, lagoon));
+        text.push_str(&demo_theme(
+            "meadow",
+            "Meadow",
+            meadow_version,
+            false,
+            meadow,
+        ));
+        text.push_str(&demo_theme("slate", "Slate", 1, all, slate));
+        if all {
+            text.push_str(&demo_theme("dusk", "Dusk", 1, false, dusk));
+        }
+        parse_catalog(text.as_bytes()).expect("the demo catalog parses")
+    };
+    let installed = catalog(1, false)
+        .themes
+        .into_iter()
+        .map(|t| t.scheme)
+        .collect();
+    (catalog(2, true), installed)
 }
