@@ -818,7 +818,8 @@ impl App {
                     tracing::info!(window = ?id, x = p.x, y = p.y, "window moved");
                     None
                 }
-                // Files dropped from the OS on a window: only these start an upload by drag.
+                // Files dropped from the OS on a window: uploaded with its file panel open, else
+                // their paths are typed (`file_drop`).
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
                     crate::file_panel::FilePanelMsg::Dropped(id, path),
                 )),

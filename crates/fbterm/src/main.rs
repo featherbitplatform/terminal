@@ -79,6 +79,7 @@ mod dialogs;
 mod display_rate;
 mod editor;
 mod export;
+mod file_drop;
 mod file_panel;
 mod find;
 mod key_log;

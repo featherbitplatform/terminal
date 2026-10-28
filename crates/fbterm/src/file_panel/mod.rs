@@ -857,7 +857,7 @@ impl App {
             FilePanelMsg::Upload(wid) => return self.pick_uploads(wid),
             FilePanelMsg::Picked(wid, paths) => self.picked(wid, paths),
             FilePanelMsg::Dropped(wid, path) => return self.dropped(wid, path),
-            FilePanelMsg::DropsSettled(wid) => self.drops_settled(wid),
+            FilePanelMsg::DropsSettled(wid) => return self.drops_settled(wid),
             FilePanelMsg::RetryTransfer(wid, id) => self.retry_transfer(wid, id),
             FilePanelMsg::Dismiss(id) => self.dismiss(id),
             FilePanelMsg::QuitWaited => return self.quit_if_stopped(true),
@@ -1065,7 +1065,7 @@ impl App {
     }
 
     /// The profile `wid`'s panel shows, when it shows a server.
-    fn shown_profile(&self, wid: window::Id) -> Option<ProfileId> {
+    pub(crate) fn shown_profile(&self, wid: window::Id) -> Option<ProfileId> {
         if !self.file_panels.is_open(wid) {
             return None;
         }
