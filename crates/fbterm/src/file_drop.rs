@@ -1,5 +1,6 @@
-//! Files dropped from the OS on a terminal window whose file panel is closed: their paths are
-//! typed into the window's focused pane, as one paste.
+//! Files dropped from the OS on a terminal window whose file panel does not show a server
+//! (closed, or open over a local pane): their paths are typed into the window's focused pane,
+//! as one paste.
 //!
 //! The files of one drop are gathered like the panel gathers them for an upload (one OS event
 //! per file, see `file_panel::queue`); once the drop settles they go as the paste chord's text
@@ -86,9 +87,10 @@ pub(crate) fn drop_text(paths: &[PathBuf], quoting: Quoting) -> String {
 }
 
 impl App {
-    /// Whether the OS drop on `wid` types paths: a terminal window whose panel is closed.
+    /// Whether the OS drop on `wid` types paths: a terminal window whose panel shows no
+    /// server to upload to (closed, or open over a local pane).
     pub(crate) fn drop_types_paths(&self, wid: window::Id) -> bool {
-        self.windows.contains_key(&wid) && !self.file_panels.is_open(wid)
+        self.windows.contains_key(&wid) && self.shown_profile(wid).is_none()
     }
 
     /// Type the paths of one settled drop into `wid`'s focused pane, if its session is live.
@@ -315,15 +317,14 @@ mod tests {
         }
 
         #[test]
-        fn a_drop_with_a_panel_open_is_not_typed() {
+        fn a_drop_with_the_panel_open_over_a_local_pane_is_typed() {
             let (mut app, wid, pane, term, _events) = app_with_cat();
             app.file_panels.show(wid);
-            // The pane is local: the open panel has nowhere to upload to, so it ignores it.
+            // The pane is local: the open panel has nowhere to upload to, so the path is typed.
             drop(&mut app, wid, &["/tmp/upload.txt"]);
             settle(&mut app, wid);
-            type_line(&mut app, wid, pane, "done");
-            wait_for(&term, "done");
-            assert!(!screen(&term).contains("upload"), "{}", screen(&term));
+            type_line(&mut app, wid, pane, "|done");
+            wait_for(&term, "/tmp/upload.txt |done");
         }
     }
 }

@@ -54,7 +54,7 @@ A finished download has **Show in Finder** (**Show in folder** on Linux and Wind
 ## Uploading
 
 - **Upload…** opens a file picker (several files at once).
-- **Drag and drop** files from Finder or your file manager onto the window while the panel is open. With the panel closed, a drop types the files' paths into the terminal instead (see [Copy and paste](keyboard-shortcuts#copy-and-paste)).
+- **Drag and drop** files from Finder or your file manager onto the window while the panel shows a server. With the panel closed, or open over a local shell, a drop types the files' paths into the terminal instead (see [Copy and paste](keyboard-shortcuts#copy-and-paste)).
 
 Files go into the folder the panel shows. Folders are not uploaded: each one gets a row `Folders are not uploaded: <name>`.
 

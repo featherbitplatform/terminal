@@ -1065,7 +1065,7 @@ impl App {
     }
 
     /// The profile `wid`'s panel shows, when it shows a server.
-    fn shown_profile(&self, wid: window::Id) -> Option<ProfileId> {
+    pub(crate) fn shown_profile(&self, wid: window::Id) -> Option<ProfileId> {
         if !self.file_panels.is_open(wid) {
             return None;
         }
