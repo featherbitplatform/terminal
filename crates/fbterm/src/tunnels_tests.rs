@@ -80,18 +80,18 @@ fn srv_on(port: u16) -> Profile {
     }
 }
 
-fn key(p: &Profile, name: &str) -> TunnelKey {
+pub(crate) fn key(p: &Profile, name: &str) -> TunnelKey {
     TunnelKey {
         profile: p.id,
         name: name.into(),
     }
 }
 
-struct World {
-    app: App,
+pub(crate) struct World {
+    pub(crate) app: App,
     fake: Arc<Fake>,
-    wid: window::Id,
-    srv: Profile,
+    pub(crate) wid: window::Id,
+    pub(crate) srv: Profile,
 }
 
 fn world() -> World {
@@ -121,7 +121,7 @@ fn world_at(paths: Paths, srv: Profile) -> World {
 
 impl World {
     /// A new tab of `srv` whose shell has connected.
-    fn open_shell(&mut self) -> PaneId {
+    pub(crate) fn open_shell(&mut self) -> PaneId {
         let pane = Pane::for_profile(&self.srv);
         let id = pane.id;
         self.app
@@ -175,7 +175,7 @@ impl World {
         let _ = self.app.close_tab(self.wid, t);
     }
 
-    fn running(&self, name: &str) -> bool {
+    pub(crate) fn running(&self, name: &str) -> bool {
         self.app.tunnels.running(&key(&self.srv, name))
     }
 
@@ -183,12 +183,12 @@ impl World {
         self.app.tunnels.state(&key(&self.srv, name))
     }
 
-    fn toggle(&mut self, name: &str) {
+    pub(crate) fn toggle(&mut self, name: &str) {
         let k = key(&self.srv, name);
         let _ = self.app.tunnel_toggle(&k);
     }
 
-    fn edit(&mut self, f: impl FnOnce(&mut Profile)) {
+    pub(crate) fn edit(&mut self, f: impl FnOnce(&mut Profile)) {
         let p = self
             .app
             .profiles
@@ -201,7 +201,7 @@ impl World {
     }
 }
 
-fn tunnels_of(p: &mut Profile) -> &mut Vec<TunnelDef> {
+pub(crate) fn tunnels_of(p: &mut Profile) -> &mut Vec<TunnelDef> {
     match &mut p.kind {
         ProfileKind::Ssh(s) => &mut s.tunnels,
         ProfileKind::Local(_) => unreachable!(),
@@ -740,7 +740,7 @@ fn closing_the_last_pane_stops_with_shell_tunnels() {
 
 /// `srv` (tunnels `web` and `db`), a `bastion` without tunnels, and `warehouse` reached through
 /// it with a remote forward `hook` and a SOCKS proxy `proxy`.
-fn panel_world() -> (World, Profile) {
+pub(crate) fn panel_world() -> (World, Profile) {
     let srv = srv();
     let bastion = Profile {
         kind: ProfileKind::Ssh(SshProfile {
@@ -792,164 +792,29 @@ fn panel_world() -> (World, Profile) {
     (world_at(paths, srv), warehouse)
 }
 
-fn groups(w: &World, query: &str) -> Vec<crate::tunnels_window::Group> {
-    crate::tunnels_window::groups(&w.app.profiles, &w.app.tunnels, query)
-}
-
-fn names(groups: &[crate::tunnels_window::Group]) -> Vec<(String, Vec<String>)> {
-    groups
-        .iter()
-        .map(|g| {
-            (
-                g.profile.clone(),
-                g.rows.iter().map(|r| r.name.clone()).collect(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn panel_lists_tunnels_grouped_by_profile() {
-    use crate::tunnels_window::Tone;
-    let (mut w, _) = panel_world();
-    let g = groups(&w, "");
-    assert_eq!(
-        names(&g),
-        [
-            ("srv".to_string(), vec!["web".to_string(), "db".to_string()]),
-            (
-                "warehouse".to_string(),
-                vec!["hook".to_string(), "proxy".to_string()]
-            ),
-        ],
-        "profiles without tunnels are left out; definition order within a profile"
-    );
-    let web = &g[0].rows[0];
-    assert_eq!(web.address, "127.0.0.1:18080 \u{2192} db.internal:5432");
-    assert_eq!(web.state, "Off");
-    assert_eq!(web.tone, Tone::Off);
-    assert!(!web.on && !web.retry && !web.restart_to_apply);
-    // A with-the-shell tunnel waiting for its shell says so.
-    assert_eq!(g[0].rows[1].state, "Starts with the shell");
-    assert_eq!(
-        g[1].rows[0].address,
-        "remote 127.0.0.1:9000 \u{2192} localhost:3000 via bastion"
-    );
-    assert_eq!(g[1].rows[1].address, "SOCKS 127.0.0.1:1080 via bastion");
-
-    // Every state, its label and tone.
-    w.toggle("web");
-    let row = |w: &World| groups(w, "")[0].rows[0].clone();
-    assert_eq!(
-        (row(&w).state.as_str(), row(&w).tone, row(&w).on),
-        ("Starting", Tone::Busy, true)
-    );
-    let web_key = key(&w.srv, "web");
-    for (state, label, tone) in [
-        (TunnelState::Up { connections: 0 }, "Up", Tone::Up),
-        (
-            TunnelState::Up { connections: 1 },
-            "Up \u{b7} 1 connection",
-            Tone::Up,
-        ),
-        (
-            TunnelState::Up { connections: 3 },
-            "Up \u{b7} 3 connections",
-            Tone::Up,
-        ),
-        (
-            TunnelState::Reconnecting {
-                attempt: 2,
-                max: 10,
-            },
-            "Reconnecting (attempt 2 of 10)",
-            Tone::Busy,
-        ),
-    ] {
-        let _ = w.app.update(Message::Tunnel(web_key.clone(), state));
-        assert_eq!((row(&w).state.as_str(), row(&w).tone), (label, tone));
-    }
-    // A changed definition marks the running tunnel.
-    w.edit(|p| {
-        if let TunnelKind::Local { host_port, .. } = &mut tunnels_of(p)[0].kind {
-            *host_port = 5433;
-        }
-    });
-    assert!(row(&w).restart_to_apply);
-    // While it runs the address is what is actually listening, not the pending edit.
-    assert_eq!(row(&w).address, "127.0.0.1:18080 \u{2192} db.internal:5432");
-    // A failure: red, switched off, with Retry.
-    let _ = w.app.update(Message::Tunnel(
-        web_key,
-        TunnelState::Failed("port 18080 already in use".into()),
-    ));
-    let r = row(&w);
-    // Off, it shows the definition the next start uses.
-    assert_eq!(r.address, "127.0.0.1:18080 \u{2192} db.internal:5433");
-    assert_eq!(r.state, "Failed: port 18080 already in use");
-    assert_eq!(r.tone, Tone::Failed);
-    assert!(!r.on && r.retry && !r.restart_to_apply);
-
-    // A with-the-shell tunnel switched off by hand while its shell is open is plainly off.
-    let _ = w.open_shell();
-    assert!(w.running("db"));
-    w.toggle("db");
-    assert_eq!(groups(&w, "")[0].rows[1].state, "Off");
-}
-
-#[test]
-fn search_filters_by_tunnel_and_profile() {
-    let (w, _) = panel_world();
-    // A tunnel name: only that row, under its profile.
-    assert_eq!(
-        names(&groups(&w, "proxy")),
-        [("warehouse".to_string(), vec!["proxy".to_string()])]
-    );
-    // A profile name: every tunnel of that profile.
-    assert_eq!(
-        names(&groups(&w, "wareh")),
-        [(
-            "warehouse".to_string(),
-            vec!["hook".to_string(), "proxy".to_string()]
-        )]
-    );
-    // Fuzzy, like the palette, and words may span profile and tunnel.
-    assert_eq!(
-        names(&groups(&w, "srv db")),
-        [("srv".to_string(), vec!["db".to_string()])]
-    );
-    assert_eq!(
-        names(&groups(&w, "wb")),
-        [("srv".to_string(), vec!["web".to_string()])]
-    );
-    assert!(groups(&w, "nothing-like-this").is_empty());
-    // Addresses are not searched.
-    assert!(groups(&w, "1080").is_empty());
-    assert_eq!(groups(&w, "  ").len(), 2, "a blank query lists everything");
-}
-
 #[test]
 fn toggle_from_panel_and_palette() {
     use crate::palette::{PaletteItem, PaletteMsg};
-    use crate::tunnels_window::TunnelsMsg;
+    use crate::tunnels_panel::TunnelsMsg;
     let (mut w, _) = panel_world();
     let web = key(&w.srv, "web");
+    let wid = w.wid;
 
     // The panel's switch.
     let _ = w
         .app
-        .update(Message::Tunnels(TunnelsMsg::Toggle(web.clone())));
+        .update(Message::Tunnels(TunnelsMsg::Toggle(wid, web.clone())));
     assert!(w.running("web"));
     let _ = w
         .app
-        .update(Message::Tunnels(TunnelsMsg::Toggle(web.clone())));
+        .update(Message::Tunnels(TunnelsMsg::Toggle(wid, web.clone())));
     assert!(!w.running("web"));
     assert_eq!(w.fake.count("web"), 1);
 
     // Retry on a failed tunnel.
     let _ = w
         .app
-        .update(Message::Tunnels(TunnelsMsg::Toggle(web.clone())));
+        .update(Message::Tunnels(TunnelsMsg::Toggle(wid, web.clone())));
     let _ = w.app.update(Message::Tunnel(
         web.clone(),
         TunnelState::Failed("refused".into()),
@@ -957,12 +822,11 @@ fn toggle_from_panel_and_palette() {
     assert!(!w.running("web"));
     let _ = w
         .app
-        .update(Message::Tunnels(TunnelsMsg::Retry(web.clone())));
+        .update(Message::Tunnels(TunnelsMsg::Retry(wid, web.clone())));
     assert!(w.running("web"));
     assert_eq!(w.fake.count("web"), 3);
 
     // The palette: choosing the row toggles the tunnel and closes the palette.
-    let wid = w.wid;
     let _ = w.app.update(Message::Palette(wid, PaletteMsg::Open));
     let _ = w.app.update(Message::Palette(
         wid,
@@ -988,7 +852,7 @@ fn toggle_from_panel_and_palette() {
 
 #[test]
 fn indicator_counts_up_tunnels() {
-    use crate::tunnels_window::indicator_count;
+    use crate::tunnels_panel::indicator_count;
     let (mut w, warehouse) = panel_world();
     assert_eq!(w.app.tunnels.up_count(), 0);
     assert_eq!(indicator_count(0), None, "nothing up: no count");
@@ -1022,19 +886,17 @@ fn indicator_counts_up_tunnels() {
         .update(Message::Tunnel(web, TunnelState::Failed("gone".into())));
     assert_eq!(w.app.tunnels.up_count(), 0);
 
-    // The indicator opens the panel.
-    assert!(w.app.tunnels_window().is_none());
+    // The indicator opens the panel in its window, and the action closes it again.
     let wid = w.wid;
+    assert!(!w.app.tunnels_panels.is_open(wid));
     let _ = w
         .app
         .update(Message::TabBar(wid, crate::app::TabBarMsg::Tunnels));
-    assert!(w.app.tunnels_window().is_some());
-    // And so does the action, which brings the open panel forward instead of a second one.
-    let first = w.app.tunnels_window();
+    assert!(w.app.tunnels_panels.is_open(wid));
     let _ = w
         .app
         .update(Message::Shortcut(wid, crate::keys::Action::Tunnels));
-    assert_eq!(w.app.tunnels_window(), first);
+    assert!(!w.app.tunnels_panels.is_open(wid));
 }
 
 #[test]
@@ -1126,7 +988,7 @@ fn palette_rows_show_state_and_refresh() {
         })
         .expect("the Tunnels action is listed");
     let _ = w.app.update(Message::Palette(wid, PaletteMsg::Pick(at)));
-    assert!(w.app.tunnels_window().is_some());
+    assert!(w.app.tunnels_panels.is_open(wid));
 }
 
 /// Asks a host-key question for every start, from a task of its own, as a tunnel connecting
@@ -1161,7 +1023,7 @@ fn deliver_prompt(rt: &tokio::runtime::Runtime, app: &mut App) {
 }
 
 #[test]
-fn panel_toggle_asks_over_the_last_used_terminal_window() {
+fn toggle_from_another_window_asks_over_the_last_used_terminal_window() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1171,10 +1033,10 @@ fn panel_toggle_asks_over_the_last_used_terminal_window() {
     w.app.tunnels.set_starter(Arc::new(Asking));
     let (a, b) = (w.wid, window::Id::unique());
     w.app.windows.insert(b, WindowState::new());
-    // The user worked in B last, then switched the tunnel on in the Tunnels window.
+    // The user worked in B last, then switched the tunnel on with another window in front.
     let _ = w.app.update(Message::WindowFocused(b));
-    let panel = window::Id::unique();
-    let _ = w.app.update(Message::WindowFocused(panel));
+    let other = window::Id::unique();
+    let _ = w.app.update(Message::WindowFocused(other));
     w.toggle("web");
     deliver_prompt(&rt, &mut w.app);
     assert!(w.app.prompts.front(b).is_some(), "asked over B");
@@ -1191,10 +1053,10 @@ fn prompt_with_no_terminal_window_fails_the_tunnel() {
     let _guard = rt.enter();
     let mut w = world();
     w.app.tunnels.set_starter(Arc::new(Asking));
-    // Only the Tunnels window is left.
+    // Only a window without terminals (Settings, say) is left.
     w.app.windows.clear();
-    let panel = window::Id::unique();
-    let _ = w.app.update(Message::WindowFocused(panel));
+    let other = window::Id::unique();
+    let _ = w.app.update(Message::WindowFocused(other));
     w.toggle("web");
     deliver_prompt(&rt, &mut w.app);
     let reason = "Open a terminal window to answer the sign-in question";
@@ -1261,4 +1123,633 @@ fn failure_line_is_cleared_after_a_profile_rename() {
         "{:?}",
         w.app.notices
     );
+}
+
+// The tunnels panel: one per terminal window, sharing the right edge with the file panel.
+
+/// `world` with a second terminal window: (world, A, B).
+fn two_windows() -> (World, window::Id, window::Id) {
+    let (mut w, _) = panel_world();
+    let (a, b) = (w.wid, window::Id::unique());
+    w.app.windows.insert(b, WindowState::new());
+    (w, a, b)
+}
+
+fn shortcut(w: &mut World, wid: window::Id, action: crate::keys::Action) -> iced::Task<Message> {
+    w.app.update(Message::Shortcut(wid, action))
+}
+
+#[test]
+fn toggle_opens_and_closes_in_that_window_only() {
+    let (mut w, a, b) = two_windows();
+    let _ = w
+        .app
+        .update(Message::TabBar(a, crate::app::TabBarMsg::Tunnels));
+    assert!(w.app.tunnels_panels.is_open(a));
+    assert!(!w.app.tunnels_panels.is_open(b));
+    let _ = shortcut(&mut w, b, crate::keys::Action::Tunnels);
+    assert!(w.app.tunnels_panels.is_open(a) && w.app.tunnels_panels.is_open(b));
+    let _ = shortcut(&mut w, a, crate::keys::Action::Tunnels);
+    assert!(!w.app.tunnels_panels.is_open(a));
+    assert!(w.app.tunnels_panels.is_open(b));
+    // The panel's close button.
+    let _ = w
+        .app
+        .update(Message::Tunnels(crate::tunnels_panel::TunnelsMsg::Close(b)));
+    assert!(!w.app.tunnels_panels.is_open(b));
+}
+
+#[test]
+fn panels_are_per_window_and_exclusive() {
+    use crate::keys::Action;
+    let (mut w, a, b) = two_windows();
+    // B shows the tunnels; A goes back and forth between the two panels.
+    let _ = shortcut(&mut w, b, Action::Tunnels);
+    let _ = shortcut(&mut w, a, Action::FilePanel);
+    assert!(w.app.file_panels.is_open(a));
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    assert!(w.app.tunnels_panels.is_open(a), "tunnels open in A");
+    assert!(!w.app.file_panels.is_open(a), "the file panel closed");
+    let _ = shortcut(&mut w, a, Action::FilePanel);
+    assert!(w.app.file_panels.is_open(a), "files open in A");
+    assert!(!w.app.tunnels_panels.is_open(a), "the tunnels panel closed");
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    assert!(!w.app.tunnels_panels.is_open(a) && !w.app.file_panels.is_open(a));
+    // B kept its own panel all along.
+    assert!(w.app.tunnels_panels.is_open(b));
+    assert!(!w.app.file_panels.is_open(b));
+}
+
+#[test]
+fn query_is_kept_while_closed_and_dropped_with_the_window() {
+    use crate::tunnels_panel::TunnelsMsg;
+    let (mut w, a, b) = two_windows();
+    let _ = shortcut(&mut w, a, crate::keys::Action::Tunnels);
+    let _ = shortcut(&mut w, b, crate::keys::Action::Tunnels);
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Query(a, "web".into())));
+    assert_eq!(w.app.tunnels_panels.query(a), "web");
+    assert_eq!(w.app.tunnels_panels.query(b), "", "each window its own");
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Close(a)));
+    assert_eq!(w.app.tunnels_panels.query(a), "web", "kept while closed");
+    let _ = shortcut(&mut w, a, crate::keys::Action::Tunnels);
+    assert_eq!(w.app.tunnels_panels.query(a), "web", "and when reopened");
+    let _ = w.app.update(Message::WindowClosed(a));
+    assert!(!w.app.tunnels_panels.is_open(a));
+    assert_eq!(w.app.tunnels_panels.query(a), "");
+    assert!(!w.app.tunnels_panels.query.contains_key(&a));
+    assert!(!w.app.tunnels_panels.input.contains_key(&a));
+    assert!(w.app.tunnels_panels.is_open(b));
+}
+
+#[test]
+fn tunnels_action_from_settings_opens_in_last_terminal_window() {
+    use crate::keys::Action;
+    use crate::settings_window::SettingsMsg;
+    let (mut w, a, b) = two_windows();
+    // Opened from B: what opening the panel there costs, raising nothing.
+    let in_place = shortcut(&mut w, b, Action::Tunnels).units();
+    let _ = shortcut(&mut w, b, Action::Tunnels);
+    let _ = w.app.update(Message::WindowFocused(a));
+    let _ = w.app.update(Message::WindowFocused(b));
+    assert_eq!(w.app.last_terminal_window(), Some(b));
+    let _ = w.app.update(Message::Settings(SettingsMsg::Open));
+    let settings = w.app.settings_window().expect("the Settings window");
+    let _ = w.app.update(Message::WindowFocused(settings));
+    assert_eq!(
+        w.app.last_terminal_window(),
+        Some(b),
+        "Settings is no terminal"
+    );
+
+    let task = shortcut(&mut w, settings, Action::Tunnels);
+    assert!(w.app.tunnels_panels.is_open(b), "opened in B");
+    assert!(!w.app.tunnels_panels.is_open(a));
+    assert_eq!(task.units(), in_place + 1, "and B is raised");
+    // Again from Settings: B's panel stays open (it opens, never closes, out of sight).
+    let _ = shortcut(&mut w, settings, Action::Tunnels);
+    assert!(w.app.tunnels_panels.is_open(b));
+
+    // B closed: the other terminal window is used.
+    let _ = w.app.update(Message::WindowClosed(b));
+    assert_eq!(w.app.last_terminal_window(), Some(a));
+    let _ = shortcut(&mut w, settings, Action::Tunnels);
+    assert!(w.app.tunnels_panels.is_open(a));
+}
+
+#[test]
+fn switch_from_panel_asks_over_its_window() {
+    use crate::tunnels_panel::TunnelsMsg;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let _guard = rt.enter();
+    // The switch, and Retry (or restart to apply).
+    let switch: [fn(window::Id, TunnelKey) -> TunnelsMsg; 2] =
+        [TunnelsMsg::Toggle, TunnelsMsg::Retry];
+    for press in switch {
+        let (mut w, a, b) = two_windows();
+        w.app.tunnels.set_starter(Arc::new(Asking));
+        let _ = shortcut(&mut w, b, crate::keys::Action::Tunnels);
+        // A is the focused window as far as the app knows; the switch is in B's panel.
+        let _ = w.app.update(Message::WindowFocused(a));
+        let web = key(&w.srv, "web");
+        let _ = w.app.update(Message::Tunnels(press(b, web)));
+        deliver_prompt(&rt, &mut w.app);
+        assert!(w.app.prompts.front(b).is_some(), "asked over B");
+        assert!(w.app.prompts.front(a).is_none());
+    }
+}
+
+#[test]
+fn width_is_persisted_and_clamped() {
+    use crate::tunnels_panel::TunnelsMsg;
+    use crate::tunnels_panel::state::{DEFAULT_WIDTH, MAX_WIDTH, MIN_WIDTH};
+    let srv = srv();
+    let paths = paths_with(&[profile("local"), srv.clone()]);
+    SavedState {
+        tunnels_panel_width: Some(410.0),
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let mut w = world_at(paths.clone(), srv);
+    assert_eq!(w.app.tunnels_panels.width, 410.0);
+
+    // A drag changes it within the file panel's limits; its end remembers it.
+    w.app.state_saving_enabled = true;
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Resize(5000.0)));
+    assert_eq!(w.app.tunnels_panels.width, MAX_WIDTH);
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Resize(10.0)));
+    assert_eq!(w.app.tunnels_panels.width, MIN_WIDTH);
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Resize(360.0)));
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::ResizeEnd));
+    let saved = SavedState::load_or_default(&paths.state());
+    assert_eq!(saved.tunnels_panel_width, Some(360.0));
+    assert_eq!(saved.file_panel_width, None, "the file panel's is its own");
+
+    // Same limits as the file panel; the default is not written.
+    assert_eq!(
+        (MIN_WIDTH, MAX_WIDTH),
+        (
+            crate::file_panel::state::MIN_WIDTH,
+            crate::file_panel::state::MAX_WIDTH
+        )
+    );
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Resize(DEFAULT_WIDTH)));
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::ResizeEnd));
+    let saved = SavedState::load_or_default(&paths.state());
+    assert_eq!(saved.tunnels_panel_width, None);
+    // An unusable saved width falls back.
+    let panels = crate::tunnels_panel::state::TunnelsPanels::new(Some(f32::NAN));
+    assert_eq!(panels.width, DEFAULT_WIDTH);
+    let panels = crate::tunnels_panel::state::TunnelsPanels::new(Some(1.0));
+    assert_eq!(panels.width, MIN_WIDTH);
+}
+
+#[test]
+fn open_tunnels_env_opens_the_panel() {
+    let (mut w, a, b) = two_windows();
+    let first = *w.app.windows.keys().next().unwrap();
+    let _ = w.app.debug_tunnels(false);
+    assert!(!w.app.tunnels_panels.is_open(a) && !w.app.tunnels_panels.is_open(b));
+    let _ = w.app.debug_tunnels(true);
+    assert!(
+        w.app.tunnels_panels.is_open(first),
+        "the first window's panel"
+    );
+    assert_eq!(
+        [a, b]
+            .iter()
+            .filter(|id| w.app.tunnels_panels.is_open(**id))
+            .count(),
+        1
+    );
+    // `FBTERM_SCREENSHOT_WINDOW=tunnels` is gone: it captures the terminal window.
+    assert_eq!(
+        crate::app::ShotWindow::parse(Some("tunnels")),
+        crate::app::ShotWindow::Terminal
+    );
+    assert_eq!(
+        crate::app::ShotWindow::parse(Some("schemes")),
+        crate::app::ShotWindow::Schemes
+    );
+}
+
+#[test]
+fn no_tunnels_window_exists() {
+    use crate::palette::{PaletteItem, PaletteMsg};
+    let (mut w, a, _) = two_windows();
+    let titles =
+        |w: &World| -> Vec<String> { w.app.windows.keys().map(|id| w.app.title(*id)).collect() };
+    let before = titles(&w);
+    let _ = shortcut(&mut w, a, crate::keys::Action::Tunnels);
+    let _ = w
+        .app
+        .update(Message::TabBar(a, crate::app::TabBarMsg::Tunnels));
+    let _ = w.app.update(Message::Palette(a, PaletteMsg::Open));
+    let _ = w
+        .app
+        .update(Message::Palette(a, PaletteMsg::Query("Tunnels".into())));
+    let at = w.app.palettes[&a]
+        .ranked_items()
+        .into_iter()
+        .position(|i| {
+            matches!(
+                i,
+                PaletteItem::Action {
+                    action: crate::keys::Action::Tunnels,
+                    ..
+                }
+            )
+        })
+        .unwrap();
+    let _ = w.app.update(Message::Palette(a, PaletteMsg::Pick(at)));
+    assert!(w.app.tunnels_panels.is_open(a));
+    // No window was made for it: the terminal windows are the same, no other window opened.
+    assert_eq!(titles(&w), before);
+    assert_eq!(w.app.windows.len(), 2);
+    assert!(w.app.editor_window().is_none());
+    assert!(w.app.settings_window().is_none());
+    assert!(w.app.schemes_window().is_none());
+    assert!(w.app.archive_window().is_none());
+}
+
+// The panel in its window: keyboard, focus and the tab bar's button.
+
+/// A key press with the text it types and the modifiers held.
+fn key_press(
+    key: iced::keyboard::Key,
+    mods: iced::keyboard::Modifiers,
+    text: Option<&str>,
+) -> iced::Event {
+    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyA),
+        location: iced::keyboard::Location::Standard,
+        modifiers: mods,
+        text: text.map(Into::into),
+        repeat: false,
+    })
+}
+
+fn typed(c: &str) -> iced::Event {
+    key_press(
+        iced::keyboard::Key::Character(c.into()),
+        iced::keyboard::Modifiers::empty(),
+        Some(c),
+    )
+}
+
+fn escape() -> iced::Event {
+    key_press(
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        iced::keyboard::Modifiers::empty(),
+        None,
+    )
+}
+
+/// The default New tab chord.
+fn new_tab_chord() -> iced::Event {
+    use iced::keyboard::Modifiers;
+    let mods = if cfg!(target_os = "macos") {
+        Modifiers::LOGO
+    } else {
+        Modifiers::CTRL | Modifiers::SHIFT
+    };
+    key_press(iced::keyboard::Key::Character("t".into()), mods, None)
+}
+
+/// `wid`'s window as drawn, laid out 1000 x 600: `focus` (a field's id) takes the keyboard
+/// first, then `events` run through it. Returns what was published.
+fn window_events(
+    app: &App,
+    wid: window::Id,
+    focus: Option<iced::widget::Id>,
+    events: &[iced::Event],
+) -> Vec<Message> {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::widget::operation::focusable;
+    use iced::advanced::{Shell, clipboard};
+    use iced::{Pixels, Rectangle, Size, mouse};
+    const WINDOW: Size = Size::new(1000.0, 600.0);
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let mut element = crate::window::view(app, wid);
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, WINDOW));
+    if let Some(id) = focus {
+        let mut op = focusable::focus::<()>(id);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    }
+    let mut messages = Vec::new();
+    for event in events {
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(WINDOW),
+        );
+    }
+    messages
+}
+
+/// Whether the field `id` is drawn in `wid`'s window, and focused: `None` when not drawn.
+fn field_focused(app: &App, wid: window::Id, id: &iced::widget::Id, focus: bool) -> Option<bool> {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::widget::operation::{Operation, focusable};
+    use iced::{Pixels, Size};
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let mut element = crate::window::view(app, wid);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &Limits::new(Size::ZERO, Size::new(1000.0, 600.0)),
+    );
+    if focus {
+        let mut op = focusable::focus::<()>(id.clone());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    }
+    struct IsFocused(iced::widget::Id, Option<bool>);
+    impl Operation for IsFocused {
+        fn focusable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            _bounds: iced::Rectangle,
+            state: &mut dyn focusable::Focusable,
+        ) {
+            if id == Some(&self.0) {
+                self.1 = Some(state.is_focused());
+            }
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+    }
+    let mut op = IsFocused(id.clone(), None);
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    op.1
+}
+
+fn reaches_terminal(messages: &[Message]) -> bool {
+    messages.iter().any(|m| matches!(m, Message::Terminal(..)))
+}
+
+#[test]
+fn typing_in_panel_search_stays_in_the_panel() {
+    use crate::tunnels_panel::TunnelsMsg;
+    let (mut w, _) = panel_world();
+    let pane = w.open_shell();
+    let wid = w.wid;
+    let _ = shortcut(&mut w, wid, crate::keys::Action::Tunnels);
+    assert!(
+        w.app.tunnels_panels.has_focus(wid),
+        "the panel has the keyboard"
+    );
+    let input = w.app.tunnels_panels.input[&wid].clone();
+
+    // The search field has the keyboard: what is typed goes into it, never to the terminal.
+    let messages = window_events(&w.app, wid, Some(input.clone()), &[typed("w")]);
+    assert!(
+        messages.iter().any(
+            |m| matches!(m, Message::Tunnels(TunnelsMsg::Query(id, q)) if *id == wid && q == "w")
+        ),
+        "typed into the search: {messages:?}"
+    );
+    assert!(!reaches_terminal(&messages));
+
+    // App shortcuts still act.
+    let messages = window_events(&w.app, wid, Some(input.clone()), &[new_tab_chord()]);
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, Message::Shortcut(_, crate::keys::Action::NewTab))),
+        "{messages:?}"
+    );
+    assert!(!reaches_terminal(&messages));
+
+    // The field let go of the keyboard (a click elsewhere in the panel): typing still goes to
+    // the search, and the field takes the keyboard again.
+    let messages = window_events(&w.app, wid, None, &[typed("e")]);
+    assert!(!reaches_terminal(&messages), "{messages:?}");
+    let typed_into: Vec<&String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tunnels(TunnelsMsg::Type(id, s)) if *id == wid => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(typed_into, ["e"]);
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Query(wid, "w".into())));
+    let task = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Type(wid, "e".into())));
+    assert_eq!(w.app.tunnels_panels.query(wid), "we");
+    assert!(task.units() >= 1, "the search field takes the keyboard");
+
+    // Meanwhile the terminal is drawn without the keyboard.
+    let win = &w.app.windows[&wid];
+    let tab = win.active_tab().unwrap();
+    let (_, p) = win.locate(pane).unwrap();
+    assert!(!w.app.pane_style(wid, tab, &tab.panes[p]).focused);
+}
+
+#[test]
+fn escape_clears_search_then_returns_the_keyboard() {
+    use crate::tunnels_panel::TunnelsMsg;
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    let _ = shortcut(&mut w, wid, crate::keys::Action::Tunnels);
+    let input = w.app.tunnels_panels.input[&wid].clone();
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Query(wid, "web".into())));
+
+    // Escape is the panel's, before the focused field sees it.
+    let messages = window_events(&w.app, wid, Some(input.clone()), &[escape()]);
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, Message::Tunnels(TunnelsMsg::Escape(id)) if *id == wid)),
+        "{messages:?}"
+    );
+    assert!(!reaches_terminal(&messages));
+
+    // First it clears the search; the panel keeps the keyboard.
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Escape(wid)));
+    assert_eq!(w.app.tunnels_panels.query(wid), "");
+    assert!(w.app.tunnels_panels.has_focus(wid));
+    // Then it gives the keyboard back to the terminal; the panel stays open.
+    let task = w.app.update(Message::Tunnels(TunnelsMsg::Escape(wid)));
+    assert!(!w.app.tunnels_panels.has_focus(wid));
+    assert!(w.app.tunnels_panels.is_open(wid));
+    assert!(
+        task.units() >= 1,
+        "the search field lets go of the keyboard"
+    );
+    let messages = window_events(&w.app, wid, None, &[typed("x")]);
+    assert!(
+        !messages.iter().any(|m| matches!(m, Message::Tunnels(_))),
+        "keys go to the terminal again: {messages:?}"
+    );
+
+    // A click in the panel takes the keyboard again; closing the panel gives it back.
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Focus(wid, true)));
+    assert!(w.app.tunnels_panels.has_focus(wid));
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Close(wid)));
+    assert!(!w.app.tunnels_panels.has_focus(wid));
+    let _ = shortcut(&mut w, wid, crate::keys::Action::Tunnels);
+    assert!(
+        w.app.tunnels_panels.has_focus(wid),
+        "reopened with the keyboard"
+    );
+
+    // Another tab taking focus gives the keyboard back too, as with the file panel.
+    let _ = w.open_shell();
+    assert!(!w.app.tunnels_panels.has_focus(wid));
+    assert!(w.app.tunnels_panels.is_open(wid));
+}
+
+#[test]
+fn tunnels_button_shows_active_while_open() {
+    use crate::keys::Action;
+    let (mut w, a, b) = two_windows();
+    assert!(!w.app.tunnels_button_active(a) && !w.app.tunnels_button_active(b));
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    assert!(w.app.tunnels_button_active(a));
+    assert!(!w.app.tunnels_button_active(b), "only in its own window");
+    // The file panel takes the edge: the button is no longer active.
+    let _ = shortcut(&mut w, a, Action::FilePanel);
+    assert!(!w.app.tunnels_button_active(a));
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    assert!(!w.app.tunnels_button_active(a));
+}
+
+#[test]
+fn search_gets_focus_on_open() {
+    use crate::keys::Action;
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    // Opening returns one task: the focus of the panel's search field.
+    let task = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(task.units(), 1);
+    let input = w.app.tunnels_panels.input[&wid].clone();
+    // That id is the search field drawn in the panel, and focusing it gives it the keyboard.
+    assert_eq!(field_focused(&w.app, wid, &input, false), Some(false));
+    assert_eq!(field_focused(&w.app, wid, &input, true), Some(true));
+    // Reopened, the same field is focused again.
+    let _ = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(field_focused(&w.app, wid, &input, false), None, "closed");
+    let task = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(task.units(), 1);
+    assert_eq!(w.app.tunnels_panels.input[&wid], input);
+    assert_eq!(field_focused(&w.app, wid, &input, true), Some(true));
+}
+
+/// Whether `wid`'s view draws a scrollable with `id`.
+fn scrollable_drawn(app: &App, wid: window::Id, id: &iced::widget::Id) -> bool {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::widget::operation::{Operation, Scrollable};
+    use iced::{Pixels, Rectangle, Size, Vector};
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let mut element = crate::window::view(app, wid);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &Limits::new(Size::ZERO, Size::new(1000.0, 600.0)),
+    );
+    struct Find(iced::widget::Id, bool);
+    impl Operation for Find {
+        fn scrollable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            _bounds: Rectangle,
+            _content_bounds: Rectangle,
+            _translation: Vector,
+            _state: &mut dyn Scrollable,
+        ) {
+            self.1 |= id == Some(&self.0);
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+    }
+    let mut op = Find(id.clone(), false);
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    op.1
+}
+
+#[test]
+fn reopening_restores_the_scroll_position() {
+    use crate::keys::Action;
+    use crate::tunnels_panel::TunnelsMsg;
+    use iced::widget::operation::AbsoluteOffset;
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    // Never scrolled: opening only focuses the search.
+    assert_eq!(shortcut(&mut w, wid, Action::Tunnels).units(), 1);
+    // The list is the window's own scrollable.
+    let list = w.app.tunnels_panels.list[&wid].clone();
+    assert!(scrollable_drawn(&w.app, wid, &list));
+    let offset = AbsoluteOffset { x: 0.0, y: 120.0 };
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Scrolled(wid, offset)));
+    assert_eq!(w.app.tunnels_panels.scroll.get(&wid), Some(&offset));
+    // Closed and reopened: the focus and the scroll back to where the list was.
+    let _ = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(w.app.tunnels_panels.scroll.get(&wid), Some(&offset), "kept");
+    assert_eq!(shortcut(&mut w, wid, Action::Tunnels).units(), 2);
+    assert_eq!(w.app.tunnels_panels.list[&wid], list, "the same scrollable");
+    // A scroll reported for a window that is gone is not kept.
+    let gone = window::Id::unique();
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Scrolled(gone, offset)));
+    assert!(!w.app.tunnels_panels.scroll.contains_key(&gone));
+    // The window closing forgets it.
+    w.app.tunnels_panels.forget(wid);
+    assert!(!w.app.tunnels_panels.scroll.contains_key(&wid));
+    assert!(!w.app.tunnels_panels.list.contains_key(&wid));
 }

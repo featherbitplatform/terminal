@@ -76,6 +76,9 @@ pub struct SavedState {
     /// turned it off; shown by default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_panel_show_hidden: Option<bool>,
+    /// The tunnels panel's width, when the user changed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tunnels_panel_width: Option<f32>,
 }
 
 impl SavedState {

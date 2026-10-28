@@ -34,7 +34,7 @@ pub enum Action {
     Settings,
     /// The Color schemes window (no chord by default).
     EditSchemes,
-    /// The Tunnels window (no chord by default).
+    /// The tunnels panel of the window it is used in (no chord by default).
     Tunnels,
     /// The archive window in its Export mode (no chord by default).
     ExportProfiles,

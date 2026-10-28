@@ -8,7 +8,7 @@ Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ct
 
 These are the defaults. Every application shortcut can be changed or removed in the **Keyboard** section of the Settings window (see [Changing shortcuts](#changing-shortcuts)); the tables below list the defaults, and the Settings window, the palette and the tab-bar tooltips always show the shortcuts in force.
 
-Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings. While the focused pane is an SSH session whose server offers SFTP, a folder button appears before the gear: it opens or closes the [file panel](file-panel) and is highlighted while the panel is open.
+Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings. The tunnels button after the tab buttons opens or closes the [tunnels panel](tunnels#the-tunnels-panel), shows how many tunnels are up and is highlighted while the panel is open. While the focused pane is an SSH session whose server offers SFTP, a folder button appears before the gear: it opens or closes the [file panel](file-panel) and is highlighted while the panel is open.
 
 On macOS the shortcuts use `Cmd`, and `Option` only for moving between panes; never `Ctrl`. Copy and paste are handled by the terminal view, see [Copy and paste](#copy-and-paste). Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
 
@@ -130,7 +130,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Edit profiles | Open the profile editor. |
 | Duplicate profile | Save a copy of the focused pane's profile (in the profile editor, of the selected one) and open it in the editor; see [Duplicating a profile](profiles#duplicating-a-profile). It has no shortcut by default. |
 | Settings | Open the Settings window. |
-| Tunnels | Open the [Tunnels](tunnels) window. It has no shortcut by default. |
+| Tunnels | Show or hide the [tunnels panel](tunnels#the-tunnels-panel) beside the terminal. It has no shortcut by default. |
 | File panel | Show or hide the [file panel](file-panel) beside the focused pane's terminal. |
 | Tunnel: _profile_ / _name_ | One row per tunnel, with its state on the right. Choosing a row switches that tunnel on or off. |
 | Color schemes | Open the Color schemes window to duplicate, rename, edit and delete color schemes. It also opens from **Edit schemes…** in Settings and in the profile editor. |
@@ -196,7 +196,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `zoom_in`, `zoom_out`, `zoom_reset` | Text size of the focused pane |
 | `find_in_tab`, `merge_tab`, `move_tile`, `tile_to_tab` | Find in this tab (all panes of the tab), merge this tab into another, move the focused tile, move it to a tab of its own (no default shortcut) |
 | `select_tab_1` to `select_tab_9` | Select tab 1 to 9 |
-| `new_window`, `edit_profiles`, `settings`, `edit_schemes`, `tunnels`, `file_panel` | New window, the profile editor, Settings, the Color schemes window, the Tunnels window (no default shortcut), the file panel (`Cmd+Shift+E`, `Ctrl+Shift+E`) |
+| `new_window`, `edit_profiles`, `settings`, `edit_schemes`, `tunnels`, `file_panel` | New window, the profile editor, Settings, the Color schemes window, the tunnels panel (no default shortcut), the file panel (`Cmd+Shift+E`, `Ctrl+Shift+E`) |
 | `find`, `find_all`, `find_next`, `find_previous` | Find in pane, find in all tabs, older and newer match in the find bar |
 | `palette`, `open_settings_file`, `reveal_config_folder`, `quit` | The palette, the palette actions of the same names, quit |
 

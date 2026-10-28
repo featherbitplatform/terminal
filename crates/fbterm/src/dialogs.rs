@@ -376,9 +376,9 @@ impl App {
                             if !self.prompts.ask(w, id, ask) {
                                 return Task::none();
                             }
-                            // A tunnel switched on from the Tunnels window asks over the
-                            // terminal window used last, which may be behind it: bring that
-                            // one forward.
+                            // A tunnel may ask over a terminal window that is not in front
+                            // (switched on from another window, or its panel's window behind
+                            // the focused one): bring that one forward.
                             let raise = if tunnel.is_some() && self.focused != Some(w) {
                                 window::gain_focus(w)
                             } else {
