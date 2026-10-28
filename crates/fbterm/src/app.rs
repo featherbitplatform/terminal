@@ -180,6 +180,8 @@ pub enum Message {
     EditorSecrets(u64, Delivered<Result<crate::editor::SecretResults, String>>),
     /// The saved secrets of profile editor duplicate `seq` were copied (how many), or not.
     EditorDuplicated(u64, Result<usize, String>),
+    /// Quit has waited for the editor's saved-secret write as long as it will.
+    ExitWaitOver,
     Shoot,
     Shot(Screenshot),
     /// The OS close button (or equivalent) was used on a window; see [`App::close_requested`].
@@ -297,6 +299,11 @@ pub struct App {
     pub editor: Option<(window::Id, EditorState)>,
     /// Numbers the editor's saves, so the result of one for a replaced editor is dropped.
     pub(crate) editor_seq: u64,
+    /// The saved-secret write of an editor Save or Duplicate, while it runs (open editor or
+    /// not): another Save, Duplicate, Import or storage change waits for it.
+    pub(crate) editor_job: Option<crate::editor::SecretJob>,
+    /// Quit waits for `editor_job` to end before the process exits.
+    pub(crate) exit_waiting: bool,
     /// The Settings window, when open.
     pub settings_win: Option<(window::Id, SettingsState)>,
     /// The Color schemes window, when open.
@@ -643,6 +650,8 @@ impl App {
             find_box: None,
             editor: None,
             editor_seq: 0,
+            editor_job: None,
+            exit_waiting: false,
             settings_win: None,
             schemes_win: None,
             tunnels_win: None,
@@ -1155,7 +1164,7 @@ impl App {
                     && self.tunnels_win.is_none()
                     && self.archive_win.is_none()
                 {
-                    iced::exit()
+                    self.exit_when_idle()
                 } else if self.quitting {
                     Task::none()
                 } else {
@@ -1187,13 +1196,11 @@ impl App {
             Message::Archive(msg) => self.archive_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::Vault(msg) => self.vault_msg(msg),
-            Message::EditorSecrets(seq, results) => {
-                self.editor_secrets_done(seq, results);
-                Task::none()
-            }
-            Message::EditorDuplicated(seq, result) => {
-                self.editor_duplicated(seq, result);
-                Task::none()
+            Message::EditorSecrets(seq, results) => self.editor_secrets_done(seq, results),
+            Message::EditorDuplicated(seq, result) => self.editor_duplicated(seq, result),
+            Message::ExitWaitOver => {
+                tracing::warn!("quitting while saved secrets are still being written");
+                iced::exit()
             }
             Message::WindowScale(id, s) => {
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {

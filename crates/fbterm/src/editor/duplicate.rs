@@ -11,7 +11,7 @@ use fbterm_config::{AuthMethod, Profile, ProfileId, ProfileKind};
 use fbterm_secrets::{MainPassword, SecretError, SecretKind, SecretStore, Zeroizing};
 use iced::{Task, window};
 
-use super::EditorMsg;
+use super::{EditorMsg, JobKind, SecretJob};
 use crate::app::{App, Message};
 
 pub const DUPLICATED: &str = "Duplicated";
@@ -89,11 +89,12 @@ impl App {
         let refused = self.profiles_error.is_some();
         let need = self.backend.needs_main_password();
         let dialog_open = self.vault.dialog_open();
+        let busy = self.editor_job.is_some();
         let Some((wid, ed)) = &mut self.editor else {
             return Task::none();
         };
         let wid = *wid;
-        let refusal = if ed.saving.is_some() {
+        let refusal = if busy {
             Some(SAVING)
         } else if refused || ed.read_only.is_some() {
             Some(READ_ONLY)
@@ -159,7 +160,11 @@ impl App {
         self.editor_seq += 1;
         let seq = self.editor_seq;
         // Save waits for the copy, so a quick delete of it cannot race the secrets.
-        ed.saving = Some(seq);
+        self.editor_job = Some(SecretJob {
+            seq,
+            kind: JobKind::Duplicate,
+            editor: ed.instance(),
+        });
         ed.notice = Some(DUPLICATING.into());
         let secrets = ed.secret_store();
         let job = self.run_blocking(
@@ -171,21 +176,26 @@ impl App {
     }
 
     /// The saved secrets of duplicate `seq` were copied (or not).
-    pub(crate) fn editor_duplicated(&mut self, seq: u64, result: Result<usize, String>) {
-        let Some((_, ed)) = self
+    pub(crate) fn editor_duplicated(
+        &mut self,
+        seq: u64,
+        result: Result<usize, String>,
+    ) -> Task<Message> {
+        let Some(job) = self.take_editor_job(seq, JobKind::Duplicate) else {
+            return Task::none();
+        };
+        let failure = result.err().map(|e| {
+            tracing::warn!(error = %e, "a duplicate's saved secrets were not copied");
+            format!("Duplicated, but its saved secrets could not be copied: {e}")
+        });
+        match self
             .editor
             .as_mut()
-            .filter(|(_, ed)| ed.saving == Some(seq))
-        else {
-            return;
-        };
-        ed.saving = None;
-        ed.notice = Some(match result {
-            Ok(_) => DUPLICATED.into(),
-            Err(e) => {
-                tracing::warn!(error = %e, "a duplicate's saved secrets were not copied");
-                format!("Duplicated, but its saved secrets could not be copied: {e}")
-            }
-        });
+            .filter(|(_, ed)| ed.instance() == job.editor)
+        {
+            Some((_, ed)) => ed.notice = Some(failure.unwrap_or_else(|| DUPLICATED.into())),
+            None => self.editor_job_orphaned(failure),
+        }
+        self.editor_job_ended()
     }
 }

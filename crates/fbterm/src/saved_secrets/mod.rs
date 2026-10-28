@@ -37,6 +37,9 @@ pub const EMPTY: &str = "Type a main password.";
 /// known, so their secrets cannot be found.
 pub const PROFILES_UNREADABLE: &str =
     "Saved secrets cannot move while profiles.toml cannot be read. Fix it first.";
+/// A move or reset confirmed while an editor save or duplicate still writes saved secrets.
+pub const EDITOR_SAVING: &str =
+    "The profile editor is still saving. Wait for it to finish, then try again.";
 
 /// Where saved secrets are kept, as the notes under secret fields say it.
 pub fn storage_note(storage: Storage) -> &'static str {
@@ -247,7 +250,8 @@ pub struct SectionNotice {
 pub struct SectionInfo {
     pub choice: SecretStorage,
     pub vault_exists: bool,
-    /// A move or reset is under way: the choices wait.
+    /// A move or reset is under way, or an editor save or duplicate writes saved secrets:
+    /// the choices wait.
     pub busy: bool,
     pub notice: Option<SectionNotice>,
     /// The storage in use, for the hint.

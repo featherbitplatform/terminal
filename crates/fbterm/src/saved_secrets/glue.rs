@@ -23,10 +23,16 @@ impl App {
         SectionInfo {
             choice: self.settings.secret_storage,
             vault_exists: self.backend.vault_exists(),
-            busy: self.vault.section_busy(),
+            busy: self.secrets_busy(),
             notice: self.vault.notice.clone(),
             active: self.storage(),
         }
+    }
+
+    /// Whether saved secrets are being moved, reset or written by an editor save or
+    /// duplicate (open editor or not): the storage choice and `Reset vault` wait.
+    pub(crate) fn secrets_busy(&self) -> bool {
+        self.vault.section_busy() || self.editor_job.is_some()
     }
 
     /// Auto found no system storage on the first secret needed and moved to the vault:
@@ -181,6 +187,12 @@ impl App {
             d.problem = Some(problem.into());
             return Task::none();
         }
+        // An editor save or duplicate started while this dialog was open: a move or reset
+        // must not run under its write.
+        if self.editor_job.is_some() && matches!(d.purpose, Purpose::Switch(_) | Purpose::Reset) {
+            d.problem = Some(super::EDITOR_SAVING.into());
+            return Task::none();
+        }
         let seq = self.vault.next_seq();
         let Some(d) = &mut self.vault.dialog else {
             return Task::none();
@@ -315,7 +327,7 @@ impl App {
         };
         let wid = *wid;
         if state.read_only.is_some()
-            || self.vault.section_busy()
+            || self.secrets_busy()
             || choice == self.settings.secret_storage
         {
             return Task::none();
@@ -371,7 +383,7 @@ impl App {
             return Task::none();
         };
         let wid = *wid;
-        if self.vault.section_busy() || !self.backend.vault_exists() {
+        if self.secrets_busy() || !self.backend.vault_exists() {
             return Task::none();
         }
         if let Some(text) = self.vault.dialog_open() {

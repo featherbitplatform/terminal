@@ -6,7 +6,10 @@ use fbterm_config::{AuthMethod, ProfileId, ProfileKind};
 use iced::{Task, window};
 
 use crate::app::{App, Delivered, Message, load_profiles};
-use crate::editor::{EditorMsg, EditorState, SaveError, SecretResults, run_secret_ops};
+use crate::editor::{
+    EditorMsg, EditorState, JobKind, SAVING, SaveError, SecretJob, SecretResults,
+    failures_without_editor, run_secret_ops,
+};
 use crate::file_panel::ClashAnswer;
 use crate::prompts::{
     Ask, Clash, Dialog, PromptEvent, PromptId, PromptMsg, Rename, key_file_title,
@@ -80,11 +83,15 @@ impl App {
             exit_on_close_request: false,
             ..window::Settings::default()
         });
-        let state = EditorState::new(
+        let mut state = EditorState::new(
             &self.profiles,
             self.secrets.clone(),
             self.profiles_error.clone(),
         );
+        // A save or duplicate of an editor closed meanwhile still writes its secrets.
+        if self.editor_job.is_some() {
+            state.notice = Some(SAVING.into());
+        }
         self.editor = Some((id, state));
         open.discard()
     }
@@ -97,11 +104,12 @@ impl App {
         let refused = self.profiles_error.is_some();
         let need = self.backend.needs_main_password();
         let dialog_open = self.vault.dialog_open();
+        let busy = self.editor_job.is_some();
         let Some((wid, ed)) = &mut self.editor else {
             return Task::none();
         };
         let wid = *wid;
-        if ed.saving.is_some() {
+        if busy {
             return Task::none();
         }
         if refused {
@@ -155,8 +163,12 @@ impl App {
         let Some((_, ed)) = &mut self.editor else {
             return Task::none();
         };
-        ed.saving = Some(seq);
-        ed.notice = Some("Saving\u{2026}".into());
+        self.editor_job = Some(SecretJob {
+            seq,
+            kind: JobKind::Save,
+            editor: ed.instance(),
+        });
+        ed.notice = Some(SAVING.into());
         let secrets = ed.secret_store();
         self.run_blocking(
             move || Delivered::new(Ok(run_secret_ops(secrets.as_ref(), ops))),
@@ -170,29 +182,85 @@ impl App {
         &mut self,
         seq: u64,
         results: Delivered<Result<SecretResults, String>>,
-    ) {
-        let Some((_, ed)) = self
+    ) -> Task<Message> {
+        let Some(job) = self.take_editor_job(seq, JobKind::Save) else {
+            return Task::none();
+        };
+        let results = results.take();
+        match self
             .editor
             .as_mut()
-            .filter(|(_, ed)| ed.saving == Some(seq))
-        else {
-            return;
-        };
-        ed.saving = None;
-        ed.notice = Some(match results.take() {
-            Some(Ok(results)) => match ed.finish(results) {
-                Ok(()) => "Saved".into(),
-                Err(SaveError::Secrets(failures)) => {
-                    format!("Profiles saved, but {}", failures.join("; "))
+            .filter(|(_, ed)| ed.instance() == job.editor)
+        {
+            Some((_, ed)) => {
+                let notice = match results {
+                    Some(Ok(results)) => Some(match ed.finish(results) {
+                        Ok(()) => "Saved".into(),
+                        Err(SaveError::Secrets(failures)) => {
+                            format!("Profiles saved, but {}", failures.join("; "))
+                        }
+                        Err(_) => "Saved".into(),
+                    }),
+                    Some(Err(e)) => {
+                        ed.dirty = true;
+                        Some(format!(
+                            "Profiles saved, but the saved secrets could not be changed: {e}"
+                        ))
+                    }
+                    None => None,
+                };
+                if let Some(notice) = notice {
+                    ed.notice = Some(notice);
                 }
-                Err(_) => "Saved".into(),
-            },
-            Some(Err(e)) => {
-                ed.dirty = true;
-                format!("Profiles saved, but the saved secrets could not be changed: {e}")
             }
-            None => return,
-        });
+            None => {
+                let failure = match results {
+                    Some(Ok(results)) => {
+                        let failures = failures_without_editor(results, &self.profiles);
+                        (!failures.is_empty())
+                            .then(|| format!("Profiles saved, but {}", failures.join("; ")))
+                    }
+                    Some(Err(e)) => Some(format!(
+                        "Profiles saved, but the saved secrets could not be changed: {e}"
+                    )),
+                    None => None,
+                };
+                self.editor_job_orphaned(failure);
+            }
+        }
+        self.editor_job_ended()
+    }
+
+    /// The running editor job, taken when it is save or duplicate `seq` (`kind`).
+    pub(crate) fn take_editor_job(&mut self, seq: u64, kind: JobKind) -> Option<SecretJob> {
+        self.editor_job
+            .take_if(|job| job.seq == seq && job.kind == kind)
+    }
+
+    /// An editor job ended after its editor closed. An editor opened since never takes in
+    /// the old drafts' results: it drops its `Saving…` notice, and a `failure` shows there,
+    /// else on the terminal windows' notice banner.
+    pub(crate) fn editor_job_orphaned(&mut self, failure: Option<String>) {
+        if let Some((_, ed)) = &mut self.editor {
+            if failure.is_some() || ed.notice.as_deref() == Some(SAVING) {
+                ed.notice = failure;
+            }
+            return;
+        }
+        if let Some(text) = failure {
+            tracing::warn!("a saved-secret write failed after the profile editor closed");
+            self.notices.push(text);
+            self.notices_dismissed = false;
+        }
+    }
+
+    /// The editor job ended: a quit waiting for it exits now.
+    pub(crate) fn editor_job_ended(&self) -> Task<Message> {
+        if self.exit_waiting {
+            iced::exit()
+        } else {
+            Task::none()
+        }
     }
 
     /// `profiles.toml` changed on disk (hand edit, or a tool). Changes that are only our own

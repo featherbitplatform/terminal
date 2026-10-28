@@ -485,15 +485,18 @@ pub struct EditorState {
     pub read_only: Option<ConfigError>,
     /// Unsaved edits exist.
     pub dirty: bool,
-    /// The secret changes of this save number run in the background: Save waits.
-    pub saving: Option<u64>,
     secrets: Arc<dyn SecretStore>,
     /// Whether the key file at this path (as typed) is an RSA private key; refreshed when the
     /// path or the selection changes, so drawing never touches the disk.
     key_check: Option<(String, bool)>,
     /// The Name field, focused when a duplicate opens for renaming.
     pub name_input: iced::widget::Id,
+    /// Tells this editor apart from one opened (or reloaded) after it.
+    instance: u64,
 }
+
+/// The next editor's [`EditorState::instance`].
+static NEXT_INSTANCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// The advice shown (editor, terminal) when a login uses an RSA key.
 pub const RSA_ADVICE: &str =
@@ -536,10 +539,10 @@ impl EditorState {
             notice: None,
             read_only,
             dirty: false,
-            saving: None,
             secrets,
             key_check: None,
             name_input: iced::widget::Id::unique(),
+            instance: NEXT_INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         };
         state.refresh_key_check();
         state
@@ -906,6 +909,11 @@ impl EditorState {
         self.finish(results)
     }
 
+    /// Tells this editor apart from one opened (or reloaded) after it.
+    pub fn instance(&self) -> u64 {
+        self.instance
+    }
+
     /// The store the secret changes of a save go to.
     pub fn secret_store(&self) -> Arc<dyn SecretStore> {
         self.secrets.clone()
@@ -933,19 +941,10 @@ impl EditorState {
     pub fn finish(&mut self, results: SecretResults) -> Result<(), SaveError> {
         let mut failures = Vec::new();
         for (op, result) in results {
-            let name = |id: ProfileId| {
+            let what = op_text(&op, |id| {
                 self.draft(id)
                     .map_or_else(|| id.to_string(), |d| d.name.clone())
-            };
-            let what = match &op {
-                SecretOp::Set { id, kind, .. } => {
-                    format!("store the {} of {}", kind_name(*kind), name(*id))
-                }
-                SecretOp::RemoveKind { id, kind } => {
-                    format!("remove the old {} of {}", kind_name(*kind), name(*id))
-                }
-                SecretOp::Remove(id) => format!("remove the secrets of a deleted profile ({id})"),
-            };
+            });
             match result {
                 Ok(()) => {
                     if let SecretOp::Set { id, value, .. } = op
@@ -1029,11 +1028,63 @@ pub fn run_secret_ops(secrets: &dyn SecretStore, ops: Vec<SecretOp>) -> SecretRe
     ops.into_iter().map(|op| (op, result.clone())).collect()
 }
 
+/// The failures of a save whose editor was closed meanwhile, as [`EditorState::finish`] words
+/// them, naming profiles as saved in `profiles`.
+pub fn failures_without_editor(results: SecretResults, profiles: &ProfileStore) -> Vec<String> {
+    results
+        .into_iter()
+        .filter_map(|(op, result)| {
+            let e = result.err()?;
+            tracing::warn!(error = %e, "a secret change failed after saving profiles");
+            let what = op_text(&op, |id| {
+                profiles
+                    .get(id)
+                    .map_or_else(|| id.to_string(), |p| p.name.clone())
+            });
+            Some(format!("could not {what}: {e}"))
+        })
+        .collect()
+}
+
+/// What secret change `op` makes, naming profiles with `name`.
+fn op_text(op: &SecretOp, name: impl Fn(ProfileId) -> String) -> String {
+    match op {
+        SecretOp::Set { id, kind, .. } => {
+            format!("store the {} of {}", kind_name(*kind), name(*id))
+        }
+        SecretOp::RemoveKind { id, kind } => {
+            format!("remove the old {} of {}", kind_name(*kind), name(*id))
+        }
+        SecretOp::Remove(id) => format!("remove the secrets of a deleted profile ({id})"),
+    }
+}
+
 fn kind_name(kind: SecretKind) -> &'static str {
     match kind {
         SecretKind::Password => "password",
         SecretKind::KeyPassphrase => "key passphrase",
     }
+}
+
+/// The notice of an editor opened while a [`SecretJob`] still runs.
+pub const SAVING: &str = "Saving\u{2026}";
+
+/// A saved-secret write started by the editor's Save or Duplicate. It is the app's, not the
+/// editor's, so closing the editor never drops the hold while the write runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SecretJob {
+    pub seq: u64,
+    pub kind: JobKind,
+    /// The [`EditorState::instance`] that started it: only that editor takes in the result
+    /// (not one opened or reloaded since).
+    pub editor: u64,
+}
+
+/// What started a [`SecretJob`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    Save,
+    Duplicate,
 }
 
 /// A secret-store change a save makes once `profiles.toml` is written.
@@ -1142,5 +1193,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
 
 #[cfg(test)]
 mod duplicate_tests;
+#[cfg(test)]
+mod job_tests;
 #[cfg(test)]
 mod tests;
