@@ -34,8 +34,80 @@ pub struct Scheme {
     pub colors: SchemeColors,
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
+    /// Where the colors came from, for a scheme installed from the gallery or imported
+    /// with its credit; written as the `[credit]` table.
+    pub credit: Option<Credit>,
+    /// Gallery bookkeeping for an installed gallery scheme; written as `[gallery]`.
+    pub gallery: Option<GalleryInfo>,
     /// True for the schemes shipped in code; never written to a file.
     pub builtin: bool,
+}
+
+/// The `[credit]` table: who made a scheme and under which license. The keys match the
+/// published theme catalog.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Credit {
+    pub project: String,
+    pub author: String,
+    pub url: String,
+    pub license: String,
+    pub copyright: String,
+    pub license_file: String,
+    pub description: String,
+    pub derived: bool,
+}
+
+/// The `[gallery]` table: which catalog entry a scheme was installed from.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct GalleryInfo {
+    /// The catalog id (the scheme id without [`GALLERY_PREFIX`]).
+    pub id: String,
+    /// The catalog version installed.
+    pub version: u32,
+    /// [`colors_hash`] of the colors as installed, to tell later edits.
+    pub colors_hash: String,
+}
+
+/// Scheme ids installed from the gallery start with this.
+pub const GALLERY_PREFIX: &str = "gallery-";
+
+/// A stable fingerprint of the 20 colors in file order: FNV-1a 64 over their r, g, b bytes,
+/// as 16 lowercase hex digits. Identical across runs and platforms.
+pub fn colors_hash(colors: &SchemeColors) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let all = [
+        colors.foreground,
+        colors.background,
+        colors.cursor,
+        colors.selection,
+    ]
+    .into_iter()
+    .chain(colors.ansi);
+    for c in all {
+        for b in [c.r, c.g, c.b] {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("{h:016x}")
+}
+
+/// The catalog id of a scheme whose id starts with [`GALLERY_PREFIX`], with or without a
+/// `[gallery]` table.
+pub fn gallery_id(scheme: &Scheme) -> Option<&str> {
+    scheme
+        .id
+        .strip_prefix(GALLERY_PREFIX)
+        .filter(|id| !id.is_empty())
+}
+
+/// Whether the colors differ from what the gallery installed: no `[gallery]` table, or a
+/// `colors_hash` that no longer matches.
+pub fn is_edited(scheme: &Scheme) -> bool {
+    scheme
+        .gallery
+        .as_ref()
+        .is_none_or(|g| g.colors_hash != colors_hash(&scheme.colors))
 }
 
 /// Ids of the built-in schemes, fixed forever.
@@ -76,6 +148,10 @@ struct SchemeFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     font_size: Option<f32>,
     colors: ColorsFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credit: Option<Credit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gallery: Option<GalleryInfo>,
 }
 
 impl From<Scheme> for SchemeFile {
@@ -86,6 +162,8 @@ impl From<Scheme> for SchemeFile {
             name: scheme.name,
             font_family: scheme.font_family,
             font_size: scheme.font_size,
+            credit: scheme.credit,
+            gallery: scheme.gallery,
         }
     }
 }
@@ -107,6 +185,8 @@ impl TryFrom<SchemeFile> for Scheme {
             colors: file.colors.into(),
             font_family: file.font_family,
             font_size: file.font_size,
+            credit: file.credit,
+            gallery: file.gallery,
             builtin: false,
         })
     }
@@ -198,6 +278,8 @@ fn builtin(
         },
         font_family: None,
         font_size: None,
+        credit: None,
+        gallery: None,
         builtin: true,
     }
 }
@@ -550,5 +632,101 @@ mod tests {
         );
         let over = vec![b'a'; MAX_FILE_BYTES as usize + 1];
         assert!(read_capped(&over[..]).unwrap().is_none());
+    }
+
+    fn sample_credit() -> Credit {
+        Credit {
+            project: "Nord".into(),
+            author: "Arctic Ice Studio".into(),
+            url: "https://example.org/nord".into(),
+            license: "MIT".into(),
+            copyright: "Copyright (c) 2016".into(),
+            license_file: "LICENSE".into(),
+            description: "An arctic palette.".into(),
+            derived: true,
+        }
+    }
+
+    fn gallery_scheme() -> Scheme {
+        let mut s = builtins().remove(0);
+        s.builtin = false;
+        s.id = "gallery-nord".into();
+        s.credit = Some(sample_credit());
+        s.gallery = Some(GalleryInfo {
+            id: "nord".into(),
+            version: 2,
+            colors_hash: colors_hash(&s.colors),
+        });
+        s
+    }
+
+    #[test]
+    fn credit_and_gallery_round_trip() {
+        let scheme = gallery_scheme();
+        let text = toml::to_string_pretty(&scheme).unwrap();
+        assert!(text.contains("[credit]") && text.contains("[gallery]"));
+        assert!(text.contains("license_file = \"LICENSE\"") && text.contains("derived = true"));
+        let back: Scheme = toml::from_str(&text).unwrap();
+        assert_eq!(back, scheme);
+    }
+
+    #[test]
+    fn old_files_without_tables_load() {
+        let text = toml::to_string_pretty(&builtins().remove(0)).unwrap();
+        assert!(!text.contains("[credit]") && !text.contains("[gallery]"));
+        let back: Scheme = toml::from_str(&text).unwrap();
+        assert!(back.credit.is_none() && back.gallery.is_none());
+    }
+
+    #[test]
+    fn file_with_tables_loads_in_old_shape() {
+        /// A scheme file as read before the tables existed (no `deny_unknown_fields`).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldSchemeFile {
+            id: String,
+            name: String,
+            font_family: Option<String>,
+            font_size: Option<f32>,
+            colors: ColorsFile,
+        }
+        let text = toml::to_string_pretty(&gallery_scheme()).unwrap();
+        let old: OldSchemeFile = toml::from_str(&text).unwrap();
+        assert_eq!(old.id, "gallery-nord");
+    }
+
+    #[test]
+    fn colors_hash_is_stable() {
+        assert_eq!(
+            colors_hash(&builtins().remove(0).colors),
+            "210775489270ef4a"
+        );
+    }
+
+    #[test]
+    fn gallery_id_without_block_counts_as_edited() {
+        let mut s = gallery_scheme();
+        s.gallery = None;
+        assert_eq!(gallery_id(&s), Some("nord"));
+        assert!(is_edited(&s));
+        s.id = "user-1".into();
+        assert_eq!(gallery_id(&s), None);
+    }
+
+    #[test]
+    fn edited_colors_count_as_edited() {
+        let mut s = gallery_scheme();
+        s.colors.cursor = hex(0x123456);
+        assert!(is_edited(&s));
+    }
+
+    #[test]
+    fn untouched_gallery_scheme_is_not_edited() {
+        assert!(!is_edited(&gallery_scheme()));
+    }
+
+    #[test]
+    fn is_valid_user_accepts_gallery_ids() {
+        assert!(is_valid_user(&gallery_scheme()));
     }
 }

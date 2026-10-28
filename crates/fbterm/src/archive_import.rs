@@ -986,6 +986,7 @@ fn plan_schemes(
                 id: schemes::new_user_id(),
                 name: format!("{} (imported)", s.name),
                 builtin: false,
+                gallery: None,
                 ..s.clone()
             })
             .map(|scheme| SchemeEntry {

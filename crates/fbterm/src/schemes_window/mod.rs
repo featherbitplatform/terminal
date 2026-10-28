@@ -171,7 +171,7 @@ pub enum SchemesMsg {
     Import,
     Imported(Option<PathBuf>),
     /// The chosen file as read on the blocking pool (the error text names file and line).
-    ImportRead(Result<Scheme, String>),
+    ImportRead(Box<Result<Scheme, String>>),
     ImportChoice(ImportChoice),
     Export,
     Exported(Option<PathBuf>),
@@ -525,6 +525,7 @@ impl SchemesState {
             id: new_user_id(),
             name: format!("{} copy", source.name.trim()),
             builtin: false,
+            gallery: None,
             ..source.clone()
         };
         self.drafts.push(copy.clone());

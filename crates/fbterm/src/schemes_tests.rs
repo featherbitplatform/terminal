@@ -49,6 +49,8 @@ pub(crate) fn user_scheme(name: &str, bg: u32) -> Scheme {
         },
         font_family: None,
         font_size: None,
+        credit: None,
+        gallery: None,
         builtin: false,
     }
 }

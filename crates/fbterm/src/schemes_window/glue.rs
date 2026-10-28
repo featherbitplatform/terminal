@@ -66,7 +66,7 @@ impl App {
             }
             SchemesMsg::Import => self.pick_import(),
             SchemesMsg::Imported(path) => Self::read_import(path),
-            SchemesMsg::ImportRead(result) => self.imported(result),
+            SchemesMsg::ImportRead(result) => self.imported(*result),
             SchemesMsg::ImportChoice(choice) => self.import_choice(choice),
             SchemesMsg::Export => self.pick_export(),
             SchemesMsg::Exported(path) => self.exported(path),
@@ -343,7 +343,7 @@ impl App {
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
             },
-            |r| Message::Schemes(SchemesMsg::ImportRead(r)),
+            |r| Message::Schemes(SchemesMsg::ImportRead(Box::new(r))),
         )
     }
 
@@ -367,6 +367,7 @@ impl App {
         state.error = None;
         if BUILTIN_IDS.contains(&scheme.id.as_str()) || !is_plain_id(&scheme.id) {
             scheme.id = new_user_id();
+            scheme.gallery = None;
         } else if let Some(existing) = self
             .schemes
             .get(&scheme.id)
@@ -397,6 +398,7 @@ impl App {
             ImportChoice::Replace => {}
             ImportChoice::KeepBoth => {
                 scheme.id = new_user_id();
+                scheme.gallery = None;
                 scheme.name = format!("{} (imported)", scheme.name.trim());
             }
         }
