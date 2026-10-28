@@ -15,7 +15,8 @@
 //!   content; a shell that ends normally reports [`SessionEvent::Exited`].
 //! - [`SshPool::acquire`] hands out the connection itself (shared with the shells, dialled the
 //!   same way) for tunnels: holding it keeps the connection open without any shell, and
-//!   [`Connection::closed`] says when it ended.
+//!   [`Connection::closed`] says when it ended. [`SshPool::existing`] hands out only a live
+//!   connection on the profile's current route, never dialling (so never asking anything).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -149,6 +150,18 @@ impl SshPool {
             .map_err(|e| e.without_prompts(can_ask))
     }
 
+    /// The profile's live connection on its current route, if it has one: never dials, so
+    /// it never asks anything. For work that may only ride a connection a shell already made
+    /// (the file panel's check after a shell connects).
+    pub fn existing(
+        &self,
+        store: &ProfileStore,
+        profile: &ProfileId,
+    ) -> Result<Option<Arc<Connection>>, SshError> {
+        let (route, _, _) = route_for(store, profile)?;
+        Ok(self.slots.current(*profile, &route, Connection::is_alive))
+    }
+
     /// The route of `profile` and its dial step (its jump chain, then the profile), asking
     /// `prompter`.
     #[allow(clippy::type_complexity)]
@@ -164,27 +177,11 @@ impl SshPool {
         ),
         SshError,
     > {
-        let target = store
-            .get(*profile)
-            .ok_or_else(|| {
-                SshError::Jump(ValidationError::MissingJump {
-                    profile: profile.to_string(),
-                    missing: *profile,
-                })
-            })?
-            .clone();
-        ssh_profile(&target)?;
-        let chain: Vec<Profile> = store
-            .jump_chain(*profile)
-            .map_err(SshError::Jump)?
-            .into_iter()
-            .cloned()
-            .collect();
+        let (route, chain, target) = route_for(store, profile)?;
         let ctx = SshContext {
             prompter,
             ..self.ctx.clone()
         };
-        let route = route_of(&chain, &target);
         Ok((route, move || {
             dial(chain.clone(), target.clone(), ctx.clone()).boxed()
         }))
@@ -207,6 +204,30 @@ impl SshPool {
 /// hop of its jump chain and then of the profile itself, tunnels left out. A connection is
 /// shared only with callers whose profile still has the route it was dialled on.
 type Route = Vec<SshProfile>;
+
+/// The route of `profile`, its jump chain and the profile itself.
+fn route_for(
+    store: &ProfileStore,
+    profile: &ProfileId,
+) -> Result<(Route, Vec<Profile>, Profile), SshError> {
+    let target = store
+        .get(*profile)
+        .ok_or_else(|| {
+            SshError::Jump(ValidationError::MissingJump {
+                profile: profile.to_string(),
+                missing: *profile,
+            })
+        })?
+        .clone();
+    ssh_profile(&target)?;
+    let chain: Vec<Profile> = store
+        .jump_chain(*profile)
+        .map_err(SshError::Jump)?
+        .into_iter()
+        .cloned()
+        .collect();
+    Ok((route_of(&chain, &target), chain, target))
+}
 
 fn route_of(chain: &[Profile], target: &Profile) -> Route {
     chain
@@ -969,6 +990,14 @@ impl<C: Settle<R> + Send + Sync + 'static, R: PartialEq + Clone + Send + Sync> S
         }
     }
 
+    /// The live connection recorded for `id` on `route`, without dialling or joining a dial.
+    fn current(&self, id: ProfileId, route: &R, alive: fn(&C) -> bool) -> Option<Arc<C>> {
+        match self.map.lock().get(&id) {
+            Some(Slot::Live(weak, on)) if on == route => weak.upgrade().filter(|c| alive(c)),
+            _ => None,
+        }
+    }
+
     /// Whether `c` is the live connection recorded for `id`.
     fn holds(&self, id: ProfileId, c: &Arc<C>) -> bool {
         matches!(self.map.lock().get(&id), Some(Slot::Live(weak, _)) if std::ptr::eq(weak.as_ptr(), Arc::as_ptr(c)))
@@ -1272,6 +1301,44 @@ mod tests {
             .unwrap();
         assert_eq!((fresh.serial, reused), (4, false));
         assert_eq!(dials.started(), 4);
+    }
+
+    #[tokio::test]
+    async fn current_hands_out_only_a_live_connection_on_the_route() {
+        let slots = Slots::<Fake, &str>::default();
+        let id = ProfileId::new();
+        let dials = Dials::default();
+        assert!(
+            slots.current(id, &"host", fake_alive).is_none(),
+            "nothing yet"
+        );
+        // A dial in flight is not joined: `current` never waits for a connect.
+        let dialing = slots.get_or_dial_on(
+            id,
+            "host",
+            ASK,
+            fake_alive,
+            dials.dialer(Duration::from_millis(200), false),
+        );
+        let ((c, _), during) = tokio::join!(async { dialing.await.unwrap() }, async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            slots.current(id, &"host", fake_alive).is_some()
+        });
+        assert!(!during, "a dial in flight is not a connection");
+        let got = slots
+            .current(id, &"host", fake_alive)
+            .expect("the live connection");
+        assert!(Arc::ptr_eq(&got, &c));
+        assert!(
+            slots.current(id, &"edited", fake_alive).is_none(),
+            "another route"
+        );
+        fake_kill(&c);
+        assert!(
+            slots.current(id, &"host", fake_alive).is_none(),
+            "a dead one"
+        );
+        assert_eq!(dials.started(), 1, "never dials");
     }
 
     #[tokio::test]

@@ -248,6 +248,67 @@ async fn home_is_reported() {
     assert!(sftp.supports_posix_rename());
 }
 
+/// Fails the test on any question at all: a host key, a secret, a key file or the vault.
+struct NeverAsk;
+
+#[async_trait]
+impl Prompter for NeverAsk {
+    async fn unlock_vault(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+        panic!("unexpected vault unlock");
+    }
+
+    async fn set_vault_password(&self) -> Option<fbterm_secrets::Zeroizing<String>> {
+        panic!("unexpected vault password");
+    }
+
+    async fn ask_key_file(&self, profile_name: &str) -> Option<std::path::PathBuf> {
+        panic!("unexpected key file question for {profile_name}");
+    }
+
+    async fn confirm_host_key(&self, host: &str, port: u16, _fp: &str) -> bool {
+        panic!("unexpected host key question for {host}:{port}");
+    }
+
+    async fn ask_secret(&self, name: &str, kind: SecretKind, _retry: bool) -> Option<SecretAnswer> {
+        panic!("unexpected {kind:?} prompt for {name}");
+    }
+}
+
+#[tokio::test]
+async fn open_existing_rides_only_a_shell_connection() {
+    if !enabled() {
+        return;
+    }
+    let mut w = World::new();
+    // The pool's own prompter fails the test if anything asks; only the shell below may
+    // trust the host key, with its own prompter.
+    w.pool = Arc::new(SshPool::new(SshContext {
+        known_hosts: w._dir.path().join(".ssh").join("known_hosts"),
+        secrets: Arc::new(MemoryStore::new()),
+        prompter: Arc::new(NeverAsk),
+    }));
+    let open = || tokio::time::timeout(STEP, Sftp::open_existing(&w.pool, &w.store, &w.bastion));
+    // No shell: nothing to ride, and nothing is dialled.
+    let none = open().await.expect("open_existing timed out");
+    assert!(matches!(none, Ok(None)), "no connection yet");
+    assert!(w.pool.connected_profiles().is_empty(), "nothing dialled");
+
+    // A shell connects: the session opens on its connection and works.
+    let shell = w.shell(w.bastion).await;
+    assert_eq!(w.pool.connected_profiles(), vec![w.bastion]);
+    let sftp = open()
+        .await
+        .expect("open_existing timed out")
+        .expect("open_existing")
+        .expect("the shell's connection");
+    assert_eq!(sftp.home().await.unwrap(), HOME);
+    let entries = list(&sftp, HOME).await.expect("list home");
+    assert!(entries.iter().all(|e| e.name != "." && e.name != ".."));
+    // Still the one connection the shell made.
+    assert_eq!(w.pool.connected_profiles(), vec![w.bastion]);
+    drop(shell);
+}
+
 #[tokio::test]
 async fn list_home_through_jump() {
     if !enabled() {

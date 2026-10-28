@@ -21,6 +21,8 @@ const CONTENT_WIDTH: f32 = 560.0;
 
 /// The `Saved secrets` section's line while secrets move.
 const MOVING: &str = "Moving saved secrets\u{2026}";
+/// The `Saved secrets` section's line while the profile editor writes saved secrets.
+pub(crate) const EDITOR_SAVING: &str = "Saving the profile editor's changes\u{2026}";
 
 fn msg(m: SettingsMsg) -> Message {
     Message::Settings(m)
@@ -540,7 +542,12 @@ fn saved_secrets<'a>(
     .spacing(8)
     .padding(Padding::from([12.0, 16.0]));
     let status = if info.busy {
-        Some((MOVING.to_owned(), t.text_secondary))
+        let line = if info.editor_saving {
+            EDITOR_SAVING
+        } else {
+            MOVING
+        };
+        Some((line.to_owned(), t.text_secondary))
     } else {
         info.notice
             .map(|n| (n.text, if n.error { t.danger } else { t.text_secondary }))

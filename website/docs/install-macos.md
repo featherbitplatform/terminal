@@ -13,17 +13,17 @@ Each release provides two files:
 - `fbterm-<version>-macos-universal.dmg`, the disk image
 - `fbterm-<version>-macos-universal.dmg.sha256`, its checksum
 
-For example, version 0.3.1 is `fbterm-0.3.1-macos-universal.dmg`.
+For example, version 0.4.0 is `fbterm-0.4.0-macos-universal.dmg`.
 
 ## Verify the download
 
 Put both files in the same folder and run this from that folder:
 
 ```bash
-shasum -a 256 -c fbterm-0.3.1-macos-universal.dmg.sha256
+shasum -a 256 -c fbterm-0.4.0-macos-universal.dmg.sha256
 ```
 
-The command prints `fbterm-0.3.1-macos-universal.dmg: OK` when the file is intact. Replace the version with the one you downloaded.
+The command prints `fbterm-0.4.0-macos-universal.dmg: OK` when the file is intact. Replace the version with the one you downloaded.
 
 ## Install
 
@@ -44,6 +44,12 @@ xattr -dr com.apple.quarantine "/Applications/featherbit terminal.app"
 ```
 
 After either option the app opens normally from then on. On macOS 15 and later, right-clicking the app and choosing **Open** no longer skips this check; use one of the options above.
+
+## If fbterm crashes or doesn't start
+
+fbterm keeps a log of each run in `fbterm.log` in its [configuration directory](files#configuration-directory), `~/Library/Application Support/io.featherbit.fbterm`. When it starts, the log of the run before is kept as `fbterm.previous.log`, so after a crash that file holds the run that crashed. A crash, or a start that fails, also adds a report to `crash.log` in the same folder (once that file is over 256 KB, it is moved to `crash.previous.log` first), and the next launch says once, in the window, that a report was written. In Finder, choose **Go** > **Go to Folder** and paste the folder's path to open it.
+
+To report the problem, send `crash.log` and `fbterm.previous.log` (or `fbterm.log` if fbterm has not been started again since). Look through them first: they can name your profiles, hosts and folders.
 
 ## Next steps
 

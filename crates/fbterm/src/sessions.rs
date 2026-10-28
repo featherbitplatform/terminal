@@ -275,6 +275,8 @@ impl App {
         }
         // The profile's first connected shell starts its "with the shell" tunnels.
         self.sync_shell_tunnels(profile);
+        // And SFTP is checked on its connection, for the tab bar's files button.
+        self.check_sftp(profile);
     }
 
     pub(crate) fn session_event(&mut self, sid: SessionId, event: SessionEvent) -> Task<Message> {

@@ -26,6 +26,7 @@ pub fn view<'a>(
     state: &'a EditorState,
     schemes: Vec<SchemeChoice>,
     storage: fbterm_secrets::Storage,
+    busy: bool,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut main = column![];
@@ -59,7 +60,7 @@ pub fn view<'a>(
     main = main.push(
         row![
             sidebar(t, state, editable),
-            column![form, footer(t, state, editable)]
+            column![form, footer(t, state, editable, busy)]
         ]
         .height(Length::Fill),
     );
@@ -490,7 +491,14 @@ fn accents<'a>(t: &'static Tokens, current: Option<Rgb>, editable: bool) -> Elem
     r.into()
 }
 
-fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Element<'a, Message> {
+/// The buttons and messages under the form. `busy`: a saved-secret write of an editor save
+/// or duplicate runs, so Save and Duplicate wait.
+fn footer<'a>(
+    t: &'static Tokens,
+    state: &'a EditorState,
+    editable: bool,
+    busy: bool,
+) -> Element<'a, Message> {
     let mut messages = column![].spacing(3).width(Length::Fill);
     for e in &state.errors {
         messages = messages.push(text(e.to_string()).font(UI_FONT).size(12).color(t.danger));
@@ -522,8 +530,7 @@ fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Ele
             ui::text_button(
                 t,
                 "Duplicate",
-                (editable && has_selection && state.saving.is_none())
-                    .then(|| msg(EditorMsg::Duplicate)),
+                (editable && has_selection && !busy).then(|| msg(EditorMsg::Duplicate)),
                 ui::ghost
             ),
             ui::text_button(t, "Export\u{2026}", Some(msg(EditorMsg::Export)), ui::ghost),
@@ -533,7 +540,7 @@ fn footer<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Ele
             ui::text_button(
                 t,
                 "Save",
-                (editable && state.dirty && state.saving.is_none()).then(|| msg(EditorMsg::Save)),
+                (editable && state.dirty && !busy).then(|| msg(EditorMsg::Save)),
                 ui::primary
             ),
         ]

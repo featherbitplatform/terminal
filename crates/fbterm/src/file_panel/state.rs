@@ -34,6 +34,9 @@ pub(crate) enum Listing {
     Closed,
     /// The SFTP session is being opened.
     Opening,
+    /// The check after a shell connected is opening the SFTP session on that shell's
+    /// connection, asking nothing; a panel that shows the profile opens it its own way instead.
+    Checking,
     /// The folder is being read.
     Loading,
     Loaded(Vec<Entry>),
@@ -276,6 +279,12 @@ impl ProfilePanel {
         }
     }
 
+    /// Whether the session is open and its connection still up: the tab bar's files button
+    /// shows for the profile.
+    pub(crate) fn available(&self) -> bool {
+        self.sftp.as_ref().is_some_and(|s| s.is_alive())
+    }
+
     /// Let go of the SFTP session: an open under way stops, and anything still on its way is
     /// ignored.
     pub(crate) fn release(&mut self) {
@@ -449,7 +458,8 @@ pub(crate) struct FilePanels {
     pub saving: HashMap<window::Id, PendingSave>,
     /// Windows with the `Upload…` picker open (one at a time per window).
     pub picking: HashSet<window::Id>,
-    /// Files dropped on each window in the current burst, uploaded together once it settles.
+    /// Files dropped on each window in the current burst, uploaded together (or their paths
+    /// typed) once it settles.
     pub dropped: HashMap<window::Id, Vec<PathBuf>>,
     /// Each window's uploads waiting for a decision, oldest first: the front one may be
     /// asking about a name clash.

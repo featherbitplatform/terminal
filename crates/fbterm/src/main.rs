@@ -39,7 +39,7 @@
 //! - `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword`: show a sample
 //!   connection or main password dialog (`setpassword` only with `FBTERM_SECRETS=memory`) in the first
 //!   window (nothing waits for the answer).
-//! - `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close`: keep that tab-bar button's
+//! - `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|files|settings|close`: keep that tab-bar button's
 //!   tooltip showing (for screenshots; `close` is the first tab's).
 //! - `FBTERM_FIND=<text>`: open the find bar of the first window's active tab with this query
 //!   (about a second after startup, once output has arrived).
@@ -50,6 +50,9 @@
 //!   any system, for screenshots.
 //!
 //! `fbterm --version` prints `fbterm <version>` and exits.
+//!
+//! Every run logs to `fbterm.log` in the config dir as well as stderr; panics and start-up
+//! failures append a report to `crash.log` there (see `crash.rs`).
 //!
 //! Windows release builds are GUI programs (no console window opens next to the app when it
 //! starts from the Start menu), so their `--version` line reaches a pipe or a file, e.g.
@@ -70,11 +73,13 @@ mod archive_window;
 mod chrome;
 mod config_files;
 mod context_menu;
+mod crash;
 mod debug;
 mod dialogs;
 mod display_rate;
 mod editor;
 mod export;
+mod file_drop;
 mod file_panel;
 mod find;
 mod key_log;
@@ -137,11 +142,10 @@ fn main() -> iced::Result {
         println!("{line}");
         return Ok(());
     }
+    crash::install_panic_hook();
     perf::init_from_env();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // Stderr as always, and `fbterm.log` in the config dir (`crash.rs`).
+    crash::init_logging(&app::paths());
     key_log::init_from_env();
     let mut daemon = iced::daemon(App::boot, App::update, window::view)
         .title(App::title)
@@ -155,5 +159,9 @@ fn main() -> iced::Result {
     }
     // Before the first window opens: on Linux this reads the desktop's button layout.
     chrome::init();
-    daemon.run()
+    let result = daemon.run();
+    if let Err(e) = &result {
+        crash::start_failed(&e.to_string());
+    }
+    result
 }

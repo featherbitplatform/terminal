@@ -10,7 +10,7 @@ The file panel browses the server of an SSH session beside the terminal and move
 
 ## Opening the panel
 
-Press `Cmd+Shift+E` (`Ctrl+Shift+E` on Linux and Windows), choose **File panel** in the palette, or use the close button in the panel's header to hide it again. The `file_panel` action can be rebound in **Keyboard** in Settings (see [Keyboard shortcuts](keyboard-shortcuts#the-keys-table)). Each window has its own panel, shown or hidden; dragging the panel's left edge changes its width, which is shared by all windows and remembered.
+Press `Cmd+Shift+E` (`Ctrl+Shift+E` on Linux and Windows), choose **File panel** in the palette, or use the close button in the panel's header to hide it again. Once an SSH session connects, fbterm checks in the background, on that same connection and without asking anything, whether the server offers SFTP; when it does, a folder button appears in the tab bar while that session's pane is focused. Click it to open or close the panel; it is highlighted while the panel is open, and the panel then shows the folder at once. The `file_panel` action can be rebound in **Keyboard** in Settings (see [Keyboard shortcuts](keyboard-shortcuts#the-keys-table)). Each window has its own panel, shown or hidden; dragging the panel's left edge changes its width, which is shared by all windows and remembered.
 
 The panel follows the focused pane of the active tab and shows that pane's profile:
 
@@ -21,7 +21,7 @@ The panel follows the focused pane of the active tab and shows that pane's profi
 | A local shell | `Local session`. |
 | A server that refuses SFTP | `SFTP is not available: <reason>`. There is no fallback to SCP or anything else. |
 
-The panel uses the profile's shared connection (and its [jump hosts](profiles#jump-hosts)), so it never asks you to sign in again; if a question does come up (a host key, a password) it appears over the window as it would for a shell. The connection stays open while the panel or a transfer uses it.
+The panel uses the profile's shared connection (and its [jump hosts](profiles#jump-hosts)), so it never asks you to sign in again; if a question does come up (a host key, a password) it appears over the window as it would for a shell. The connection stays open while the panel or a transfer uses it; the background check never keeps it open on its own, so it closes with the session's last shell.
 
 A profile's panel starts in the server's home folder. The folder you were in is kept for each profile until you quit the app, so switching between panes and tabs of different servers returns to where you were.
 
@@ -54,7 +54,7 @@ A finished download has **Show in Finder** (**Show in folder** on Linux and Wind
 ## Uploading
 
 - **Upload…** opens a file picker (several files at once).
-- **Drag and drop** files from Finder or your file manager onto the window while the panel is open.
+- **Drag and drop** files from Finder or your file manager onto the window while the panel shows a server. With the panel closed, or open over a local shell, a drop types the files' paths into the terminal instead (see [Copy and paste](keyboard-shortcuts#copy-and-paste)).
 
 Files go into the folder the panel shows. Folders are not uploaded: each one gets a row `Folders are not uploaded: <name>`.
 

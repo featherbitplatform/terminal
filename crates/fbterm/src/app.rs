@@ -51,6 +51,8 @@ pub enum TabBarMsg {
     Profiles,
     /// The tunnels indicator: opens the Tunnels window.
     Tunnels,
+    /// The files button: shows or hides the window's file panel.
+    Files,
     Settings,
 }
 
@@ -180,6 +182,8 @@ pub enum Message {
     EditorSecrets(u64, Delivered<Result<crate::editor::SecretResults, String>>),
     /// The saved secrets of profile editor duplicate `seq` were copied (how many), or not.
     EditorDuplicated(u64, Result<usize, String>),
+    /// Quit has waited for the editor's saved-secret write as long as it will.
+    ExitWaitOver,
     Shoot,
     Shot(Screenshot),
     /// The OS close button (or equivalent) was used on a window; see [`App::close_requested`].
@@ -297,6 +301,11 @@ pub struct App {
     pub editor: Option<(window::Id, EditorState)>,
     /// Numbers the editor's saves, so the result of one for a replaced editor is dropped.
     pub(crate) editor_seq: u64,
+    /// The saved-secret write of an editor Save or Duplicate, while it runs (open editor or
+    /// not): another Save, Duplicate, Import or storage change waits for it.
+    pub(crate) editor_job: Option<crate::editor::SecretJob>,
+    /// Quit waits for `editor_job` to end before the process exits.
+    pub(crate) exit_waiting: bool,
     /// The Settings window, when open.
     pub settings_win: Option<(window::Id, SettingsState)>,
     /// The Color schemes window, when open.
@@ -381,7 +390,7 @@ pub struct App {
     /// that window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
-    /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close` (debug aid): that tab-bar
+    /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|files|settings|close` (debug aid): that tab-bar
     /// button's tooltip always shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
     /// `FBTERM_SCALE` (debug aid): extra UI scale on top of the OS's, e.g. 0.625 on a 2x
@@ -429,7 +438,7 @@ pub(crate) fn unix_now() -> i64 {
 
 /// Configuration directory: `FBTERM_CONFIG_DIR` (debug aid: keeps manual runs away from the
 /// real config) or the platform default.
-fn paths() -> Paths {
+pub(crate) fn paths() -> Paths {
     match std::env::var_os("FBTERM_CONFIG_DIR") {
         Some(dir) if !dir.is_empty() => Paths {
             config_dir: dir.into(),
@@ -643,6 +652,8 @@ impl App {
             find_box: None,
             editor: None,
             editor_seq: 0,
+            editor_job: None,
+            exit_waiting: false,
             settings_win: None,
             schemes_win: None,
             tunnels_win: None,
@@ -703,6 +714,13 @@ impl App {
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
+        // A report the last run left: said once (debug-aid runs that keep no state leave the
+        // marker for a real run).
+        if app.state_saving_enabled
+            && let Some(line) = crate::crash::take_pending(&app.paths)
+        {
+            app.notices.push(line);
+        }
         // Before any window opens: the Linux `window_decorations` setting picks the chrome.
         let _ = app.reapply_chrome();
         let mut task = match crate::perf::opts() {
@@ -796,7 +814,14 @@ impl App {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
-                // Files dropped from the OS on a window: only these start an upload by drag.
+                // Window geometry goes to the run log, for reports of windows that jump or
+                // vanish between screens (logical pixels; the scale is logged when it changes).
+                Event::Window(window::Event::Moved(p)) => {
+                    tracing::info!(window = ?id, x = p.x, y = p.y, "window moved");
+                    None
+                }
+                // Files dropped from the OS on a window: uploaded with its file panel open, else
+                // their paths are typed (`file_drop`).
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
                     crate::file_panel::FilePanelMsg::Dropped(id, path),
                 )),
@@ -1043,6 +1068,7 @@ impl App {
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
                     TabBarMsg::Tunnels => self.action(Some(wid), Action::Tunnels),
+                    TabBarMsg::Files => self.action(Some(wid), Action::FilePanel),
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }
@@ -1155,7 +1181,7 @@ impl App {
                     && self.tunnels_win.is_none()
                     && self.archive_win.is_none()
                 {
-                    iced::exit()
+                    self.exit_when_idle()
                 } else if self.quitting {
                     Task::none()
                 } else {
@@ -1187,21 +1213,26 @@ impl App {
             Message::Archive(msg) => self.archive_msg(msg),
             Message::Prompt(msg) => self.prompt_msg(msg),
             Message::Vault(msg) => self.vault_msg(msg),
-            Message::EditorSecrets(seq, results) => {
-                self.editor_secrets_done(seq, results);
-                Task::none()
-            }
-            Message::EditorDuplicated(seq, result) => {
-                self.editor_duplicated(seq, result);
-                Task::none()
+            Message::EditorSecrets(seq, results) => self.editor_secrets_done(seq, results),
+            Message::EditorDuplicated(seq, result) => self.editor_duplicated(seq, result),
+            Message::ExitWaitOver => {
+                tracing::warn!("quitting while saved secrets are still being written");
+                iced::exit()
             }
             Message::WindowScale(id, s) => {
+                tracing::info!(window = ?id, scale = s, "window scale");
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
                     self.os_scales.insert(id, s);
                 }
                 Task::none()
             }
             Message::WindowResized(id, size) => {
+                tracing::info!(
+                    window = ?id,
+                    width = size.width,
+                    height = size.height,
+                    "window resized"
+                );
                 self.close_context_menu(id);
                 let drawn = self.chrome.get().draws_controls();
                 Task::batch([self.window_resized(id, size), query_mode(id, drawn)])

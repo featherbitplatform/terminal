@@ -14,7 +14,7 @@ featherbit terminal keeps its configuration in one directory per user.
 | Linux | `~/.config/fbterm` (respects `XDG_CONFIG_HOME`) |
 | Windows | `%APPDATA%\featherbit\fbterm\config` |
 
-Uninstalling the app never removes this directory (see [Install on Linux](install-linux#uninstall) and [Install on Windows](install-windows#upgrade-and-uninstall)). The directory is created the first time the app writes a file. All files are TOML and are written atomically (a temporary file in the same directory, then a rename), so a crash never leaves a half-written file.
+Uninstalling the app never removes this directory (see [Install on Linux](install-linux#uninstall) and [Install on Windows](install-windows#upgrade-and-uninstall)). The directory is created the first time the app starts. The configuration files are TOML and are written atomically (a temporary file in the same directory, then a rename), so a crash never leaves a half-written file.
 
 | File | Written by | Purpose |
 | --- | --- | --- |
@@ -24,6 +24,9 @@ Uninstalling the app never removes this directory (see [Install on Linux](instal
 | `secrets.fbvault` | the app | Your saved passwords and passphrases, encrypted with your main password. Only exists once you use the encrypted vault. See [Saved secrets](saved-secrets). |
 | `secrets.dpapi` | the app | Windows only: your saved passwords and passphrases, encrypted for your Windows account, when saved secrets use the system storage. See [Saved secrets](saved-secrets). |
 | `state.toml` | the app | Open windows and tabs, and when each profile was last used. |
+| `fbterm.log`, `fbterm.previous.log` | the app | The log of the current run and of the run before. See [If fbterm crashes or doesn't start](install-macos#if-fbterm-crashes-or-doesnt-start). |
+| `crash.log`, `crash.previous.log` | the app | Reports of crashes and failed starts, newest last; older reports move to `crash.previous.log` once `crash.log` is over 256 KB. |
+| `crash.pending` | the app | Empty marker: a report was written that the next launch has not mentioned yet. |
 
 `profiles.toml` and `settings.toml` are reloaded while the app runs. If a file has a syntax error, the app reports the file and line, keeps what it had loaded, and never overwrites the broken file.
 

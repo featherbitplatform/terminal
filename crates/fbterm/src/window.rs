@@ -24,7 +24,7 @@ use crate::tab_look::{Surroundings, look};
 use crate::tabs::{Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
-use crate::ui::{ICON_PLUS, ICON_SETTINGS, ICON_TUNNELS, ICON_USERS, ICON_X, icon};
+use crate::ui::{ICON_FOLDER, ICON_PLUS, ICON_SETTINGS, ICON_TUNNELS, ICON_USERS, ICON_X, icon};
 use crate::windows::{Carry, DragMsg};
 
 /// Space around the terminal area. Where the chrome is drawn the window's resize band lies
@@ -84,7 +84,13 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
-        let content = content.push(crate::editor::view::view(t, state, schemes, app.storage()));
+        let content = content.push(crate::editor::view::view(
+            t,
+            state,
+            schemes,
+            app.storage(),
+            app.editor_job.is_some(),
+        ));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -228,6 +234,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         bindings: &app.bindings,
         carry,
         tunnels_up: app.tunnels.up_count(),
+        files: app.files_button(id),
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -793,6 +800,8 @@ struct TabBar<'b> {
     carry: Option<Carry>,
     /// How many tunnels are up (the indicator's count).
     tunnels_up: usize,
+    /// The files button: `None` hidden, else whether the window's file panel is open.
+    files: Option<bool>,
 }
 
 fn tab_bar<'a>(
@@ -811,6 +820,7 @@ fn tab_bar<'a>(
         demo_tip,
         bindings,
         tunnels_up,
+        files,
         ..
     } = bar;
     let tabs_bar = bar;
@@ -851,6 +861,19 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::Tunnels))
         .padding(7)
         .style(move |_, status| ghost(t, status));
+    let files = files.map(|open| {
+        let color = if open { t.accent } else { t.text_muted };
+        let button = button(icon(ICON_FOLDER, 14.0, color))
+            .on_press(msg(TabBarMsg::Files))
+            .padding(7)
+            .style(move |_, status| ghost(t, status));
+        tip(
+            t,
+            button,
+            tooltip_text("Files", Action::FilePanel, bindings),
+            demo_tip == Some(DemoTip::Files),
+        )
+    });
     let settings = button(icon(ICON_SETTINGS, 14.0, t.text_muted))
         .on_press(msg(TabBarMsg::Settings))
         .padding(7)
@@ -888,6 +911,9 @@ fn tab_bar<'a>(
     // After the tab buttons, like every trailing button: `BarBackground` measures the tabs as
     // the row's first children.
     bar = bar.push(container(tunnels).center_y(height));
+    if let Some(files) = files {
+        bar = bar.push(container(files).center_y(height));
+    }
     bar = bar.push(container(settings).center_y(height));
     let bar = container(bar)
         .padding(Padding {
@@ -2077,6 +2103,8 @@ mod tests {
                 carry,
                 // The indicator with a count sits after the tabs; tabs are measured as before.
                 tunnels_up: 3,
+                // So is the files button.
+                files: Some(true),
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(

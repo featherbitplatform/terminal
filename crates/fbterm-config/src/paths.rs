@@ -44,4 +44,29 @@ impl Paths {
     pub fn schemes(&self) -> PathBuf {
         self.config_dir.join("schemes")
     }
+
+    /// The log of the current run (what stderr shows, without colors).
+    pub fn run_log(&self) -> PathBuf {
+        self.config_dir.join("fbterm.log")
+    }
+
+    /// The log of the run before, kept when a new run starts.
+    pub fn previous_run_log(&self) -> PathBuf {
+        self.config_dir.join("fbterm.previous.log")
+    }
+
+    /// Crash and start-up failure reports, newest last.
+    pub fn crash_log(&self) -> PathBuf {
+        self.config_dir.join("crash.log")
+    }
+
+    /// The older reports, moved aside when `crash.log` grows too large.
+    pub fn previous_crash_log(&self) -> PathBuf {
+        self.config_dir.join("crash.previous.log")
+    }
+
+    /// Empty marker: a report was written that the next launch has not mentioned yet.
+    pub fn crash_pending(&self) -> PathBuf {
+        self.config_dir.join("crash.pending")
+    }
 }

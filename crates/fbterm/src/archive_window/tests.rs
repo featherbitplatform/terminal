@@ -1032,7 +1032,12 @@ fn import_refused_while_the_editor_is_saving() {
     let keys = ready_import(&mut app, dir.path(), &sample_archive());
     let _ = app.update(Message::Editor(crate::editor::EditorMsg::Open));
     // An editor save whose secret changes are still running.
-    app.editor.as_mut().unwrap().1.saving = Some(7);
+    let job = crate::editor::SecretJob {
+        seq: 7,
+        kind: crate::editor::JobKind::Save,
+        editor: app.editor.as_ref().unwrap().1.instance(),
+    };
+    app.editor_job = Some(job);
     let before = std::fs::read_to_string(paths.profiles()).unwrap();
 
     send(&mut app, ArchiveMsg::Import);
@@ -1043,5 +1048,17 @@ fn import_refused_while_the_editor_is_saving() {
     assert!(state(&app).import.opened.is_some(), "kept to import later");
     assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
     assert!(!keys.exists());
-    assert_eq!(app.editor.as_ref().unwrap().1.saving, Some(7));
+    assert_eq!(app.editor_job, Some(job));
+
+    // Still refused once the editor that started the save is closed.
+    let wid = app.editor_window().unwrap();
+    let _ = app.update(Message::WindowClosed(wid));
+    assert!(app.editor.is_none());
+    send(&mut app, ArchiveMsg::Import);
+    assert_eq!(
+        state(&app).import.problem.as_deref(),
+        Some(super::EDITOR_SAVING)
+    );
+    assert_eq!(std::fs::read_to_string(paths.profiles()).unwrap(), before);
+    assert!(!keys.exists());
 }

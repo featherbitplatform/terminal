@@ -16,36 +16,36 @@ You need a desktop session, Wayland or X11, with Vulkan or OpenGL graphics.
 
 ## Download
 
-Each release provides, for each architecture and format, the package and its checksum. For example, for version 0.3.1 on x86-64:
+Each release provides, for each architecture and format, the package and its checksum. For example, for version 0.4.0 on x86-64:
 
-- `fbterm-0.3.1-linux-x86_64.deb` and `fbterm-0.3.1-linux-x86_64.deb.sha256`
-- `fbterm-0.3.1-linux-x86_64.rpm` and `fbterm-0.3.1-linux-x86_64.rpm.sha256`
-- `fbterm-0.3.1-linux-x86_64.tar.gz` and `fbterm-0.3.1-linux-x86_64.tar.gz.sha256`
+- `fbterm-0.4.0-linux-x86_64.deb` and `fbterm-0.4.0-linux-x86_64.deb.sha256`
+- `fbterm-0.4.0-linux-x86_64.rpm` and `fbterm-0.4.0-linux-x86_64.rpm.sha256`
+- `fbterm-0.4.0-linux-x86_64.tar.gz` and `fbterm-0.4.0-linux-x86_64.tar.gz.sha256`
 
-In the commands on this page, replace the example version 0.3.1 and `x86_64` with the ones you downloaded (`aarch64` on Arm machines).
+In the commands on this page, replace the example version 0.4.0 and `x86_64` with the ones you downloaded (`aarch64` on Arm machines).
 
 ## Verify the download
 
 Put the package and its `.sha256` file in the same folder and run this from that folder:
 
 ```bash
-sha256sum -c fbterm-0.3.1-linux-x86_64.deb.sha256
+sha256sum -c fbterm-0.4.0-linux-x86_64.deb.sha256
 ```
 
-It prints `fbterm-0.3.1-linux-x86_64.deb: OK` when the file is intact.
+It prints `fbterm-0.4.0-linux-x86_64.deb: OK` when the file is intact.
 
 ## Install
 
 On Debian, Ubuntu and their relatives:
 
 ```bash
-sudo apt install ./fbterm-0.3.1-linux-x86_64.deb
+sudo apt install ./fbterm-0.4.0-linux-x86_64.deb
 ```
 
 On Fedora, RHEL and compatible systems:
 
 ```bash
-sudo dnf install ./fbterm-0.3.1-linux-x86_64.rpm
+sudo dnf install ./fbterm-0.4.0-linux-x86_64.rpm
 ```
 
 Both put the program at `/usr/bin/fbterm`, add **featherbit terminal** to your application launcher (a desktop entry in the System and Terminal Emulator categories) and install the icon. Your package manager also installs the libraries fbterm needs: xkbcommon, the Wayland and X11 client libraries and D-Bus.
@@ -55,8 +55,8 @@ Both put the program at `/usr/bin/fbterm`, add **featherbit terminal** to your a
 Unpack the archive; it holds `bin/fbterm`, `share/applications/fbterm.desktop`, the icons under `share/icons/hicolor/` and an `INSTALL` note with these commands. For your user only:
 
 ```bash
-tar -xzf fbterm-0.3.1-linux-x86_64.tar.gz
-cd fbterm-0.3.1-linux-x86_64
+tar -xzf fbterm-0.4.0-linux-x86_64.tar.gz
+cd fbterm-0.4.0-linux-x86_64
 install -Dm755 bin/fbterm ~/.local/bin/fbterm
 cp -r share/applications share/icons ~/.local/share/
 ```
@@ -106,6 +106,12 @@ sudo dnf remove fbterm     # Fedora, RHEL
 ```
 
 For a tarball install, delete the files you copied (`fbterm` from `bin`, `fbterm.desktop` from `share/applications` and `fbterm.png` from each `share/icons/hicolor/<size>/apps`). Removing the program leaves your [configuration directory](files#configuration-directory), `~/.config/fbterm`, in place; delete it too to remove your profiles and settings.
+
+## If fbterm crashes or doesn't start
+
+fbterm keeps a log of each run in `fbterm.log` in its [configuration directory](files#configuration-directory), `~/.config/fbterm` (or `$XDG_CONFIG_HOME/fbterm`). When it starts, the log of the run before is kept as `fbterm.previous.log`, so after a crash that file holds the run that crashed. A crash, or a start that fails, also adds a report to `crash.log` in the same folder (once that file is over 256 KB, it is moved to `crash.previous.log` first), and the next launch says once, in the window, that a report was written.
+
+To report the problem, send `crash.log` and `fbterm.previous.log` (or `fbterm.log` if fbterm has not been started again since). Look through them first: they can name your profiles, hosts and folders.
 
 ## Next steps
 

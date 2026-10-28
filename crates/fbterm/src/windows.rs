@@ -16,6 +16,9 @@ use crate::tabs::{self, Pane, Tab, TabId, TabState, WindowState};
 /// How long a carried tab hovers over another tab's button before that tab is shown.
 pub(crate) const HOVER_SWITCH: Duration = Duration::from_millis(500);
 
+/// The longest quit waits for the editor's saved-secret write before the process exits.
+pub(crate) const EXIT_WAIT: Duration = Duration::from_secs(10);
+
 /// What is being carried across a window: a tab picked up from the tab bar, or a tile.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Carry {
@@ -294,7 +297,28 @@ impl App {
             .chain(self.archive_window())
             .collect();
         self.closing.extend(ids.iter().copied());
-        Task::batch(ids.into_iter().map(window::close)).chain(iced::exit())
+        let exit = self.exit_when_idle();
+        Task::batch(ids.into_iter().map(window::close)).chain(exit)
+    }
+
+    /// End the process, once the editor's saved-secret write (if one runs) has ended or
+    /// [`EXIT_WAIT`] has passed, so the write is never cut off.
+    pub(crate) fn exit_when_idle(&mut self) -> Task<Message> {
+        if self.exit_now() {
+            return iced::exit();
+        }
+        if std::mem::replace(&mut self.exit_waiting, true) {
+            // Already waiting.
+            return Task::none();
+        }
+        Task::perform(async { tokio::time::sleep(EXIT_WAIT).await }, |()| {
+            Message::ExitWaitOver
+        })
+    }
+
+    /// Whether the process may end now: no editor saved-secret write runs.
+    pub(crate) fn exit_now(&self) -> bool {
+        self.editor_job.is_none()
     }
 
     /// The OS close button: other windows close; a terminal window asks first when closing
