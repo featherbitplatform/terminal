@@ -360,10 +360,12 @@ impl App {
     /// in that order, then store the saved secrets in one batch on the blocking pool. A vault
     /// that must be unlocked or made first is asked for before anything is written.
     fn import_opened(&mut self) -> Task<Message> {
-        let editor = self
-            .editor
-            .as_ref()
-            .map(|(_, ed)| (ed.dirty, ed.saving.is_some()));
+        // Unsaved editor changes, and an editor save's secrets still being written (open
+        // editor or not).
+        let editor = (
+            self.editor.as_ref().is_some_and(|(_, ed)| ed.dirty),
+            self.editor_job.is_some(),
+        );
         let probe = self.backend.probe_pending();
         let Some((wid, state)) = &mut self.archive_win else {
             return Task::none();
@@ -477,7 +479,7 @@ impl App {
         &mut self,
         opened: &Opened,
         key_dir: Option<&Path>,
-        editor: Option<(bool, bool)>,
+        editor: (bool, bool),
         need: Option<MainPassword>,
     ) -> Result<Written, String> {
         let plan = &opened.plan;
@@ -495,8 +497,8 @@ impl App {
         )?;
         // The profile editor (unsaved changes, saving) would overwrite or lose the import.
         match editor {
-            Some((true, _)) => return Err(EDITOR_DIRTY.into()),
-            Some((_, true)) => return Err(EDITOR_SAVING.into()),
+            (true, _) => return Err(EDITOR_DIRTY.into()),
+            (_, true) => return Err(EDITOR_SAVING.into()),
             _ => {}
         }
         if !anything_to_import(plan) {

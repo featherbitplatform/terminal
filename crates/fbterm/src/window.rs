@@ -84,7 +84,13 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
-        let content = content.push(crate::editor::view::view(t, state, schemes, app.storage()));
+        let content = content.push(crate::editor::view::view(
+            t,
+            state,
+            schemes,
+            app.storage(),
+            app.editor_job.is_some(),
+        ));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,

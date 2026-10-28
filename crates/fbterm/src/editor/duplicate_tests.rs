@@ -123,7 +123,7 @@ fn duplicate_saves_a_copy_after_the_original_with_its_secrets_and_selects_it() {
     let order: Vec<&str> = ed.drafts().iter().map(|d| d.name.as_str()).collect();
     assert_eq!(&order[..3], ["a", "a copy", "b"]);
     assert!(!ed.dirty);
-    assert!(ed.saving.is_none());
+    assert!(app.editor_job.is_none());
     assert_eq!(ed.notice.as_deref(), Some(DUPLICATED));
 
     // Again: the next free name, right after the original.
@@ -281,7 +281,7 @@ fn cancelling_the_unlock_duplicates_without_secrets_and_says_so() {
     let ed = ed(&app);
     assert_eq!(ed.selected, Some(copy));
     assert_eq!(ed.notice.as_deref(), Some(LOCKED));
-    assert!(!ed.dirty && ed.saving.is_none());
+    assert!(!ed.dirty && app.editor_job.is_none());
 }
 
 #[test]
@@ -361,7 +361,7 @@ fn a_second_duplicate_waits_for_the_first_ones_secrets() {
     editor(&mut app, EditorMsg::Open);
     editor(&mut app, EditorMsg::Select(a.id));
     editor(&mut app, EditorMsg::Duplicate);
-    assert!(ed(&app).saving.is_some());
+    assert!(app.editor_job.is_some());
     editor(&mut app, EditorMsg::Select(a.id));
     editor(&mut app, EditorMsg::Duplicate);
     assert_eq!(&names(&on_disk(&app))[..2], ["a", "a copy"]);

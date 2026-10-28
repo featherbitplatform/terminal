@@ -920,7 +920,7 @@ fn requests_while_a_connects_unlock_dialog_is_open_say_so() {
     let _ = app.update(Message::Editor(EditorMsg::Save));
     let ed = &app.editor.as_ref().unwrap().1;
     assert_eq!(ed.notice.as_deref(), Some(BUSY));
-    assert!(ed.dirty && ed.saving.is_none());
+    assert!(ed.dirty && app.editor_job.is_none());
     assert_eq!(
         std::fs::read_to_string(paths.profiles()).unwrap(),
         profiles_before
@@ -942,4 +942,66 @@ fn requests_while_a_connects_unlock_dialog_is_open_say_so() {
             .as_deref(),
         Some("new-pw")
     );
+}
+
+#[test]
+fn storage_choice_and_reset_wait_for_an_editor_save_even_after_it_closed() {
+    let db = ssh("db");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("secrets.fbvault");
+    make_vault(&path, db.id);
+    let mut app = app_with(std::slice::from_ref(&db));
+    let backend = vault_backend(&path, Arc::new(MemoryStore::new()));
+    app.use_secret_backend(backend.clone());
+    app.settings.secret_storage = SecretStorage::Vault;
+    backend.unlock_vault(MAIN).unwrap();
+    // The confirmation of a reset is open before the editor's save starts.
+    settings(&mut app, SettingsMsg::Open);
+    settings(&mut app, SettingsMsg::ResetVault);
+    assert!(app.vault.dialog.is_some());
+
+    // An editor save whose secrets are still being written, from an editor closed since.
+    app.blocking_inline = false;
+    let _ = app.update(Message::Editor(EditorMsg::Open));
+    let _ = app.update(Message::Editor(EditorMsg::Select(db.id)));
+    let _ = app.update(Message::Editor(EditorMsg::Secret(Redacted(
+        "new-pw".into(),
+    ))));
+    let _ = app.update(Message::Editor(EditorMsg::Save));
+    let job = app
+        .editor_job
+        .expect("the save's secrets are being written");
+    let _ = app.update(Message::WindowClosed(app.editor_window().unwrap()));
+    assert!(app.secrets_section().busy, "the section shows it busy");
+    assert!(app.secrets_section().editor_saving, "as the editor's save");
+
+    // The open confirmation does not reset under the write.
+    vault(&mut app, VaultMsg::Submit);
+    let d = app.vault.dialog.as_ref().expect("still asking");
+    assert_eq!(d.problem.as_deref(), Some(super::EDITOR_SAVING));
+    assert!(d.busy.is_none());
+    assert!(path.exists());
+    vault(&mut app, VaultMsg::Cancel);
+
+    // Neither Reset vault nor a storage choice starts.
+    settings(&mut app, SettingsMsg::ResetVault);
+    assert!(app.vault.dialog.is_none());
+    settings(
+        &mut app,
+        SettingsMsg::SecretStorage(SecretStorage::Keychain),
+    );
+    assert!(app.vault.dialog.is_none() && app.vault.direct.is_none());
+    assert_eq!(app.settings.secret_storage, SecretStorage::Vault);
+    assert_eq!(backend.active(), Storage::Vault);
+    assert!(path.exists());
+
+    // Once the write ends, both work again.
+    let _ = app.update(Message::EditorSecrets(
+        job.seq,
+        Delivered::new(Ok(Vec::new())),
+    ));
+    assert!(app.editor_job.is_none());
+    assert!(!app.secrets_section().busy);
+    settings(&mut app, SettingsMsg::ResetVault);
+    assert_eq!(app.vault.dialog.as_ref().map(|d| d.kind), Some(Kind::Reset));
 }
