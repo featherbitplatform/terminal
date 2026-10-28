@@ -11,7 +11,7 @@ use parking_lot::Mutex;
 
 use super::gallery::{
     EDITED_HERE, GalleryIo, GalleryLoad, GalleryRow, NO_LONGER_OFFERED, RowButton, UpdateChoice,
-    credit_line, gallery_rows,
+    clip_chars, credit_line, gallery_rows,
 };
 use super::{Entry, SchemesMsg, SchemesState};
 use crate::app::{App, Message};
@@ -720,12 +720,18 @@ fn demo_gallery_shows_every_row_kind() {
     assert!(catalog.skipped.is_empty(), "{:?}", catalog.skipped);
     let (app, _, _, _) = app_with(&[profile("a")], "", &installed);
     let rows = gallery_rows(&catalog, &app.schemes, "", None);
+    assert_eq!(rows.len(), 5);
+    assert_eq!(rows[0].button, Some(RowButton::Install));
     let kinds: Vec<_> = rows
         .iter()
         .map(|r| (r.name.as_str(), r.button, r.note))
         .collect();
+    let long = rows[0].name.as_str();
+    assert!(long.starts_with("A Very Long Sample Theme Name"));
+    assert!(long.chars().count() >= 120, "worst-case name: {long}");
+    assert!(rows[0].credit_line.chars().count() >= 400);
     assert_eq!(
-        kinds,
+        kinds[1..],
         [
             ("Dusk", Some(RowButton::Install), None),
             ("Lagoon", Some(RowButton::Installed), None),
@@ -742,4 +748,16 @@ fn demo_gallery_shows_every_row_kind() {
             t.id
         );
     }
+}
+
+#[test]
+fn clip_chars_cuts_with_an_ellipsis() {
+    assert_eq!(clip_chars("Dusk", 10), "Dusk");
+    assert_eq!(clip_chars("abcdefghij", 10), "abcdefghij");
+    assert_eq!(clip_chars("abcdefghijk", 10), "abcdefghi\u{2026}");
+    // Characters, not bytes, and no trailing space before the ellipsis.
+    assert_eq!(
+        clip_chars("\u{e9}\u{e9}\u{e9} \u{e9}\u{e9}", 5),
+        "\u{e9}\u{e9}\u{e9}\u{2026}"
+    );
 }

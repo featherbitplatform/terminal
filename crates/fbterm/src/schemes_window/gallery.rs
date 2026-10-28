@@ -74,6 +74,16 @@ pub struct GalleryRow {
     pub colors: SchemeColors,
 }
 
+/// `s` in at most `max` characters: cut with an ellipsis (spaces before it dropped) when
+/// longer, so a long catalog name stays on one line.
+pub fn clip_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let kept: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{}\u{2026}", kept.trim_end())
+}
+
 /// A credit as one line: `"<project> by <author>, <license>"`.
 pub fn credit_line(credit: &Credit) -> String {
     format!(
@@ -428,6 +438,7 @@ fn demo_theme(
     name: &str,
     version: u32,
     withdrawn: bool,
+    author: &str,
     (dark, fg, bg, ansi): (bool, &str, &str, [&str; 16]),
 ) -> String {
     const KEYS: [&str; 16] = [
@@ -459,19 +470,19 @@ fn demo_theme(
     for (key, value) in KEYS.iter().zip(ansi) {
         out.push_str(&format!("{key} = \"{value}\"\n"));
     }
-    out.push_str(
-        "\n[themes.credit]\nproject = \"Sample Themes\"\nauthor = \"Example Author\"\n\
+    out.push_str(&format!(
+        "\n[themes.credit]\nproject = \"Sample Themes\"\nauthor = \"{author}\"\n\
          url = \"https://example.org/sample-themes\"\nlicense = \"MIT\"\n\
          copyright = \"Copyright (c) 2026 Example Author\"\n\
          license_file = \"LICENSES/sample-themes-MIT.txt\"\n\
-         description = \"A sample theme.\"\nderived = false\n",
-    );
+         description = \"A sample theme.\"\nderived = false\n"
+    ));
     out
 }
 
-/// The `FBTERM_DEMO_GALLERY` scene: a catalog of four sample themes and the installed schemes
+/// The `FBTERM_DEMO_GALLERY` scene: a catalog of sample themes and the installed schemes
 /// that give one row of each kind (Install, Installed, Update, and a withdrawn theme still
-/// installed).
+/// installed), plus a worst-case row with a very long name and credit.
 pub fn demo_catalog() -> (Catalog, Vec<Scheme>) {
     let lagoon = (
         true,
@@ -511,17 +522,30 @@ pub fn demo_catalog() -> (Catalog, Vec<Scheme>) {
     );
     let catalog = |meadow_version: u32, all: bool| {
         let mut text = String::from("format = 1\n");
-        text.push_str(&demo_theme("lagoon", "Lagoon", 1, false, lagoon));
+        let a = "Example Author";
+        text.push_str(&demo_theme("lagoon", "Lagoon", 1, false, a, lagoon));
         text.push_str(&demo_theme(
             "meadow",
             "Meadow",
             meadow_version,
             false,
+            a,
             meadow,
         ));
-        text.push_str(&demo_theme("slate", "Slate", 1, all, slate));
+        text.push_str(&demo_theme("slate", "Slate", 1, all, a, slate));
         if all {
-            text.push_str(&demo_theme("dusk", "Dusk", 1, false, dusk));
+            text.push_str(&demo_theme("dusk", "Dusk", 1, false, a, dusk));
+            // The worst case: a 120-character name and a 400-character author.
+            let name = format!("{}Ends Here", "A Very Long Sample Theme Name ".repeat(4));
+            let author = "Example Author With A Rather Long Credit, ".repeat(10);
+            text.push_str(&demo_theme(
+                "long-sample",
+                name.trim(),
+                1,
+                false,
+                author.trim_end_matches([',', ' ']),
+                slate,
+            ));
         }
         parse_catalog(text.as_bytes()).expect("the demo catalog parses")
     };

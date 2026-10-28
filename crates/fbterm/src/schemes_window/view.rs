@@ -9,7 +9,9 @@ use iced::widget::{
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::gallery::{GalleryRow, RowButton, credit_line, credit_link_ok, gallery_rows};
+use super::gallery::{
+    GalleryRow, RowButton, clip_chars, credit_line, credit_link_ok, gallery_rows,
+};
 use super::{
     DeleteAsk, Entry, GalleryLoad, ImportAsk, ImportChoice, SchemesMsg, SchemesState, UpdateChoice,
 };
@@ -20,6 +22,10 @@ use crate::ui::{self, MONO};
 
 const SIDEBAR_WIDTH: f32 = 250.0;
 const FORM_WIDTH: f32 = 640.0;
+/// The longest theme name a gallery row shows before an ellipsis.
+const NAME_CHARS: usize = 32;
+/// The longest credit line shown before an ellipsis (the rest wraps).
+const CREDIT_CHARS: usize = 300;
 /// Height of the preview terminal: the sample's seven lines at the usual sizes.
 const PREVIEW_HEIGHT: f32 = 116.0;
 
@@ -777,15 +783,17 @@ fn import_question<'a>(t: &'static Tokens, ask: &'a ImportAsk) -> Element<'a, Me
 
 /// Who made a scheme's colors, `<project> by <author>, <license>`, and its project page.
 fn credit<'a>(t: &'static Tokens, c: &Credit) -> Element<'a, Message> {
+    // The text takes the room left by the link and wraps, so the link always shows.
     let mut r = row![
-        text(credit_line(c))
+        text(clip_chars(&credit_line(c), CREDIT_CHARS))
             .font(UI_FONT)
             .size(12.5)
             .color(t.text_secondary)
+            .width(Length::Fill)
             .wrapping(text::Wrapping::WordOrGlyph),
     ]
     .spacing(8)
-    .align_y(Alignment::Center);
+    .align_y(Alignment::Start);
     if credit_link_ok(&c.url) {
         r = r.push(link(t, c.url.clone()));
     }
@@ -981,33 +989,37 @@ fn gallery_row<'a>(t: &'static Tokens, r: GalleryRow) -> Element<'a, Message> {
         },
         ..container::Style::default()
     });
-    let mut credit = row![
-        text(r.credit_line)
-            .font(UI_FONT)
-            .size(12)
-            .color(t.text_secondary)
-            .wrapping(text::Wrapping::WordOrGlyph),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-    if let Some(url) = r.link {
-        credit = credit.push(link(t, url));
-    }
-    let info = column![
-        row![
-            text(r.name)
+    // The name takes one line, cut with an ellipsis and clipped to the room left by the
+    // link, which keeps its size and always shows.
+    let mut name = row![
+        container(
+            text(clip_chars(&r.name, NAME_CHARS))
                 .font(UI_FONT)
                 .size(14)
                 .color(t.text)
-                .wrapping(text::Wrapping::WordOrGlyph),
-            variant,
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-        credit,
+                .wrapping(text::Wrapping::None),
+        )
+        .width(Length::Fill)
+        .clip(true),
     ]
-    .spacing(3)
-    .width(Length::Fill);
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if let Some(url) = r.link {
+        name = name.push(link(t, url));
+    }
+    // The variant tag keeps its size; the credit takes the rest of the line and wraps.
+    let credit = row![
+        variant,
+        text(clip_chars(&r.credit_line, CREDIT_CHARS))
+            .font(UI_FONT)
+            .size(12)
+            .color(t.text_secondary)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::WordOrGlyph),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Start);
+    let info = column![name, credit].spacing(4).width(Length::Fill);
     let action: Element<'a, Message> = match (r.button, r.note) {
         (Some(RowButton::Install), _) => {
             small(t, "Install", Some(SchemesMsg::Install(r.id)), ui::primary)

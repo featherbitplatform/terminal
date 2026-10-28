@@ -189,22 +189,31 @@ impl App {
     /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
     /// value selects the scheme of that name. With `FBTERM_DEMO_GALLERY=1`, the window shows
     /// its gallery with a sample catalog (one theme to install, one installed, one with an
-    /// update, one withdrawn), never fetched. With `FBTERM_CONFIG_DIR` set as well, the
-    /// installed ones are written to that folder's `schemes/` first; without it nothing is
-    /// written and every row offers Install.
+    /// update, one withdrawn, and a worst-case row with a very long name and credit), never
+    /// fetched. With a non-empty `FBTERM_CONFIG_DIR` as well, the installed ones are written to
+    /// that folder's `schemes/` first; without it nothing is written and every row offers
+    /// Install. `FBTERM_DEMO_GALLERY=question` also asks about updating the sample theme
+    /// `Meadow` as edited on this machine (with `FBTERM_CONFIG_DIR`, its installed copy is
+    /// written edited and the gallery's own Update raises the question).
     pub(crate) fn open_debug_schemes(&mut self) -> Task<Message> {
         let Some(value) = debug_env("FBTERM_OPEN_SCHEMES") else {
             return Task::none();
         };
-        let demo = debug_env("FBTERM_DEMO_GALLERY").is_some();
+        let demo = debug_env("FBTERM_DEMO_GALLERY");
+        let question = demo.as_deref().is_some_and(|v| v == "question");
+        // Installed copies only in a config folder chosen for the run, never the real one.
+        let own_dir = std::env::var_os("FBTERM_CONFIG_DIR").is_some_and(|d| !d.is_empty());
         let mut task = Task::none();
-        if demo {
+        if demo.is_some() {
             let (catalog, installed) = crate::schemes_window::gallery::demo_catalog();
-            // Installed copies only in a config folder chosen for the run, never the real one.
-            if std::env::var_os("FBTERM_CONFIG_DIR").is_some() {
+            if own_dir {
                 let dir = self.paths.schemes();
-                for s in &installed {
-                    if let Err(e) = fbterm_config::schemes::save_user(&dir, s) {
+                for mut s in installed {
+                    if question && s.id == "gallery-meadow" {
+                        // Edited here: its colors no longer match what the gallery installed.
+                        s.colors.background.r ^= 0x08;
+                    }
+                    if let Err(e) = fbterm_config::schemes::save_user(&dir, &s) {
                         tracing::warn!(error = %e, "demo gallery scheme not written");
                     }
                 }
@@ -219,9 +228,20 @@ impl App {
             .iter()
             .find(|s| s.name == value)
             .map(|s| s.id.clone());
-        let task = task.chain(self.open_schemes(select));
-        if demo && let Some((_, state)) = &mut self.schemes_win {
+        let mut task = task.chain(self.open_schemes(select));
+        if demo.is_some()
+            && let Some((_, state)) = &mut self.schemes_win
+        {
             state.showing_gallery = true;
+            if question && !own_dir {
+                // Nothing installed to edit: show the question as it would read.
+                state.pending_update = Some("meadow".into());
+            }
+        }
+        if question && own_dir {
+            task = task.chain(
+                self.schemes_msg(crate::schemes_window::SchemesMsg::Update("meadow".into())),
+            );
         }
         task
     }
