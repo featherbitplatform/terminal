@@ -34,6 +34,9 @@ pub(crate) enum Listing {
     Closed,
     /// The SFTP session is being opened.
     Opening,
+    /// The check after a shell connected is opening the SFTP session on that shell's
+    /// connection, asking nothing; a panel that shows the profile opens it its own way instead.
+    Checking,
     /// The folder is being read.
     Loading,
     Loaded(Vec<Entry>),
@@ -274,6 +277,12 @@ impl ProfilePanel {
             token: 0,
             opening: None,
         }
+    }
+
+    /// Whether the session is open and its connection still up: the tab bar's files button
+    /// shows for the profile.
+    pub(crate) fn available(&self) -> bool {
+        self.sftp.as_ref().is_some_and(|s| s.is_alive())
     }
 
     /// Let go of the SFTP session: an open under way stops, and anything still on its way is
