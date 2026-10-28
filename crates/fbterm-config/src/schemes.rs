@@ -127,7 +127,7 @@ pub const BUILTIN_IDS: [&str; 4] = ["graphite", "graphite-light", "harbor", "emb
 
 /// The `[colors]` table of a scheme file.
 #[derive(Serialize, Deserialize)]
-struct ColorsFile {
+pub(crate) struct ColorsFile {
     foreground: Rgb,
     background: Rgb,
     cursor: Rgb,
