@@ -104,15 +104,16 @@ mod mac {
     use std::ptr::NonNull;
 
     use block2::RcBlock;
-    use iced::window::{self, raw_window_handle::RawWindowHandle};
+    use iced::window;
     use objc2::MainThreadMarker;
     use objc2::rc::Retained;
     use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
-    use objc2_app_kit::{NSView, NSWindow, NSWindowDidChangeScreenNotification};
+    use objc2_app_kit::{NSWindow, NSWindowDidChangeScreenNotification};
     use objc2_foundation::{NSNotification, NSNotificationCenter};
     use tokio::sync::mpsc::UnboundedSender;
 
     use super::Change;
+    use crate::chrome::ns_window;
 
     type Observer = Retained<ProtocolObject<dyn NSObjectProtocol>>;
 
@@ -130,20 +131,6 @@ mod mac {
     pub(super) fn rate(w: &NSWindow) -> Option<u32> {
         let fps = w.screen()?.maximumFramesPerSecond();
         u32::try_from(fps).ok().filter(|hz| *hz > 0)
-    }
-
-    /// The AppKit window behind `w`; `None` off the main thread or for a non-AppKit handle.
-    pub(super) fn ns_window(w: &dyn window::Window) -> Option<Retained<NSWindow>> {
-        // Window callbacks run on the main thread, as AppKit requires.
-        MainThreadMarker::new()?;
-        let handle = w.window_handle().ok()?;
-        let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
-            return None;
-        };
-        // SAFETY: the handle points at the window's live content view for the duration of
-        // this callback, and we are on the main thread.
-        let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
-        view.window()
     }
 
     pub(super) fn watch(id: window::Id, w: &dyn window::Window, tx: UnboundedSender<Change>) {

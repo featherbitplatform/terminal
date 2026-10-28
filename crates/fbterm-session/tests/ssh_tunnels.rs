@@ -327,7 +327,8 @@ async fn shell_value(handle: &SessionHandle, tag: &str, command: &str) -> String
         loop {
             let text = grid_text(handle);
             if let Some(v) = text.split(open.as_str()).skip(1).find_map(|s| {
-                let v = s.split(">>").next()?;
+                // The echoed command line can wrap right after the tag, leaving a line break before `$`.
+                let v = s.split(">>").next()?.trim();
                 (!v.starts_with('$')).then(|| v.to_owned())
             }) {
                 return v;

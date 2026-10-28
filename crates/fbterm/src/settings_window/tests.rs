@@ -480,6 +480,42 @@ fn a_recorded_free_chord_is_applied_and_written_at_once() {
 }
 
 #[test]
+fn a_press_the_system_kept_keeps_recording_and_says_so() {
+    let mut s = state();
+    // Not recording: nothing to say.
+    assert_eq!(
+        s.update(SettingsMsg::Withheld(Some(chord("ctrl+shift+0")))),
+        Effect::NONE
+    );
+    assert!(s.recording.is_none());
+    s.update(SettingsMsg::Record(Action::NewTab));
+    assert_eq!(
+        s.update(SettingsMsg::Withheld(Some(chord("ctrl+shift+0")))),
+        Effect::NONE
+    );
+    let Some(RecordProblem::NotAllowed(why)) =
+        &s.recording.as_ref().expect("still recording").problem
+    else {
+        panic!("{:?}", s.recording);
+    };
+    assert!(
+        why.starts_with(&format!(
+            "{} never reaches fbterm: ",
+            chord("ctrl+shift+0").label(s.bindings().mac())
+        )),
+        "{why}"
+    );
+    assert!(why.ends_with(" or another program uses it"), "{why}");
+    s.update(SettingsMsg::Withheld(None));
+    let Some(RecordProblem::NotAllowed(why)) =
+        &s.recording.as_ref().expect("still recording").problem
+    else {
+        panic!("{:?}", s.recording);
+    };
+    assert!(why.starts_with("That key never reaches fbterm"), "{why}");
+}
+
+#[test]
 fn a_chord_that_cannot_be_bound_keeps_recording_and_says_why() {
     let mut s = state();
     s.update(SettingsMsg::Record(Action::NewWindow));

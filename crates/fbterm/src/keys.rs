@@ -3,8 +3,8 @@
 //! Defaults: Cmd on macOS, Ctrl+Shift elsewhere (Settings is Ctrl+,, find in all tabs
 //! Ctrl+Alt+F).
 
-use iced::keyboard::key::Named;
-use iced::keyboard::{Key, Modifiers};
+use iced::keyboard::key::{Code, Named, Physical};
+use iced::keyboard::{Key, Location, Modifiers};
 
 pub use fbterm_config::keys::{Action, Bindings, Chord, ChordKey};
 
@@ -75,6 +75,108 @@ fn named_key(named: Named) -> Option<ChordKey> {
         Named::F24 => ChordKey::F(24),
         _ => return None,
     })
+}
+
+/// A key press as the shortcut layer sees it: the key iced reports, for named-key handling
+/// (Escape, arrows, Enter), and the key and modifiers chords are built from. The two differ only
+/// for numpad digits on Windows with Num Lock on (see [`Press::new`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Press {
+    /// The key as pressed, without modifiers applied (iced's `key`).
+    pub key: Key,
+    /// The modifiers held, as reported.
+    pub mods: Modifiers,
+    /// The key chords are built from and matched against.
+    pub chord_key: Key,
+    /// The modifiers chords are built from and matched against.
+    pub chord_mods: Modifiers,
+}
+
+impl Press {
+    /// A press whose chord is its key, as reported.
+    pub fn plain(key: Key, mods: Modifiers) -> Self {
+        Self {
+            chord_key: key.clone(),
+            chord_mods: mods,
+            key,
+            mods,
+        }
+    }
+
+    /// The press of `key` (iced's `key`), `modified_key` (with modifiers applied) at `physical`
+    /// in `location`. `num_lock` gives the Num Lock state where the system reports it
+    /// ([`num_lock`]: Windows), `None` elsewhere; it is asked only for a numpad key.
+    ///
+    /// With Num Lock on, Windows reports a numpad digit wrongly twice over: the key without
+    /// modifiers is worked out as if Num Lock were off (Numpad1 is End), and Shift turns Num
+    /// Lock off for that press, so Shift+Numpad1 arrives as End with Shift released. A numpad
+    /// digit is then its digit, with Shift when the system turned it into a navigation key.
+    /// With Num Lock off the numpad keys are the navigation keys they report.
+    pub fn new(
+        key: &Key,
+        modified_key: &Key,
+        physical: Physical,
+        location: Location,
+        mods: Modifiers,
+        num_lock: impl FnOnce() -> Option<bool>,
+    ) -> Self {
+        let plain = Self::plain(key.clone(), mods);
+        if location != Location::Numpad || num_lock() != Some(true) {
+            return plain;
+        }
+        let Some(digit) = numpad_digit(physical) else {
+            return plain;
+        };
+        let chord_mods = match modified_key {
+            Key::Character(_) => mods,
+            // Only Shift turns a numpad digit into a navigation key while Num Lock is on.
+            Key::Named(_) => mods | Modifiers::SHIFT,
+            Key::Unidentified => return plain,
+        };
+        Self {
+            chord_key: Key::Character(digit.to_string().into()),
+            chord_mods,
+            ..plain
+        }
+    }
+}
+
+/// The digit of a numpad digit key.
+fn numpad_digit(physical: Physical) -> Option<char> {
+    let Physical::Code(code) = physical else {
+        return None;
+    };
+    Some(match code {
+        Code::Numpad0 => '0',
+        Code::Numpad1 => '1',
+        Code::Numpad2 => '2',
+        Code::Numpad3 => '3',
+        Code::Numpad4 => '4',
+        Code::Numpad5 => '5',
+        Code::Numpad6 => '6',
+        Code::Numpad7 => '7',
+        Code::Numpad8 => '8',
+        Code::Numpad9 => '9',
+        _ => return None,
+    })
+}
+
+/// Whether Num Lock is on, where the system can say and it matters for [`Press::new`]
+/// (Windows); `None` elsewhere.
+pub fn num_lock() -> Option<bool> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_NUMLOCK};
+        // SAFETY: GetKeyState takes a virtual-key code by value and only reads the calling
+        // thread's keyboard state; it has no pointers or other preconditions.
+        let state = unsafe { GetKeyState(i32::from(VK_NUMLOCK)) };
+        // The low bit is the toggle state.
+        Some(state & 1 != 0)
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
 }
 
 /// Whether `key` is a modifier on its own (pressed while building a chord).
@@ -578,5 +680,152 @@ mod tests {
             s(false, &Key::Named(Named::Enter), ctrl_shift()),
             Some(Action::MaximizePane)
         );
+    }
+
+    const NUMPAD: [(Code, Named); 10] = [
+        (Code::Numpad0, Named::Insert),
+        (Code::Numpad1, Named::End),
+        (Code::Numpad2, Named::ArrowDown),
+        (Code::Numpad3, Named::PageDown),
+        (Code::Numpad4, Named::ArrowLeft),
+        (Code::Numpad5, Named::Clear),
+        (Code::Numpad6, Named::ArrowRight),
+        (Code::Numpad7, Named::Home),
+        (Code::Numpad8, Named::ArrowUp),
+        (Code::Numpad9, Named::PageUp),
+    ];
+
+    fn digit(i: usize) -> Key {
+        Key::Character(i.to_string().into())
+    }
+
+    #[test]
+    fn shift_with_a_numpad_digit_is_that_digit_with_num_lock_on() {
+        // Windows turns Num Lock off while Shift is held: the press arrives as the navigation
+        // key, and Shift is released for it.
+        for (i, (code, nav)) in NUMPAD.into_iter().enumerate() {
+            let nav = Key::Named(nav);
+            let p = Press::new(
+                &nav,
+                &nav,
+                Physical::Code(code),
+                Location::Numpad,
+                Modifiers::CTRL,
+                || Some(true),
+            );
+            assert_eq!(p.chord_key, digit(i), "{code:?}");
+            assert_eq!(p.chord_mods, Modifiers::CTRL | Modifiers::SHIFT, "{code:?}");
+            let c = press_chord(&p.chord_key, p.chord_mods).unwrap();
+            assert_eq!(c.label(false), format!("Ctrl+Shift+{i}"));
+            // Named-key handling (lists, menus) still sees what the system reported.
+            assert_eq!(p.key, nav);
+            assert_eq!(p.mods, Modifiers::CTRL);
+        }
+    }
+
+    #[test]
+    fn a_numpad_digit_without_shift_is_that_digit_with_num_lock_on() {
+        // The key without modifiers is worked out as if Num Lock were off; the typed key is right.
+        for (i, (code, nav)) in NUMPAD.into_iter().enumerate() {
+            let p = Press::new(
+                &Key::Named(nav),
+                &digit(i),
+                Physical::Code(code),
+                Location::Numpad,
+                Modifiers::CTRL,
+                || Some(true),
+            );
+            assert_eq!(p.chord_key, digit(i), "{code:?}");
+            assert_eq!(p.chord_mods, Modifiers::CTRL, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn with_num_lock_off_the_numpad_keys_are_navigation_keys() {
+        for (code, nav) in NUMPAD {
+            for mods in [Modifiers::CTRL, Modifiers::CTRL | Modifiers::SHIFT] {
+                let nav = Key::Named(nav);
+                let p = Press::new(
+                    &nav,
+                    &nav,
+                    Physical::Code(code),
+                    Location::Numpad,
+                    mods,
+                    || Some(false),
+                );
+                assert_eq!((p.chord_key, p.chord_mods), (nav, mods), "{code:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_insert_key_itself_stays_insert() {
+        let insert = Key::Named(Named::Insert);
+        let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
+        for num_lock in [Some(true), Some(false), None] {
+            let p = Press::new(
+                &insert,
+                &insert,
+                Physical::Code(Code::Insert),
+                Location::Standard,
+                ctrl_shift,
+                || num_lock,
+            );
+            assert_eq!((p.chord_key, p.chord_mods), (insert.clone(), ctrl_shift));
+        }
+    }
+
+    #[test]
+    fn num_lock_is_asked_only_for_numpad_keys() {
+        let insert = Key::Named(Named::Insert);
+        let asked = std::cell::Cell::new(0);
+        let num_lock = || {
+            asked.set(asked.get() + 1);
+            Some(true)
+        };
+        let _ = Press::new(
+            &insert,
+            &insert,
+            Physical::Code(Code::Insert),
+            Location::Standard,
+            Modifiers::CTRL,
+            num_lock,
+        );
+        assert_eq!(asked.get(), 0);
+        let _ = Press::new(
+            &insert,
+            &insert,
+            Physical::Code(Code::Numpad0),
+            Location::Numpad,
+            Modifiers::CTRL,
+            num_lock,
+        );
+        assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn where_num_lock_is_unknown_the_press_is_unchanged() {
+        // macOS has no Num Lock and reports numpad digits as digits already; Linux keeps the
+        // system's keys.
+        let one = digit(1);
+        let p = Press::new(
+            &one,
+            &one,
+            Physical::Code(Code::Numpad1),
+            Location::Numpad,
+            Modifiers::LOGO,
+            || None,
+        );
+        assert_eq!((p.chord_key, p.chord_mods), (one, Modifiers::LOGO));
+        let end = Key::Named(Named::End);
+        let p = Press::new(
+            &end,
+            &end,
+            Physical::Code(Code::Numpad1),
+            Location::Numpad,
+            Modifiers::CTRL,
+            || None,
+        );
+        assert_eq!((p.chord_key, p.chord_mods), (end, Modifiers::CTRL));
     }
 }

@@ -338,6 +338,9 @@ pub struct App {
     pub maximized: std::collections::HashSet<window::Id>,
     /// Every open window, of any kind (their decorations switch with the chrome).
     pub(crate) open_windows: std::collections::HashSet<window::Id>,
+    /// The windows the system may not move now: the pointer is over a tab or a button of
+    /// their unified bar ([`chrome::Chrome::system_may_drag`]).
+    pub(crate) held_still: std::collections::HashSet<window::Id>,
     /// The chrome in use: [`chrome::CHROME`], or in tests a cell of the app's own.
     pub(crate) chrome: &'static chrome::ChromeCell,
     /// Whose window conventions this run follows and the chrome it started with (see
@@ -661,6 +664,7 @@ impl App {
             fullscreen: Default::default(),
             maximized: Default::default(),
             open_windows: Default::default(),
+            held_still: Default::default(),
             chrome: app_chrome_cell(),
             chrome_base: (chrome::setup().look, chrome::setup().chrome),
             watch_moves: chrome::Platform::current() == chrome::Platform::Linux,
@@ -829,6 +833,10 @@ impl App {
             subs.push(iced::time::every(Duration::from_millis(1500)).map(|_| Message::Shoot));
         }
         subs.push(window::resize_events().map(|(id, size)| Message::WindowResized(id, size)));
+        if self.key_log_listening() {
+            // Debug aid, only while a shortcut is recorded: log what the windows receive.
+            subs.push(iced::event::listen_with(crate::key_log::listen));
+        }
         if self.move_watch.watching() {
             // Only while a move or resize request is watched (at most `ANSWER_TIME`).
             subs.push(iced::event::listen_with(crate::move_watch::watch_event));
@@ -841,6 +849,36 @@ impl App {
             .map(Message::ConfigChanged),
         );
         Subscription::batch(subs)
+    }
+
+    /// The pointer moved onto a widget of window `wid`'s bar that takes a press (`over`) or
+    /// off it: let the system move the window or not (only when that changes).
+    pub(crate) fn pointer_over_bar_widget(&mut self, wid: window::Id, over: bool) -> Task<Message> {
+        let movable = self.chrome.get().system_may_drag(over);
+        let changed = if movable {
+            self.held_still.remove(&wid)
+        } else {
+            self.held_still.insert(wid)
+        };
+        if changed {
+            chrome::set_system_drag(wid, movable)
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Whether the key log listens to every window's keyboard events now (`FBTERM_LOG_KEYS`
+    /// and a shortcut being recorded).
+    pub(crate) fn key_log_listening(&self) -> bool {
+        crate::key_log::active(crate::key_log::enabled(), self.recording_window()).is_some()
+    }
+
+    /// The Settings window while it records a shortcut.
+    pub(crate) fn recording_window(&self) -> Option<window::Id> {
+        self.settings_win
+            .as_ref()
+            .filter(|(_, state)| state.recording.is_some())
+            .map(|(id, _)| *id)
     }
 
     fn first_window_ready(&self) -> bool {
@@ -866,6 +904,7 @@ impl App {
         self.sync_file_panels();
         self.sync_context_menu();
         self.sync_quit_key();
+        crate::key_log::set_recording(self.recording_window());
         match self.sync_panel_focus() {
             Some(unfocus) => Task::batch([task, unfocus]),
             None => task,
@@ -993,7 +1032,8 @@ impl App {
                 if self.focused == Some(id) {
                     self.app_active = false;
                 }
-                Task::none()
+                // Never leave a window the system cannot move behind.
+                self.pointer_over_bar_widget(id, false)
             }
             Message::TabBar(wid, msg) => {
                 self.focused = Some(wid);
@@ -1008,6 +1048,9 @@ impl App {
             }
             // A drawn close control is the OS close button.
             Message::TitleBar(wid, BarAction::Close) => self.close_requested(wid),
+            Message::TitleBar(wid, BarAction::PointerOverWidget(over)) => {
+                self.pointer_over_bar_widget(wid, over)
+            }
             Message::TitleBar(wid, action) => {
                 Task::batch([chrome::perform(wid, action), self.watch_move(wid, action)])
             }
@@ -1071,6 +1114,7 @@ impl App {
                 self.fullscreen.remove(&id);
                 self.maximized.remove(&id);
                 self.open_windows.remove(&id);
+                self.held_still.remove(&id);
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
                 self.file_panels.ui.remove(&id);

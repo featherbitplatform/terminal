@@ -5,6 +5,9 @@
 //!   in `<dir>` instead of the platform config directory.
 //! - `FBTERM_SECRETS=memory`: keep secrets in memory only; the OS keychain is never touched.
 //!
+//! - `FBTERM_LOG_KEYS=1` (works in release builds, see `key_log.rs`): while the Settings window
+//!   records a shortcut, log every keyboard event the app receives to stderr.
+//!
 //! Measurement mode (works in release builds, see `perf.rs`): `--perf-tabs <N> | --perf-panes <N>
 //! --perf-cmd <cmd> [--perf-exit-after <secs>] [--perf-close-after <secs>]`.
 //!
@@ -74,6 +77,7 @@ mod editor;
 mod export;
 mod file_panel;
 mod find;
+mod key_log;
 mod keys;
 mod layout;
 mod memory;
@@ -138,6 +142,7 @@ fn main() -> iced::Result {
         .with_writer(std::io::stderr)
         .with_max_level(tracing::Level::INFO)
         .init();
+    key_log::init_from_env();
     let mut daemon = iced::daemon(App::boot, App::update, window::view)
         .title(App::title)
         .theme(|app: &App, _| app.theme.clone())

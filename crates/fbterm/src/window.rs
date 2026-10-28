@@ -2171,9 +2171,82 @@ mod tests {
             assert_eq!(selects(&messages), [1]);
             assert!(drags(&messages).is_empty(), "{messages:?}");
             assert!(
-                !messages.iter().any(|m| matches!(m, Message::TitleBar(..))),
+                !messages.iter().any(|m| matches!(
+                    m,
+                    Message::TitleBar(_, BarAction::Drag | BarAction::ToggleMaximize)
+                )),
                 "a press on a tab never drags the window"
             );
+        }
+
+        fn pointer_reports(messages: &[Message]) -> Vec<bool> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::TitleBar(_, BarAction::PointerOverWidget(over)) => Some(*over),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn the_unified_bar_reports_the_pointer_onto_and_off_a_tab() {
+            let tabs = tabs();
+            let messages = drive(&tabs, None, |b| {
+                let tab = b[1].center();
+                let along = Point::new(tab.x + 4.0, tab.y);
+                // Far right of the bar: empty space.
+                let empty = Point::new(SIZE.width - 20.0, tab.y);
+                vec![
+                    (moved(empty), empty),
+                    (moved(tab), tab),
+                    (moved(along), along),
+                    (moved(empty), empty),
+                    (moved(tab), tab),
+                    (Event::Mouse(mouse::Event::CursorLeft), tab),
+                    (moved(tab), tab),
+                    (Event::Window(window::Event::Unfocused), tab),
+                    (moved(along), along),
+                ]
+            });
+            // Empty first, onto the tab once (not again along it), off, on, out of the window,
+            // back, and once more after focus changed (the app made the window movable).
+            assert_eq!(
+                pointer_reports(&messages),
+                [false, true, false, true, false, true, true]
+            );
+        }
+
+        #[test]
+        fn a_tab_drag_ending_off_the_tabs_reports_the_pointer_off() {
+            let tabs = tabs();
+            let id = tabs[1].id;
+            let messages = drive(&tabs, Some(Carry::Tab(id)), |b| {
+                let at = b[1].center();
+                let below = Point::new(at.x, SIZE.height + 100.0);
+                vec![
+                    (moved(at), at),
+                    (press(), at),
+                    (moved(below), below),
+                    (release(), below),
+                ]
+            });
+            assert_eq!(pointer_reports(&messages).last(), Some(&false));
+        }
+
+        #[test]
+        fn drawn_bars_never_report_the_pointer() {
+            let tabs = tabs();
+            let messages = drive_with(Chrome::Drawn, &tabs, None, |b, _| {
+                let tab = b[1].center();
+                let empty = Point::new(SIZE.width / 2.0, tab.y);
+                vec![
+                    (moved(tab), tab),
+                    (moved(empty), empty),
+                    (Event::Mouse(mouse::Event::CursorLeft), empty),
+                ]
+            });
+            assert!(pointer_reports(&messages).is_empty(), "{messages:?}");
         }
 
         #[test]
