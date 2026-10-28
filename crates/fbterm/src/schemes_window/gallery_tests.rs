@@ -1,0 +1,447 @@
+//! The theme gallery in the Color schemes window, against a temporary config directory and a
+//! fake fetch: when the catalog is fetched, how failures read, and what Install and Update do
+//! to scheme files and open panes. Nothing here touches the network.
+
+use std::sync::Arc;
+
+use fbterm_config::catalog::{CATALOG_URL, MAX_CATALOG_BYTES, parse_catalog};
+use fbterm_config::schemes::{Scheme, read_file};
+use iced::Task;
+use parking_lot::Mutex;
+
+use super::gallery::{GalleryIo, GalleryLoad, UpdateChoice};
+use super::{SchemesMsg, SchemesState};
+use crate::app::{App, Message};
+use crate::schemes_tests::{app_with, rgb, style, with_scheme};
+
+/// What the fake fetch and opener saw.
+#[derive(Default)]
+struct Calls {
+    fetched: Vec<(String, usize)>,
+    opened: Vec<String>,
+}
+
+/// Replace the app's network fetch and link opener with fakes: the fetch answers `answer`.
+fn fake_io(app: &mut App, answer: Result<Vec<u8>, String>) -> Arc<Mutex<Calls>> {
+    let calls = Arc::new(Mutex::new(Calls::default()));
+    let (c1, c2) = (calls.clone(), calls.clone());
+    app.gallery_io = GalleryIo {
+        fetch: Arc::new(move |url, max| {
+            c1.lock().fetched.push((url.to_owned(), max));
+            answer.clone()
+        }),
+        open: Arc::new(move |url| c2.lock().opened.push(url.to_owned())),
+    };
+    calls
+}
+
+/// One catalog entry: Graphite-like colors on background `bg`.
+fn entry(id: &str, version: u32, bg: &str, withdrawn: bool) -> String {
+    format!(
+        r##"
+[[themes]]
+id = "{id}"
+name = "Theme {id}"
+version = {version}
+variant = "dark"
+withdrawn = {withdrawn}
+
+[themes.colors]
+foreground = "#f5f5f7"
+background = "{bg}"
+cursor = "#a584ff"
+selection = "#392f56"
+black = "#262629"
+red = "#ed4a49"
+green = "#2bbb71"
+yellow = "#f2a635"
+blue = "#70b3f7"
+magenta = "#a584ff"
+cyan = "#59c5f5"
+white = "#d0d0d9"
+bright_black = "#919199"
+bright_red = "#fd736d"
+bright_green = "#52cd86"
+bright_yellow = "#fac053"
+bright_blue = "#9ccbfa"
+bright_magenta = "#bea8ff"
+bright_cyan = "#8fd6f7"
+bright_white = "#f5f5f7"
+
+[themes.credit]
+project = "Project {id}"
+author = "Someone"
+url = "https://example.org/{id}"
+license = "MIT"
+copyright = "Copyright (c) 2026 Someone"
+license_file = "LICENSES/{id}-MIT.txt"
+description = "A theme."
+derived = false
+"##
+    )
+}
+
+fn catalog(entries: &[String]) -> Vec<u8> {
+    format!("format = 1\n{}", entries.concat()).into_bytes()
+}
+
+/// The scheme the gallery installs for the only theme of `bytes`.
+fn installed_form(bytes: &[u8]) -> Scheme {
+    parse_catalog(bytes).unwrap().themes.remove(0).scheme
+}
+
+fn send(app: &mut App, m: SchemesMsg) -> Task<Message> {
+    app.update(Message::Schemes(m))
+}
+
+fn win(app: &App) -> &SchemesState {
+    &app.schemes_win.as_ref().expect("schemes window open").1
+}
+
+fn file(app: &App, id: &str) -> std::path::PathBuf {
+    app.paths.schemes().join(format!("{id}.toml"))
+}
+
+/// Run the fetch the way the blocking task does and hand its result to the window.
+fn finish_fetch(app: &mut App) {
+    let result = app.gallery_job()();
+    let _ = send(app, SchemesMsg::GalleryFetched(result));
+}
+
+/// Open the window and its gallery, fetching `bytes` as the catalog.
+fn open_gallery(app: &mut App, bytes: Vec<u8>) -> Arc<Mutex<Calls>> {
+    let calls = fake_io(app, Ok(bytes));
+    let _ = send(app, SchemesMsg::Open);
+    let _ = send(app, SchemesMsg::ShowGallery(true));
+    finish_fetch(app);
+    assert!(matches!(win(app).gallery, GalleryLoad::Loaded(_)));
+    calls
+}
+
+/// Load `bytes` as the next catalog, through Refresh.
+fn refresh_with(app: &mut App, bytes: Vec<u8>) {
+    let _ = fake_io(app, Ok(bytes));
+    let _ = send(app, SchemesMsg::RefreshGallery);
+    finish_fetch(app);
+}
+
+fn failed(app: &App) -> &str {
+    match &win(app).gallery {
+        GalleryLoad::Failed(line) => line,
+        other => panic!("not failed: {other:?}"),
+    }
+}
+
+/// A local profile named `name` (a shell that is never started).
+fn profile(name: &str) -> fbterm_config::Profile {
+    crate::restore_tests::profile(name)
+}
+
+fn scheme_files(app: &App) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(app.paths.schemes())
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort();
+    names
+}
+
+#[test]
+fn opening_gallery_fetches_once() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let calls = fake_io(&mut app, Ok(catalog(&[entry("x", 1, "#101010", false)])));
+    let _ = send(&mut app, SchemesMsg::Open);
+    assert_eq!(send(&mut app, SchemesMsg::ShowGallery(true)).units(), 1);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loading));
+    assert!(win(&app).showing_gallery);
+    // Away and back while it loads: no second fetch.
+    let _ = send(&mut app, SchemesMsg::ShowGallery(false));
+    assert_eq!(send(&mut app, SchemesMsg::ShowGallery(true)).units(), 0);
+    assert_eq!(send(&mut app, SchemesMsg::RefreshGallery).units(), 0);
+    finish_fetch(&mut app);
+    assert_eq!(
+        calls.lock().fetched,
+        vec![(CATALOG_URL.to_owned(), MAX_CATALOG_BYTES)]
+    );
+    // Loaded: showing it again keeps the catalog; Refresh fetches again.
+    assert_eq!(send(&mut app, SchemesMsg::ShowGallery(true)).units(), 0);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loaded(_)));
+    assert_eq!(send(&mut app, SchemesMsg::RefreshGallery).units(), 1);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loading));
+    finish_fetch(&mut app);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loaded(_)));
+    // Closed and opened again in the same run: the catalog is still there, unfetched.
+    let _ = send(&mut app, SchemesMsg::Close);
+    let id = app.schemes_window();
+    if let Some(id) = id {
+        let _ = app.update(Message::WindowClosed(id));
+    }
+    let _ = send(&mut app, SchemesMsg::Open);
+    assert_eq!(send(&mut app, SchemesMsg::ShowGallery(true)).units(), 0);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loaded(_)));
+}
+
+#[test]
+fn nothing_fetches_without_the_gallery() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let _ = fake_io(&mut app, Ok(catalog(&[entry("x", 1, "#101010", false)])));
+    let _ = send(&mut app, SchemesMsg::Open);
+    let _ = send(&mut app, SchemesMsg::Select("harbor".into()));
+    // No fetch was started: one would have left the gallery Loading.
+    assert!(matches!(win(&app).gallery, GalleryLoad::Idle));
+    assert!(!win(&app).showing_gallery);
+    // Install and Update with no catalog do nothing.
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert!(scheme_files(&app).is_empty());
+}
+
+#[test]
+fn bad_catalog_shows_error_and_keeps_installed() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let _ = open_gallery(&mut app, catalog(&[entry("x", 1, "#101010", false)]));
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    let before = read_file(&file(&app, "gallery-x")).unwrap();
+    refresh_with(&mut app, b"<html>Not Found</html>".to_vec());
+    assert!(
+        failed(&app).starts_with("Couldn't load the theme gallery: "),
+        "{}",
+        failed(&app)
+    );
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), before);
+    assert_eq!(app.schemes.get("gallery-x"), Some(&before));
+    // A catalog with only bad themes is the same line, not a crash.
+    refresh_with(&mut app, catalog(&[entry("Bad Id", 1, "#101010", false)]));
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loaded(ref c) if c.themes.is_empty()));
+}
+
+#[test]
+fn offline_shows_error_line() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let _ = fake_io(&mut app, Err("connection refused".into()));
+    let _ = send(&mut app, SchemesMsg::Open);
+    let _ = send(&mut app, SchemesMsg::ShowGallery(true));
+    finish_fetch(&mut app);
+    assert_eq!(
+        failed(&app),
+        "Couldn't load the theme gallery: connection refused"
+    );
+    // Retry is Refresh: it fetches again.
+    let _ = fake_io(&mut app, Ok(catalog(&[entry("x", 1, "#101010", false)])));
+    assert_eq!(send(&mut app, SchemesMsg::RefreshGallery).units(), 1);
+    finish_fetch(&mut app);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loaded(_)));
+}
+
+#[test]
+fn install_writes_gallery_file() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let bytes = catalog(&[entry("x", 2, "#101010", false)]);
+    let _ = open_gallery(&mut app, bytes.clone());
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    let path = file(&app, "gallery-x");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("[credit]"), "{text}");
+    assert!(text.contains("[gallery]"), "{text}");
+    let saved = read_file(&path).unwrap();
+    assert_eq!(saved, installed_form(&bytes));
+    let g = saved.gallery.as_ref().unwrap();
+    assert_eq!((g.id.as_str(), g.version), ("x", 2));
+    // A normal user scheme now: in the set and selectable in the window.
+    assert_eq!(app.schemes.get("gallery-x"), Some(&saved));
+    assert!(win(&app).error.is_none());
+    assert_eq!(win(&app).notice.as_deref(), Some("Installed \"Theme x\""));
+    let _ = send(&mut app, SchemesMsg::Select("gallery-x".into()));
+    assert_eq!(win(&app).selected, "gallery-x");
+    // Installing again at the same version is not offered: nothing changes.
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    assert_eq!(read_file(&path).unwrap(), saved);
+    assert!(win(&app).pending_update.is_none());
+    // An id the catalog does not have does nothing.
+    let _ = send(&mut app, SchemesMsg::Install("nope".into()));
+    assert_eq!(scheme_files(&app), vec!["gallery-x.toml".to_owned()]);
+}
+
+#[test]
+fn update_in_place_recolors_open_panes() {
+    let v1 = catalog(&[entry("x", 1, "#101010", false)]);
+    let installed = installed_form(&v1);
+    let a = with_scheme(&profile("a"), "gallery-x");
+    let (mut app, _, wid, ids) = app_with(&[a], "", std::slice::from_ref(&installed));
+    assert_eq!(style(&app, wid, ids[0]).scheme.background, rgb(0x101010));
+    let _ = open_gallery(&mut app, catalog(&[entry("x", 2, "#203040", false)]));
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert!(win(&app).pending_update.is_none(), "unedited: no question");
+    let saved = read_file(&file(&app, "gallery-x")).unwrap();
+    assert_eq!(saved.colors.background, rgb(0x203040));
+    assert_eq!(saved.gallery.as_ref().unwrap().version, 2);
+    assert_eq!(style(&app, wid, ids[0]).scheme.background, rgb(0x203040));
+    let t = crate::schemes_tests::term(&app, wid, ids[0]);
+    assert!(crate::schemes_tests::answers(&t, rgb(0x203040)));
+    assert_eq!(win(&app).notice.as_deref(), Some("Updated \"Theme x\""));
+}
+
+/// An installed v1 of `x` whose background the user changed to `#555555`.
+fn edited_v1() -> Scheme {
+    let mut s = installed_form(&catalog(&[entry("x", 1, "#101010", false)]));
+    s.colors.background = rgb(0x555555);
+    s
+}
+
+#[test]
+fn update_of_edited_asks() {
+    let v2 = catalog(&[entry("x", 2, "#203040", false)]);
+    // Replace overwrites the edits.
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[edited_v1()]);
+    let _ = open_gallery(&mut app, v2.clone());
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), edited_v1());
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Replace));
+    assert!(win(&app).pending_update.is_none());
+    assert_eq!(
+        read_file(&file(&app, "gallery-x")).unwrap(),
+        installed_form(&v2)
+    );
+
+    // Copy makes a new user scheme with the credit and no gallery block; the edited one stays.
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[edited_v1()]);
+    let _ = open_gallery(&mut app, v2.clone());
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Copy));
+    assert!(win(&app).pending_update.is_none());
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), edited_v1());
+    let copies: Vec<&Scheme> = app
+        .schemes
+        .all()
+        .iter()
+        .filter(|s| s.id.starts_with("user-"))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let copy = copies[0];
+    assert_eq!(copy.colors, installed_form(&v2).colors);
+    assert_eq!(copy.credit, installed_form(&v2).credit);
+    assert!(copy.credit.is_some());
+    assert!(copy.gallery.is_none());
+    assert!(file(&app, &copy.id).exists());
+    let text = std::fs::read_to_string(file(&app, &copy.id)).unwrap();
+    assert!(
+        text.contains("[credit]") && !text.contains("[gallery]"),
+        "{text}"
+    );
+
+    // Cancel leaves everything as it was.
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[edited_v1()]);
+    let _ = open_gallery(&mut app, v2);
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Cancel));
+    assert!(win(&app).pending_update.is_none());
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), edited_v1());
+    assert_eq!(scheme_files(&app), vec!["gallery-x.toml".to_owned()]);
+    // A choice with no question pending does nothing.
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Replace));
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), edited_v1());
+}
+
+#[test]
+fn update_of_blockless_file_asks() {
+    // A `gallery-x` scheme without a `[gallery]` block (an older fbterm saved it), same version.
+    let bytes = catalog(&[entry("x", 1, "#101010", false)]);
+    let blockless = Scheme {
+        gallery: None,
+        ..installed_form(&bytes)
+    };
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&blockless));
+    let _ = open_gallery(&mut app, bytes.clone());
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), blockless);
+    // Install asks the same question.
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Cancel));
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Replace));
+    assert_eq!(
+        read_file(&file(&app, "gallery-x")).unwrap(),
+        installed_form(&bytes)
+    );
+
+    // A `gallery-x.toml` that does not load is not overwritten without asking either.
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    std::fs::create_dir_all(app.paths.schemes()).unwrap();
+    std::fs::write(file(&app, "gallery-x"), "not a scheme").unwrap();
+    let _ = app.reload_schemes();
+    let _ = open_gallery(&mut app, bytes);
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    assert_eq!(
+        std::fs::read_to_string(file(&app, "gallery-x")).unwrap(),
+        "not a scheme"
+    );
+}
+
+#[test]
+fn withdrawn_installed_stays() {
+    let v1 = catalog(&[entry("x", 1, "#101010", false)]);
+    let installed = installed_form(&v1);
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&installed));
+    let _ = open_gallery(
+        &mut app,
+        catalog(&[
+            entry("x", 2, "#203040", true),
+            entry("y", 1, "#101010", true),
+        ]),
+    );
+    for id in ["x", "y"] {
+        let _ = send(&mut app, SchemesMsg::Update(id.into()));
+        let _ = send(&mut app, SchemesMsg::Install(id.into()));
+    }
+    assert!(win(&app).pending_update.is_none());
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), installed);
+    assert_eq!(app.schemes.get("gallery-x"), Some(&installed));
+    assert!(!file(&app, "gallery-y").exists(), "withdrawn: not offered");
+}
+
+#[test]
+fn newer_format_message() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let mut newer = catalog(&[entry("x", 1, "#101010", false)]);
+    newer.splice(0..10, b"format = 2".iter().copied());
+    let _ = fake_io(&mut app, Ok(newer));
+    let _ = send(&mut app, SchemesMsg::Open);
+    let _ = send(&mut app, SchemesMsg::ShowGallery(true));
+    finish_fetch(&mut app);
+    assert_eq!(failed(&app), "This catalog needs a newer fbterm.");
+}
+
+#[test]
+fn credit_link_only_https() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let calls = fake_io(&mut app, Err("unused".into()));
+    let _ = send(&mut app, SchemesMsg::Open);
+    for bad in [
+        "http://example.org/a",
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "https://",
+        "https:///path",
+        "https://example.org/a b",
+        "https://example.org/\u{7}",
+        "--help",
+        "",
+    ] {
+        let _ = send(&mut app, SchemesMsg::OpenCreditLink(bad.into()));
+    }
+    assert!(calls.lock().opened.is_empty(), "{:?}", calls.lock().opened);
+    let _ = send(
+        &mut app,
+        SchemesMsg::OpenCreditLink("https://example.org/x".into()),
+    );
+    assert_eq!(
+        calls.lock().opened,
+        vec!["https://example.org/x".to_owned()]
+    );
+}

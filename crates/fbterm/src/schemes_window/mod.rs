@@ -14,6 +14,11 @@ use parking_lot::Mutex;
 
 use crate::settings_window::FontChoice;
 
+pub use gallery::{GalleryLoad, UpdateChoice};
+
+pub mod gallery;
+#[cfg(test)]
+mod gallery_tests;
 mod glue;
 #[cfg(test)]
 mod tests;
@@ -177,6 +182,44 @@ pub enum SchemesMsg {
     Exported(Option<PathBuf>),
     /// Something the preview terminal reported (only a resize matters).
     Preview(fbterm_term::TerminalOutput),
+    /// Show (true) or leave the gallery; showing it fetches the catalog when none is loaded.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sent by the gallery view, which comes next")
+    )]
+    ShowGallery(bool),
+    /// Fetch the catalog again (also the Retry after a failure).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sent by the gallery view, which comes next")
+    )]
+    RefreshGallery,
+    /// The catalog as fetched on the blocking pool.
+    GalleryFetched(Result<Vec<u8>, String>),
+    /// Install the catalog theme with this id.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sent by the gallery view, which comes next")
+    )]
+    Install(String),
+    /// Update the installed copy of the catalog theme with this id.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sent by the gallery view, which comes next")
+    )]
+    Update(String),
+    /// The answer to the question about updating an edited theme.
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sent by the gallery view, which comes next")
+    )]
+    UpdateChoice(UpdateChoice),
+    /// A credit's project link, for the system browser (`https://` only).
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "sent by the gallery view, which comes next")
+    )]
+    OpenCreditLink(String),
 }
 
 /// The delete question for a scheme, with how many profiles use it.
@@ -299,6 +342,12 @@ pub struct SchemesState {
     installed: Vec<String>,
     /// The preview terminal (no session: fed the sample once per size).
     pub preview: SharedTerminal,
+    /// The theme gallery's catalog, or why there is none.
+    pub gallery: GalleryLoad,
+    /// The gallery shows instead of the scheme editor.
+    pub showing_gallery: bool,
+    /// The catalog id of an edited theme whose update is being asked about.
+    pub pending_update: Option<String>,
 }
 
 impl SchemesState {
@@ -317,6 +366,9 @@ impl SchemesState {
             error: None,
             installed,
             preview: preview_terminal(crate::app::DEFAULT_GRID),
+            gallery: GalleryLoad::Idle,
+            showing_gallery: false,
+            pending_update: None,
         };
         let first = state
             .drafts

@@ -35,16 +35,24 @@ impl App {
             exit_on_close_request: false,
             ..window::Settings::default()
         });
-        let state = SchemesState::new(
+        let mut state = SchemesState::new(
             &self.schemes,
             Some(&select),
             crate::settings_window::installed_monospace(),
         );
+        if let Some(catalog) = &self.gallery_catalog {
+            // The catalog of this run: shown again without a fetch.
+            state.gallery = super::GalleryLoad::Loaded(catalog.clone());
+        }
         self.schemes_win = Some((id, state));
         open.discard()
     }
 
     pub(crate) fn schemes_msg(&mut self, msg: SchemesMsg) -> Task<Message> {
+        let msg = match self.gallery_msg(msg) {
+            Ok(task) => return task,
+            Err(msg) => msg,
+        };
         match msg {
             SchemesMsg::Open => self.open_schemes(None),
             SchemesMsg::Close => match self.schemes_window() {
