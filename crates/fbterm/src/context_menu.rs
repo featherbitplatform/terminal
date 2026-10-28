@@ -1,9 +1,12 @@
-//! The terminal's right-click menu (Windows and Linux): `Copy` and `Paste` at the pointer.
+//! The terminal's right-click menu: `Copy` and `Paste` at the pointer.
 //!
-//! A right-click on a selection copies it without a menu (the terminal widget does that); with
-//! nothing selected the widget asks for this menu ([`TerminalOutput::ContextMenu`]), so `Copy`
-//! is shown disabled. `Paste` is the paste chord's: the same clipboard read and the same
-//! bracketed-paste handling ([`fbterm_term::paste_input`]). The menu closes on a choice,
+//! On macOS every right-click asks for this menu ([`TerminalOutput::ContextMenu`]) and keeps
+//! the selection; `Copy` is enabled when there is one and copies it as the copy chord does,
+//! leaving it selected. On Windows and Linux a right-click on a selection copies it without a
+//! menu (the terminal widget does that, see [`fbterm_term::RightClick`]); with nothing
+//! selected the widget asks for the menu, so `Copy` is shown disabled. `Paste` is the paste
+//! chord's: the same clipboard read and the same bracketed-paste handling
+//! ([`fbterm_term::paste_input`]). The menu closes on a choice,
 //! Escape, a click outside it, the window losing focus or being resized. Only the user's own
 //! right-click opens it; nothing a program in the terminal sends can.
 
@@ -41,9 +44,12 @@ impl MenuItem {
         }
     }
 
-    /// The menu opens only with nothing selected, so there is nothing to copy.
-    fn enabled(self) -> bool {
-        self == MenuItem::Paste
+    /// Whether it can be chosen: `Copy` only with a selection to copy (`can_copy`).
+    fn enabled(self, can_copy: bool) -> bool {
+        match self {
+            MenuItem::Copy => can_copy,
+            MenuItem::Paste => true,
+        }
     }
 
     /// Its chord, from the fixed shortcuts (never a hardcoded label).
@@ -56,30 +62,36 @@ impl MenuItem {
     }
 }
 
-/// The open menu: over which window and pane, where the right-click was, which item the
-/// keyboard is on.
+/// The open menu: over which window and pane, where the right-click was, whether the pane
+/// had a selection to copy, which item the keyboard is on.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContextMenu {
     pub window: window::Id,
     pub pane: PaneId,
     /// The pointer when the menu opened, in the window's logical pixels.
     pub at: Point,
+    /// The pane had a selection when the menu opened: `Copy` is enabled.
+    pub can_copy: bool,
     pub selected: MenuItem,
 }
 
 impl ContextMenu {
-    pub fn new(window: window::Id, pane: PaneId, at: Point) -> Self {
+    pub fn new(window: window::Id, pane: PaneId, at: Point, can_copy: bool) -> Self {
         Self {
             window,
             pane,
             at,
+            can_copy,
             selected: MenuItem::Paste,
         }
     }
 
     /// Move the keyboard's item by `step` over the enabled items, wrapping around.
     fn step(&mut self, step: isize) {
-        let enabled: Vec<MenuItem> = MenuItem::ALL.into_iter().filter(|i| i.enabled()).collect();
+        let enabled: Vec<MenuItem> = MenuItem::ALL
+            .into_iter()
+            .filter(|i| i.enabled(self.can_copy))
+            .collect();
         let Some(here) = enabled.iter().position(|i| *i == self.selected) else {
             return;
         };
@@ -145,7 +157,7 @@ pub(crate) fn menu_origin(at: Point, size: Size, window: Option<Size>) -> Point 
 
 impl App {
     /// The widget asked for the menu: open it at the pointer (again, at the new point, when
-    /// it was already open) and focus the right-clicked pane, so the menu's Paste and the
+    /// it was already open), `Copy` enabled when `can_copy`, and focus the right-clicked pane, so the menu's Paste and the
     /// paste chord go to the same pane. Not while the palette, the find-in-all-tabs box or a
     /// dialog is up in that window: their backdrops let a right-click through to the terminal.
     pub(crate) fn open_context_menu(
@@ -153,6 +165,7 @@ impl App {
         wid: window::Id,
         pane: PaneId,
         at: Point,
+        can_copy: bool,
     ) -> Task<Message> {
         let covered = self.palettes.contains_key(&wid)
             || self.find_box.as_ref().is_some_and(|f| f.window == wid)
@@ -161,7 +174,7 @@ impl App {
         if covered || !self.windows.contains_key(&wid) {
             return Task::none();
         }
-        self.context_menu = Some(ContextMenu::new(wid, pane, at));
+        self.context_menu = Some(ContextMenu::new(wid, pane, at, can_copy));
         self.focus_pane(wid, pane)
     }
 
@@ -211,14 +224,37 @@ impl App {
                 return Task::none();
             }
         };
-        let pane = menu.pane;
+        let (pane, can_copy) = (menu.pane, menu.can_copy);
         self.context_menu = None;
+        if !item.enabled(can_copy) {
+            return Task::none();
+        }
         match item {
             MenuItem::Paste => iced::clipboard::read()
                 .map(move |text| Message::ContextMenu(wid, MenuMsg::Pasted(pane, text))),
-            // Never enabled: the menu opens only with nothing selected.
-            MenuItem::Copy => Task::none(),
+            MenuItem::Copy => self.menu_copy(wid, pane),
         }
+    }
+
+    /// The text selected in `pane`, if any (what the copy chord would copy).
+    fn selected_text(&self, wid: window::Id, pane: PaneId) -> Option<String> {
+        let w = self.windows.get(&wid)?;
+        let (t, p) = w.locate(pane)?;
+        let terminal = w.tabs[t].panes.get(p)?.terminal()?;
+        let term = terminal.lock();
+        term.selection()
+            .map(|s| s.text(&term))
+            .filter(|t| !t.is_empty())
+    }
+
+    /// The menu's `Copy`: what the copy chord does, the selection put on the clipboard and
+    /// reported as the widget reports it ([`TerminalOutput::Copy`]). The selection stays.
+    fn menu_copy(&mut self, wid: window::Id, pane: PaneId) -> Task<Message> {
+        let Some(text) = self.selected_text(wid, pane) else {
+            return Task::none();
+        };
+        let copied = self.terminal_output(wid, pane, TerminalOutput::Copy(text.clone()));
+        Task::batch([iced::clipboard::write(text), copied])
     }
 
     /// The menu's `Paste`: what the paste chord sends, sent the way typing is.
@@ -249,7 +285,8 @@ pub(crate) fn view<'a>(
     let msg = move |m| Message::ContextMenu(window, m);
     let mut items = column![];
     for item in MenuItem::ALL {
-        items = items.push(item_view(t, window, item, item == menu.selected));
+        let enabled = item.enabled(menu.can_copy);
+        items = items.push(item_view(t, window, item, enabled, item == menu.selected));
     }
     let card = container(items)
         .width(MENU_WIDTH)
@@ -285,7 +322,8 @@ pub(crate) fn view<'a>(
 
 /// The clear layer over the window while the menu is open. Outside the menu a press closes
 /// it, and only a right-click goes on to the terminal beneath, which then copies a selection
-/// there or opens the menu again at the new point (the same right-click rules). The wheel,
+/// there (Windows and Linux) or opens the menu again at the new point (the same right-click
+/// rules). The wheel,
 /// pointer moves and other presses stop here, so the terminal neither scrolls, hovers nor
 /// reports them to its program while the menu is up.
 struct Layer<'a> {
@@ -426,9 +464,9 @@ fn item_view<'a>(
     t: &'static Tokens,
     window: window::Id,
     item: MenuItem,
+    enabled: bool,
     selected: bool,
 ) -> Element<'a, Message> {
-    let enabled = item.enabled();
     let color = if enabled { t.text } else { t.text_muted };
     let mut line = row![
         text(item.title()).font(UI_FONT).size(13).color(color),
@@ -499,8 +537,9 @@ mod tests {
     }
 
     #[test]
-    fn copy_is_disabled_and_paste_shows_the_paste_chord() {
-        assert!(!MenuItem::Copy.enabled() && MenuItem::Paste.enabled());
+    fn copy_needs_a_selection_and_paste_shows_the_paste_chord() {
+        assert!(!MenuItem::Copy.enabled(false) && MenuItem::Paste.enabled(false));
+        assert!(MenuItem::Copy.enabled(true) && MenuItem::Paste.enabled(true));
         let mac = cfg!(target_os = "macos");
         let paste = if mac { "\u{2318}V" } else { "Ctrl+Shift+V" };
         assert_eq!(MenuItem::Paste.chord_label().as_deref(), Some(paste));
@@ -527,9 +566,15 @@ mod tests {
         let _ = app.update(Message::Terminal(
             wid,
             pane,
-            TerminalOutput::ContextMenu(at),
+            TerminalOutput::ContextMenu {
+                at,
+                can_copy: false,
+            },
         ));
-        assert_eq!(app.context_menu, Some(ContextMenu::new(wid, pane, at)));
+        assert_eq!(
+            app.context_menu,
+            Some(ContextMenu::new(wid, pane, at, false))
+        );
     }
 
     #[test]
@@ -604,6 +649,64 @@ mod tests {
         wait_for(&term, "^[[201~^[[200~next");
     }
 
+    /// Gives `pane` a terminal showing `word two` with `word` selected.
+    fn select_word(app: &mut App, wid: window::Id, pane: PaneId) -> fbterm_term::SharedTerminal {
+        let mut term = fbterm_term::Terminal::new(crate::app::DEFAULT_GRID, 100);
+        term.feed(b"word two");
+        term.set_selection(Some(fbterm_term::Selection::on_line(0, 0, 3)));
+        let term = std::sync::Arc::new(parking_lot::Mutex::new(term));
+        let w = app.windows.get_mut(&wid).unwrap();
+        let (t, p) = w.locate(pane).unwrap();
+        w.tabs[t].panes[p].placeholder = Some(term.clone());
+        term
+    }
+
+    /// The widget asks for the menu with `can_copy` (as on macOS, whatever the host).
+    fn open_menu(app: &mut App, wid: window::Id, pane: PaneId, can_copy: bool) {
+        let at = Point::new(120.0, 80.0);
+        let _ = app.update(Message::Terminal(
+            wid,
+            pane,
+            TerminalOutput::ContextMenu { at, can_copy },
+        ));
+        assert_eq!(
+            app.context_menu,
+            Some(ContextMenu::new(wid, pane, at, can_copy))
+        );
+    }
+
+    #[test]
+    fn with_a_selection_copy_is_enabled_and_copies_it_keeping_it_selected() {
+        let (mut app, wid, pane) = app_with_pane();
+        let term = select_word(&mut app, wid, pane);
+        open_menu(&mut app, wid, pane, true);
+        // The keyboard reaches Copy.
+        let _ = app.update(Message::ContextMenu(wid, MenuMsg::Up));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, MenuItem::Copy);
+        assert_eq!(app.selected_text(wid, pane).as_deref(), Some("word"));
+        let task = app.update(Message::ContextMenu(wid, MenuMsg::Submit));
+        // The clipboard write (the widget's Copy report needs no work of the app).
+        assert_eq!(task.units(), 1);
+        assert_eq!(app.context_menu, None);
+        assert!(term.lock().selection().is_some(), "the selection stays");
+        // Chosen with the pointer, the same.
+        open_menu(&mut app, wid, pane, true);
+        let task = app.update(Message::ContextMenu(wid, MenuMsg::Choose(MenuItem::Copy)));
+        assert_eq!(task.units(), 1);
+        assert!(term.lock().selection().is_some());
+    }
+
+    #[test]
+    fn without_a_selection_copy_is_disabled() {
+        let (mut app, wid, pane) = app_with_pane();
+        open_menu(&mut app, wid, pane, false);
+        let _ = app.update(Message::ContextMenu(wid, MenuMsg::Up));
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, MenuItem::Paste);
+        let task = app.update(Message::ContextMenu(wid, MenuMsg::Choose(MenuItem::Copy)));
+        assert_eq!(task.units(), 0, "a disabled Copy does nothing");
+        assert_eq!(app.context_menu, None);
+    }
+
     /// An app with one window whose tab is split into two panes; the first is focused.
     fn app_with_split() -> (App, window::Id, PaneId, PaneId) {
         let (mut app, wid, a) = app_with_pane();
@@ -648,8 +751,12 @@ mod tests {
         let (mut app, wid, a, b) = app_with_split();
         right_click(&mut app, wid, a);
         let at = Point::new(400.0, 300.0);
-        let _ = app.update(Message::Terminal(wid, b, TerminalOutput::ContextMenu(at)));
-        assert_eq!(app.context_menu, Some(ContextMenu::new(wid, b, at)));
+        let menu = TerminalOutput::ContextMenu {
+            at,
+            can_copy: false,
+        };
+        let _ = app.update(Message::Terminal(wid, b, menu));
+        assert_eq!(app.context_menu, Some(ContextMenu::new(wid, b, at, false)));
     }
 
     #[test]
@@ -657,7 +764,10 @@ mod tests {
         use crate::keys::Action;
         let (mut app, wid, pane) = app_with_pane();
         let at = Point::new(120.0, 80.0);
-        let menu = TerminalOutput::ContextMenu(at);
+        let menu = TerminalOutput::ContextMenu {
+            at,
+            can_copy: false,
+        };
         let _ = app.update(Message::Shortcut(wid, Action::Palette));
         assert!(app.palettes.contains_key(&wid));
         let _ = app.update(Message::Terminal(wid, pane, menu.clone()));
@@ -684,7 +794,7 @@ mod tests {
         ));
         let size = Size::new(800.0, 600.0);
         let wid = window::Id::unique();
-        let menu = ContextMenu::new(wid, PaneId::next(), Point::new(100.0, 100.0));
+        let menu = ContextMenu::new(wid, PaneId::next(), Point::new(100.0, 100.0), false);
         let mut element = view(t, wid, &menu, Some(size));
         let mut tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(

@@ -9,8 +9,8 @@ use iced::advanced::clipboard::Kind;
 use iced::keyboard::{self, Key, Modifiers};
 use iced::{Event, Rectangle, mouse};
 
-use super::TerminalOutput;
 use super::geometry::{pixel_to_cell, pixel_to_point};
+use super::{RightClick, TerminalOutput};
 use crate::{
     GridSize, KeyAction, KeyInput, MouseButton, MouseKind, MouseReport, Selection, SharedTerminal,
     TermMode, Terminal, encode_key_input, encode_mouse, encode_paste,
@@ -27,9 +27,8 @@ pub struct Context<'a> {
     pub bounds: Rectangle,
     pub grid: GridSize,
     pub cursor: mouse::Cursor,
-    /// A right-click copies the selection, or asks for the context menu without one (Windows
-    /// and Linux; see [`super::RIGHT_CLICK_MENU`]).
-    pub right_click_menu: bool,
+    /// What a right-click the program does not take does (see [`super::RIGHT_CLICK`]).
+    pub right_click: RightClick,
 }
 
 /// What the widget should do after handling an event.
@@ -438,7 +437,7 @@ impl InputState {
             self.report(b, MouseKind::Press, cell, mode, out);
             return Effect::CAPTURE;
         }
-        if button == mouse::Button::Right && ctx.right_click_menu {
+        if button == mouse::Button::Right {
             return self.right_click(&mut term, ctx, clipboard, out);
         }
         if button != mouse::Button::Left {
@@ -488,9 +487,11 @@ impl InputState {
         Effect::REDRAW
     }
 
-    /// A right-click the program does not get: copy the selection to the clipboard (as the
-    /// Copy chord does) and clear it; without one, ask the host for the context menu at the
-    /// pointer. Only a press of the user's mouse gets here, never anything a program sends.
+    /// A right-click the program does not get. [`RightClick::CopyOrMenu`]: copy the selection
+    /// to the clipboard (as the Copy chord does) and clear it; without one, ask the host for
+    /// the context menu at the pointer. [`RightClick::Menu`]: ask for the menu, saying whether
+    /// there is a selection to copy, and keep it. Only a press of the user's mouse gets here,
+    /// never anything a program sends.
     fn right_click(
         &mut self,
         term: &mut Terminal,
@@ -503,14 +504,15 @@ impl InputState {
             .selection()
             .map(|s| s.text(term))
             .filter(|t| !t.is_empty());
-        if let Some(text) = text {
+        let can_copy = text.is_some();
+        if let (RightClick::CopyOrMenu, Some(text)) = (ctx.right_click, text) {
             clipboard.write(Kind::Standard, text.clone());
             out.push(TerminalOutput::Copy(text));
             term.set_selection(None);
             return Effect::REDRAW;
         }
         if let Some(at) = ctx.cursor.position() {
-            out.push(TerminalOutput::ContextMenu(at));
+            out.push(TerminalOutput::ContextMenu { at, can_copy });
         }
         Effect::CAPTURE
     }
@@ -813,7 +815,7 @@ mod tests {
     }
 
     /// A context over a 40x24 terminal at (10, 20) in the window, the pointer at `at`.
-    fn ctx_at(term: &SharedTerminal, at: iced::Point, menu: bool) -> Context<'_> {
+    fn ctx_at(term: &SharedTerminal, at: iced::Point, right_click: RightClick) -> Context<'_> {
         let grid = term.lock().size();
         Context {
             term,
@@ -821,7 +823,7 @@ mod tests {
             bounds: Rectangle::new(iced::Point::new(10.0, 20.0), iced::Size::new(320.0, 384.0)),
             grid,
             cursor: mouse::Cursor::Available(at),
-            right_click_menu: menu,
+            right_click,
         }
     }
 
@@ -848,7 +850,7 @@ mod tests {
         let mut clip = TestClipboard::default();
         let mut out = Vec::new();
         let effect = st.handle(
-            &ctx_at(&term, at, true),
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
             &right_press(),
             &mut clip,
             &mut out,
@@ -870,36 +872,110 @@ mod tests {
         let mut clip = TestClipboard::default();
         let mut out = Vec::new();
         let effect = st.handle(
-            &ctx_at(&term, at, true),
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
             &right_press(),
             &mut clip,
             &mut out,
         );
-        assert_eq!(out, vec![TerminalOutput::ContextMenu(at)]);
+        assert_eq!(
+            out,
+            vec![TerminalOutput::ContextMenu {
+                at,
+                can_copy: false
+            }]
+        );
         assert!(clip.written.is_empty());
         assert!(effect.capture);
         // Releasing the button does nothing more.
         let mut out = Vec::new();
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
-        st.handle(&ctx_at(&term, at, true), &release, &mut clip, &mut out);
+        st.handle(
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
+            &release,
+            &mut clip,
+            &mut out,
+        );
         assert!(out.is_empty());
     }
 
     #[test]
-    fn right_click_does_nothing_where_the_menu_is_off() {
-        let term = shared(filled(24));
+    fn right_click_on_macos_asks_for_the_menu_and_keeps_the_selection() {
+        let mut t = filled(24);
+        t.feed(b"\x1b[H\x1b[2Jword two\r\n");
+        let term = shared(t);
         select_first_word(&term);
         let at = iced::Point::new(50.0, 40.0);
         let mut st = InputState::default();
         let mut clip = TestClipboard::default();
         let mut out = Vec::new();
-        st.handle(
-            &ctx_at(&term, at, false),
+        let effect = st.handle(
+            &ctx_at(&term, at, RightClick::Menu),
             &right_press(),
             &mut clip,
             &mut out,
         );
-        assert!(out.is_empty() && clip.written.is_empty());
+        assert_eq!(
+            out,
+            vec![TerminalOutput::ContextMenu { at, can_copy: true }]
+        );
+        assert!(clip.written.is_empty(), "nothing is copied");
+        assert!(term.lock().selection().is_some(), "the selection stays");
+        assert!(effect.capture);
+        // Without a selection there is nothing to copy.
+        term.lock().set_selection(None);
+        let mut out = Vec::new();
+        st.handle(
+            &ctx_at(&term, at, RightClick::Menu),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![TerminalOutput::ContextMenu {
+                at,
+                can_copy: false
+            }]
+        );
+        assert!(clip.written.is_empty());
+    }
+
+    #[test]
+    fn under_mouse_reporting_right_click_on_macos_is_the_programs_and_shift_opens_the_menu() {
+        let mut t = filled(24);
+        t.feed(b"\x1b[?1000h\x1b[?1006h");
+        let term = shared(t);
+        let at = iced::Point::new(50.0, 40.0);
+        let mut st = InputState::default();
+        let mut clip = TestClipboard::default();
+        let mut out = Vec::new();
+        st.handle(
+            &ctx_at(&term, at, RightClick::Menu),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(inputs(out), vec![b"\x1b[<2;6;2M".to_vec()]);
+        let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::SHIFT));
+        let mut out = Vec::new();
+        st.handle(
+            &ctx_at(&term, at, RightClick::Menu),
+            &shift,
+            &mut clip,
+            &mut out,
+        );
+        select_first_word(&term);
+        st.handle(
+            &ctx_at(&term, at, RightClick::Menu),
+            &right_press(),
+            &mut clip,
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            vec![TerminalOutput::ContextMenu { at, can_copy: true }]
+        );
+        assert!(clip.written.is_empty());
         assert!(term.lock().selection().is_some());
     }
 
@@ -913,13 +989,18 @@ mod tests {
         let mut clip = TestClipboard::default();
         let mut out = Vec::new();
         st.handle(
-            &ctx_at(&term, at, true),
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
             &right_press(),
             &mut clip,
             &mut out,
         );
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right));
-        st.handle(&ctx_at(&term, at, true), &release, &mut clip, &mut out);
+        st.handle(
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
+            &release,
+            &mut clip,
+            &mut out,
+        );
         assert_eq!(
             inputs(out),
             vec![b"\x1b[<2;6;2M".to_vec(), b"\x1b[<2;6;2m".to_vec()]
@@ -927,19 +1008,30 @@ mod tests {
         // With Shift held: the menu, and nothing reaches the program.
         let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(Modifiers::SHIFT));
         let mut out = Vec::new();
-        st.handle(&ctx_at(&term, at, true), &shift, &mut clip, &mut out);
         st.handle(
-            &ctx_at(&term, at, true),
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
+            &shift,
+            &mut clip,
+            &mut out,
+        );
+        st.handle(
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
             &right_press(),
             &mut clip,
             &mut out,
         );
-        assert_eq!(out, vec![TerminalOutput::ContextMenu(at)]);
+        assert_eq!(
+            out,
+            vec![TerminalOutput::ContextMenu {
+                at,
+                can_copy: false
+            }]
+        );
         // ...and with a selection, the copy.
         select_first_word(&term);
         let mut out = Vec::new();
         st.handle(
-            &ctx_at(&term, at, true),
+            &ctx_at(&term, at, RightClick::CopyOrMenu),
             &right_press(),
             &mut clip,
             &mut out,
@@ -1010,7 +1102,7 @@ mod tests {
             bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(320.0, 384.0)),
             grid,
             cursor: mouse::Cursor::Unavailable,
-            right_click_menu: false,
+            right_click: RightClick::CopyOrMenu,
         };
         let mut st = InputState::default();
         let mut clip = iced::advanced::clipboard::Null;
@@ -1055,7 +1147,7 @@ mod tests {
             bounds: Rectangle::new(iced::Point::ORIGIN, iced::Size::new(320.0, 384.0)),
             grid,
             cursor: mouse::Cursor::Unavailable,
-            right_click_menu: false,
+            right_click: RightClick::CopyOrMenu,
         };
         let mut clip = iced::advanced::clipboard::Null;
         let mut out = Vec::new();
