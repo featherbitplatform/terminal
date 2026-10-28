@@ -224,6 +224,23 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     let menu = app.context_menu.as_ref().filter(|m| m.window == id);
     let modal = palette.is_some() || find_box.is_some() || asking || menu.is_some();
     let carry = app.carry_in(id);
+    // The file panel docks at the active tab's right edge, outside the tiles: they lay out in
+    // what is left, as they would in a narrower window.
+    let panel = win
+        .active_tab()
+        .and_then(|_| crate::file_panel::view::panel(app, id))
+        .map(|(panel, width)| Docked {
+            panel,
+            width,
+            window: id,
+            focused: app.file_panels.has_focus(id),
+        });
+    // The panel's rule outlines the content's right side; the bar carries that line on along
+    // the content's top and around the active tab, ending where the rule's right edge is.
+    let outline_end = panel.as_ref().and_then(|p| {
+        let total = app.sizes.get(&id)?.0;
+        Some(total - docked_width(p.width, total) + crate::file_panel::view::RULE_WIDTH)
+    });
     let bar = TabBar {
         window: id,
         bar_bg,
@@ -243,6 +260,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         tunnels_up: app.tunnels.up_count(),
         files: app.files_button(id),
         update_dot: app.update_dot(),
+        outline_end,
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -316,17 +334,6 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
             ..container::Style::default()
         })
         .into();
-    // The file panel docks at the active tab's right edge, outside the tiles: they lay out in
-    // what is left, as they would in a narrower window.
-    let panel = win
-        .active_tab()
-        .and_then(|_| crate::file_panel::view::panel(app, id))
-        .map(|(panel, width)| Docked {
-            panel,
-            width,
-            window: id,
-            focused: app.file_panels.has_focus(id),
-        });
     let panel_focused = panel.as_ref().is_some_and(|p| p.focused);
     body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
@@ -412,6 +419,12 @@ pub(crate) const MIN_TERMINAL_WIDTH: f32 = 200.0;
 /// How wide the band at the file panel's left edge is that a press grabs to resize it. It lies
 /// on the panel's side of the edge, so it never takes a press meant for the terminal.
 pub(crate) const DOCK_GRAB: f32 = 6.0;
+
+/// How wide a file panel asking for `width` is docked in a window `total` wide: it never
+/// squeezes the terminal below [`MIN_TERMINAL_WIDTH`].
+fn docked_width(width: f32, total: f32) -> f32 {
+    width.min(total - MIN_TERMINAL_WIDTH).max(0.0).round()
+}
 
 /// The file panel as docked beside a window's content.
 pub(crate) struct Docked<'a> {
@@ -519,12 +532,7 @@ impl<'a> Widget<Message, iced::Theme, iced::Renderer> for Dock<'a> {
                     .layout(&mut tree.children[0], renderer, limits);
             return layout::Node::with_children(content.size(), vec![content]);
         };
-        // The panel never squeezes the terminal below its minimum width.
-        let width = self
-            .width
-            .min(max.width - MIN_TERMINAL_WIDTH)
-            .max(0.0)
-            .round();
+        let width = docked_width(self.width, max.width);
         let content_width = max.width - width;
         let content = self.content.as_widget_mut().layout(
             &mut tree.children[0],
@@ -812,6 +820,9 @@ struct TabBar<'b> {
     files: Option<bool>,
     /// A newer release is out: a red dot on the settings button (see [`crate::update`]).
     update_dot: bool,
+    /// With the file panel docked: where its left rule ends (window x), so the outline along
+    /// the content's top and around the active tab meets it. `None` draws no outline.
+    outline_end: Option<f32>,
 }
 
 fn tab_bar<'a>(
@@ -966,6 +977,7 @@ fn tab_bar<'a>(
             .map(|t| (t.accent(), t.accent_style()))
             .collect(),
         scale: tabs_bar.scale,
+        outline_end: tabs_bar.outline_end,
     });
     // Drawn controls sit beside the tabs' row, on a plate of the bar's color: beside the
     // background, never under it (a translucent bar would show twice), and never in the row,
@@ -1156,6 +1168,87 @@ fn corners(hole: Rectangle, radius: f32) -> [Corner; 2] {
     ]
 }
 
+/// One piece of the content outline: a straight run, or a quarter arc drawn as a ring quad
+/// (transparent inside, its border `width` wide at the outer edge) clipped to `clip`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Stroke {
+    Line(Rectangle),
+    Arc {
+        clip: Rectangle,
+        ring: Rectangle,
+        width: f32,
+    },
+}
+
+/// The outline's width in window scale `scale`: one logical pixel, on whole physical pixels.
+fn outline_width(scale: f32) -> f32 {
+    whole_px(1.0, scale).max(1.0 / scale)
+}
+
+/// The content outline's pieces in the tab bar, `width` wide: along the bar's bottom edge
+/// `bottom` from `start` to `end`, and with an active tab `hole` (top corner radius
+/// `radius`) around it instead of under it: through the left flare, up its side, over its
+/// rounded top corners, down the other side and through the right flare. Every piece lies
+/// outside the tab and outside the flares' tab-colored part, so the tab and the content read
+/// as one outlined shape and nothing is drawn under the tab.
+fn outline(
+    start: f32,
+    end: f32,
+    bottom: f32,
+    hole: Option<Rectangle>,
+    radius: f32,
+    width: f32,
+) -> Vec<Stroke> {
+    let w = width;
+    let mut out = Vec::new();
+    let mut line = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        if x1 > x0 && y1 > y0 {
+            out.push(Stroke::Line(Rectangle::new(
+                Point::new(x0, y0),
+                Size::new(x1 - x0, y1 - y0),
+            )));
+        }
+    };
+    let Some(h) = hole else {
+        line(start, bottom - w, end, bottom);
+        return out;
+    };
+    let (right, tab_bottom) = (h.x + h.width, h.y + h.height);
+    // The same radii as the flares and the corner pieces.
+    let rf = radius.min(h.height);
+    let rc = radius.min(h.width / 2.0).min(h.height);
+    line(start, bottom - w, (h.x - rf).min(end), bottom);
+    line((right + rf).max(start), bottom - w, end, bottom);
+    line(h.x - w, h.y + rc, h.x, tab_bottom - rf);
+    line(right, h.y + rc, right + w, tab_bottom - rf);
+    line(h.x + rc, h.y - w, right - rc, h.y);
+    let arc = |clip: Rectangle, center: Point, outer: f32| Stroke::Arc {
+        clip,
+        ring: Rectangle::new(
+            Point::new(center.x - outer, center.y - outer),
+            Size::new(2.0 * outer, 2.0 * outer),
+        ),
+        width: w,
+    };
+    // Flares: just inside the bar's disc, along its circle.
+    for (x, cx) in [(h.x - rf, h.x - rf), (right, right + rf)] {
+        out.push(arc(
+            Rectangle::new(Point::new(x, tab_bottom - rf), Size::new(rf, rf)),
+            Point::new(cx, tab_bottom - rf),
+            rf,
+        ));
+    }
+    // Top corners: just outside the tab's rounding.
+    for (x, cx) in [(h.x - w, h.x + rc), (right - rc, right - rc)] {
+        out.push(arc(
+            Rectangle::new(Point::new(x, h.y - w), Size::new(rc + w, rc + w)),
+            Point::new(cx, h.y + rc),
+            rc + w,
+        ));
+    }
+    out
+}
+
 /// Paints the tab bar's background everywhere except under the active tab (child `hole` of
 /// the bar's row), which draws its own, and its flares; and the inactive tabs' backgrounds
 /// (hover, tint), kept off the flares.
@@ -1179,6 +1272,8 @@ struct BarBackground<'a> {
     tabs: Vec<(Option<fbterm_config::Rgb>, fbterm_config::AccentStyle)>,
     /// Physical pixels per logical pixel.
     scale: f32,
+    /// See [`TabBar::outline_end`].
+    outline_end: Option<f32>,
 }
 
 /// A press on a tab button, until its release.
@@ -1535,6 +1630,32 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
                     },
                 );
                 renderer.with_layer(clip, |renderer| renderer.fill_quad(disc, background));
+            }
+        }
+        // With the file panel docked, its rule's line carries on along the content's top
+        // and around the active tab. From the window's left edge, over drawn controls on the
+        // left too (drawn before the bar).
+        if let Some(end) = self.outline_end {
+            let bottom = whole_px(bounds.y + bounds.height, scale);
+            let width = outline_width(scale);
+            let color = self.tokens.border;
+            for stroke in outline(0.0, whole_px(end, scale), bottom, hole, radius, width) {
+                match stroke {
+                    Stroke::Line(r) => renderer.fill_quad(quad(r, Border::default()), color),
+                    Stroke::Arc { clip, ring, width } => {
+                        let edge = quad(
+                            ring,
+                            Border {
+                                color,
+                                width,
+                                radius: (ring.width / 2.0).into(),
+                            },
+                        );
+                        renderer.with_layer(clip, |renderer| {
+                            renderer.fill_quad(edge, Color::TRANSPARENT);
+                        });
+                    }
+                }
             }
         }
         self.content.as_widget().draw(
@@ -1928,6 +2049,13 @@ mod tests {
         width: 600.0,
         height: 32.0,
     };
+    /// A bar wide enough for every tab the outline tests place.
+    const OUTER_WIDE: Rectangle = Rectangle {
+        x: 0.0,
+        y: 0.0,
+        width: 1000.0,
+        height: 32.0,
+    };
     const TAB: Rectangle = Rectangle {
         x: 100.0,
         y: 4.0,
@@ -2133,6 +2261,8 @@ mod tests {
                 files: Some(true),
                 // And the settings button with its update dot.
                 update_dot: true,
+                // And the outline a docked file panel brings.
+                outline_end: Some(500.0),
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
@@ -2462,5 +2592,142 @@ mod tests {
         let [l, r] = corners(thin, TAB_RADIUS);
         assert_eq!(l.radius, 4.0);
         assert!(l.clip.x + l.clip.width <= r.clip.x);
+    }
+
+    /// `v` lies on a whole physical pixel at `scale`.
+    fn on_px(v: f32, scale: f32) -> bool {
+        (v * scale - (v * scale).round()).abs() < 1e-3
+    }
+
+    /// `a` and `b` agree up to float rounding.
+    fn same(a: Rectangle, b: Rectangle) -> bool {
+        [
+            (a.x, b.x),
+            (a.y, b.y),
+            (a.width, b.width),
+            (a.height, b.height),
+        ]
+        .iter()
+        .all(|(p, q)| (p - q).abs() < 1e-3)
+    }
+
+    fn rect_on_px(r: Rectangle, scale: f32) -> bool {
+        [r.x, r.y, r.x + r.width, r.y + r.height]
+            .iter()
+            .all(|&v| on_px(v, scale))
+    }
+
+    #[test]
+    fn the_outline_goes_around_the_active_tab_on_whole_pixels() {
+        for (scale, px) in [(1.0, 1.0), (2.0, 2.0), (1.25, 1.0)] {
+            // A tab laid out off the pixel grid, snapped as the bar snaps it.
+            let raw = Rectangle::new((100.3, 4.1).into(), Size::new(196.45, 27.9));
+            let h = snap_rect(raw, scale);
+            let r = tab_radius(scale);
+            let w = outline_width(scale);
+            assert_eq!(w * scale, px, "one logical pixel at {scale}");
+            let bottom = h.y + h.height;
+            let end = whole_px(700.4, scale);
+            let strokes = outline(0.0, end, bottom, Some(h), r, w);
+            let mut lines = Vec::new();
+            let mut arcs = Vec::new();
+            for s in &strokes {
+                match *s {
+                    Stroke::Line(l) => lines.push(l),
+                    Stroke::Arc { clip, ring, width } => arcs.push((clip, ring, width)),
+                }
+            }
+            assert_eq!((lines.len(), arcs.len()), (5, 4), "{scale}");
+            for &l in &lines {
+                assert!(rect_on_px(l, scale), "{l:?} at {scale}");
+                // Never under the tab.
+                assert!(l.intersection(&h).is_none_or(|i| i.width * i.height < 1e-4));
+            }
+            for &(clip, ring, width) in &arcs {
+                assert!(
+                    rect_on_px(clip, scale) && rect_on_px(ring, scale),
+                    "{scale}"
+                );
+                assert_eq!(width, w);
+            }
+            let right = h.x + h.width;
+            let line = |x: f32, y: f32, x1: f32, y1: f32| {
+                Rectangle::new((x, y).into(), Size::new(x1 - x, y1 - y))
+            };
+            // Along the bar's bottom up to the flares, then from them to the end.
+            assert!(
+                same(lines[0], line(0.0, bottom - w, h.x - r, bottom)),
+                "{:?} at {scale}",
+                lines[0]
+            );
+            assert!(
+                same(lines[1], line(right + r, bottom - w, end, bottom)),
+                "{:?} at {scale}",
+                lines[1]
+            );
+            // The sides, just outside the tab, between its top corners and the flares.
+            assert!(
+                same(lines[2], line(h.x - w, h.y + r, h.x, bottom - r)),
+                "{:?} at {scale}",
+                lines[2]
+            );
+            assert!(
+                same(lines[3], line(right, h.y + r, right + w, bottom - r)),
+                "{:?} at {scale}",
+                lines[3]
+            );
+            // The top, just above it, between its corners.
+            assert!(
+                same(lines[4], line(h.x + r, h.y - w, right - r, h.y)),
+                "{:?} at {scale}",
+                lines[4]
+            );
+            // Flares: the flare squares, along the inside of the bar's disc (outer radius r,
+            // centered where the flare's circle is), so never on the tab's part.
+            let fl = flares(OUTER_WIDE, h, r);
+            for (i, f) in fl.iter().enumerate() {
+                let (clip, ring, _) = arcs[i];
+                assert!(same(clip, f.square), "{:?} at {scale}", clip);
+                assert!(same(ring, f.disc()), "{:?} at {scale}", ring);
+            }
+            // Top corners: centered on the tab's corner circles, starting where they end.
+            let tab_corners = corners(h, r);
+            for (i, c) in tab_corners.iter().enumerate() {
+                let (clip, ring, width) = arcs[2 + i];
+                assert!(ring.center().distance(c.ring.center()) < 1e-3);
+                assert!((ring.width / 2.0 - width - r).abs() < 1e-3);
+                // The clip reaches out by the outline's width, over and beside the tab.
+                assert!((clip.y - (h.y - w)).abs() < 1e-3);
+                assert!((clip.width - (r + w)).abs() < 1e-3);
+            }
+            assert!((arcs[2].0.x - (h.x - w)).abs() < 1e-3);
+            assert!((arcs[3].0.x - (right - r)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn the_outline_without_an_active_tab_is_one_line_and_stops_at_the_panel() {
+        let strokes = outline(0.0, 500.0, 32.0, None, TAB_RADIUS, 1.0);
+        assert_eq!(
+            strokes,
+            [Stroke::Line(Rectangle::new(
+                (0.0, 31.0).into(),
+                Size::new(500.0, 1.0)
+            ))]
+        );
+        // An active tab past the panel's rule: the bottom line still ends at the rule.
+        let far = Rectangle { x: 600.0, ..TAB };
+        let strokes = outline(0.0, 500.0, 32.0, Some(far), TAB_RADIUS, 1.0);
+        let bottoms: Vec<Rectangle> = strokes
+            .iter()
+            .filter_map(|s| match s {
+                Stroke::Line(l) if l.y == 31.0 => Some(*l),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bottoms,
+            [Rectangle::new((0.0, 31.0).into(), Size::new(500.0, 1.0))]
+        );
     }
 }
