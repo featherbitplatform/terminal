@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -59,8 +59,8 @@ semver = "1"
 lto = "thin"
 codegen-units = 1
 
-# Our winit fork (see LICENSES.md and the fork's FORK.md): on Windows, a window dragged onto a
-# monitor with a different scale keeps the position Windows suggests. Change it in the fork, then
-# bump the rev; drop the patch once iced's winit has the fix.
+# Our winit fork (see LICENSES.md and the fork's FORK.md): 0.30.13 plus a backport of upstream's
+# Windows 11 WM_DPICHANGED fix (rust-windowing/winit#4041). Change it in the fork, then bump the
+# rev; drop the patch once iced uses a winit release that has the fix.
 [patch.crates-io]
-winit = { git = "https://github.com/featherbitplatform/winit", rev = "918b37358e833ac0df3a9ce140c3ed786779ecbb" }
+winit = { git = "https://github.com/featherbitplatform/winit", rev = "1db366a512f082cb91d93cd95960ba800f9d52c7" }

@@ -610,6 +610,7 @@ fn side(panel: iced::Element<'_, Message>, width: f32) -> crate::window::Docked<
         width,
         window: window::Id::unique(),
         focused: false,
+        content: crate::window::DockContent::Files,
     }
 }
 
@@ -833,6 +834,7 @@ mod dock {
                 width: 300.0,
                 window: wid,
                 focused: panel_focused,
+                content: crate::window::DockContent::Files,
             }),
         );
         let mut element = Element::new(crate::shortcuts::Shortcuts {

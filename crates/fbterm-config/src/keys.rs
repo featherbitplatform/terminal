@@ -34,7 +34,7 @@ pub enum Action {
     Settings,
     /// The Color schemes window (no chord by default).
     EditSchemes,
-    /// The Tunnels window (no chord by default).
+    /// The tunnels panel of the window it is used in (no chord by default).
     Tunnels,
     /// The archive window in its Export mode (no chord by default).
     ExportProfiles,
@@ -742,7 +742,11 @@ pub fn fixed_shortcuts(mac: bool) -> Vec<FixedShortcut> {
     };
     let mut list = vec![
         FixedShortcut {
-            note: (!mac).then_some("Ctrl+C goes to the program. Right-click copies a selection."),
+            note: Some(if mac {
+                "Right-click opens Copy and Paste."
+            } else {
+                "Ctrl+C goes to the program. Right-click copies a selection."
+            }),
             ..row("Copy", clipboard('c'))
         },
         FixedShortcut {
@@ -1485,14 +1489,21 @@ mod tests {
         assert_eq!(label(false, 2), "Shift+PageUp");
         assert_eq!(fixed_shortcuts(true)[4].also, Some(c("cmd+home")));
         assert_eq!(fixed_shortcuts(false)[4].also, None);
-        // Elsewhere the copy row says where Ctrl+C goes and that right-click copies.
-        assert!(
-            fixed_shortcuts(false)[0]
-                .note
-                .unwrap()
-                .contains("Right-click")
+        // Elsewhere the copy row says where Ctrl+C goes and that right-click copies; on
+        // macOS that right-click opens the menu.
+        assert_eq!(
+            fixed_shortcuts(false)[0].note,
+            Some("Ctrl+C goes to the program. Right-click copies a selection.")
         );
-        assert_eq!(fixed_shortcuts(true)[0].note, None);
+        assert_eq!(
+            fixed_shortcuts(true)[0].note,
+            Some("Right-click opens Copy and Paste.")
+        );
+        assert_eq!(
+            fixed_shortcuts(false)[1].note,
+            Some("Right-click with nothing selected offers Paste.")
+        );
+        assert_eq!(fixed_shortcuts(true)[1].note, None);
     }
 
     #[test]

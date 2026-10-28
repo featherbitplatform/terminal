@@ -246,12 +246,17 @@ impl App {
         task
     }
 
-    /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the Tunnels window at startup.
+    /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the first window's tunnels panel at startup.
     pub(crate) fn open_debug_tunnels(&mut self) -> Task<Message> {
-        if debug_env("FBTERM_OPEN_TUNNELS").is_none() {
-            return Task::none();
+        self.debug_tunnels(debug_env("FBTERM_OPEN_TUNNELS").is_some())
+    }
+
+    /// [`App::open_debug_tunnels`] when `on`.
+    pub(crate) fn debug_tunnels(&mut self, on: bool) -> Task<Message> {
+        match self.windows.keys().next().copied() {
+            Some(wid) if on => self.open_tunnels_panel(wid),
+            _ => Task::none(),
         }
-        self.open_tunnels()
     }
 
     /// `FBTERM_OPEN_ARCHIVE=export|import` (debug aid): open the export and import window at
@@ -327,6 +332,7 @@ impl App {
         let rows = || demo.sample_rows();
         self.file_panels.demo = true;
         if let Some(&wid) = self.windows.keys().next() {
+            self.close_tunnels_panel(wid);
             self.file_panels.show(wid);
             if let Some(names) = debug_env("FBTERM_DEMO_UPLOAD") {
                 let paths = names

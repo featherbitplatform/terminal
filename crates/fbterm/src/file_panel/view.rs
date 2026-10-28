@@ -7,12 +7,11 @@ use std::time::SystemTime;
 
 use chrono::Datelike;
 use fbterm_session::ssh::sftp::{Entry, EntryKind, SortKey};
-use iced::advanced::widget::{Id, Operation, operation::Focusable};
 use iced::widget::{
     Space, button, column, container, mouse_area, progress_bar, responsive, row, scrollable, text,
     text_input, toggler,
 };
-use iced::{Alignment, Border, Element, Length, Padding, Rectangle, Size, Task, window};
+use iced::{Alignment, Border, Element, Length, Padding, Size, Task, window};
 
 use super::state::{self, Direction, PARENT, RowState, TransferRow, WindowPanel};
 use super::{Body, FilePanelMsg, ProfilePanel, REVEAL_LABEL, plain_name};
@@ -26,6 +25,8 @@ use crate::ui::{
 
 /// The fewest characters of a link's target worth showing (a shorter target shows whole).
 const MIN_TARGET: usize = 8;
+/// Width of the rule along the panel's left edge, the content's outline on that side.
+pub(crate) const RULE_WIDTH: f32 = 1.0;
 /// The height of one list row, in logical pixels.
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
 /// The list's height assumed before it has reported one.
@@ -169,19 +170,7 @@ pub(crate) fn scroll_into_view(index: usize, offset: f32, height: f32) -> Option
 
 /// Lets go of the keyboard in `ui`'s fields only (the find bar and other windows keep theirs).
 pub(crate) fn unfocus_fields(ui: &WindowPanel) -> Task<Message> {
-    struct Unfocus(Vec<Id>);
-    impl<T> Operation<T> for Unfocus {
-        fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
-            if id.is_some_and(|id| self.0.contains(id)) {
-                state.unfocus();
-            }
-        }
-
-        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
-            operate(self);
-        }
-    }
-    iced::advanced::widget::operate(Unfocus(vec![ui.filter_id.clone(), ui.path_id.clone()]))
+    crate::ui::unfocus(vec![ui.filter_id.clone(), ui.path_id.clone()])
 }
 
 /// `wid`'s panel and its width, when it is open.
@@ -248,7 +237,7 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
         content = content.push(transfers(t, wid, rows, drawn));
     }
     let rule = container(Space::new())
-        .width(1)
+        .width(RULE_WIDTH)
         .height(Length::Fill)
         .style(move |_| container::Style {
             background: Some(t.border.into()),

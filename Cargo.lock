@@ -1275,7 +1275,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "git+https://github.com/featherbitplatform/winit?rev=918b37358e833ac0df3a9ce140c3ed786779ecbb#918b37358e833ac0df3a9ce140c3ed786779ecbb"
+source = "git+https://github.com/featherbitplatform/winit?rev=1db366a512f082cb91d93cd95960ba800f9d52c7#1db366a512f082cb91d93cd95960ba800f9d52c7"
 
 [[package]]
 name = "dtor"
@@ -1454,7 +1454,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbterm"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "block2 0.6.2",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-config"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "directories",
  "serde",
@@ -1505,7 +1505,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-secrets"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-session"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-trait",
  "data-encoding",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-term"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "fbterm-config",
  "feathercritty",
@@ -6626,7 +6626,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/featherbitplatform/winit?rev=918b37358e833ac0df3a9ce140c3ed786779ecbb#918b37358e833ac0df3a9ce140c3ed786779ecbb"
+source = "git+https://github.com/featherbitplatform/winit?rev=1db366a512f082cb91d93cd95960ba800f9d52c7#1db366a512f082cb91d93cd95960ba800f9d52c7"
 dependencies = [
  "ahash",
  "android-activity",

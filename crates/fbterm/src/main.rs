@@ -20,9 +20,8 @@
 //! - `FBTERM_PALETTE_QUERY=<text>`: open the quick-launch palette in the first window, pre-filled.
 //! - `FBTERM_SCREENSHOT=<path.png>`: once the first window has rendered for a moment, capture
 //!   that window only (never the screen), write it as PNG and exit.
-//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels|archive`: capture the profile
-//!   editor, the Settings window, the Color schemes window, the Tunnels window or the export
-//!   and import window instead.
+//! - `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|archive`: capture the profile editor,
+//!   the Settings window, the Color schemes window or the export and import window instead.
 //! - `FBTERM_OPEN_EDITOR=<profile name>`: open the profile editor at startup, that profile
 //!   selected.
 //! - `FBTERM_OPEN_SETTINGS=1`: open the Settings window at startup (`secrets`: scrolled to the
@@ -34,7 +33,7 @@
 //!   With `FBTERM_DEMO_GALLERY=1` as well, it shows the theme gallery with a sample catalog,
 //!   never fetched (with `FBTERM_CONFIG_DIR`, its installed themes are written there first);
 //!   `FBTERM_DEMO_GALLERY=question` also asks about updating the edited sample theme.
-//! - `FBTERM_OPEN_TUNNELS=1`: open the Tunnels window at startup.
+//! - `FBTERM_OPEN_TUNNELS=1`: open the first window's tunnels panel at startup.
 //! - `FBTERM_OPEN_ARCHIVE=export|import`: open the export and import window at startup in that
 //!   mode. With `FBTERM_DEMO_ARCHIVE=1` as well, export starts with the jump hosts unchecked
 //!   and key files on, and import shows a sample archive built in memory (its key folder in
@@ -115,9 +114,9 @@ mod theme;
 mod tiles;
 mod tooltip;
 mod tunnels;
+mod tunnels_panel;
 #[cfg(test)]
 mod tunnels_tests;
-mod tunnels_window;
 mod ui;
 mod update;
 mod visibility;

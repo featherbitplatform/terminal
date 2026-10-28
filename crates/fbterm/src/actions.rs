@@ -72,7 +72,7 @@ impl App {
             Action::DuplicateProfile => self.duplicate_action(window),
             Action::Settings => self.settings_msg(SettingsMsg::Open),
             Action::EditSchemes => self.open_schemes(None),
-            Action::Tunnels => self.open_tunnels(),
+            Action::Tunnels => self.tunnels_action(window),
             Action::ExportProfiles => self.open_archive(crate::archive_window::ArchiveMode::Export),
             Action::ImportProfiles => self.open_archive(crate::archive_window::ArchiveMode::Import),
             Action::FilePanel => self.on_window(wid, App::toggle_file_panel),
@@ -121,7 +121,7 @@ impl App {
     pub(crate) fn palette_items(&self) -> Vec<PaletteItem> {
         palette::items(
             &self.profiles,
-            crate::tunnels_window::palette_rows(&self.profiles, &self.tunnels),
+            crate::tunnels_panel::palette_rows(&self.profiles, &self.tunnels),
         )
     }
 
