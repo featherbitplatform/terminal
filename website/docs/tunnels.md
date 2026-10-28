@@ -6,8 +6,6 @@ sidebar_label: Tunnels
 
 A tunnel is a named port forward or SOCKS proxy that rides an SSH profile's connection. Use one to reach a database on a private host, a web server behind a bastion, or to let a remote machine reach a service on yours. Tunnels belong to the profile, so they go through its [jump hosts](profiles#jump-hosts) too.
 
-![The Tunnels window: tunnels grouped by profile, each with its addresses, state and an on/off switch](/img/tunnels-panel.png)
-
 ## Kinds
 
 | Kind | What it does |
@@ -28,10 +26,10 @@ Open the profile editor, pick an SSH profile and use the **Tunnels** section: **
 
 | Mode | Behavior |
 | --- | --- |
-| **On demand** (default) | Starts only when you switch it on, in the Tunnels window or from the palette, and runs until you switch it off. With no shell of the profile open it opens a connection of its own, with the same host key and password prompts a shell would show. |
+| **On demand** (default) | Starts only when you switch it on, in the tunnels panel or from the palette, and runs until you switch it off. With no shell of the profile open it opens a connection of its own, with the same host key and password prompts a shell would show. |
 | **With the shell** | Starts when the profile's first shell (tab or pane) connects and stops when the last shell of that profile closes or disconnects. While it waits for a shell it shows `Starts with the shell`. When a disconnected shell is reconnected, the tunnel starts again. |
 
-A tunnel switched on from the Tunnels window asks its questions (host key, password) in the terminal window you used last, which comes to the front. With no terminal window open, a tunnel that needs to ask fails with `Open a terminal window to answer the sign-in question`.
+A tunnel switched on from the tunnels panel asks its questions (host key, password) in the terminal window you switched it on from (else the one you used last), which comes to the front. With no terminal window open, a tunnel that needs to ask fails with `Open a terminal window to answer the sign-in question`.
 
 Details for **With the shell** tunnels:
 
@@ -41,11 +39,13 @@ Details for **With the shell** tunnels:
 
 The profile's connection is shared by its shells and its tunnels, and it closes only when nothing uses it any more: no shell, no running tunnel. A shell opened after you edit the profile's host or jump hosts connects afresh; a tunnel still running on the old connection keeps it until you restart the tunnel.
 
-## The Tunnels window
+## The tunnels panel
 
-Open it from the palette (**Tunnels**), from the tunnels indicator in the tab bar, which shows how many tunnels are up, or bind a shortcut to the `tunnels` action in **Keyboard** in Settings (it has none by default, see [Keyboard shortcuts](keyboard-shortcuts#the-keys-table)).
+The tunnels panel is docked at the right edge of a terminal window, beside the terminal, like the [file panel](file-panel). Open or close it with the tunnels button in the tab bar (it shows how many tunnels are up and looks pressed while the panel is open), with **Tunnels** in the palette, with the panel's close button, or with a shortcut bound to the `tunnels` action in **Keyboard** in Settings (it has none by default, see [Keyboard shortcuts](keyboard-shortcuts#the-keys-table)). Each window has its own panel, open or closed; dragging its left edge changes the width, which is shared by all windows and remembered. Whether it is open is not restored at launch.
 
-The window lists tunnels grouped by profile. Each row shows the name, the addresses, the state and a switch. The address line reads `localhost:5432 → db.internal:5432 via bastion` for a local forward, `remote 127.0.0.1:9000 → localhost:3000` for a remote forward and `SOCKS 127.0.0.1:1080` for a proxy, with `via` and the jump hosts joined by arrows when the profile has jumps. The search box at the top filters by tunnel and profile name as you type.
+Only one panel sits at the right edge: opening the tunnels panel closes the window's file panel, and opening the file panel closes the tunnels panel. From a window without a dock (the profile editor, Settings, Color schemes, export and import), the **Tunnels** action brings the most recently focused terminal window forward and opens the panel there.
+
+The panel lists the tunnels of every SSH profile, grouped by profile. The group of the profile whose pane has the focus is listed first, with its name in the accent color. It follows the window: switch tabs or focus another pane and the highlight moves. A local pane, or a profile without tunnels, highlights nothing. If the search hides the highlighted group, nothing is highlighted until it shows again. Each row shows the name, the addresses, the state and a switch. The address line reads `localhost:5432 → db.internal:5432 via bastion` for a local forward, `remote 127.0.0.1:9000 → localhost:3000` for a remote forward and `SOCKS 127.0.0.1:1080` for a proxy, with `via` and the jump hosts joined by arrows when the profile has jumps. The search box at the top filters by tunnel and profile name as you type; it takes the focus when the panel opens, each window's panel keeps its own search text while the app runs, and `Escape` clears it, then gives the keyboard back to the terminal. With no tunnels defined the panel says where to add them: in the SSH profile in the profile editor.
 
 | State | Meaning |
 | --- | --- |
