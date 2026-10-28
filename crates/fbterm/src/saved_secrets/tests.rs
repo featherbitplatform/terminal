@@ -973,6 +973,7 @@ fn storage_choice_and_reset_wait_for_an_editor_save_even_after_it_closed() {
         .expect("the save's secrets are being written");
     let _ = app.update(Message::WindowClosed(app.editor_window().unwrap()));
     assert!(app.secrets_section().busy, "the section shows it busy");
+    assert!(app.secrets_section().editor_saving, "as the editor's save");
 
     // The open confirmation does not reset under the write.
     vault(&mut app, VaultMsg::Submit);

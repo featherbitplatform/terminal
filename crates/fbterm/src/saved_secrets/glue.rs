@@ -24,6 +24,7 @@ impl App {
             choice: self.settings.secret_storage,
             vault_exists: self.backend.vault_exists(),
             busy: self.secrets_busy(),
+            editor_saving: self.editor_job.is_some() && !self.vault.section_busy(),
             notice: self.vault.notice.clone(),
             active: self.storage(),
         }

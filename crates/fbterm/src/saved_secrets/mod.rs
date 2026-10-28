@@ -253,6 +253,8 @@ pub struct SectionInfo {
     /// A move or reset is under way, or an editor save or duplicate writes saved secrets:
     /// the choices wait.
     pub busy: bool,
+    /// The busy one is the editor's write, not a move or reset.
+    pub editor_saving: bool,
     pub notice: Option<SectionNotice>,
     /// The storage in use, for the hint.
     pub active: Storage,
