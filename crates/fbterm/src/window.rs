@@ -207,9 +207,11 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     let panel = docked(app, id);
     // The panel's rule outlines the content's right side; the bar carries that line on along
     // the content's top and around the active tab, ending where the rule's right edge is.
-    let outline_end = panel.as_ref().and_then(|p| {
-        let total = app.sizes.get(&id)?.0;
-        Some(total - docked_width(p.width, total) + crate::file_panel::view::RULE_WIDTH)
+    // The outline along the content's top and around the active tab always shows: with a panel
+    // docked it ends where the panel's rule starts, else at the window's right edge.
+    let outline_end = app.sizes.get(&id).map(|&(total, _)| match panel.as_ref() {
+        Some(p) => total - docked_width(p.width, total) + crate::file_panel::view::RULE_WIDTH,
+        None => total,
     });
     let bar = TabBar {
         window: id,
@@ -863,8 +865,9 @@ struct TabBar<'b> {
     files: Option<bool>,
     /// A newer release is out: a red dot on the settings button (see [`crate::update`]).
     update_dot: bool,
-    /// With a panel docked: where its left rule ends (window x), so the outline along
-    /// the content's top and around the active tab meets it. `None` draws no outline.
+    /// Where the outline along the content's top and around the active tab ends (window x):
+    /// the docked panel's left rule, else the window's right edge. `None` (size not known
+    /// yet) draws no outline.
     outline_end: Option<f32>,
 }
 
