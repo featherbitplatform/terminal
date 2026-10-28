@@ -48,12 +48,12 @@ Next to the editor, the Color schemes window has an **Editor | Gallery** switch.
 
 - **Browsing.** Rows are sorted by name. The search box matches the name, the project and the author, and **All**, **Dark** and **Light** narrow the list. Each row shows a preview, its credit (project, author and license) and a **Project page** link.
 - **Install.** **Install** saves the theme as a scheme of yours, a file named `gallery-<id>.toml` in the `schemes/` folder, and the button then reads **Installed**. It appears in Settings and the profile editor like any other scheme, and you can duplicate or edit it.
-- **Update.** When the catalog has a newer version, the button reads **Update** and replaces the installed file in place: profiles keep using it and open panes recolor. If you changed the theme on this machine, fbterm asks first: **Replace my changes**, **Install as a copy** (the default, on `Enter`) or **Cancel**. A theme that the catalog no longer offers shows **No longer offered**; the installed copy keeps working.
-- **Credits.** An installed theme keeps its credit in its file (the `[credit]` table), shows it in the editor and keeps it when you export the scheme. This works offline.
+- **Update.** When the catalog has a newer version, the button reads **Update** and replaces the installed file in place: profiles keep using it and open panes recolor. If you changed the theme on this machine, fbterm asks first: **Replace my changes**, **Install as a copy** (the default, on `Enter`) or **Cancel**. The copy is a scheme of yours that keeps the credit. A theme that the catalog no longer offers and that you have installed shows the note **No longer offered** instead of a button; the installed copy keeps working.
+- **Credits.** An installed theme keeps its credit in its file (the `[credit]` table), shows it in the editor and keeps it when you duplicate or export the scheme. This works offline.
 
 ### What the gallery contacts
 
-The gallery reads one file, `https://raw.githubusercontent.com/featherbitplatform/terminal-themes/main/catalog.toml`, and only when you open the gallery or press **Refresh**. Nothing is fetched at startup or in the background, no check repeats, and nothing is cached on disk. Programs running in your sessions can never trigger it. If you are offline, the gallery shows one error line with **Retry**; your installed themes keep working.
+The gallery reads one file, `https://raw.githubusercontent.com/featherbitplatform/terminal-themes/main/catalog.toml`, and only when you first open the gallery in a session or press **Refresh** (or **Retry** after an error). Nothing is fetched at startup or in the background, no check repeats, and nothing is cached on disk. Programs running in your sessions can never trigger it. If you are offline, the gallery shows one error line with **Retry**; your installed themes keep working.
 
 The themes come from [terminal-themes](https://github.com/featherbitplatform/terminal-themes), each under a permissive license with credit to its author. The full credits, and how to propose a new theme by pull request, are in that repository.
 
