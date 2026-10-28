@@ -429,7 +429,7 @@ pub(crate) fn unix_now() -> i64 {
 
 /// Configuration directory: `FBTERM_CONFIG_DIR` (debug aid: keeps manual runs away from the
 /// real config) or the platform default.
-fn paths() -> Paths {
+pub(crate) fn paths() -> Paths {
     match std::env::var_os("FBTERM_CONFIG_DIR") {
         Some(dir) if !dir.is_empty() => Paths {
             config_dir: dir.into(),
@@ -703,6 +703,13 @@ impl App {
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
+        // A report the last run left: said once (debug-aid runs that keep no state leave the
+        // marker for a real run).
+        if app.state_saving_enabled
+            && let Some(line) = crate::crash::take_pending(&app.paths)
+        {
+            app.notices.push(line);
+        }
         // Before any window opens: the Linux `window_decorations` setting picks the chrome.
         let _ = app.reapply_chrome();
         let mut task = match crate::perf::opts() {
