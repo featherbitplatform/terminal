@@ -812,6 +812,12 @@ impl App {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
+                // Window geometry goes to the run log, for reports of windows that jump or
+                // vanish between screens (logical pixels; the scale is logged when it changes).
+                Event::Window(window::Event::Moved(p)) => {
+                    tracing::info!(window = ?id, x = p.x, y = p.y, "window moved");
+                    None
+                }
                 // Files dropped from the OS on a window: only these start an upload by drag.
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
                     crate::file_panel::FilePanelMsg::Dropped(id, path),
@@ -1210,12 +1216,19 @@ impl App {
                 iced::exit()
             }
             Message::WindowScale(id, s) => {
+                tracing::info!(window = ?id, scale = s, "window scale");
                 if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
                     self.os_scales.insert(id, s);
                 }
                 Task::none()
             }
             Message::WindowResized(id, size) => {
+                tracing::info!(
+                    window = ?id,
+                    width = size.width,
+                    height = size.height,
+                    "window resized"
+                );
                 self.close_context_menu(id);
                 let drawn = self.chrome.get().draws_controls();
                 Task::batch([self.window_resized(id, size), query_mode(id, drawn)])
