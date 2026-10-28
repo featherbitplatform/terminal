@@ -449,7 +449,8 @@ pub(crate) struct FilePanels {
     pub saving: HashMap<window::Id, PendingSave>,
     /// Windows with the `Upload…` picker open (one at a time per window).
     pub picking: HashSet<window::Id>,
-    /// Files dropped on each window in the current burst, uploaded together once it settles.
+    /// Files dropped on each window in the current burst, uploaded together (or their paths
+    /// typed) once it settles.
     pub dropped: HashMap<window::Id, Vec<PathBuf>>,
     /// Each window's uploads waiting for a decision, oldest first: the front one may be
     /// asking about a name clash.

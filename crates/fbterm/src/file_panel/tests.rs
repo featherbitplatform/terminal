@@ -2232,7 +2232,7 @@ fn rename_prefills_free_name() {
 }
 
 #[test]
-fn drop_uploads_when_panel_open_and_is_ignored_when_closed() {
+fn drop_uploads_when_panel_open_and_not_when_closed() {
     let (mut w, dir) = World::uploading(
         vec![file("x.conf"), file("y.conf")],
         &["a.conf", "b.conf", "x.conf", "y.conf"],
@@ -2261,7 +2261,7 @@ fn drop_uploads_when_panel_open_and_is_ignored_when_closed() {
     assert!(w.dialog().is_none());
     assert_eq!(w.uploads().len(), 4);
 
-    // The panel closed: drops are ignored.
+    // The panel closed: nothing is uploaded (the paths are typed instead, see `file_drop`).
     w.toggle();
     drop(&mut w, &["a.conf"]);
     assert_eq!(w.uploads().len(), 4);

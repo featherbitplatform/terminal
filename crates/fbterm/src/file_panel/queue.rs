@@ -11,7 +11,8 @@
 //!   [`UploadMode::New`], which never replaces anything even when the listing was out of
 //!   date. Once no upload into the shown folder runs, the folder is read again.
 //! - **Drops** come one OS event per file; those of one burst are gathered (a single short
-//!   wait after the first, no timer otherwise) into one batch.
+//!   wait after the first, no timer otherwise) into one batch. With the window's panel
+//!   closed the batch types its paths instead (`crate::file_drop`).
 //! - **Retry** does a failed row's [`Job`] again in its place. When the session is gone (the
 //!   connection dropped) it is opened again first, asking over the window `Retry` was
 //!   pressed in, and the row waits for it.
@@ -143,10 +144,11 @@ impl App {
         }
     }
 
-    /// The OS dropped `path` on `wid`. Ignored unless the panel there shows a server; the
-    /// files of one drop are gathered and uploaded together.
+    /// The OS dropped `path` on `wid`. The files of one drop are gathered, then uploaded
+    /// together when the panel there shows a server, or typed into the focused pane when
+    /// the window's panel is closed (`crate::file_drop`). Ignored anywhere else.
     pub(super) fn dropped(&mut self, wid: window::Id, path: PathBuf) -> Task<Message> {
-        if self.shown_profile(wid).is_none() {
+        if self.shown_profile(wid).is_none() && !self.drop_types_paths(wid) {
             return Task::none();
         }
         let gathered = self.file_panels.dropped.entry(wid).or_default();
@@ -159,10 +161,16 @@ impl App {
         })
     }
 
-    pub(super) fn drops_settled(&mut self, wid: window::Id) {
-        if let Some(paths) = self.file_panels.dropped.remove(&wid) {
-            self.upload_files(wid, paths);
+    /// The files of one drop have all arrived: upload them, or type their paths.
+    pub(super) fn drops_settled(&mut self, wid: window::Id) -> Task<Message> {
+        let Some(paths) = self.file_panels.dropped.remove(&wid) else {
+            return Task::none();
+        };
+        if self.drop_types_paths(wid) {
+            return self.type_dropped_paths(wid, &paths);
         }
+        self.upload_files(wid, paths);
+        Task::none()
     }
 
     /// Upload `paths` into the folder `wid`'s panel shows, as one batch.

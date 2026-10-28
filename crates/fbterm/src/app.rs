@@ -812,7 +812,8 @@ impl App {
                 Event::Window(window::Event::Focused) => Some(Message::WindowFocused(id)),
                 Event::Window(window::Event::Unfocused) => Some(Message::WindowUnfocused(id)),
                 Event::Window(window::Event::Rescaled(s)) => Some(Message::WindowScale(id, s)),
-                // Files dropped from the OS on a window: only these start an upload by drag.
+                // Files dropped from the OS on a window: uploaded with its file panel open, else
+                // their paths are typed (`file_drop`).
                 Event::Window(window::Event::FileDropped(path)) => Some(Message::FilePanel(
                     crate::file_panel::FilePanelMsg::Dropped(id, path),
                 )),

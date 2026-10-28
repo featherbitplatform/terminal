@@ -25,6 +25,8 @@ On Linux and Windows `Ctrl+C` is not copy: it goes to the program as usual (it i
 
 **Right-click** (Linux and Windows): on a selection it copies it to the clipboard and clears the selection. With nothing selected it focuses the pane you clicked and opens a small menu at the pointer with **Copy** (disabled, as nothing is selected) and **Paste**, which pastes into that pane exactly like `Ctrl+Shift+V`. Another right-click while the menu is open does the same at the new point. `Up` and `Down` move in the menu, `Enter` chooses, and `Escape`, a click outside it, switching to another window or resizing the window close it. When the program in the pane uses the mouse itself (an editor or a system monitor with mouse support), a plain right-click goes to the program; hold `Shift` while right-clicking to copy or open the menu instead. On macOS right-click is unchanged: it goes only to programs that use the mouse. Only your own right-click does any of this; nothing a program prints can open the menu or touch the clipboard.
 
+**Dropping files** from Finder, Explorer or your file manager onto a terminal window types their paths into the focused pane, as a paste: several files go on one line, separated by spaces, with a space after the last and no Enter, so nothing runs until you press it. A path with spaces or shell characters is quoted for the pane's shell (single quotes on macOS, Linux and in SSH sessions, double quotes in a local shell on Windows). A pane that is connecting or whose session ended gets nothing. While the window's [file panel](file-panel#uploading) is open, a drop uploads the files instead.
+
 These shortcuts cannot be changed; Settings lists them under **Fixed** at the end of the **Keyboard** section.
 
 ## Windows and tabs
