@@ -173,7 +173,7 @@ pub fn write_report(paths: &Paths, text: &str) -> PathBuf {
 pub fn take_pending(paths: &Paths) -> Option<String> {
     fs::remove_file(paths.crash_pending()).ok()?;
     Some(format!(
-        "fbterm closed unexpectedly last time. The report is in {}.",
+        "fbterm ran into an error last time. The report is in {}.",
         paths.crash_log().display()
     ))
 }
@@ -300,7 +300,7 @@ mod tests {
         assert_eq!(
             take_pending(&paths),
             Some(format!(
-                "fbterm closed unexpectedly last time. The report is in {}.",
+                "fbterm ran into an error last time. The report is in {}.",
                 paths.crash_log().display()
             ))
         );
