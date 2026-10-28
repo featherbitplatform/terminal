@@ -29,6 +29,10 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 The terminal emulation library, [feathercritty](https://github.com/featherbitplatform/feathercritty), is our fork of [`alacritty_terminal`](https://github.com/alacritty/alacritty/tree/master/alacritty_terminal) 0.26.0 by the Alacritty authors (Apache-2.0, license in the fork's `LICENSE-APACHE`; attribution required). It is used as a git dependency pinned by commit. The fork's changes (a bug fix, a scroll counter, a read-only getter and the rename) are listed in its README, and the files it modifies say so in their first line.
 
+## winit
+
+iced's windowing library, [winit](https://github.com/rust-windowing/winit) 0.30.13 by the winit authors (Apache-2.0), comes from our fork, [featherbitplatform/winit](https://github.com/featherbitplatform/winit), through a `[patch.crates-io]` entry pinned by commit in the root `Cargo.toml`; with it comes the `dpi` crate of the same release (Apache-2.0 or MIT). The fork's one change (Windows: a window dragged onto a monitor with a different scale keeps the position Windows suggests) is described in its `FORK.md`, and the file it modifies says so in its first line.
+
 ## Bundled fonts
 
 Geist and Geist Mono are bundled under the SIL Open Font License 1.1. The license text is in `crates/fbterm/assets/fonts/LICENSE`.
