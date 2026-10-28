@@ -176,6 +176,32 @@ fn highlighted_group_comes_first_others_keep_order() {
 }
 
 #[test]
+fn highlighted_middle_group_moves_first_the_others_keep_order() {
+    let (mut w, warehouse) = panel_world();
+    // A third profile with tunnels, after the other two.
+    let zeta = fbterm_config::Profile {
+        id: ProfileId::new(),
+        name: "zeta".into(),
+        ..warehouse
+    };
+    w.app.profiles.profiles.push(zeta);
+    assert_eq!(
+        highlighted(&w, "", None),
+        [s("srv", false), s("warehouse", false), s("zeta", false)]
+    );
+    let wh = id_of(&w, "warehouse");
+    assert_eq!(
+        highlighted(&w, "", Some(wh)),
+        [s("warehouse", true), s("srv", false), s("zeta", false)]
+    );
+    let z = id_of(&w, "zeta");
+    assert_eq!(
+        highlighted(&w, "", Some(z)),
+        [s("zeta", true), s("srv", false), s("warehouse", false)]
+    );
+}
+
+#[test]
 fn no_highlight_keeps_profile_order() {
     let (w, _) = panel_world();
     assert_eq!(

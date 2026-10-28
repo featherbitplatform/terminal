@@ -58,6 +58,8 @@ pub enum TunnelsMsg {
     /// The switch: on or off.
     Toggle(window::Id, TunnelKey),
     Retry(window::Id, TunnelKey),
+    /// The list scrolled: its new position, restored when the panel reopens.
+    Scrolled(window::Id, iced::widget::operation::AbsoluteOffset),
     /// Dragging the resize handle: the new width.
     Resize(f32),
     /// The drag ended: the width is remembered.
@@ -82,7 +84,8 @@ impl App {
         }
     }
 
-    /// Open `wid`'s panel (closing its file panel) with its search focused.
+    /// Open `wid`'s panel (closing its file panel) with its search focused and its list
+    /// scrolled back to where it was.
     pub(crate) fn open_tunnels_panel(&mut self, wid: window::Id) -> Task<Message> {
         if !self.windows.contains_key(&wid) {
             return Task::none();
@@ -91,7 +94,15 @@ impl App {
             self.close_file_panel(wid);
         }
         let input = self.tunnels_panels.show(wid);
-        iced::widget::operation::focus(input)
+        let focus = iced::widget::operation::focus(input);
+        let panels = &self.tunnels_panels;
+        match (panels.list.get(&wid), panels.scroll.get(&wid)) {
+            (Some(list), Some(&offset)) => Task::batch([
+                focus,
+                iced::widget::operation::scroll_to(list.clone(), offset),
+            ]),
+            _ => focus,
+        }
     }
 
     /// Hide `wid`'s panel; the keyboard goes back to the terminal.
@@ -198,6 +209,11 @@ impl App {
             }
             TunnelsMsg::Toggle(wid, key) => return self.tunnel_toggle_in(wid, &key),
             TunnelsMsg::Retry(wid, key) => return self.tunnel_retry_in(wid, &key),
+            TunnelsMsg::Scrolled(wid, offset) => {
+                if self.windows.contains_key(&wid) {
+                    self.tunnels_panels.scroll.insert(wid, offset);
+                }
+            }
             TunnelsMsg::Resize(width) => self.tunnels_panels.width = state::clamp_width(width),
             TunnelsMsg::ResizeEnd => self.save_state(),
         }
@@ -237,7 +253,7 @@ pub struct Group {
     pub profile_id: ProfileId,
     pub profile: String,
     pub rows: Vec<Row>,
-    /// The profile the panel was opened for: its group is listed first.
+    /// The window's focused pane's profile: its group is listed first.
     pub highlighted: bool,
 }
 

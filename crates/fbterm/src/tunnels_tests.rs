@@ -1678,3 +1678,78 @@ fn search_gets_focus_on_open() {
     assert_eq!(w.app.tunnels_panels.input[&wid], input);
     assert_eq!(field_focused(&w.app, wid, &input, true), Some(true));
 }
+
+/// Whether `wid`'s view draws a scrollable with `id`.
+fn scrollable_drawn(app: &App, wid: window::Id, id: &iced::widget::Id) -> bool {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::widget::operation::{Operation, Scrollable};
+    use iced::{Pixels, Rectangle, Size, Vector};
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let mut element = crate::window::view(app, wid);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &Limits::new(Size::ZERO, Size::new(1000.0, 600.0)),
+    );
+    struct Find(iced::widget::Id, bool);
+    impl Operation for Find {
+        fn scrollable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            _bounds: Rectangle,
+            _content_bounds: Rectangle,
+            _translation: Vector,
+            _state: &mut dyn Scrollable,
+        ) {
+            self.1 |= id == Some(&self.0);
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+    }
+    let mut op = Find(id.clone(), false);
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    op.1
+}
+
+#[test]
+fn reopening_restores_the_scroll_position() {
+    use crate::keys::Action;
+    use crate::tunnels_panel::TunnelsMsg;
+    use iced::widget::operation::AbsoluteOffset;
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    // Never scrolled: opening only focuses the search.
+    assert_eq!(shortcut(&mut w, wid, Action::Tunnels).units(), 1);
+    // The list is the window's own scrollable.
+    let list = w.app.tunnels_panels.list[&wid].clone();
+    assert!(scrollable_drawn(&w.app, wid, &list));
+    let offset = AbsoluteOffset { x: 0.0, y: 120.0 };
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Scrolled(wid, offset)));
+    assert_eq!(w.app.tunnels_panels.scroll.get(&wid), Some(&offset));
+    // Closed and reopened: the focus and the scroll back to where the list was.
+    let _ = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(w.app.tunnels_panels.scroll.get(&wid), Some(&offset), "kept");
+    assert_eq!(shortcut(&mut w, wid, Action::Tunnels).units(), 2);
+    assert_eq!(w.app.tunnels_panels.list[&wid], list, "the same scrollable");
+    // A scroll reported for a window that is gone is not kept.
+    let gone = window::Id::unique();
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Scrolled(gone, offset)));
+    assert!(!w.app.tunnels_panels.scroll.contains_key(&gone));
+    // The window closing forgets it.
+    w.app.tunnels_panels.forget(wid);
+    assert!(!w.app.tunnels_panels.scroll.contains_key(&wid));
+    assert!(!w.app.tunnels_panels.list.contains_key(&wid));
+}

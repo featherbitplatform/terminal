@@ -95,12 +95,13 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
     }
     // The panel docks at the window's right edge: its scrollbar keeps clear of the resize band.
     let drawn = app.chrome.get().draws_controls();
-    let list = scrollable(container(list).padding(Padding {
+    let mut list = scrollable(container(list).padding(Padding {
         top: 2.0,
         right: PAD_X,
         bottom: 12.0,
         left: PAD_X,
     }))
+    .on_scroll(move |v| msg(TunnelsMsg::Scrolled(wid, v.absolute_offset())))
     .direction(scrollable::Direction::Vertical(ui::edge_scrollbar(
         drawn, 6.0, 6.0, 3.0,
     )))
@@ -116,6 +117,9 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
         s
     })
     .height(Length::Fill);
+    if let Some(id) = panels.list.get(&wid) {
+        list = list.id(id.clone());
+    }
     let content = column![header, search, list]
         .width(Length::Fill)
         .height(Length::Fill);

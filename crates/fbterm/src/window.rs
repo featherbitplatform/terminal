@@ -451,6 +451,10 @@ pub(crate) struct Docked<'a> {
 /// both), only while the window has an active tab.
 pub(crate) fn docked(app: &App, id: window::Id) -> Option<Docked<'_>> {
     app.windows.get(&id)?.active_tab()?;
+    debug_assert!(
+        !(app.tunnels_panels.is_open(id) && app.file_panels.is_open(id)),
+        "one panel at a time at a window's edge"
+    );
     if let Some((panel, width)) = crate::tunnels_panel::view::panel(app, id) {
         return Some(Docked {
             panel,

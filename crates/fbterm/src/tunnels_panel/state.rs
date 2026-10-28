@@ -1,10 +1,11 @@
 //! The tunnels panel's state, free of the UI: which terminal windows show it, which of those
-//! panels have the keyboard, each window's search (kept while its panel is closed, forgotten
-//! with the window) and the panel's width, the same in every window. The width limits are the
+//! panels have the keyboard, each window's search and scroll position (kept while its panel
+//! is closed, forgotten with the window) and the panel's width, the same in every window. The width limits are the
 //! file panel's.
 
 use std::collections::{HashMap, HashSet};
 
+use iced::widget::operation::AbsoluteOffset;
 use iced::window;
 
 pub(crate) use crate::file_panel::state::clamp_width;
@@ -21,6 +22,10 @@ pub(crate) struct TunnelsPanels {
     pub query: HashMap<window::Id, String>,
     /// Each window's search field, focused when its panel opens.
     pub input: HashMap<window::Id, iced::widget::Id>,
+    /// Each window's list, scrolled back to where it was when its panel reopens.
+    pub list: HashMap<window::Id, iced::widget::Id>,
+    /// Each window's list's scroll position, as last reported, for the app session.
+    pub scroll: HashMap<window::Id, AbsoluteOffset>,
     /// Open panels with the keyboard: keys go to the panel, not the terminal (the panel
     /// opening or a click in it; a click in the terminal, Escape, another pane or tab taking
     /// focus or the panel closing gives them back).
@@ -38,6 +43,8 @@ impl TunnelsPanels {
             open: HashSet::new(),
             query: HashMap::new(),
             input: HashMap::new(),
+            list: HashMap::new(),
+            scroll: HashMap::new(),
             focused: HashSet::new(),
             pane: HashMap::new(),
             width: width.map_or(DEFAULT_WIDTH, clamp_width),
@@ -52,6 +59,9 @@ impl TunnelsPanels {
     pub(crate) fn show(&mut self, window: window::Id) -> iced::widget::Id {
         self.open.insert(window);
         self.focused.insert(window);
+        self.list
+            .entry(window)
+            .or_insert_with(iced::widget::Id::unique);
         self.input
             .entry(window)
             .or_insert_with(iced::widget::Id::unique)
@@ -80,6 +90,8 @@ impl TunnelsPanels {
         self.open.remove(&window);
         self.query.remove(&window);
         self.input.remove(&window);
+        self.list.remove(&window);
+        self.scroll.remove(&window);
         self.focused.remove(&window);
         self.pane.remove(&window);
     }
