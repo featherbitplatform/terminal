@@ -1269,7 +1269,7 @@ checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 [[package]]
 name = "dpi"
 version = "0.1.1"
-source = "git+https://github.com/featherbitplatform/winit?rev=81a738fcc87feeba7ba3bf88dc35c1270d6d365a#81a738fcc87feeba7ba3bf88dc35c1270d6d365a"
+source = "git+https://github.com/featherbitplatform/winit?rev=918b37358e833ac0df3a9ce140c3ed786779ecbb#918b37358e833ac0df3a9ce140c3ed786779ecbb"
 
 [[package]]
 name = "dtor"
@@ -6522,7 +6522,7 @@ checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
 [[package]]
 name = "winit"
 version = "0.30.13"
-source = "git+https://github.com/featherbitplatform/winit?rev=81a738fcc87feeba7ba3bf88dc35c1270d6d365a#81a738fcc87feeba7ba3bf88dc35c1270d6d365a"
+source = "git+https://github.com/featherbitplatform/winit?rev=918b37358e833ac0df3a9ce140c3ed786779ecbb#918b37358e833ac0df3a9ce140c3ed786779ecbb"
 dependencies = [
  "ahash",
  "android-activity",

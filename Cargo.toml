@@ -58,4 +58,4 @@ codegen-units = 1
 # monitor with a different scale keeps the position Windows suggests. Change it in the fork, then
 # bump the rev; drop the patch once iced's winit has the fix.
 [patch.crates-io]
-winit = { git = "https://github.com/featherbitplatform/winit", rev = "81a738fcc87feeba7ba3bf88dc35c1270d6d365a" }
+winit = { git = "https://github.com/featherbitplatform/winit", rev = "918b37358e833ac0df3a9ce140c3ed786779ecbb" }
