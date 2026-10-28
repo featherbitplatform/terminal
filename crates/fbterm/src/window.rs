@@ -134,7 +134,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
-        let content = content.push(crate::schemes_window::view::view(t, state, &app.style));
+        let content = content.push(crate::schemes_window::view::view(
+            t,
+            state,
+            &app.style,
+            &app.schemes,
+        ));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -142,6 +147,8 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
                 Mode::SchemesConfirm
             } else if state.import.is_some() {
                 Mode::SchemesImport
+            } else if state.pending_update.is_some() {
+                Mode::SchemesUpdate
             } else {
                 Mode::Schemes
             },
@@ -235,6 +242,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         carry,
         tunnels_up: app.tunnels.up_count(),
         files: app.files_button(id),
+        update_dot: app.update_dot(),
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -802,6 +810,8 @@ struct TabBar<'b> {
     tunnels_up: usize,
     /// The files button: `None` hidden, else whether the window's file panel is open.
     files: Option<bool>,
+    /// A newer release is out: a red dot on the settings button (see [`crate::update`]).
+    update_dot: bool,
 }
 
 fn tab_bar<'a>(
@@ -821,6 +831,7 @@ fn tab_bar<'a>(
         bindings,
         tunnels_up,
         files,
+        update_dot,
         ..
     } = bar;
     let tabs_bar = bar;
@@ -874,7 +885,22 @@ fn tab_bar<'a>(
             demo_tip == Some(DemoTip::Files),
         )
     });
-    let settings = button(icon(ICON_SETTINGS, 14.0, t.text_muted))
+    let gear = icon(ICON_SETTINGS, 14.0, t.text_muted);
+    let gear: Element<'_, Message> = if update_dot {
+        // A badge over the gear's top-right corner, never a change of the icon itself.
+        stack![
+            gear,
+            container(crate::ui::dot(t.danger, 6.0))
+                .width(14)
+                .height(14)
+                .align_right(14)
+                .align_top(14),
+        ]
+        .into()
+    } else {
+        gear
+    };
+    let settings = button(gear)
         .on_press(msg(TabBarMsg::Settings))
         .padding(7)
         .style(move |_, status| ghost(t, status));
@@ -2105,6 +2131,8 @@ mod tests {
                 tunnels_up: 3,
                 // So is the files button.
                 files: Some(true),
+                // And the settings button with its update dot.
+                update_dot: true,
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(

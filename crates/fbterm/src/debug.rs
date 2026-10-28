@@ -187,11 +187,40 @@ impl App {
     }
 
     /// `FBTERM_OPEN_SCHEMES=1` (debug aid): open the Color schemes window at startup; any other
-    /// value selects the scheme of that name.
+    /// value selects the scheme of that name. With `FBTERM_DEMO_GALLERY=1`, the window shows
+    /// its gallery with a sample catalog (one theme to install, one installed, one with an
+    /// update, one withdrawn, and a worst-case row with a very long name and credit), never
+    /// fetched. With a non-empty `FBTERM_CONFIG_DIR` as well, the installed ones are written to
+    /// that folder's `schemes/` first; without it nothing is written and every row offers
+    /// Install. `FBTERM_DEMO_GALLERY=question` also asks about updating the sample theme
+    /// `Meadow` as edited on this machine (with `FBTERM_CONFIG_DIR`, its installed copy is
+    /// written edited and the gallery's own Update raises the question).
     pub(crate) fn open_debug_schemes(&mut self) -> Task<Message> {
         let Some(value) = debug_env("FBTERM_OPEN_SCHEMES") else {
             return Task::none();
         };
+        let demo = debug_env("FBTERM_DEMO_GALLERY");
+        let question = demo.as_deref().is_some_and(|v| v == "question");
+        // Installed copies only in a config folder chosen for the run, never the real one.
+        let own_dir = std::env::var_os("FBTERM_CONFIG_DIR").is_some_and(|d| !d.is_empty());
+        let mut task = Task::none();
+        if demo.is_some() {
+            let (catalog, installed) = crate::schemes_window::gallery::demo_catalog();
+            if own_dir {
+                let dir = self.paths.schemes();
+                for mut s in installed {
+                    if question && s.id == "gallery-meadow" {
+                        // Edited here: its colors no longer match what the gallery installed.
+                        s.colors.background.r ^= 0x08;
+                    }
+                    if let Err(e) = fbterm_config::schemes::save_user(&dir, &s) {
+                        tracing::warn!(error = %e, "demo gallery scheme not written");
+                    }
+                }
+                task = self.reload_schemes();
+            }
+            self.gallery_catalog = Some(catalog);
+        }
         let value = value.to_string_lossy();
         let select = self
             .schemes
@@ -199,7 +228,22 @@ impl App {
             .iter()
             .find(|s| s.name == value)
             .map(|s| s.id.clone());
-        self.open_schemes(select)
+        let mut task = task.chain(self.open_schemes(select));
+        if demo.is_some()
+            && let Some((_, state)) = &mut self.schemes_win
+        {
+            state.showing_gallery = true;
+            if question && !own_dir {
+                // Nothing installed to edit: show the question as it would read.
+                state.pending_update = Some("meadow".into());
+            }
+        }
+        if question && own_dir {
+            task = task.chain(
+                self.schemes_msg(crate::schemes_window::SchemesMsg::Update("meadow".into())),
+            );
+        }
+        task
     }
 
     /// `FBTERM_OPEN_TUNNELS=1` (debug aid): open the Tunnels window at startup.
@@ -349,7 +393,7 @@ impl App {
         Task::batch([search, focus])
     }
 
-    /// `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword` (debug aid): show a sample dialog in the
+    /// `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword|updates` (debug aid): show a sample dialog in the
     /// first window. Nothing waits for its answer.
     pub(crate) fn open_debug_prompt(&mut self) -> Task<Message> {
         let Some(kind) = debug_env("FBTERM_DEMO_PROMPT") else {
@@ -394,6 +438,11 @@ impl App {
                     )
                 };
                 return self.open_vault_dialog(w, kind, purpose);
+            }
+            // The first-launch update question (answering it writes `check_updates`).
+            "updates" => {
+                self.prompts.push(w, None, Dialog::CheckUpdates);
+                return Task::none();
             }
             "changed" => {
                 self.prompts.push(

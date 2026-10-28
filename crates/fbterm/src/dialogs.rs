@@ -424,6 +424,11 @@ impl App {
                 self.prompts.trust(w);
                 self.focus_prompt(w)
             }
+            // Closing the update question (Escape) is `Not now`.
+            PromptMsg::Cancel(w) if matches!(self.prompts.front(w), Some(Dialog::CheckUpdates)) => {
+                self.answer_update_question(w, false)
+            }
+            PromptMsg::AnswerUpdates(w, yes) => self.answer_update_question(w, yes),
             PromptMsg::Cancel(w) => {
                 // In the name field, `Back` (or Escape) returns to the choice.
                 if let Some(Dialog::Clash(clash)) = self.prompts.front_mut(w)

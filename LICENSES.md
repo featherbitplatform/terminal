@@ -25,9 +25,17 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 - BSL-1.0 is used only by Windows builds, through `clipboard-win` and `error-code`, which `iced_winit` pulls in for Windows clipboard support (`iced_winit` > `window_clipboard` > `clipboard-win` > `error-code`).
 - CC0-1.0 comes from `hexf-parse`, used by the `naga` shader compiler that `wgpu` depends on, and from `notify`, the file-watching crate fbterm uses directly.
 
+## Gallery themes
+
+Color schemes installed from the theme gallery are not part of fbterm and are not shipped with it. They come from [terminal-themes](https://github.com/featherbitplatform/terminal-themes): its catalog, which holds every theme in full, is downloaded only when you open the gallery or press Refresh or Retry, and Install writes the chosen theme from that catalog. Each one is under its own permissive license, stated together with its project and author in its file (the `[credit]` table) and in `terminal-themes`, where the full credits are kept.
+
 ## feathercritty
 
 The terminal emulation library, [feathercritty](https://github.com/featherbitplatform/feathercritty), is our fork of [`alacritty_terminal`](https://github.com/alacritty/alacritty/tree/master/alacritty_terminal) 0.26.0 by the Alacritty authors (Apache-2.0, license in the fork's `LICENSE-APACHE`; attribution required). It is used as a git dependency pinned by commit. The fork's changes (a bug fix, a scroll counter, a read-only getter and the rename) are listed in its README, and the files it modifies say so in their first line.
+
+## winit
+
+iced's windowing library, [winit](https://github.com/rust-windowing/winit) 0.30.13 by the winit authors (Apache-2.0), comes from our fork, [featherbitplatform/winit](https://github.com/featherbitplatform/winit), through a `[patch.crates-io]` entry pinned by commit in the root `Cargo.toml`; with it comes the `dpi` crate of the same release (Apache-2.0 or MIT). The fork's one change (Windows: a window dragged onto a monitor with a different scale keeps the position Windows suggests) is described in its `FORK.md`, and the file it modifies says so in its first line.
 
 ## Bundled fonts
 

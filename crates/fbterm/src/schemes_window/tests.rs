@@ -655,7 +655,7 @@ fn scratch(app: &App) -> std::path::PathBuf {
 /// What the chosen file does: read as the blocking task does, then handled.
 fn import_file(app: &mut App, path: std::path::PathBuf) {
     let read = read_file(&path).map_err(|e| e.to_string());
-    send(app, SchemesMsg::ImportRead(read));
+    send(app, SchemesMsg::ImportRead(Box::new(read)));
 }
 
 fn files_in_schemes(app: &App) -> usize {

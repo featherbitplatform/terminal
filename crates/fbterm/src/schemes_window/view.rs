@@ -1,15 +1,20 @@
 //! The Color schemes window: the schemes on the left, the selected one's preview, colors and
-//! font on the right, and a footer with Import, Export and Save.
+//! font on the right (or the theme gallery), and a footer with Import, Export and Save.
 
 use fbterm_config::Rgb;
-use fbterm_config::schemes::Scheme;
+use fbterm_config::schemes::{Credit, Scheme, SchemeColors, SchemeSet};
 use fbterm_term::{TerminalStyle, highlighted_terminal_view};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, slider, stack, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::{DeleteAsk, Entry, ImportAsk, ImportChoice, SchemesMsg, SchemesState};
+use super::gallery::{
+    GalleryRow, RowButton, clip_chars, credit_line, credit_link_ok, gallery_rows,
+};
+use super::{
+    DeleteAsk, Entry, GalleryLoad, ImportAsk, ImportChoice, SchemesMsg, SchemesState, UpdateChoice,
+};
 use crate::app::Message;
 use crate::settings_window::view::{menu_style, pick_style, slider_style};
 use crate::theme::{Tokens, UI_FONT};
@@ -17,6 +22,10 @@ use crate::ui::{self, MONO};
 
 const SIDEBAR_WIDTH: f32 = 250.0;
 const FORM_WIDTH: f32 = 640.0;
+/// The longest theme name a gallery row shows before an ellipsis.
+const NAME_CHARS: usize = 32;
+/// The longest credit line shown before an ellipsis (the rest wraps).
+const CREDIT_CHARS: usize = 300;
 /// Height of the preview terminal: the sample's seven lines at the usual sizes.
 const PREVIEW_HEIGHT: f32 = 116.0;
 
@@ -24,15 +33,22 @@ fn msg(m: SchemesMsg) -> Message {
     Message::Schemes(m)
 }
 
-/// `base`: the global terminal look, for what the scheme does not set.
+/// `base`: the global terminal look, for what the scheme does not set; `installed`: the
+/// loaded schemes, which the gallery's buttons compare against.
 pub fn view<'a>(
     t: &'static Tokens,
     state: &'a SchemesState,
     base: &TerminalStyle,
+    installed: &SchemeSet,
 ) -> Element<'a, Message> {
-    let form: Element<'a, Message> = match state.selected_draft() {
-        Some(d) => scrollable(
-            container(form(t, state, d, base))
+    let pane = if state.showing_gallery {
+        Some(gallery(t, state, installed))
+    } else {
+        state.selected_draft().map(|d| form(t, state, d, base))
+    };
+    let form: Element<'a, Message> = match pane {
+        Some(pane) => scrollable(
+            container(pane)
                 .padding(Padding::from([20.0, 28.0]))
                 .max_width(FORM_WIDTH + 56.0),
         )
@@ -56,10 +72,14 @@ pub fn view<'a>(
                 text_color: Some(t.text),
                 ..container::Style::default()
             });
-    match (&state.confirm, &state.import) {
-        (Some(ask), _) => stack![page, confirm(t, ask)].into(),
-        (None, Some(ask)) => stack![page, import_question(t, ask)].into(),
-        (None, None) => page.into(),
+    if let Some(ask) = &state.confirm {
+        stack![page, confirm(t, ask)].into()
+    } else if let Some(ask) = &state.import {
+        stack![page, import_question(t, ask)].into()
+    } else if let Some((title, line)) = state.update_question() {
+        stack![page, update_question(t, title, line)].into()
+    } else {
+        page.into()
     }
 }
 
@@ -120,20 +140,101 @@ fn chip<'a>(s: &Scheme) -> Element<'a, Message> {
     .into()
 }
 
+/// A row of options, the one that is on drawn as selected.
+fn segmented<'a>(
+    t: &'static Tokens,
+    options: Vec<(&'a str, SchemesMsg, bool)>,
+) -> Element<'a, Message> {
+    let mut r = row![].spacing(2);
+    for (caption, m, on) in options {
+        r = r.push(
+            button(
+                text(caption)
+                    .font(UI_FONT)
+                    .size(12.5)
+                    .align_x(Alignment::Center)
+                    .width(Length::Fill),
+            )
+            .on_press(msg(m))
+            .width(Length::Fill)
+            .padding(Padding::from([4.0, 10.0]))
+            .style(move |_, status| {
+                let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                button::Style {
+                    background: if on {
+                        Some(t.accent_soft.into())
+                    } else {
+                        hovered.then(|| t.hover.into())
+                    },
+                    text_color: if on { t.text } else { t.text_secondary },
+                    border: Border {
+                        color: if on {
+                            t.accent_edge
+                        } else {
+                            Color::TRANSPARENT
+                        },
+                        width: if on { 1.0 } else { 0.0 },
+                        radius: 5.0.into(),
+                    },
+                    ..button::Style::default()
+                }
+            }),
+        );
+    }
+    container(r)
+        .padding(2)
+        .style(move |_| container::Style {
+            background: Some(t.app.into()),
+            border: Border {
+                color: t.border,
+                width: 1.0,
+                radius: 7.0.into(),
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 fn sidebar<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Message> {
     let mut list = column![].spacing(2);
     for s in state.drafts() {
         list = list.push(scheme_row(
             t,
             s,
-            state.selected == s.id,
+            !state.showing_gallery && state.selected == s.id,
             state.is_dirty(&s.id),
         ));
     }
+    let switch = segmented(
+        t,
+        vec![
+            (
+                "Editor",
+                SchemesMsg::ShowGallery(false),
+                !state.showing_gallery,
+            ),
+            (
+                "Gallery",
+                SchemesMsg::ShowGallery(true),
+                state.showing_gallery,
+            ),
+        ],
+    );
     container(
         column![
-            container(text("Color schemes").font(UI_FONT).size(14).color(t.text))
-                .padding(Padding::from([14.0, 16.0])),
+            container(
+                column![
+                    text("Color schemes").font(UI_FONT).size(14).color(t.text),
+                    switch,
+                ]
+                .spacing(10),
+            )
+            .padding(Padding {
+                top: 14.0,
+                right: 12.0,
+                bottom: 10.0,
+                left: 12.0,
+            }),
             scrollable(container(list).padding(Padding::from([0.0, 8.0]))).height(Length::Fill),
         ]
         .height(Length::Fill),
@@ -298,6 +399,9 @@ fn form<'a>(
             .spacing(8)
             .align_y(Alignment::Center),
         );
+    }
+    if let Some(c) = state.credit_of(d) {
+        col = col.push(credit(t, c));
     }
     col = col.push(preview(t, state, d, base));
     if let Some(hint) = state.contrast_hint() {
@@ -668,6 +772,300 @@ fn import_question<'a>(t: &'static Tokens, ask: &'a ImportAsk) -> Element<'a, Me
                 t,
                 "Keep both",
                 Some(msg(SchemesMsg::ImportChoice(ImportChoice::KeepBoth))),
+                ui::primary,
+            )
+            .into(),
+        ]),
+    ]
+    .spacing(14);
+    crate::prompt_view::modal(t, body.into())
+}
+
+/// Who made a scheme's colors, `<project> by <author>, <license>`, and its project page.
+fn credit<'a>(t: &'static Tokens, c: &Credit) -> Element<'a, Message> {
+    // The text takes the room left by the link and wraps, so the link always shows.
+    let mut r = row![
+        text(clip_chars(&credit_line(c), CREDIT_CHARS))
+            .font(UI_FONT)
+            .size(12.5)
+            .color(t.text_secondary)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::WordOrGlyph),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Start);
+    if credit_link_ok(&c.url) {
+        r = r.push(link(t, c.url.clone()));
+    }
+    r.into()
+}
+
+/// A credit's project page, opened in the system browser.
+fn link<'a>(t: &'static Tokens, url: String) -> Element<'a, Message> {
+    button(text("Project page").font(UI_FONT).size(12))
+        .on_press(msg(SchemesMsg::OpenCreditLink(url)))
+        .padding(Padding::from([2.0, 6.0]))
+        .style(move |_, status| {
+            let mut style = ui::ghost(t, status);
+            style.text_color = t.accent_edge;
+            style
+        })
+        .into()
+}
+
+/// The theme gallery: Refresh, the search box and the dark/light filter, then the themes
+/// (or why there are none).
+fn gallery<'a>(
+    t: &'static Tokens,
+    state: &'a SchemesState,
+    installed: &SchemeSet,
+) -> Element<'a, Message> {
+    let loading = matches!(state.gallery, GalleryLoad::Idle | GalleryLoad::Loading);
+    let refresh = button(
+        row![
+            ui::icon(ui::ICON_RESET, 12.0, t.text_secondary),
+            text("Refresh").font(UI_FONT).size(12.5),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .on_press_maybe((!loading).then_some(msg(SchemesMsg::RefreshGallery)))
+    .padding(Padding::from([5.0, 12.0]))
+    .style(move |_, status| ui::secondary(t, status));
+    let header = row![
+        text("Theme gallery").font(UI_FONT).size(18).color(t.text),
+        Space::new().width(Length::Fill),
+        refresh,
+    ]
+    .align_y(Alignment::Center);
+    let search = stack![
+        text_input("Search by name, project or author", &state.gallery_query)
+            .on_input(|s| msg(SchemesMsg::GalleryQuery(s)))
+            .font(UI_FONT)
+            .size(13)
+            .padding(Padding {
+                top: 7.0,
+                right: 10.0,
+                bottom: 7.0,
+                left: 32.0,
+            })
+            .style(move |_, status| ui::input_style(t, status)),
+        container(ui::icon(ui::ICON_SEARCH, 13.0, t.text_muted))
+            .padding(Padding {
+                left: 11.0,
+                ..Padding::ZERO
+            })
+            .center_y(Length::Fill),
+    ];
+    let v = state.gallery_variant;
+    let variant = container(segmented(
+        t,
+        vec![
+            ("All", SchemesMsg::GalleryVariant(None), v.is_none()),
+            (
+                "Dark",
+                SchemesMsg::GalleryVariant(Some(true)),
+                v == Some(true),
+            ),
+            (
+                "Light",
+                SchemesMsg::GalleryVariant(Some(false)),
+                v == Some(false),
+            ),
+        ],
+    ))
+    .width(200);
+    let controls = row![search, variant].spacing(12).align_y(Alignment::Center);
+    let mut col = column![header, controls].spacing(14).width(Length::Fill);
+    let quiet = |line: &'a str| -> Element<'a, Message> {
+        container(text(line).font(UI_FONT).size(13).color(t.text_muted))
+            .padding(Padding::from([18.0, 2.0]))
+            .into()
+    };
+    match &state.gallery {
+        GalleryLoad::Idle | GalleryLoad::Loading => {
+            col = col.push(quiet("Loading the theme gallery\u{2026}"));
+        }
+        GalleryLoad::Failed(line) => {
+            col = col.push(
+                container(
+                    row![
+                        ui::icon(ui::ICON_WARNING, 14.0, t.warning),
+                        text(line.as_str())
+                            .font(UI_FONT)
+                            .size(13)
+                            .color(t.text_secondary)
+                            .width(Length::Fill)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                        ui::text_button(
+                            t,
+                            "Retry",
+                            Some(msg(SchemesMsg::RefreshGallery)),
+                            ui::secondary
+                        ),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([12.0, 14.0]))
+                .width(Length::Fill)
+                .style(move |_| ui::card(t)),
+            );
+        }
+        GalleryLoad::Loaded(catalog) => {
+            let rows = gallery_rows(catalog, installed, &state.gallery_query, v);
+            if rows.is_empty() {
+                col = col.push(quiet("No themes match."));
+            }
+            let mut list = column![].spacing(8).width(Length::Fill);
+            for r in rows {
+                list = list.push(gallery_row(t, r));
+            }
+            col = col.push(list);
+        }
+    }
+    col.into()
+}
+
+/// A theme's colors in a strip: "Aa" in the foreground on the background, and the 16 colors,
+/// normal over bright.
+fn strip<'a>(c: SchemeColors) -> Element<'a, Message> {
+    let line =
+        |range: std::ops::Range<usize>| {
+            let mut r = row![].spacing(3);
+            for n in range {
+                r = r.push(container(text("")).width(12).height(12).style(move |_| {
+                    container::Style {
+                        background: Some(Background::Color(ui::to_color(c.ansi[n]))),
+                        border: Border {
+                            radius: 3.0.into(),
+                            ..Border::default()
+                        },
+                        ..container::Style::default()
+                    }
+                }));
+            }
+            r
+        };
+    container(
+        row![
+            text("Aa")
+                .font(MONO)
+                .size(15)
+                .color(ui::to_color(c.foreground)),
+            column![line(0..8), line(8..16)].spacing(3),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([9.0, 12.0]))
+    .style(move |_| container::Style {
+        background: Some(Background::Color(ui::to_color(c.background))),
+        border: Border {
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.12),
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// One theme: its colors, name and variant, credit and project page, and Install, Update,
+/// Installed or the withdrawn note.
+fn gallery_row<'a>(t: &'static Tokens, r: GalleryRow) -> Element<'a, Message> {
+    let variant = container(
+        text(if r.dark { "Dark" } else { "Light" })
+            .font(UI_FONT)
+            .size(11)
+            .color(t.text_muted),
+    )
+    .padding(Padding::from([1.0, 6.0]))
+    .style(move |_| container::Style {
+        border: Border {
+            color: t.border,
+            width: 1.0,
+            radius: 4.0.into(),
+        },
+        ..container::Style::default()
+    });
+    // The name takes one line, cut with an ellipsis and clipped to the room left by the
+    // link, which keeps its size and always shows.
+    let mut name = row![
+        container(
+            text(clip_chars(&r.name, NAME_CHARS))
+                .font(UI_FONT)
+                .size(14)
+                .color(t.text)
+                .wrapping(text::Wrapping::None),
+        )
+        .width(Length::Fill)
+        .clip(true),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if let Some(url) = r.link {
+        name = name.push(link(t, url));
+    }
+    // The variant tag keeps its size; the credit takes the rest of the line and wraps.
+    let credit = row![
+        variant,
+        text(clip_chars(&r.credit_line, CREDIT_CHARS))
+            .font(UI_FONT)
+            .size(12)
+            .color(t.text_secondary)
+            .width(Length::Fill)
+            .wrapping(text::Wrapping::WordOrGlyph),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Start);
+    let info = column![name, credit].spacing(4).width(Length::Fill);
+    let action: Element<'a, Message> = match (r.button, r.note) {
+        (Some(RowButton::Install), _) => {
+            small(t, "Install", Some(SchemesMsg::Install(r.id)), ui::primary)
+        }
+        (Some(RowButton::Update), _) => {
+            small(t, "Update", Some(SchemesMsg::Update(r.id)), ui::primary)
+        }
+        (Some(RowButton::Installed), _) => small(t, "Installed", None, ui::secondary),
+        (None, Some(note)) => text(note).font(UI_FONT).size(12).color(t.text_muted).into(),
+        (None, None) => Space::new().into(),
+    };
+    container(
+        row![strip(r.colors), info, action]
+            .spacing(14)
+            .align_y(Alignment::Center),
+    )
+    .padding(Padding::from([10.0, 12.0]))
+    .width(Length::Fill)
+    .style(move |_| ui::card(t))
+    .into()
+}
+
+/// The question for an Update (or Install) over a theme edited here: Replace my changes,
+/// Install as a copy (the default, which loses nothing) or Cancel.
+fn update_question<'a>(
+    t: &'static Tokens,
+    title: String,
+    line: &'static str,
+) -> Element<'a, Message> {
+    let choice = |c| Some(msg(SchemesMsg::UpdateChoice(c)));
+    let body = column![
+        crate::prompt_view::header(t, ui::ICON_WARNING, t.warning, title),
+        text(line).font(UI_FONT).size(13).color(t.text_secondary),
+        crate::prompt_view::buttons(vec![
+            ui::text_button(t, "Cancel", choice(UpdateChoice::Cancel), ui::secondary).into(),
+            ui::text_button(
+                t,
+                "Replace my changes",
+                choice(UpdateChoice::Replace),
+                ui::secondary,
+            )
+            .into(),
+            ui::text_button(
+                t,
+                "Install as a copy",
+                choice(UpdateChoice::Copy),
                 ui::primary,
             )
             .into(),

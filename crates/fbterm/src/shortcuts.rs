@@ -16,7 +16,7 @@ use crate::keys::{self, Action, Bindings, Press};
 use crate::palette::PaletteMsg;
 use crate::prompts::PromptMsg;
 use crate::saved_secrets::VaultMsg;
-use crate::schemes_window::{ImportChoice, SchemesMsg};
+use crate::schemes_window::{ImportChoice, SchemesMsg, UpdateChoice};
 use crate::settings_window::SettingsMsg;
 use crate::tunnels_window::TunnelsMsg;
 
@@ -69,6 +69,10 @@ pub(crate) enum Mode {
     /// Enter keeps both, Escape cancels, and no other key reaches a field behind the question
     /// or acts as a shortcut.
     SchemesImport,
+    /// The Color schemes window asking what to do about updating a theme edited here: Enter
+    /// installs it as a copy, Escape cancels, and no other key reaches a field behind the
+    /// question or acts as a shortcut.
+    SchemesUpdate,
     /// The Tunnels window: Cmd+W closes it, Settings, the profile editor, Color schemes and
     /// Quit work; other shortcuts do nothing (typing goes to the search bar).
     Tunnels,
@@ -286,6 +290,15 @@ fn press_message(
             )),
             keyboard::Key::Named(Named::Enter) if !repeat => Some(Message::Schemes(
                 SchemesMsg::ImportChoice(ImportChoice::KeepBoth),
+            )),
+            _ => None,
+        }),
+        Mode::SchemesUpdate => Some(match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => Some(Message::Schemes(
+                SchemesMsg::UpdateChoice(UpdateChoice::Cancel),
+            )),
+            keyboard::Key::Named(Named::Enter) if !repeat => Some(Message::Schemes(
+                SchemesMsg::UpdateChoice(UpdateChoice::Copy),
             )),
             _ => None,
         }),
@@ -1073,6 +1086,40 @@ mod tests {
             Some(None)
         ));
         assert!(matches!(press(Mode::SchemesImport, "w", false), Some(None)));
+    }
+
+    #[test]
+    fn the_update_question_takes_enter_and_escape_only() {
+        let at = |key: keyboard::Key| {
+            key_message(
+                &defaults(),
+                Mode::SchemesUpdate,
+                window::Id::unique(),
+                &key,
+                keyboard::Modifiers::empty(),
+                false,
+                None,
+            )
+        };
+        use keyboard::key::Named;
+        let named = |n| keyboard::Key::Named(n);
+        assert!(matches!(
+            at(named(Named::Escape)),
+            Some(Some(Message::Schemes(SchemesMsg::UpdateChoice(
+                UpdateChoice::Cancel
+            ))))
+        ));
+        assert!(matches!(
+            at(named(Named::Enter)),
+            Some(Some(Message::Schemes(SchemesMsg::UpdateChoice(
+                UpdateChoice::Copy
+            ))))
+        ));
+        assert!(matches!(
+            at(keyboard::Key::Character("a".into())),
+            Some(None)
+        ));
+        assert!(matches!(press(Mode::SchemesUpdate, "w", false), Some(None)));
     }
 
     #[test]

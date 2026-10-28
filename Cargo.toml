@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license = "Apache-2.0"
 
@@ -49,7 +49,18 @@ age = { version = "0.11.5", default-features = false }
 zeroize = { version = "1.9.1", features = ["serde"] }
 # Key file bytes inside the archive TOML.
 base64 = "0.22.1"
+# The update check's HTTPS GET (`fbterm/src/net.rs`): rustls with ring (already here through
+# russh) and the bundled webpki roots, so no OpenSSL or other system library is linked.
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+# Comparing release versions for the update check (already in the lockfile through rustc_version).
+semver = "1"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Our winit fork (see LICENSES.md and the fork's FORK.md): on Windows, a window dragged onto a
+# monitor with a different scale keeps the position Windows suggests. Change it in the fork, then
+# bump the rev; drop the patch once iced's winit has the fix.
+[patch.crates-io]
+winit = { git = "https://github.com/featherbitplatform/winit", rev = "918b37358e833ac0df3a9ce140c3ed786779ecbb" }

@@ -38,9 +38,9 @@ Requires a recent stable Rust toolchain (edition 2024).
 ```bash
 cargo run -p fbterm            # build and run
 cargo test --workspace         # tests
-bash dev/package-macos.sh 0.4.0  # universal .app and .dmg into target/dist/ (macOS only)
-bash dev/package-linux.sh 0.4.0 x86_64  # .deb, .rpm, .tar.gz (Linux; see the script)
-pwsh dev/package-windows.ps1 0.4.0      # .msi (Windows)
+bash dev/package-macos.sh 0.5.0  # universal .app and .dmg into target/dist/ (macOS only)
+bash dev/package-linux.sh 0.5.0 x86_64  # .deb, .rpm, .tar.gz (Linux; see the script)
+pwsh dev/package-windows.ps1 0.5.0      # .msi (Windows)
 ```
 
 The code builds and tests on macOS, Linux and Windows, and releases ship for all three. Terminal emulation comes from [feathercritty](https://github.com/featherbitplatform/feathercritty), our fork of the `alacritty_terminal` crate.

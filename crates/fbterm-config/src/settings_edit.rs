@@ -25,6 +25,7 @@ pub enum SettingChange {
     WindowDecorations(WindowDecorations),
     MaxFps(MaxFps),
     TunnelMaxRetries(u32),
+    CheckUpdates(bool),
     SecretStorage(SecretStorage),
     /// Every keyboard shortcut override (the whole `[keys]` table as the app sees it). Only
     /// the actions whose chord differs from what the file gives are written, so entries the
@@ -48,6 +49,7 @@ impl SettingChange {
             Self::WindowDecorations(_) => "window_decorations",
             Self::MaxFps(_) => "max_fps",
             Self::TunnelMaxRetries(_) => "tunnel_max_retries",
+            Self::CheckUpdates(_) => "check_updates",
             Self::SecretStorage(_) => "secret_storage",
             Self::Keys(_) => "keys",
         }
@@ -67,6 +69,7 @@ impl SettingChange {
             Self::WindowDecorations(v) => settings.window_decorations = *v,
             Self::MaxFps(v) => settings.max_fps.clone_from(v),
             Self::TunnelMaxRetries(v) => settings.tunnel_max_retries = *v,
+            Self::CheckUpdates(v) => settings.check_updates = Some(*v),
             Self::SecretStorage(v) => settings.secret_storage = *v,
             Self::Keys(v) => {
                 settings.keys.map.clone_from(v);
@@ -82,7 +85,9 @@ impl SettingChange {
             Self::ScrollbackLines(v) => Value::from(i64::try_from(*v).unwrap_or(i64::MAX)),
             Self::Theme(ThemeMode::Dark) => Value::from("dark"),
             Self::Theme(ThemeMode::Light) => Value::from("light"),
-            Self::KittyKeyboard(v) | Self::BackgroundBlur(v) => Value::from(*v),
+            Self::KittyKeyboard(v) | Self::BackgroundBlur(v) | Self::CheckUpdates(v) => {
+                Value::from(*v)
+            }
             // A number for a fixed rate, the string for the display's.
             Self::MaxFps(MaxFps::Fixed(n)) => Value::from(i64::from(*n)),
             Self::MaxFps(MaxFps::Display) => Value::from("display"),
