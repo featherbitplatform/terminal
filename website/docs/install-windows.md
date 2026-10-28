@@ -13,15 +13,15 @@ Each release provides two files:
 - `fbterm-<version>-windows-x86_64.msi`, the installer
 - `fbterm-<version>-windows-x86_64.msi.sha256`, its checksum
 
-For example, version 0.6.0 is `fbterm-0.6.0-windows-x86_64.msi`.
+For example, version 0.6.1 is `fbterm-0.6.1-windows-x86_64.msi`.
 
 ## Verify the download
 
 Put both files in the same folder and run this in PowerShell from that folder:
 
 ```powershell
-(Get-FileHash .\fbterm-0.6.0-windows-x86_64.msi -Algorithm SHA256).Hash
-Get-Content .\fbterm-0.6.0-windows-x86_64.msi.sha256
+(Get-FileHash .\fbterm-0.6.1-windows-x86_64.msi -Algorithm SHA256).Hash
+Get-Content .\fbterm-0.6.1-windows-x86_64.msi.sha256
 ```
 
 The first command prints the checksum of the file you downloaded and the second prints the one published with the release; the hash at the start of that line must be the same (PowerShell prints it in capital letters, the file in lowercase, which is the same value). Replace the version with the one you downloaded.
@@ -32,7 +32,7 @@ Double-click the `.msi` and follow the installer. It installs for all users of t
 
 The installer is not signed yet, so on the first run Windows SmartScreen may show **Windows protected your PC**. Choose **More info**, then **Run anyway**.
 
-To install from a prompt without the wizard, run `msiexec /i fbterm-0.6.0-windows-x86_64.msi /qb` as administrator.
+To install from a prompt without the wizard, run `msiexec /i fbterm-0.6.1-windows-x86_64.msi /qb` as administrator.
 
 ## Starting and checking the version
 
