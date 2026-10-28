@@ -28,6 +28,8 @@ use crate::tiles::TilesMsg;
 #[derive(Default)]
 struct Fake {
     opens: Mutex<Vec<(ProfileId, window::Id, u64)>>,
+    /// Checks after a shell connected: the profile and the token.
+    checks: Mutex<Vec<(ProfileId, u64)>>,
     lists: Mutex<Vec<(ProfileId, String, u64)>>,
     runtime: Option<tokio::runtime::Runtime>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
@@ -63,6 +65,18 @@ impl Backend for Fake {
         self.opens
             .lock()
             .push((request.profile, request.window, request.token));
+        let task = self.runtime.as_ref()?.spawn(std::future::pending());
+        let abort = task.abort_handle();
+        self.tasks.lock().push(task);
+        Some(abort)
+    }
+
+    fn check(
+        &self,
+        request: super::CheckRequest,
+        _sink: super::PanelSink,
+    ) -> Option<tokio::task::AbortHandle> {
+        self.checks.lock().push((request.profile, request.token));
         let task = self.runtime.as_ref()?.spawn(std::future::pending());
         let abort = task.abort_handle();
         self.tasks.lock().push(task);
@@ -339,6 +353,52 @@ impl World {
         })
     }
 
+    /// `pane`'s shell drops (its connection was lost).
+    fn disconnect(&mut self, pane: PaneId) {
+        let w = &self.app.windows[&self.wid];
+        let (t, p) = w.locate(pane).unwrap();
+        let sid = w.tabs[t].panes[p].session.as_ref().unwrap().id;
+        let _ = self.app.update(Message::Session(
+            sid,
+            fbterm_session::SessionEvent::Disconnected("connection lost".into()),
+        ));
+    }
+
+    /// The last check requested for `p`: its token.
+    fn last_check(&self, p: &Profile) -> Option<u64> {
+        self.fake
+            .checks
+            .lock()
+            .iter()
+            .rev()
+            .find(|(id, _)| *id == p.id)
+            .map(|(_, t)| *t)
+    }
+
+    fn checks(&self, p: &Profile) -> usize {
+        self.fake
+            .checks
+            .lock()
+            .iter()
+            .filter(|(id, _)| *id == p.id)
+            .count()
+    }
+
+    /// Answer `p`'s pending check with `result`.
+    fn answer_check(&mut self, p: &Profile, result: super::Checked) {
+        let token = self.last_check(p).expect("a check was requested");
+        self.event(PanelEvent::Checked {
+            profile: p.id,
+            token,
+            result,
+        });
+    }
+
+    /// Whether the tab bar shows the files button, and whether it says the panel is open.
+    fn files_button(&self) -> Option<bool> {
+        self.app.files_button(self.wid)
+    }
+
     fn msg(&mut self, msg: FilePanelMsg) -> iced::Task<Message> {
         self.app.update(Message::FilePanel(msg))
     }
@@ -472,7 +532,7 @@ fn local_pane_shows_placeholder() {
 fn folder_is_kept_per_profile() {
     let mut w = world();
     let (db, web) = (w.db.clone(), w.web.clone());
-    let (_, right) = w.open_split(&db, &web);
+    let (left, right) = w.open_split(&db, &web);
     w.toggle();
     w.answer_open(&db, "/home/user");
     w.answer_list(&db, vec![file("app.log")]);
@@ -484,25 +544,30 @@ fn folder_is_kept_per_profile() {
     assert_eq!(w.folder_of(&web), "/srv");
     assert_eq!(w.folder_of(&db), "/var/log");
 
-    // Hiding the panel lets the sessions go; showing it again reopens one but keeps the
-    // folder rather than going home.
+    // Hiding the panel keeps the sessions while their shells are connected.
     w.toggle();
     assert!(
         w.app
             .file_panels
             .by_profile
             .values()
-            .all(|p| p.sftp.is_none()),
-        "no session is held while no panel is open"
+            .all(|p| p.sftp.is_some()),
+        "the shells' sessions are kept"
     );
-    let (left, _) = {
-        let tab = w.app.windows[&w.wid].active_tab().unwrap();
-        (tab.panes[0].id, tab.panes[1].id)
-    };
+    // The db shell drops: its session goes. Reconnecting checks again, which opens the
+    // session in the folder kept rather than at home.
+    w.disconnect(left);
+    assert!(w.app.file_panels.by_profile[&db.id].sftp.is_none());
     w.focus(left);
-    w.toggle();
-    assert_eq!(w.opens(&db), 2);
-    w.answer_open(&db, "/home/user");
+    w.connect(left);
+    assert_eq!(w.opens(&db), 1, "the check opens it, not the panel");
+    w.answer_check(
+        &db,
+        super::Checked::Available(Opened {
+            remote: Arc::new(NoRemote),
+            home: Ok("/home/user".into()),
+        }),
+    );
     assert_eq!(w.folder_of(&db), "/var/log");
     assert_eq!(
         w.last_list(&db).map(|(f, _)| f).as_deref(),
@@ -929,8 +994,13 @@ fn without_a_runtime_the_panel_says_so_instead_of_loading_forever() {
     let db = w.db.clone();
     w.open_tab(&db);
     w.toggle();
-    let event = rx.try_recv().expect("the open reports at once");
-    w.event(event);
+    // The check after connecting reported first; the panel's open replaced it.
+    let mut events = 0;
+    while let Ok(event) = rx.try_recv() {
+        w.event(event);
+        events += 1;
+    }
+    assert_eq!(events, 2, "the check and the open report at once");
     let shows = w.shows().unwrap();
     assert!(
         shows.starts_with("error: SFTP is not available: "),
@@ -1764,8 +1834,12 @@ fn running_downloads_keep_the_session_when_the_panel_hides() {
             local: None,
         },
     );
-    // Any message runs the sync: nothing runs any more, so the session goes.
+    // Any message runs the sync: nothing runs any more, but the shell is still connected.
     let _ = w.msg(FilePanelMsg::ResizeEnd);
+    assert!(w.panel().sftp.is_some(), "the connected shell keeps it");
+    // Its shell drops: nothing needs the session any more.
+    let pane = w.app.windows[&w.wid].active_tab().unwrap().focused;
+    w.disconnect(pane);
     assert!(w.panel().sftp.is_none());
 }
 
@@ -2923,4 +2997,206 @@ fn the_list_scrollbar_is_clear_of_the_resize_edge() {
             "a press on the scrollbar at x = {x} scrolled nothing"
         );
     }
+}
+
+/// The check after `p`'s shell connected found a working session at `/home/user`.
+fn available() -> super::Checked {
+    super::Checked::Available(Opened {
+        remote: Arc::new(NoRemote),
+        home: Ok("/home/user".into()),
+    })
+}
+
+#[test]
+fn a_shell_connecting_starts_one_check() {
+    let mut w = world();
+    let (db, local) = (w.db.clone(), w.local.clone());
+    w.open_tab(&local);
+    assert!(w.fake.checks.lock().is_empty(), "a local pane: nothing");
+    // An SSH pane still connecting: nothing yet.
+    let pane = Pane::for_profile(&db);
+    let id = pane.id;
+    w.window().push(Tab::single(pane));
+    assert_eq!(w.checks(&db), 0);
+    w.connect(id);
+    assert_eq!(w.checks(&db), 1);
+    assert_eq!(w.opens(&db), 0, "the check is not the panel's open");
+    assert_eq!(w.panel().listing, super::Listing::Checking);
+    // Another shell of the profile while the check runs: still one.
+    w.open_tab(&db);
+    assert_eq!(w.checks(&db), 1);
+    // Once the session works, more shells check nothing.
+    w.answer_check(&db, available());
+    w.open_tab(&db);
+    assert_eq!(w.checks(&db), 1);
+}
+
+#[test]
+fn a_check_that_works_shows_the_button_and_a_failed_one_hides_it() {
+    let mut w = world();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    assert_eq!(w.files_button(), None, "not known yet");
+    w.answer_check(&db, available());
+    assert_eq!(w.files_button(), Some(false));
+
+    // A server that refuses SFTP: no button, and the refusal is remembered for the
+    // connection, so another shell on it checks nothing.
+    let mut w = world();
+    let db = w.db.clone();
+    let first = w.open_tab(&db);
+    w.answer_check(
+        &db,
+        super::Checked::Unavailable("the server refused the sftp subsystem".into()),
+    );
+    assert_eq!(w.files_button(), None);
+    let second = w.open_tab(&db);
+    assert_eq!(w.checks(&db), 1);
+    // The connection is gone with every shell: a reconnect checks again.
+    w.disconnect(first);
+    w.disconnect(second);
+    w.connect(second);
+    assert_eq!(w.checks(&db), 2);
+    w.answer_check(&db, available());
+    assert_eq!(w.files_button(), Some(false));
+}
+
+#[test]
+fn a_check_that_could_not_ride_a_connection_shows_no_button() {
+    let mut w = world();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.answer_check(
+        &db,
+        super::Checked::Unknown("the profile has no live connection".into()),
+    );
+    assert_eq!(w.files_button(), None);
+    assert_eq!(w.panel().listing, super::Listing::Closed);
+    // The panel still opens its own way.
+    w.toggle();
+    assert_eq!(w.opens(&db), 1);
+}
+
+#[test]
+fn the_check_never_dials_or_asks() {
+    // The real backend on a runtime, with no connection in the pool: the profile points at
+    // a closed port, so a dial would fail as refused rather than report SFTP as not known.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let _inside = rt.enter();
+    let mut w = world();
+    w.app.file_panel_work = super::Work::new(w.app.pool.clone());
+    let mut rx = w.app.file_panel_work.receiver.0.lock().take().unwrap();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    let event = rt
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await
+        })
+        .expect("the check reports")
+        .expect("an event");
+    assert!(
+        matches!(
+            event,
+            PanelEvent::Checked {
+                result: super::Checked::Unknown(_),
+                ..
+            }
+        ),
+        "no live connection: not known"
+    );
+    w.event(event);
+    assert!(
+        w.app.pool.connected_profiles().is_empty(),
+        "nothing dialled"
+    );
+    assert!(w.app.prompts.front(w.wid).is_none(), "nothing asked");
+    assert_eq!(w.files_button(), None);
+}
+
+#[test]
+fn the_last_shell_closing_lets_the_checked_session_go() {
+    let mut w = world();
+    let db = w.db.clone();
+    let a = w.open_tab(&db);
+    let b = w.open_tab(&db);
+    w.answer_check(&db, available());
+    // Nothing else holds it: no panel, no transfer. The shells keep it.
+    let _ = w.msg(FilePanelMsg::ResizeEnd);
+    assert!(w.panel().sftp.is_some());
+    w.disconnect(a);
+    assert!(w.panel().sftp.is_some(), "one shell is still connected");
+    w.disconnect(b);
+    assert!(w.panel().sftp.is_none(), "the last shell took it along");
+    assert_eq!(w.panel().listing, super::Listing::Closed);
+}
+
+#[test]
+fn a_panel_showing_the_profile_keeps_the_checked_session() {
+    let mut w = world();
+    let db = w.db.clone();
+    let pane = w.open_tab(&db);
+    w.answer_check(&db, available());
+    w.toggle();
+    // A panel shows the profile while its shell is down only with `FBTERM_DEMO_FILES`, where
+    // SSH panes count as connected.
+    w.app.file_panels.demo = true;
+    w.disconnect(pane);
+    assert!(w.panel().sftp.is_some(), "the panel shows it");
+    w.toggle();
+    assert!(w.panel().sftp.is_none(), "nothing needs it any more");
+}
+
+#[test]
+fn opening_the_panel_after_the_check_shows_the_listing_at_once() {
+    let mut w = world();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.answer_check(&db, available());
+    assert_eq!(
+        w.last_list(&db).map(|(f, _)| f).as_deref(),
+        Some("/home/user")
+    );
+    w.answer_list(&db, vec![file("app.log")]);
+    w.toggle();
+    assert_eq!(w.opens(&db), 0, "the session is already open");
+    assert_eq!(w.shows().as_deref(), Some(".. app.log"));
+}
+
+#[test]
+fn the_files_button_toggles_the_panel() {
+    let mut w = world();
+    let db = w.db.clone();
+    w.open_tab(&db);
+    w.answer_check(&db, available());
+    let wid = w.wid;
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Files));
+    assert!(w.app.file_panels.is_open(wid));
+    assert_eq!(w.files_button(), Some(true), "drawn in the accent color");
+    let _ = w
+        .app
+        .update(Message::TabBar(wid, crate::app::TabBarMsg::Files));
+    assert!(!w.app.file_panels.is_open(wid));
+    assert_eq!(w.files_button(), Some(false));
+}
+
+#[test]
+fn the_files_button_follows_the_focused_pane() {
+    let mut w = world();
+    let (db, web, local) = (w.db.clone(), w.web.clone(), w.local.clone());
+    let (a, b) = w.open_split(&db, &web);
+    w.answer_check(&db, available());
+    w.focus(a);
+    assert_eq!(w.files_button(), Some(false));
+    // `web` is still being checked.
+    w.focus(b);
+    assert_eq!(w.files_button(), None);
+    // A local pane: none.
+    w.open_tab(&local);
+    assert_eq!(w.files_button(), None);
 }

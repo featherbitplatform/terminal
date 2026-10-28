@@ -280,6 +280,19 @@ impl Sftp {
         Self::on(connection).await
     }
 
+    /// Open an SFTP session on `profile`'s live connection only ([`SshPool::existing`]):
+    /// `Ok(None)` when it has none on its current route. Never dials and never asks anything.
+    pub async fn open_existing(
+        pool: &SshPool,
+        store: &ProfileStore,
+        profile: &ProfileId,
+    ) -> Result<Option<Sftp>, SshError> {
+        match pool.existing(store, profile)? {
+            Some(connection) => Self::on(connection).await.map(Some),
+            None => Ok(None),
+        }
+    }
+
     async fn on(connection: Arc<Connection>) -> Result<Sftp, SshError> {
         let unavailable = |what: &str| SshError::Protocol(what.to_owned());
         let start = async {

@@ -39,7 +39,7 @@
 //! - `FBTERM_DEMO_PROMPT=hostkey|password|keyfile|changed|unlock|setpassword`: show a sample
 //!   connection or main password dialog (`setpassword` only with `FBTERM_SECRETS=memory`) in the first
 //!   window (nothing waits for the answer).
-//! - `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close`: keep that tab-bar button's
+//! - `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|files|settings|close`: keep that tab-bar button's
 //!   tooltip showing (for screenshots; `close` is the first tab's).
 //! - `FBTERM_FIND=<text>`: open the find bar of the first window's active tab with this query
 //!   (about a second after startup, once output has arrived).

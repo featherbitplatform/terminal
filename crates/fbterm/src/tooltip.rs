@@ -203,12 +203,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for ForceHover<'_> {
     }
 }
 
-/// Which tab-bar button shows its tooltip for `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close`.
+/// Which tab-bar button shows its tooltip for `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|files|settings|close`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DemoTip {
     New,
     Profiles,
     Tunnels,
+    /// The files button (shown only while SFTP works for the focused pane).
+    Files,
     Settings,
     /// The first tab's close button.
     Close,
@@ -220,6 +222,7 @@ impl DemoTip {
             "new" => Some(Self::New),
             "profiles" => Some(Self::Profiles),
             "tunnels" => Some(Self::Tunnels),
+            "files" => Some(Self::Files),
             "settings" => Some(Self::Settings),
             "close" => Some(Self::Close),
             _ => None,

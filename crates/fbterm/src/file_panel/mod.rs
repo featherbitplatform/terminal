@@ -12,12 +12,23 @@
 //! - **Sessions.** For a connected SSH pane the panel opens SFTP on the profile's shared
 //!   connection ([`Sftp::open`]), asking any question over the panel's window
 //!   ([`UiPrompter`]). The session holds the connection open. It is kept while a panel shows
-//!   the profile, while a panel is open anywhere and the profile still has a connected shell
-//!   (so moving focus back and forth does not reopen it), and while its transfers run; else it
-//!   is let go (an open still under way is aborted, so it can raise no question after the
-//!   panel is gone). Holding the channel while a panel is open elsewhere adds no connection
-//!   lifetime: the profile's connected shell holds the connection anyway. A server that
-//!   refuses SFTP shows `SFTP is not available: {reason}`; there is no fallback.
+//!   the profile, while the profile still has a connected shell (so moving focus back and
+//!   forth does not reopen it, and the tab bar's files button stays), and while its transfers
+//!   run; else it is let go. An open still under way that may ask is kept only while a panel
+//!   is open and the profile has a connected shell, else aborted, so it can raise no question
+//!   after the panels are gone. Holding the channel for a connected shell adds no connection
+//!   lifetime: the shell holds the connection anyway. A server that refuses SFTP shows
+//!   `SFTP is not available: {reason}`; there is no fallback.
+//! - **The check after connecting.** When an SSH shell connects, [`App::check_sftp`] opens
+//!   the profile's session in the background (unless one is open or opening) on the live
+//!   connection that shell rides only ([`Sftp::open_existing`]): it never dials and has no
+//!   prompter, so it can ask nothing. A profile with a working session shows the tab bar's
+//!   files button ([`App::files_button`]). The session is kept like a panel's: while the
+//!   profile has a connected shell, a panel shows it or its transfers run. A refused check
+//!   (`Listing::Unavailable`) is remembered until the profile's last shell is gone, so a
+//!   reconnect checks again; a check that found no connection it could use leaves the
+//!   profile unchecked. A panel that shows a profile still being checked opens the session
+//!   its own way (it may ask).
 //! - **Folders.** Each profile's folder is kept for the app session ([`ProfilePanel`]); it
 //!   starts as the server's answer for `.`. Answers that come back after their profile moved
 //!   on (a newer open or read, a released session) are dropped by their token.
@@ -125,6 +136,25 @@ pub(crate) struct OpenRequest {
     pub window: window::Id,
 }
 
+/// What the check after a shell connected takes: no prompter and no window, as it may ask
+/// nothing.
+pub(crate) struct CheckRequest {
+    pub profile: ProfileId,
+    pub token: u64,
+    pub store: ProfileStore,
+}
+
+/// How the check after a shell connected ended.
+pub(crate) enum Checked {
+    /// The session opened on the shell's connection.
+    Available(Opened),
+    /// The server refused SFTP, or the session did not start: the reason.
+    Unavailable(String),
+    /// The profile had no live connection to check on (it would have to dial or ask): SFTP is
+    /// not known either way. The reason, for the log.
+    Unknown(String),
+}
+
 /// What reading a folder takes.
 pub(crate) struct ListRequest {
     pub profile: ProfileId,
@@ -152,6 +182,11 @@ pub(crate) enum PanelEvent {
         token: u64,
         folder: String,
         result: Result<Vec<Entry>, SftpError>,
+    },
+    Checked {
+        profile: ProfileId,
+        token: u64,
+        result: Checked,
     },
 }
 
@@ -191,6 +226,9 @@ pub(crate) struct Started {
 pub(crate) trait Backend: Send + Sync {
     /// Start opening; the handle stops the open when the session is no longer wanted.
     fn open(&self, request: OpenRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle>;
+    /// Start the check after a shell connected: open the session on the profile's live
+    /// connection only, never dialling or asking. The handle stops it.
+    fn check(&self, request: CheckRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle>;
     fn list(&self, request: ListRequest, sink: PanelSink);
     /// Start a download reporting to `sink`, or say why it cannot start.
     fn download(&self, request: DownloadRequest, sink: TransferSink) -> Result<Started, String>;
@@ -295,6 +333,38 @@ impl Backend for PoolBackend {
                 Err(e) => Err(unavailable_reason(&e)),
             };
             let _ = sink.send(PanelEvent::Opened {
+                profile: r.profile,
+                token: r.token,
+                result,
+            });
+        });
+        Some(task.abort_handle())
+    }
+
+    fn check(&self, r: CheckRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle> {
+        let Some(rt) = runtime() else {
+            let _ = sink.send(PanelEvent::Checked {
+                profile: r.profile,
+                token: r.token,
+                result: Checked::Unknown(NO_RUNTIME.into()),
+            });
+            return None;
+        };
+        let pool = self.0.clone();
+        let task = rt.spawn(async move {
+            let result = match Sftp::open_existing(&pool, &r.store, &r.profile).await {
+                Ok(Some(sftp)) => {
+                    let sftp = Arc::new(sftp);
+                    let home = sftp.home().await.map_err(|e| e.to_string());
+                    Checked::Available(Opened {
+                        remote: Arc::new(Live(sftp)),
+                        home,
+                    })
+                }
+                Ok(None) => Checked::Unknown("the profile has no live connection".into()),
+                Err(e) => Checked::Unavailable(unavailable_reason(&e)),
+            };
+            let _ = sink.send(PanelEvent::Checked {
                 profile: r.profile,
                 token: r.token,
                 result,
@@ -435,6 +505,18 @@ impl Backend for Demo {
             profile: r.profile,
             token: r.token,
             result: Ok(Opened {
+                remote: Arc::new(DemoRemote(self.entries.clone())),
+                home: Ok(self.home.clone()),
+            }),
+        });
+        None
+    }
+
+    fn check(&self, r: CheckRequest, sink: PanelSink) -> Option<tokio::task::AbortHandle> {
+        let _ = sink.send(PanelEvent::Checked {
+            profile: r.profile,
+            token: r.token,
+            result: Checked::Available(Opened {
                 remote: Arc::new(DemoRemote(self.entries.clone())),
                 home: Ok(self.home.clone()),
             }),
@@ -1383,39 +1465,33 @@ impl App {
                 token,
                 result,
             } => {
-                let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
-                    return Task::none();
-                };
-                if panel.token != token || panel.listing != Listing::Opening {
+                if self.take_open(profile, token, &Listing::Opening) {
+                    self.session_opened(profile, result);
+                }
+                Task::none()
+            }
+            PanelEvent::Checked {
+                profile,
+                token,
+                result,
+            } => {
+                if !self.take_open(profile, token, &Listing::Checking) {
                     return Task::none();
                 }
-                panel.opening = None;
                 match result {
-                    Err(reason) => {
-                        self.run_waiting(profile, Err(&reason));
-                        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
-                            panel.listing = Listing::Unavailable(reason);
-                        }
+                    Checked::Available(opened) => {
+                        tracing::info!(%profile, "SFTP check: available");
+                        self.session_opened(profile, Ok(opened));
                     }
-                    Ok(Opened { remote, home }) => {
-                        panel.sftp = Some(remote);
-                        self.run_waiting(profile, Ok(()));
-                        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
-                            return Task::none();
-                        };
-                        if let Ok(home) = &home {
-                            panel.home.clone_from(home);
+                    Checked::Unavailable(reason) => {
+                        tracing::info!(%profile, %reason, "SFTP check: not available");
+                        self.session_opened(profile, Err(reason));
+                    }
+                    Checked::Unknown(reason) => {
+                        tracing::info!(%profile, %reason, "SFTP check: not known");
+                        if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                            panel.listing = Listing::Closed;
                         }
-                        if panel.folder.is_empty() {
-                            match home {
-                                Ok(home) => panel.folder = home,
-                                Err(e) => {
-                                    panel.listing = Listing::Failed(e);
-                                    return Task::none();
-                                }
-                            }
-                        }
-                        self.read_folder(profile);
                     }
                 }
                 Task::none()
@@ -1453,6 +1529,96 @@ impl App {
                 self.list_to_top(Some(profile))
             }
         }
+    }
+
+    /// Whether an open's answer for `profile` with `token` is still wanted: its listing is
+    /// still `pending` under that token. The open is then no longer under way.
+    fn take_open(&mut self, profile: ProfileId, token: u64, pending: &Listing) -> bool {
+        let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
+            return false;
+        };
+        if panel.token != token || panel.listing != *pending {
+            return false;
+        }
+        panel.opening = None;
+        true
+    }
+
+    /// `profile`'s session opened (its folder is read next) or could not (`Err`, why).
+    fn session_opened(&mut self, profile: ProfileId, result: Result<Opened, String>) {
+        match result {
+            Err(reason) => {
+                self.run_waiting(profile, Err(&reason));
+                if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                    panel.listing = Listing::Unavailable(reason);
+                }
+            }
+            Ok(Opened { remote, home }) => {
+                if let Some(panel) = self.file_panels.by_profile.get_mut(&profile) {
+                    panel.sftp = Some(remote);
+                }
+                self.run_waiting(profile, Ok(()));
+                let Some(panel) = self.file_panels.by_profile.get_mut(&profile) else {
+                    return;
+                };
+                if let Ok(home) = &home {
+                    panel.home.clone_from(home);
+                }
+                if panel.folder.is_empty() {
+                    match home {
+                        Ok(home) => panel.folder = home,
+                        Err(e) => {
+                            panel.listing = Listing::Failed(e);
+                            return;
+                        }
+                    }
+                }
+                self.read_folder(profile);
+            }
+        }
+    }
+
+    /// The check after a shell of `profile` connected: open its session in the background on
+    /// that shell's connection, asking nothing, unless the session is open or opening, or
+    /// the server already refused it while the profile's shells were up (see the module docs).
+    pub(crate) fn check_sftp(&mut self, profile: ProfileId) {
+        if !matches!(
+            self.profiles.get(profile).map(|p| &p.kind),
+            Some(ProfileKind::Ssh(_))
+        ) {
+            return;
+        }
+        let panel = self
+            .file_panels
+            .by_profile
+            .entry(profile)
+            .or_insert_with(ProfilePanel::new);
+        if panel.sftp.is_some() || panel.listing != Listing::Closed {
+            return;
+        }
+        panel.token += 1;
+        panel.listing = Listing::Checking;
+        panel.opening = self.file_panel_work.backend.check(
+            CheckRequest {
+                profile,
+                token: panel.token,
+                store: self.profiles.clone(),
+            },
+            self.file_panel_work.sink.clone(),
+        );
+    }
+
+    /// Whether `wid`'s tab bar shows the files button, and whether its panel is open: shown
+    /// while the window's focused pane is a connected SSH pane whose profile's session works.
+    pub(crate) fn files_button(&self, wid: window::Id) -> Option<bool> {
+        let Some(Shown::Remote(p)) = self.panel_shows(wid) else {
+            return None;
+        };
+        self.file_panels
+            .by_profile
+            .get(&p)
+            .is_some_and(ProfilePanel::available)
+            .then(|| self.file_panels.is_open(wid))
     }
 
     /// Read `profile`'s folder on its session.
@@ -1548,8 +1714,14 @@ impl App {
 
     pub(crate) fn sync_file_panels(&mut self) {
         let panels = &self.file_panels;
-        let holding = |p: &ProfilePanel| p.sftp.is_some() || p.listing == Listing::Opening;
-        if panels.open.is_empty() && !panels.by_profile.values().any(holding) {
+        let holding = |p: &ProfilePanel| {
+            p.sftp.is_some() || matches!(p.listing, Listing::Opening | Listing::Checking)
+        };
+        // A session that is gone, or was refused: forgotten with the profile's last shell.
+        let refused = |p: &ProfilePanel| {
+            p.sftp.is_none() && matches!(p.listing, Listing::Unavailable(_) | Listing::Failed(_))
+        };
+        if panels.open.is_empty() && !panels.by_profile.values().any(|p| holding(p) || refused(p)) {
             return;
         }
         // The profiles shown, each with the first window (in a stable order) showing it.
@@ -1569,7 +1741,8 @@ impl App {
                 .file_panels
                 .by_profile
                 .get(&profile)
-                .is_none_or(|p| p.listing == Listing::Closed);
+                // A check still under way is replaced: the panel's open may ask.
+                .is_none_or(|p| matches!(p.listing, Listing::Closed | Listing::Checking));
             if closed {
                 self.open_sftp(profile, wid);
             }
@@ -1580,13 +1753,24 @@ impl App {
             .by_profile
             .iter()
             .filter(|(id, p)| {
-                holding(p)
-                    && !p.transfers.iter().any(TransferRow::is_running)
-                    && !shown.iter().any(|(q, _)| q == *id)
-                    && !(any_open && self.shell_count(**id) > 0)
+                if shown.iter().any(|(q, _)| q == *id) {
+                    return false;
+                }
+                let running = p.transfers.iter().any(TransferRow::is_running);
+                let shells = self.shell_count(**id) > 0;
+                if p.listing == Listing::Opening {
+                    // An open that may ask: kept only while a panel is open and the profile
+                    // has a connected shell, so it raises no question after the panels are gone.
+                    return !running && !(any_open && shells);
+                }
+                // An open session, or the check, is kept while the profile has a connected
+                // shell (whose connection it rides anyway, so it never keeps a connection
+                // open by itself) or its transfers run.
+                !shells && (holding(p) && !running || refused(p))
             })
             .map(|(id, _)| *id)
             .collect();
+        // A refusal is forgotten with the shells it was found on, so a reconnect checks again.
         for id in release {
             if let Some(p) = self.file_panels.by_profile.get_mut(&id) {
                 p.release();
@@ -1603,7 +1787,10 @@ impl App {
             Shown::Local => Body::Note("Local session".into()),
             Shown::NotConnected => Body::Note("Not connected".into()),
             Shown::Remote(p) => match self.file_panels.by_profile.get(&p).map(|p| &p.listing) {
-                None | Some(Listing::Closed | Listing::Opening | Listing::Loading) => Body::Loading,
+                None
+                | Some(Listing::Closed | Listing::Opening | Listing::Checking | Listing::Loading) => {
+                    Body::Loading
+                }
                 Some(Listing::Loaded(_)) => Body::Entries(&self.file_panels.by_profile[&p]),
                 Some(Listing::Failed(e)) => Body::Error(plain_name(e)),
                 Some(Listing::Unavailable(reason)) => {

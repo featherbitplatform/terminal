@@ -51,6 +51,8 @@ pub enum TabBarMsg {
     Profiles,
     /// The tunnels indicator: opens the Tunnels window.
     Tunnels,
+    /// The files button: shows or hides the window's file panel.
+    Files,
     Settings,
 }
 
@@ -388,7 +390,7 @@ pub struct App {
     /// that window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
-    /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|settings|close` (debug aid): that tab-bar
+    /// `FBTERM_DEMO_TOOLTIP=new|profiles|tunnels|files|settings|close` (debug aid): that tab-bar
     /// button's tooltip always shows.
     pub(crate) demo_tip: Option<crate::tooltip::DemoTip>,
     /// `FBTERM_SCALE` (debug aid): extra UI scale on top of the OS's, e.g. 0.625 on a 2x
@@ -1059,6 +1061,7 @@ impl App {
                     TabBarMsg::New => self.action(Some(wid), Action::NewTab),
                     TabBarMsg::Profiles => self.action(Some(wid), Action::EditProfiles),
                     TabBarMsg::Tunnels => self.action(Some(wid), Action::Tunnels),
+                    TabBarMsg::Files => self.action(Some(wid), Action::FilePanel),
                     TabBarMsg::Settings => self.action(Some(wid), Action::Settings),
                 }
             }

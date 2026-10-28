@@ -8,7 +8,7 @@ Application shortcuts use `Cmd` on macOS. On Linux and Windows shortcuts are `Ct
 
 These are the defaults. Every application shortcut can be changed or removed in the **Keyboard** section of the Settings window (see [Changing shortcuts](#changing-shortcuts)); the tables below list the defaults, and the Settings window, the palette and the tab-bar tooltips always show the shortcuts in force.
 
-Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings.
+Hover over a button in the tab bar to see what it does and its shortcut. The gear button at the end of the tab bar opens Settings. While the focused pane is an SSH session whose server offers SFTP, a folder button appears before the gear: it opens or closes the [file panel](file-panel) and is highlighted while the panel is open.
 
 On macOS the shortcuts use `Cmd`, and `Option` only for moving between panes; never `Ctrl`. Copy and paste are handled by the terminal view, see [Copy and paste](#copy-and-paste). Programs running in the terminal, including on SSH hosts, cannot read or change your clipboard.
 
