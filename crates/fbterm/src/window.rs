@@ -134,7 +134,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
-        let content = content.push(crate::schemes_window::view::view(t, state, &app.style));
+        let content = content.push(crate::schemes_window::view::view(
+            t,
+            state,
+            &app.style,
+            &app.schemes,
+        ));
         return Element::new(Shortcuts {
             content: content.into(),
             window: id,
@@ -142,6 +147,8 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
                 Mode::SchemesConfirm
             } else if state.import.is_some() {
                 Mode::SchemesImport
+            } else if state.pending_update.is_some() {
+                Mode::SchemesUpdate
             } else {
                 Mode::Schemes
             },

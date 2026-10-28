@@ -10,7 +10,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use fbterm_config::profile::{AuthMethod, ProfileKind, SshProfile, TunnelDef, TunnelKind};
-use fbterm_config::schemes::SchemeSet;
+use fbterm_config::schemes::{Scheme, SchemeSet};
 use fbterm_config::{Profile, ProfileId, ProfileStore};
 use fbterm_secrets::archive::{Archive, ArchiveKind, ArchivedKey, ArchivedSecret, MAX_KEY_BYTES};
 use fbterm_secrets::{SecretKind, SecretStore};
@@ -101,7 +101,11 @@ pub(crate) fn build(
             && !scheme.builtin
             && !archive.schemes.iter().any(|s| s.id == scheme.id)
         {
-            archive.schemes.push(scheme.clone());
+            // Install bookkeeping stays local; the credit travels with the colors.
+            archive.schemes.push(Scheme {
+                gallery: None,
+                ..scheme.clone()
+            });
         }
     }
     Ok((archive, warnings))

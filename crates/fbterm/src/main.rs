@@ -31,6 +31,9 @@
 //!   (in its temporary folder, main password `demo`) so Settings shows `Reset vault`.
 //! - `FBTERM_OPEN_SCHEMES=1`: open the Color schemes window at startup (any other value: the
 //!   name of the scheme to select).
+//!   With `FBTERM_DEMO_GALLERY=1` as well, it shows the theme gallery with a sample catalog,
+//!   never fetched (with `FBTERM_CONFIG_DIR`, its installed themes are written there first);
+//!   `FBTERM_DEMO_GALLERY=question` also asks about updating the edited sample theme.
 //! - `FBTERM_OPEN_TUNNELS=1`: open the Tunnels window at startup.
 //! - `FBTERM_OPEN_ARCHIVE=export|import`: open the export and import window at startup in that
 //!   mode. With `FBTERM_DEMO_ARCHIVE=1` as well, export starts with the jump hosts unchecked

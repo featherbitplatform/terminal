@@ -34,8 +34,170 @@ pub struct Scheme {
     pub colors: SchemeColors,
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
+    /// Where the colors came from, for a scheme installed from the gallery or imported
+    /// with its credit; written as the `[credit]` table.
+    pub credit: Option<Credit>,
+    /// Gallery bookkeeping for an installed gallery scheme; written as `[gallery]`.
+    pub gallery: Option<GalleryInfo>,
     /// True for the schemes shipped in code; never written to a file.
     pub builtin: bool,
+}
+
+/// The `[credit]` table: who made a scheme and under which license. The keys match the
+/// published theme catalog.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Credit {
+    pub project: String,
+    pub author: String,
+    pub url: String,
+    pub license: String,
+    pub copyright: String,
+    pub license_file: String,
+    pub description: String,
+    pub derived: bool,
+}
+
+/// The `[gallery]` table: which catalog entry a scheme was installed from.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct GalleryInfo {
+    /// The catalog id (the scheme id without [`GALLERY_PREFIX`]).
+    pub id: String,
+    /// The catalog version installed.
+    pub version: u32,
+    /// [`install_hash`] of the scheme as installed (name, font and colors), to tell later
+    /// edits. Kept under this key so files written before the hash covered the name and font
+    /// still load; their value has no format prefix, so they count as edited.
+    pub colors_hash: String,
+}
+
+/// Scheme ids installed from the gallery start with this.
+pub const GALLERY_PREFIX: &str = "gallery-";
+
+/// The format prefix of [`install_hash`]; a stored hash with any other prefix (or none, as
+/// written by the first gallery builds, which hashed the colors only) never matches.
+const INSTALL_HASH_FORMAT: &str = "2:";
+
+/// A stable fingerprint of what Update would overwrite: the name, the font family and size
+/// and the 20 colors in file order, hashed with FNV-1a 64 and written as
+/// `2:<16 lowercase hex digits>`. Identical across runs and platforms.
+pub fn install_hash(scheme: &Scheme) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    // Every variable-length field is length-prefixed and every optional one tagged, so no two
+    // different schemes feed the same bytes.
+    let text = |feed: &mut dyn FnMut(&[u8]), t: &str| {
+        feed(&(t.len() as u64).to_le_bytes());
+        feed(t.as_bytes());
+    };
+    text(&mut feed, &scheme.name);
+    match &scheme.font_family {
+        None => feed(&[0]),
+        Some(f) => {
+            feed(&[1]);
+            text(&mut feed, f);
+        }
+    }
+    match scheme.font_size {
+        None => feed(&[0]),
+        Some(size) => {
+            feed(&[1]);
+            feed(&size.to_bits().to_le_bytes());
+        }
+    }
+    let c = &scheme.colors;
+    for rgb in [c.foreground, c.background, c.cursor, c.selection]
+        .into_iter()
+        .chain(c.ansi)
+    {
+        feed(&[rgb.r, rgb.g, rgb.b]);
+    }
+    format!("{INSTALL_HASH_FORMAT}{h:016x}")
+}
+
+/// The catalog id of a scheme whose id starts with [`GALLERY_PREFIX`], with or without a
+/// `[gallery]` table.
+pub fn gallery_id(scheme: &Scheme) -> Option<&str> {
+    scheme
+        .id
+        .strip_prefix(GALLERY_PREFIX)
+        .filter(|id| !id.is_empty())
+}
+
+/// Drop a `[gallery]` block that does not match the scheme id (its `id` must be the catalog
+/// id in a `gallery-` scheme id), so a hand-edited or foreign block is never trusted.
+pub fn sanitize_gallery(scheme: &mut Scheme) {
+    let agrees = scheme
+        .gallery
+        .as_ref()
+        .is_some_and(|g| gallery_id(scheme) == Some(g.id.as_str()));
+    if !agrees {
+        scheme.gallery = None;
+    }
+}
+
+/// Whether the scheme differs from what the gallery installed: no `[gallery]` table, or a
+/// stored hash that no longer matches [`install_hash`] (a changed name, font or color, or a
+/// hash of an older or unknown format).
+pub fn is_edited(scheme: &Scheme) -> bool {
+    scheme
+        .gallery
+        .as_ref()
+        .is_none_or(|g| g.colors_hash != install_hash(scheme))
+}
+
+/// Whether `c` must never appear in displayed credit or catalog text: control characters and
+/// the invisible, line-breaking or bidi formatting characters that can hide or reorder text.
+pub fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{00AD}'
+                | '\u{061C}'
+                | '\u{180E}'
+                | '\u{200B}'..='\u{200F}'
+                | '\u{2028}'..='\u{202E}'
+                | '\u{2060}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// The first `[credit]` field holding a character of [`is_unsafe_char`], if any. Only the
+/// description may span lines (`\n`).
+pub fn unsafe_credit_field(credit: &Credit) -> Option<&'static str> {
+    [
+        ("project", &credit.project),
+        ("author", &credit.author),
+        ("url", &credit.url),
+        ("license", &credit.license),
+        ("copyright", &credit.copyright),
+        ("license_file", &credit.license_file),
+        ("description", &credit.description),
+    ]
+    .into_iter()
+    .find(|(field, text)| {
+        text.chars()
+            .any(|c| is_unsafe_char(c) && !(*field == "description" && c == '\n'))
+    })
+    .map(|(field, _)| field)
+}
+
+/// Whether every `[credit]` field is free of [`is_unsafe_char`] characters (the description
+/// may span lines). The same rule holds for catalog themes, scheme files and archives.
+pub fn credit_is_safe(credit: &Credit) -> bool {
+    unsafe_credit_field(credit).is_none()
+}
+
+/// Drop a `[credit]` table that could hide or reorder text when shown; the colors stay.
+pub fn sanitize_credit(scheme: &mut Scheme) {
+    if scheme.credit.as_ref().is_some_and(|c| !credit_is_safe(c)) {
+        scheme.credit = None;
+    }
 }
 
 /// Ids of the built-in schemes, fixed forever.
@@ -43,7 +205,7 @@ pub const BUILTIN_IDS: [&str; 4] = ["graphite", "graphite-light", "harbor", "emb
 
 /// The `[colors]` table of a scheme file.
 #[derive(Serialize, Deserialize)]
-struct ColorsFile {
+pub(crate) struct ColorsFile {
     foreground: Rgb,
     background: Rgb,
     cursor: Rgb,
@@ -76,6 +238,10 @@ struct SchemeFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     font_size: Option<f32>,
     colors: ColorsFile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    credit: Option<Credit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    gallery: Option<GalleryInfo>,
 }
 
 impl From<Scheme> for SchemeFile {
@@ -86,6 +252,8 @@ impl From<Scheme> for SchemeFile {
             name: scheme.name,
             font_family: scheme.font_family,
             font_size: scheme.font_size,
+            credit: scheme.credit,
+            gallery: scheme.gallery,
         }
     }
 }
@@ -107,6 +275,8 @@ impl TryFrom<SchemeFile> for Scheme {
             colors: file.colors.into(),
             font_family: file.font_family,
             font_size: file.font_size,
+            credit: file.credit,
+            gallery: file.gallery,
             builtin: false,
         })
     }
@@ -198,6 +368,8 @@ fn builtin(
         },
         font_family: None,
         font_size: None,
+        credit: None,
+        gallery: None,
         builtin: true,
     }
 }
@@ -331,7 +503,10 @@ pub fn read_file(path: &Path) -> Result<Scheme, ConfigError> {
         let line = e.span().map(|s| line_of(&text, s.start));
         ConfigError::new(path, line, e.message().to_string())
     })?;
-    Scheme::try_from(file).map_err(|m| ConfigError::new(path, None, m))
+    let mut scheme = Scheme::try_from(file).map_err(|m| ConfigError::new(path, None, m))?;
+    sanitize_gallery(&mut scheme);
+    sanitize_credit(&mut scheme);
+    Ok(scheme)
 }
 
 /// Write a scheme file atomically. The `builtin` flag is never written.
@@ -550,5 +725,211 @@ mod tests {
         );
         let over = vec![b'a'; MAX_FILE_BYTES as usize + 1];
         assert!(read_capped(&over[..]).unwrap().is_none());
+    }
+
+    fn sample_credit() -> Credit {
+        Credit {
+            project: "Nord".into(),
+            author: "Arctic Ice Studio".into(),
+            url: "https://example.org/nord".into(),
+            license: "MIT".into(),
+            copyright: "Copyright (c) 2016".into(),
+            license_file: "LICENSE".into(),
+            description: "An arctic palette.".into(),
+            derived: true,
+        }
+    }
+
+    fn gallery_scheme() -> Scheme {
+        let mut s = builtins().remove(0);
+        s.builtin = false;
+        s.id = "gallery-nord".into();
+        s.credit = Some(sample_credit());
+        s.gallery = Some(GalleryInfo {
+            id: "nord".into(),
+            version: 2,
+            colors_hash: install_hash(&s),
+        });
+        s
+    }
+
+    #[test]
+    fn credit_and_gallery_round_trip() {
+        let scheme = gallery_scheme();
+        let text = toml::to_string_pretty(&scheme).unwrap();
+        assert!(text.contains("[credit]") && text.contains("[gallery]"));
+        assert!(text.contains("license_file = \"LICENSE\"") && text.contains("derived = true"));
+        let back: Scheme = toml::from_str(&text).unwrap();
+        assert_eq!(back, scheme);
+    }
+
+    #[test]
+    fn old_files_without_tables_load() {
+        let text = toml::to_string_pretty(&builtins().remove(0)).unwrap();
+        assert!(!text.contains("[credit]") && !text.contains("[gallery]"));
+        let back: Scheme = toml::from_str(&text).unwrap();
+        assert!(back.credit.is_none() && back.gallery.is_none());
+    }
+
+    #[test]
+    fn file_with_tables_loads_in_old_shape() {
+        /// A scheme file as read before the tables existed (no `deny_unknown_fields`).
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldSchemeFile {
+            id: String,
+            name: String,
+            font_family: Option<String>,
+            font_size: Option<f32>,
+            colors: ColorsFile,
+        }
+        let text = toml::to_string_pretty(&gallery_scheme()).unwrap();
+        let old: OldSchemeFile = toml::from_str(&text).unwrap();
+        assert_eq!(old.id, "gallery-nord");
+    }
+
+    #[test]
+    fn install_hash_is_stable() {
+        assert_eq!(install_hash(&builtins().remove(0)), "2:27f2b40e716e5a72");
+    }
+
+    #[test]
+    fn install_hash_covers_name_and_font() {
+        let base = gallery_scheme();
+        let hash = install_hash(&base);
+        assert!(hash.starts_with("2:") && hash.len() == 18, "{hash}");
+        let mut renamed = base.clone();
+        renamed.name = "Nord (mine)".into();
+        let mut family = base.clone();
+        family.font_family = Some("Geist Mono".into());
+        let mut size = base.clone();
+        size.font_size = Some(15.0);
+        let mut both = base.clone();
+        both.font_family = Some(String::new());
+        for other in [&renamed, &family, &size, &both] {
+            assert_ne!(install_hash(other), hash);
+            assert!(is_edited(&Scheme {
+                gallery: base.gallery.clone(),
+                ..other.clone()
+            }));
+        }
+        // An empty family is not the same as none.
+        assert_ne!(install_hash(&both), hash);
+        // The credit and the gallery block are not part of it.
+        let mut credited = base.clone();
+        credited.credit = None;
+        credited.gallery = None;
+        assert_eq!(install_hash(&credited), hash);
+    }
+
+    #[test]
+    fn older_or_unknown_hash_formats_count_as_edited() {
+        let mut s = gallery_scheme();
+        let current = install_hash(&s);
+        // The first gallery builds wrote the bare colors hash, with no prefix.
+        for stored in [
+            "210775489270ef4a".to_owned(),
+            format!("3:{}", &current[2..]),
+            current[2..].to_owned(),
+            String::new(),
+        ] {
+            s.gallery.as_mut().unwrap().colors_hash = stored;
+            assert!(is_edited(&s));
+        }
+    }
+
+    #[test]
+    fn unsafe_credit_characters_are_found() {
+        assert!(credit_is_safe(&sample_credit()));
+        let mut multi = sample_credit();
+        multi.description = "Line one.\nLine two.".into();
+        assert!(credit_is_safe(&multi));
+        for c in [
+            '\u{0007}', '\u{00AD}', '\u{061C}', '\u{180E}', '\u{200B}', '\u{200F}', '\u{2028}',
+            '\u{2029}', '\u{202E}', '\u{2060}', '\u{2066}', '\u{2069}', '\u{FEFF}',
+        ] {
+            assert!(is_unsafe_char(c), "{:04X}", c as u32);
+            let mut bad = sample_credit();
+            bad.author = format!("Some{c}one");
+            assert_eq!(unsafe_credit_field(&bad), Some("author"));
+            assert!(!credit_is_safe(&bad));
+        }
+        let mut newline = sample_credit();
+        newline.project = "Two\nlines".into();
+        assert_eq!(unsafe_credit_field(&newline), Some("project"));
+        assert!(!is_unsafe_char('e') && !is_unsafe_char('\u{00E9}') && !is_unsafe_char(' '));
+    }
+
+    #[test]
+    fn read_file_drops_an_unsafe_credit() {
+        let dir = std::env::temp_dir().join(format!("fbterm-cred-{}", new_user_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = gallery_scheme();
+        s.credit.as_mut().unwrap().author = "evil\u{202E}txt.exe".into();
+        let path = dir.join("gallery-nord.toml");
+        std::fs::write(&path, toml::to_string_pretty(&s).unwrap()).unwrap();
+        let back = read_file(&path).unwrap();
+        assert!(back.credit.is_none());
+        assert_eq!(back.colors, s.colors);
+        // A safe credit stays.
+        std::fs::write(&path, toml::to_string_pretty(&gallery_scheme()).unwrap()).unwrap();
+        assert_eq!(read_file(&path).unwrap().credit, Some(sample_credit()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn gallery_id_without_block_counts_as_edited() {
+        let mut s = gallery_scheme();
+        s.gallery = None;
+        assert_eq!(gallery_id(&s), Some("nord"));
+        assert!(is_edited(&s));
+        s.id = "user-1".into();
+        assert_eq!(gallery_id(&s), None);
+    }
+
+    #[test]
+    fn edited_colors_count_as_edited() {
+        let mut s = gallery_scheme();
+        s.colors.cursor = hex(0x123456);
+        assert!(is_edited(&s));
+    }
+
+    #[test]
+    fn sanitize_gallery_keeps_only_matching_blocks() {
+        let mut ok = gallery_scheme();
+        sanitize_gallery(&mut ok);
+        assert!(ok.gallery.is_some());
+
+        let mut user = gallery_scheme();
+        user.id = "user-x".into();
+        sanitize_gallery(&mut user);
+        assert!(user.gallery.is_none() && user.credit.is_some());
+
+        let mut other = gallery_scheme();
+        other.gallery.as_mut().unwrap().id = "bar".into();
+        sanitize_gallery(&mut other);
+        assert!(other.gallery.is_none());
+    }
+
+    #[test]
+    fn read_file_drops_a_mismatched_gallery_block() {
+        let dir = std::env::temp_dir().join(format!("fbterm-san-{}", new_user_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = gallery_scheme();
+        s.id = "user-x".into();
+        let path = dir.join("user-x.toml");
+        std::fs::write(&path, toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert!(read_file(&path).unwrap().gallery.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn untouched_gallery_scheme_is_not_edited() {
+        assert!(!is_edited(&gallery_scheme()));
+    }
+
+    #[test]
+    fn is_valid_user_accepts_gallery_ids() {
+        assert!(is_valid_user(&gallery_scheme()));
     }
 }

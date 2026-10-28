@@ -35,16 +35,27 @@ impl App {
             exit_on_close_request: false,
             ..window::Settings::default()
         });
-        let state = SchemesState::new(
+        let mut state = SchemesState::new(
             &self.schemes,
             Some(&select),
             crate::settings_window::installed_monospace(),
         );
+        if self.gallery_loading {
+            // The fetch started before the window closed is still running.
+            state.gallery = super::GalleryLoad::Loading;
+        } else if let Some(catalog) = &self.gallery_catalog {
+            // The catalog of this run: shown again without a fetch.
+            state.gallery = super::GalleryLoad::Loaded(catalog.clone());
+        }
         self.schemes_win = Some((id, state));
         open.discard()
     }
 
     pub(crate) fn schemes_msg(&mut self, msg: SchemesMsg) -> Task<Message> {
+        let msg = match self.gallery_msg(msg) {
+            Ok(task) => return task,
+            Err(msg) => msg,
+        };
         match msg {
             SchemesMsg::Open => self.open_schemes(None),
             SchemesMsg::Close => match self.schemes_window() {
@@ -66,7 +77,7 @@ impl App {
             }
             SchemesMsg::Import => self.pick_import(),
             SchemesMsg::Imported(path) => Self::read_import(path),
-            SchemesMsg::ImportRead(result) => self.imported(result),
+            SchemesMsg::ImportRead(result) => self.imported(*result),
             SchemesMsg::ImportChoice(choice) => self.import_choice(choice),
             SchemesMsg::Export => self.pick_export(),
             SchemesMsg::Exported(path) => self.exported(path),
@@ -314,9 +325,11 @@ impl App {
         let Some((_, state)) = &mut self.schemes_win else {
             return Task::none();
         };
-        let Some(scheme) = state.selected_draft().cloned() else {
+        let Some(mut scheme) = state.selected_draft().cloned() else {
             return Task::none();
         };
+        // Install bookkeeping stays local, as in profile archives; the credit travels.
+        scheme.gallery = None;
         match write_file(&path, &scheme) {
             Ok(()) => {
                 tracing::info!(id = %scheme.id, "scheme exported");
@@ -343,7 +356,7 @@ impl App {
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
             },
-            |r| Message::Schemes(SchemesMsg::ImportRead(r)),
+            |r| Message::Schemes(SchemesMsg::ImportRead(Box::new(r))),
         )
     }
 
@@ -365,6 +378,11 @@ impl App {
             }
         };
         state.error = None;
+        // A `[gallery]` block is only ever written by Install on this machine: an imported
+        // copy, even of a gallery theme, counts as edited, so Update asks before replacing it.
+        scheme.gallery = None;
+        // `read_file` drops an unsafe `[credit]` already; checked again for any other source.
+        fbterm_config::schemes::sanitize_credit(&mut scheme);
         if BUILTIN_IDS.contains(&scheme.id.as_str()) || !is_plain_id(&scheme.id) {
             scheme.id = new_user_id();
         } else if let Some(existing) = self

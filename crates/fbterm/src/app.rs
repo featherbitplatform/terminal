@@ -407,6 +407,14 @@ pub struct App {
     pub(crate) export_notice: Option<crate::export::ExportNotice>,
     /// A newer release found by the update check (cleared when `check_updates` goes off).
     pub(crate) update_available: Option<crate::update::Available>,
+    /// The last theme catalog loaded in this run (kept in memory only, never on disk).
+    pub(crate) gallery_catalog: Option<fbterm_config::catalog::Catalog>,
+    /// The generation of the latest catalog fetch; a result of any other is stale.
+    pub(crate) gallery_generation: u64,
+    /// A catalog fetch is under way (at most one per run at a time, whatever the window).
+    pub(crate) gallery_loading: bool,
+    /// How the theme gallery fetches its catalog and opens credit links (fakes in tests).
+    pub(crate) gallery_io: crate::schemes_window::gallery::GalleryIo,
     /// Whether the first-launch update question may be asked at all: off in unit tests, which
     /// would otherwise all find it queued in front of their own dialogs.
     pub(crate) ask_updates: bool,
@@ -724,6 +732,10 @@ impl App {
                 .unwrap_or(1.0),
             os_scales: HashMap::new(),
             update_available: None,
+            gallery_catalog: None,
+            gallery_generation: 0,
+            gallery_loading: false,
+            gallery_io: crate::schemes_window::gallery::GalleryIo::default(),
             ask_updates: !cfg!(test),
             update_asked: false,
             demo_update: debug_env("FBTERM_DEMO_UPDATE").map(|v| v.to_string_lossy().into_owned()),
