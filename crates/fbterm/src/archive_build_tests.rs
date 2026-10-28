@@ -544,6 +544,50 @@ fn key_through_a_link_is_read_from_its_target() {
 }
 
 #[test]
+fn exported_scheme_keeps_credit_and_drops_gallery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut s = schemes::builtins().remove(1);
+    s.builtin = false;
+    s.id = "gallery-nord".into();
+    s.credit = Some(schemes::Credit {
+        project: "Nord".into(),
+        author: "A".into(),
+        url: "https://example.org".into(),
+        license: "MIT".into(),
+        copyright: "c".into(),
+        license_file: "LICENSE".into(),
+        description: "d".into(),
+        derived: false,
+    });
+    s.gallery = Some(schemes::GalleryInfo {
+        id: "nord".into(),
+        version: 1,
+        colors_hash: schemes::colors_hash(&s.colors),
+    });
+    schemes::save_user(dir.path(), &s).unwrap();
+    let (set, errors) = SchemeSet::load(dir.path());
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(set.get("gallery-nord").unwrap().gallery.is_some());
+    let mut p = ssh("a", AuthMethod::Agent, Vec::new());
+    p.color_scheme = Some(s.id.clone());
+    let store = ProfileStore {
+        profiles: vec![p.clone()],
+    };
+    let (archive, _) = build(
+        &store,
+        &[p.id],
+        ArchiveKind::Full,
+        false,
+        &MemoryStore::new(),
+        &set,
+    )
+    .unwrap();
+    assert_eq!(archive.schemes.len(), 1);
+    assert_eq!(archive.schemes[0].credit, s.credit);
+    assert!(archive.schemes[0].gallery.is_none());
+}
+
+#[test]
 fn used_user_schemes_are_included() {
     let dir = tempfile::tempdir().unwrap();
     let mut used = schemes::builtins().remove(1);

@@ -958,7 +958,17 @@ fn plan_schemes(
     let mut dropped = HashSet::new();
     // The name of the first copy of each id.
     let mut seen: HashMap<&str, &str> = HashMap::new();
-    for s in &archive.schemes {
+    // An archive is outside input: a `[gallery]` block that disagrees with its id is dropped.
+    let sanitized: Vec<Scheme> = archive
+        .schemes
+        .iter()
+        .cloned()
+        .map(|mut s| {
+            schemes::sanitize_gallery(&mut s);
+            s
+        })
+        .collect();
+    for s in &sanitized {
         // A built-in id is the built-in, whatever the archive's copy says.
         if BUILTIN_IDS.contains(&s.id.as_str()) {
             continue;

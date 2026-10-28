@@ -101,6 +101,18 @@ pub fn gallery_id(scheme: &Scheme) -> Option<&str> {
         .filter(|id| !id.is_empty())
 }
 
+/// Drop a `[gallery]` block that does not match the scheme id (its `id` must be the catalog
+/// id in a `gallery-` scheme id), so a hand-edited or foreign block is never trusted.
+pub fn sanitize_gallery(scheme: &mut Scheme) {
+    let agrees = scheme
+        .gallery
+        .as_ref()
+        .is_some_and(|g| gallery_id(scheme) == Some(g.id.as_str()));
+    if !agrees {
+        scheme.gallery = None;
+    }
+}
+
 /// Whether the colors differ from what the gallery installed: no `[gallery]` table, or a
 /// `colors_hash` that no longer matches.
 pub fn is_edited(scheme: &Scheme) -> bool {
@@ -413,7 +425,9 @@ pub fn read_file(path: &Path) -> Result<Scheme, ConfigError> {
         let line = e.span().map(|s| line_of(&text, s.start));
         ConfigError::new(path, line, e.message().to_string())
     })?;
-    Scheme::try_from(file).map_err(|m| ConfigError::new(path, None, m))
+    let mut scheme = Scheme::try_from(file).map_err(|m| ConfigError::new(path, None, m))?;
+    sanitize_gallery(&mut scheme);
+    Ok(scheme)
 }
 
 /// Write a scheme file atomically. The `builtin` flag is never written.
@@ -718,6 +732,35 @@ mod tests {
         let mut s = gallery_scheme();
         s.colors.cursor = hex(0x123456);
         assert!(is_edited(&s));
+    }
+
+    #[test]
+    fn sanitize_gallery_keeps_only_matching_blocks() {
+        let mut ok = gallery_scheme();
+        sanitize_gallery(&mut ok);
+        assert!(ok.gallery.is_some());
+
+        let mut user = gallery_scheme();
+        user.id = "user-x".into();
+        sanitize_gallery(&mut user);
+        assert!(user.gallery.is_none() && user.credit.is_some());
+
+        let mut other = gallery_scheme();
+        other.gallery.as_mut().unwrap().id = "bar".into();
+        sanitize_gallery(&mut other);
+        assert!(other.gallery.is_none());
+    }
+
+    #[test]
+    fn read_file_drops_a_mismatched_gallery_block() {
+        let dir = std::env::temp_dir().join(format!("fbterm-san-{}", new_user_id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = gallery_scheme();
+        s.id = "user-x".into();
+        let path = dir.join("user-x.toml");
+        std::fs::write(&path, toml::to_string_pretty(&s).unwrap()).unwrap();
+        assert!(read_file(&path).unwrap().gallery.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

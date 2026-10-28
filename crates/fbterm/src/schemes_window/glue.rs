@@ -365,6 +365,7 @@ impl App {
             }
         };
         state.error = None;
+        fbterm_config::schemes::sanitize_gallery(&mut scheme);
         if BUILTIN_IDS.contains(&scheme.id.as_str()) || !is_plain_id(&scheme.id) {
             scheme.id = new_user_id();
             scheme.gallery = None;
