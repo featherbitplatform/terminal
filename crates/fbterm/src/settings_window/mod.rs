@@ -70,6 +70,9 @@ pub enum SettingsMsg {
     Record(Action),
     /// A key press while recording: its chord, or `None` for a key that cannot be one.
     Pressed(Option<Chord>),
+    /// A key let go while recording whose press never reached fbterm: its chord, or `None`
+    /// for a key that cannot be one.
+    Withheld(Option<Chord>),
     CancelRecording,
     /// Give the recorded chord to the action being recorded; the action that had it is left
     /// without one.
@@ -101,6 +104,19 @@ pub enum RecordProblem {
     NotAllowed(String),
     /// Another action has it: take it over or cancel.
     Taken { chord: Chord, other: Action },
+}
+
+/// Why the recorder never saw a key press: the system or another program kept it.
+fn withheld_note(mac: bool, chord: Option<Chord>) -> String {
+    let system = if cfg!(windows) {
+        "Windows"
+    } else if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "The desktop"
+    };
+    let what = chord.map_or_else(|| "That key".to_string(), |c| c.label(mac));
+    format!("{what} never reaches fbterm: {system} or another program uses it")
 }
 
 /// The note under the Scrollback field above [`SCROLLBACK_WARN_ABOVE`] lines.
@@ -466,6 +482,13 @@ impl SettingsState {
                 Some(r) => self.pressed(r.action, chord),
                 None => Effect::NONE,
             },
+            SettingsMsg::Withheld(chord) => {
+                let mac = self.bindings().mac();
+                if let Some(r) = &mut self.recording {
+                    r.problem = Some(RecordProblem::NotAllowed(withheld_note(mac, chord)));
+                }
+                Effect::NONE
+            }
             SettingsMsg::TakeOver => match self.recording.take() {
                 Some(Recording {
                     action,

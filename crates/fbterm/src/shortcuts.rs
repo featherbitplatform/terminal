@@ -2,7 +2,7 @@
 //! kind of window and overlay, before a terminal or a field sees the key.
 
 use iced::advanced::layout::{self, Layout};
-use iced::advanced::widget::{Operation, Tree, Widget};
+use iced::advanced::widget::{Operation, Tree, Widget, tree};
 use iced::advanced::{Clipboard, Shell, overlay, renderer};
 use iced::{Element, Event, Length, Rectangle, Size, Vector, keyboard, mouse, window};
 
@@ -330,6 +330,51 @@ fn recording_key(press: &Press, repeat: bool) -> Option<Message> {
     ))))
 }
 
+/// The keys whose press the recorder saw, held now. A key let go without a press is one the
+/// system or another program kept for itself (Windows keeps Ctrl+Shift+0 when Ctrl+Shift
+/// switches keyboard layouts): the recorder says so instead of waiting for it.
+#[derive(Default)]
+struct Held(Vec<keyboard::key::Physical>);
+
+/// What a key event means to the chord recorder beyond its presses: the release of a key whose
+/// press never came, with the modifiers held then, as [`SettingsMsg::Withheld`].
+fn recording_release(held: &mut Held, event: &Event) -> Option<Message> {
+    match event {
+        Event::Keyboard(keyboard::Event::KeyPressed { physical_key, .. }) => {
+            if !held.0.contains(physical_key) {
+                held.0.push(*physical_key);
+            }
+            None
+        }
+        Event::Keyboard(keyboard::Event::KeyReleased {
+            key,
+            modified_key,
+            physical_key,
+            location,
+            modifiers,
+        }) => {
+            let before = held.0.len();
+            held.0.retain(|k| k != physical_key);
+            if held.0.len() < before || keys::is_modifier(key) {
+                return None;
+            }
+            let press = Press::new(
+                key,
+                modified_key,
+                *physical_key,
+                *location,
+                *modifiers,
+                keys::num_lock,
+            );
+            Some(Message::Settings(SettingsMsg::Withheld(keys::press_chord(
+                &press.chord_key,
+                press.chord_mods,
+            ))))
+        }
+        _ => None,
+    }
+}
+
 /// What a key press the panel's fields left means to the panel.
 fn panel_key(event: &Event) -> Option<PanelKey> {
     use keyboard::key::Named;
@@ -396,6 +441,14 @@ fn typed_text(event: &Event) -> Option<String> {
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Held>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(Held::default())
+    }
+
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
@@ -443,6 +496,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
         viewport: &Rectangle,
     ) {
         crate::key_log::shortcuts(self.window, event, shell.is_event_captured());
+        let held = tree.state.downcast_mut::<Held>();
+        if self.mode != Mode::Recording {
+            held.0.clear();
+        } else if let Some(msg) = recording_release(held, event) {
+            shell.publish(msg);
+            shell.capture_event();
+            return;
+        }
         if let Event::Keyboard(keyboard::Event::KeyPressed {
             key,
             modified_key,
@@ -1290,6 +1351,57 @@ mod tests {
             key_message(&b, Mode::Recording, w, &a, none, true, None),
             Some(None)
         ));
+    }
+
+    #[test]
+    fn a_key_let_go_without_its_press_says_the_system_kept_it() {
+        use keyboard::key::{Code, Named, Physical};
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let event = |pressed: bool, key: keyboard::Key, code: Code| {
+            let physical_key = Physical::Code(code);
+            let location = keyboard::Location::Standard;
+            Event::Keyboard(if pressed {
+                keyboard::Event::KeyPressed {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location,
+                    modifiers: ctrl_shift,
+                    text: None,
+                    repeat: false,
+                }
+            } else {
+                keyboard::Event::KeyReleased {
+                    key: key.clone(),
+                    modified_key: key,
+                    physical_key,
+                    location,
+                    modifiers: ctrl_shift,
+                }
+            })
+        };
+        let zero = keyboard::Key::Character("0".into());
+        let one = keyboard::Key::Character("1".into());
+        let shift = keyboard::Key::Named(Named::Shift);
+        let mut held = Held::default();
+        // Ctrl+Shift+0 as Windows reports it when it keeps the press: the release alone.
+        assert!(
+            recording_release(&mut held, &event(true, shift.clone(), Code::ShiftLeft)).is_none()
+        );
+        let Some(Message::Settings(SettingsMsg::Withheld(Some(c)))) =
+            recording_release(&mut held, &event(false, zero, Code::Digit0))
+        else {
+            panic!("the kept press is reported");
+        };
+        assert_eq!(c.label(false), "Ctrl+Shift+0");
+        // A key whose press came, and a modifier, let go quietly.
+        assert!(recording_release(&mut held, &event(true, one.clone(), Code::Digit1)).is_none());
+        assert!(recording_release(&mut held, &event(false, one, Code::Digit1)).is_none());
+        assert!(
+            recording_release(&mut held, &event(false, shift.clone(), Code::ShiftLeft)).is_none()
+        );
+        assert!(recording_release(&mut held, &event(false, shift, Code::ShiftRight)).is_none());
+        assert!(held.0.is_empty());
     }
 
     #[test]
