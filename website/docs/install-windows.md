@@ -60,6 +60,12 @@ fbterm draws its own minimize, maximize and close buttons in the tab bar in the 
 
 Passwords and key passphrases are kept in `secrets.dpapi`, encrypted for your Windows account, or in the encrypted vault if you choose it. See [Saved secrets](saved-secrets).
 
+## If fbterm crashes or doesn't start
+
+fbterm keeps a log of each run in `fbterm.log` in its [configuration directory](files#configuration-directory), `%APPDATA%\featherbit\fbterm\config`. When it starts, the log of the run before is kept as `fbterm.previous.log`, so after a crash that file holds the run that crashed. A crash, or a start that fails, also adds a report to `crash.log` in the same folder (once that file is over 256 KB, it is moved to `crash.previous.log` first), and the next launch says once, in the window, that a report was written. If fbterm cannot start, a message says so and names the report's file. To open the folder, paste its path into the File Explorer address bar.
+
+To report the problem, send `crash.log` and `fbterm.previous.log` (or `fbterm.log` if fbterm has not been started again since). Look through them first: they can name your profiles, hosts and folders.
+
 ## Next steps
 
 On first launch you get a local shell. Add your SSH hosts as [profiles](profiles) and open them from the palette with `Ctrl+Shift+P`.
