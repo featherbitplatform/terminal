@@ -27,7 +27,7 @@ fbterm itself is licensed under Apache-2.0 (see `LICENSE`).
 
 ## Gallery themes
 
-Color schemes installed from the theme gallery are not part of fbterm and are not shipped with it. They are downloaded only when you choose Install, from [terminal-themes](https://github.com/featherbitplatform/terminal-themes). Each one is under its own permissive license, stated together with its project and author in its file (the `[credit]` table) and in `terminal-themes`, where the full credits are kept.
+Color schemes installed from the theme gallery are not part of fbterm and are not shipped with it. They come from [terminal-themes](https://github.com/featherbitplatform/terminal-themes): its catalog, which holds every theme in full, is downloaded only when you open the gallery or press Refresh or Retry, and Install writes the chosen theme from that catalog. Each one is under its own permissive license, stated together with its project and author in its file (the `[credit]` table) and in `terminal-themes`, where the full credits are kept.
 
 ## feathercritty
 

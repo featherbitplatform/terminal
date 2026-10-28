@@ -119,7 +119,7 @@ dark/light is the builder's call.
 **Installing.**
 - **Install** writes `schemes/gallery-<id>.toml`: the scheme with stable scheme id
   `gallery-<id>`, plus the `[credit]` block and a `[gallery]` block recording `id`, `version`
-  and a hash of the colors as installed. It is then a normal user scheme: selectable globally
+  and a hash of the scheme as installed (name, font and colors). It is then a normal user scheme: selectable globally
   and per profile, exportable, editable.
 - Installing an already installed theme at the same version is not offered (the button reads
   **Installed**).
@@ -132,7 +132,7 @@ dark/light is the builder's call.
 **Updating.**
 - When the catalog version of an installed theme is higher than the installed one, its row
   shows **Update**.
-- If the installed colors still match the recorded hash, Update replaces the file in place
+- If the installed name, font and colors still match the recorded hash, Update replaces the file in place
   (same scheme id, so profiles using it keep it and recolor).
 - If the user edited it, Update asks: **Replace my changes**, **Install as a copy** (a new
   user scheme with the new colors and the credit; the edited one stays) or **Cancel**.
@@ -140,8 +140,10 @@ dark/light is the builder's call.
   user's machine; its row says it is no longer offered.
 
 **Credit after install.** The Color schemes window shows, for a scheme with a `[credit]`
-block, the project, author, license and link, offline. Export keeps the `[credit]` and
-`[gallery]` blocks, so a shared copy keeps its attribution. Editing a gallery theme keeps its
+block, the project, author, license and link, offline. Exports (a scheme file or a
+profile archive) keep the `[credit]` block only, so a shared copy keeps its attribution; the
+`[gallery]` block is local bookkeeping. Imports (a scheme file or an archive) drop any
+`[gallery]` block, so an imported copy of a gallery theme counts as edited and Update asks. Editing a gallery theme keeps its
 credit (the colors stay derived from the original).
 
 **Docs.** The website's color schemes page explains the gallery, the network access it makes
