@@ -13,6 +13,8 @@ allow = [
     "BSL-1.0",
     # hexf-parse (naga, via wgpu) and notify (file watching)
     "CC0-1.0",
+    # webpki-roots (Mozilla's root certificates as data, for the update check over ureq)
+    "CDLA-Permissive-2.0",
 ]
 
 [advisories]

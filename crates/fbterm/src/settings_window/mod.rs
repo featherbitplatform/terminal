@@ -66,6 +66,10 @@ pub enum SettingsMsg {
     RetriesSubmit,
     Kitty(bool),
     MaxFps(MaxFps),
+    /// `Check for updates automatically`.
+    CheckUpdates(bool),
+    /// `Download` beside a newer version: the app opens its release page.
+    DownloadUpdate,
     /// Record a new chord for an action (a click on its chord).
     Record(Action),
     /// A key press while recording: its chord, or `None` for a key that cannot be one.
@@ -216,6 +220,8 @@ pub struct SettingsState {
     generation: u64,
     /// The scrolling page, for the `FBTERM_OPEN_SETTINGS=secrets` debug aid.
     pub page: iced::widget::Id,
+    /// A newer release the update check found (kept in step by the app).
+    pub update: Option<crate::update::Available>,
 }
 
 pub(crate) fn size_text(v: f32) -> String {
@@ -251,6 +257,7 @@ impl SettingsState {
             pending: Vec::new(),
             generation: 0,
             page: iced::widget::Id::unique(),
+            update: None,
         };
         state.sync(values);
         state
@@ -429,7 +436,8 @@ impl SettingsState {
             | SettingsMsg::RevealFolder
             | SettingsMsg::EditSchemes
             | SettingsMsg::SecretStorage(_)
-            | SettingsMsg::ResetVault => Effect::NONE,
+            | SettingsMsg::ResetVault
+            | SettingsMsg::DownloadUpdate => Effect::NONE,
             SettingsMsg::Flush(n) => match self.held_lower {
                 Some((v, at)) if at == n => {
                     self.held_lower = None;
@@ -460,6 +468,7 @@ impl SettingsState {
             SettingsMsg::TitleBar(v) => self.change(SettingChange::WindowDecorations(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
             SettingsMsg::MaxFps(v) => self.change(SettingChange::MaxFps(v), false),
+            SettingsMsg::CheckUpdates(v) => self.change(SettingChange::CheckUpdates(v), false),
             SettingsMsg::Record(action)
             | SettingsMsg::ResetKey(action)
             | SettingsMsg::ClearKey(action)

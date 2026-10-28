@@ -29,6 +29,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Only for the FBTERM_SCREENSHOT debug aid.
 png = { workspace = true }
+# The update check (`update.rs`, `net.rs`): HTTPS GET, version comparison, the release JSON.
+ureq = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 # The secrets crate with `test-support`, to search decrypted archives in tests.
@@ -74,7 +79,8 @@ winresource = { version = "0.1.34", default-features = false }
 # - file dialogs: libdbus-1 (the desktop portal); required;
 # - graphics: libvulkan, libEGL, libwayland-egl; only recommended (weak on RPM), so a
 #   minimal install still runs `fbterm --version`; the desktop's GPU stack provides them.
-# Saved secrets use the Secret Service over D-Bus in pure Rust: no library to declare.
+# Saved secrets use the Secret Service over D-Bus in pure Rust: no library to declare. The
+# update check's HTTPS (ureq, rustls with ring and bundled webpki roots) links no OpenSSL.
 [package.metadata.deb]
 name = "fbterm"
 maintainer = "featherbit <featherbit-gw@outlook.com>"

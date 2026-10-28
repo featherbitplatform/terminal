@@ -104,6 +104,10 @@ impl App {
             }
             SettingsMsg::SecretStorage(choice) => self.choose_secret_storage(choice),
             SettingsMsg::ResetVault => self.ask_reset_vault(),
+            SettingsMsg::DownloadUpdate => {
+                self.open_update_page();
+                Task::none()
+            }
             // The row shows `System` after the desktop refused drawn chrome while the setting
             // stays "fbterm": choosing fbterm tries drawn chrome again (nothing to write).
             SettingsMsg::TitleBar(WindowDecorations::Fbterm)
@@ -309,6 +313,8 @@ impl App {
     /// created transparent (always on macOS, see [`Chrome::backdrop`]), and `background_blur`
     /// is fixed when a window opens, so those apply to windows opened from now on.
     /// `window_decorations` (Linux) switches every open window's title bar at once.
+    /// `check_updates` starts or stops the update check (its subscription); off also drops
+    /// what it found.
     ///
     /// Returns the find refreshes a scrollback lowering asks for.
     pub(crate) fn apply_settings(
@@ -360,6 +366,10 @@ impl App {
                      were created opaque"
                 );
             }
+        }
+        // Turning the update check off forgets what it found: no dot, no message.
+        if !new.checks_updates() {
+            self.update_available = None;
         }
         if new.keys.map != self.settings.keys.map {
             self.bindings = crate::keys::Bindings::current(&new.keys.map);

@@ -1,5 +1,5 @@
-//! The Settings window: Appearance, Terminal and Keyboard cards of labelled controls, and a
-//! footer with the settings file actions.
+//! The Settings window: Appearance, Terminal, Tunnels, Saved secrets, Updates and Keyboard
+//! cards of labelled controls, and a footer with the settings file actions.
 
 use fbterm_config::keys::{Action, ActionGroup, Bindings, FixedShortcut, fixed_shortcuts, risk};
 use fbterm_config::settings::{FONT_SIZE_RANGE, OPACITY_RANGE};
@@ -18,6 +18,8 @@ use crate::theme::{Tokens, UI_FONT};
 use crate::ui::{self, MONO};
 
 const CONTENT_WIDTH: f32 = 560.0;
+/// Diameter of the dot beside a newer version (the one on the settings button's size).
+const UPDATE_DOT: f32 = 6.0;
 
 /// The `Saved secrets` section's line while secrets move.
 const MOVING: &str = "Moving saved secrets\u{2026}";
@@ -77,6 +79,7 @@ pub fn view<'a>(
             "Saved secrets",
             saved_secrets(t, secrets, editable),
         ))
+        .push(section(t, "Updates", updates(t, state, editable)))
         .push(keyboard(t, state, editable));
     let page = scrollable(
         container(container(body).max_width(CONTENT_WIDTH))
@@ -501,6 +504,41 @@ fn tunnels<'a>(
         false,
         retries,
     )]
+}
+
+/// The update check's switch and, when a newer version is known, a line with its download
+/// link under it.
+fn updates<'a>(
+    t: &'static Tokens,
+    state: &'a SettingsState,
+    editable: bool,
+) -> Vec<Element<'a, Message>> {
+    let on = state.values.checks_updates();
+    let mut rows = vec![setting(
+        t,
+        "Check for updates automatically",
+        Some("Asks GitHub once a day for a newer version; nothing is downloaded"),
+        false,
+        switch(t, on, editable, false, SettingsMsg::CheckUpdates),
+    )];
+    if let Some(found) = state.update.as_ref().filter(|_| on) {
+        rows.push(
+            row![
+                ui::dot(t.danger, UPDATE_DOT),
+                text(found.message())
+                    .font(UI_FONT)
+                    .size(12.5)
+                    .color(t.text)
+                    .width(Length::Fill),
+                small_button(t, "Download", msg(SettingsMsg::DownloadUpdate), ui::primary),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center)
+            .padding(Padding::from([10.0, 16.0]))
+            .into(),
+        );
+    }
+    rows
 }
 
 /// Where saved passwords and passphrases live, with a line for a move under way or its

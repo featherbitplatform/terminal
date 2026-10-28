@@ -204,6 +204,8 @@ pub enum Message {
     Tunnel(TunnelKey, TunnelState),
     /// The file panel (see [`crate::file_panel`]).
     FilePanel(crate::file_panel::FilePanelMsg),
+    /// An update check finished (see [`crate::update`]): a newer release, none, or why not.
+    UpdateChecked(Result<Option<crate::update::Available>, String>),
 }
 
 /// Where a settings change came from. The scrollback notice is for edits made in
@@ -403,6 +405,16 @@ pub struct App {
     pub(crate) exporting: Option<window::Id>,
     /// The last export's outcome, shown in the window it ran in until dismissed.
     pub(crate) export_notice: Option<crate::export::ExportNotice>,
+    /// A newer release found by the update check (cleared when `check_updates` goes off).
+    pub(crate) update_available: Option<crate::update::Available>,
+    /// Whether the first-launch update question may be asked at all: off in unit tests, which
+    /// would otherwise all find it queued in front of their own dialogs.
+    pub(crate) ask_updates: bool,
+    /// The update question was shown this run.
+    pub(crate) update_asked: bool,
+    /// `FBTERM_DEMO_UPDATE=<version>` (debug aid): the update check reports this version
+    /// without any network access.
+    pub(crate) demo_update: Option<String>,
 }
 
 impl App {
@@ -711,6 +723,10 @@ impl App {
                 .filter(|s| s.is_finite() && (0.25..=4.0).contains(s))
                 .unwrap_or(1.0),
             os_scales: HashMap::new(),
+            update_available: None,
+            ask_updates: !cfg!(test),
+            update_asked: false,
+            demo_update: debug_env("FBTERM_DEMO_UPDATE").map(|v| v.to_string_lossy().into_owned()),
         };
         app.update_output_rate();
         app.refresh_scheme_notices();
@@ -866,6 +882,18 @@ impl App {
             // Only while a move or resize request is watched (at most `ANSWER_TIME`).
             subs.push(iced::event::listen_with(crate::move_watch::watch_event));
         }
+        if self.update_check_scheduled() {
+            // Checks at once, then sleeps a day between checks (no ticks in between).
+            subs.push(
+                Subscription::run_with(
+                    crate::update::CheckKey {
+                        demo: self.demo_update.clone(),
+                    },
+                    crate::update::check_stream,
+                )
+                .map(Message::UpdateChecked),
+            );
+        }
         subs.push(
             Subscription::run_with(
                 ConfigDir(self.paths.config_dir.clone()),
@@ -929,6 +957,8 @@ impl App {
         self.sync_file_panels();
         self.sync_context_menu();
         self.sync_quit_key();
+        self.ask_update_question();
+        self.sync_update_state();
         crate::key_log::set_recording(self.recording_window());
         match self.sync_panel_focus() {
             Some(unfocus) => Task::batch([task, unfocus]),
@@ -1274,6 +1304,10 @@ impl App {
             }
             Message::Tunnel(key, state) => self.tunnel_event(key, state),
             Message::FilePanel(msg) => self.file_panel_msg(msg),
+            Message::UpdateChecked(result) => {
+                self.update_checked(result);
+                Task::none()
+            }
             Message::CloseRequested(id) => self.close_requested(id),
             Message::Shoot => self.shoot(),
             Message::Shot(shot) => {
