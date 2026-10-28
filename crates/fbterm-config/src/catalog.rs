@@ -40,6 +40,9 @@ const MAX_FIELD_CHARS: usize = 2_000;
 /// The longest catalog id.
 const MAX_ID_CHARS: usize = 64;
 
+/// The longest skip reason kept in [`Catalog::skipped`], in characters.
+const MAX_REASON_CHARS: usize = 200;
+
 /// One valid theme of the catalog.
 #[derive(Clone, PartialEq, Debug)]
 pub struct CatalogTheme {
@@ -118,7 +121,8 @@ struct ThemeEntry {
 }
 
 /// Parse a downloaded catalog. Whole-catalog problems are errors; a bad theme is only
-/// skipped, with its reason in [`Catalog::skipped`].
+/// skipped, with its reason in [`Catalog::skipped`]. Among entries sharing an id, the first
+/// valid entry with that id wins; later ones are skipped as duplicates.
 pub fn parse_catalog(bytes: &[u8]) -> Result<Catalog, CatalogError> {
     let not_toml = |why: &str| CatalogError::NotToml(why.to_string());
     if bytes.len() > MAX_CATALOG_BYTES {
@@ -161,7 +165,9 @@ pub fn parse_catalog(bytes: &[u8]) -> Result<Catalog, CatalogError> {
             .filter(|id| is_slug(id))
             .map_or_else(|| format!("theme {}", index + 1), str::to_string);
         match theme_from(value) {
-            Err(why) => catalog.skipped.push(format!("{label}: {why}")),
+            Err(why) => catalog
+                .skipped
+                .push(format!("{label}: {}", truncate_reason(&why))),
             Ok(theme) if catalog.themes.iter().any(|t| t.id == theme.id) => {
                 catalog.skipped.push(format!("{label}: duplicate id"));
             }
@@ -182,6 +188,39 @@ fn is_slug(id: &str) -> bool {
                 && w.bytes()
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
         })
+}
+
+/// `why` cut to [`MAX_REASON_CHARS`] characters (on a char boundary) with an ellipsis, so
+/// a hostile entry cannot flood the log through an error message that quotes it.
+fn truncate_reason(why: &str) -> String {
+    match why.char_indices().nth(MAX_REASON_CHARS) {
+        None => why.to_string(),
+        Some((cut, _)) => format!("{}...", &why[..cut]),
+    }
+}
+
+/// Whether `c` must never appear in a displayed string: control characters and the
+/// invisible or bidi formatting characters that can disguise text.
+fn is_unsafe_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+/// A `license_file` of the form `LICENSES/<name>`, the name of `[A-Za-z0-9._-]` with no `..`.
+fn is_license_file(path: &str) -> bool {
+    path.strip_prefix("LICENSES/").is_some_and(|name| {
+        !name.is_empty()
+            && !name.contains("..")
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    })
 }
 
 /// An `https://` URL with a host and no whitespace or control characters.
@@ -237,11 +276,26 @@ fn theme_from(value: &toml::Value) -> Result<CatalogTheme, String> {
             "{field} is longer than {MAX_FIELD_CHARS} characters"
         ));
     }
+    // Only the description may span lines; nothing may hide or reorder text.
+    let unsafe_field = credit_fields
+        .into_iter()
+        .chain([("name", &entry.name)])
+        .chain(entry.font_family.as_ref().map(|f| ("font_family", f)))
+        .find(|(field, text)| {
+            text.chars()
+                .any(|c| is_unsafe_char(c) && !(*field == "description" && c == '\n'))
+        });
+    if let Some((field, _)) = unsafe_field {
+        return Err(format!("{field} has control or invisible characters"));
+    }
     if !LICENSES.contains(&credit.license.as_str()) {
         return Err(format!(
             "license {:?} is not on the allowlist",
             credit.license
         ));
+    }
+    if !is_license_file(&credit.license_file) {
+        return Err("license_file is not LICENSES/<name>".into());
     }
     if !is_https_url(&credit.url) {
         return Err("credit url is not https://".into());
@@ -671,6 +725,87 @@ derived = false
             &format!("description = \"{at_limit}\""),
         );
         assert_eq!(parse(&text).themes.len(), 1);
+    }
+
+    #[test]
+    fn hidden_characters_are_skipped() {
+        for bad in [
+            "a\u{1b}[31mb",
+            "a\u{202e}b",
+            "a\nb",
+            "a\u{200b}b",
+            "\u{feff}a",
+            "a\u{2066}b",
+        ] {
+            let toml_str = toml::Value::String(bad.into()).to_string();
+            assert_skipped("a", "name = \"Theme a\"", &format!("name = {toml_str}"));
+            assert_skipped("a", "author = \"Someone\"", &format!("author = {toml_str}"));
+            assert_skipped(
+                "a",
+                "version = 3",
+                &format!("version = 3\nfont_family = {toml_str}"),
+            );
+        }
+        assert_skipped(
+            "a",
+            "description = \"A theme.\"",
+            "description = \"a\\u202eb\"",
+        );
+        // A newline is fine in the description, and only there.
+        let text = catalog_of(&[entry("a")]).replace(
+            "description = \"A theme.\"",
+            "description = \"Line one.\\nLine two.\"",
+        );
+        let catalog = parse(&text);
+        assert_eq!(catalog.themes.len(), 1, "{:?}", catalog.skipped);
+        assert_eq!(
+            catalog.themes[0]
+                .scheme
+                .credit
+                .as_ref()
+                .unwrap()
+                .description,
+            "Line one.\nLine two."
+        );
+    }
+
+    #[test]
+    fn license_file_must_be_under_licenses() {
+        for path in [
+            "LICENSE",
+            "LICENSES/",
+            "LICENSES/../x",
+            "LICENSES/a..b",
+            "LICENSES/sub/x.txt",
+            "/etc/passwd",
+            "licenses/x.txt",
+            "LICENSES/x y.txt",
+        ] {
+            assert_skipped(
+                "a",
+                "license_file = \"LICENSES/a-MIT.txt\"",
+                &format!("license_file = \"{path}\""),
+            );
+        }
+        let text = catalog_of(&[entry("a")])
+            .replace("LICENSES/a-MIT.txt", "LICENSES/Some_Project-2.0.MIT.txt");
+        assert_eq!(parse(&text).themes.len(), 1);
+    }
+
+    #[test]
+    fn long_skip_reasons_are_truncated() {
+        let huge = "z".repeat(100_000);
+        let bad = entry("a").replace("red = \"#ed4a49\"", &format!("red = \"{huge}\""));
+        let catalog = parse(&catalog_of(&[bad]));
+        assert_eq!(catalog.skipped.len(), 1);
+        let line = &catalog.skipped[0];
+        assert!(line.starts_with("a: "), "{line}");
+        assert!(line.ends_with("..."), "{line}");
+        assert!(line.chars().count() <= "a: ".len() + MAX_REASON_CHARS + 3);
+        // Cuts on a char boundary, multibyte text included.
+        let cut = truncate_reason(&"\u{e9}".repeat(1_000));
+        assert_eq!(cut.chars().count(), MAX_REASON_CHARS + 3);
+        assert_eq!(truncate_reason("short"), "short");
     }
 
     #[test]
