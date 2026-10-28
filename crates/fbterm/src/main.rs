@@ -51,6 +51,9 @@
 //!
 //! `fbterm --version` prints `fbterm <version>` and exits.
 //!
+//! Every run logs to `fbterm.log` in the config dir as well as stderr; panics and start-up
+//! failures append a report to `crash.log` there (see `crash.rs`).
+//!
 //! Windows release builds are GUI programs (no console window opens next to the app when it
 //! starts from the Start menu), so their `--version` line reaches a pipe or a file, e.g.
 //! `fbterm --version | more`, but not a console window directly.
@@ -70,6 +73,7 @@ mod archive_window;
 mod chrome;
 mod config_files;
 mod context_menu;
+mod crash;
 mod debug;
 mod dialogs;
 mod display_rate;
@@ -137,11 +141,10 @@ fn main() -> iced::Result {
         println!("{line}");
         return Ok(());
     }
+    crash::install_panic_hook();
     perf::init_from_env();
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    // Stderr as always, and `fbterm.log` in the config dir (`crash.rs`).
+    crash::init_logging(&app::paths());
     key_log::init_from_env();
     let mut daemon = iced::daemon(App::boot, App::update, window::view)
         .title(App::title)
@@ -155,5 +158,9 @@ fn main() -> iced::Result {
     }
     // Before the first window opens: on Linux this reads the desktop's button layout.
     chrome::init();
-    daemon.run()
+    let result = daemon.run();
+    if let Err(e) = &result {
+        crash::start_failed(&e.to_string());
+    }
+    result
 }
