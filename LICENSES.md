@@ -35,7 +35,7 @@ The terminal emulation library, [feathercritty](https://github.com/featherbitpla
 
 ## winit
 
-iced's windowing library, [winit](https://github.com/rust-windowing/winit) 0.30.13 by the winit authors (Apache-2.0), comes from our fork, [featherbitplatform/winit](https://github.com/featherbitplatform/winit), through a `[patch.crates-io]` entry pinned by commit in the root `Cargo.toml`; with it comes the `dpi` crate of the same release (Apache-2.0 or MIT). The fork's one change (Windows: a window dragged onto a monitor with a different scale keeps the position Windows suggests) is described in its `FORK.md`, and the file it modifies says so in its first line.
+iced's windowing library, [winit](https://github.com/rust-windowing/winit) 0.30.13 by the winit authors (Apache-2.0), comes from our fork, [featherbitplatform/winit](https://github.com/featherbitplatform/winit), through a `[patch.crates-io]` entry pinned by commit in the root `Cargo.toml`; with it comes the `dpi` crate of the same release (Apache-2.0 or MIT). The fork's one change, a backport of upstream winit's Windows 11 `WM_DPICHANGED` fix (upstream commit `488c036`, issue rust-windowing/winit#4041: a window dragged onto a monitor with a different scale keeps the position Windows suggests), is described in its `FORK.md`, and the files it modifies say so in their first line.
 
 ## Bundled fonts
 
