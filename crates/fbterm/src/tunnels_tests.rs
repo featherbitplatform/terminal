@@ -532,7 +532,17 @@ fn restart_waits_for_the_old_instance() {
         .unwrap();
     let _guard = rt.enter();
     let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let srv = srv_on(silent.local_addr().unwrap().port());
+    let mut srv = srv_on(silent.local_addr().unwrap().port());
+    // The tunnel really binds its local port here: use one the system just handed out, not
+    // the fixed 18080 the other tests only name, so a busy CI machine cannot collide with it.
+    let free = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    if let ProfileKind::Ssh(ssh) = &mut srv.kind {
+        ssh.tunnels[0] = local("web", free, StartMode::OnDemand);
+    }
     let paths = paths_with(&[profile("local"), srv.clone()]);
     let (mut app, _) = App::build(paths, true);
     app.state_saving_enabled = false;
