@@ -849,6 +849,8 @@ impl App {
         if self.file_panels.is_open(wid) {
             self.close_file_panel(wid);
         } else {
+            // One panel at a time on the right edge.
+            self.close_tunnels_panel(wid);
             // Shown with the shortcut or the palette: the user means to browse.
             self.file_panels.show(wid);
             if let Some(Shown::Remote(p)) = self.panel_shows(wid)
@@ -948,7 +950,7 @@ impl App {
     }
 
     /// Hide `wid`'s panel; a profile no panel shows any more lets go of its finished rows.
-    fn close_file_panel(&mut self, wid: window::Id) {
+    pub(crate) fn close_file_panel(&mut self, wid: window::Id) {
         let shown = self.shown_profile(wid);
         self.file_panels.open.remove(&wid);
         self.file_panels.ui.remove(&wid);

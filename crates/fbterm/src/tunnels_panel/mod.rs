@@ -1,17 +1,122 @@
-//! The tunnels list shared by the Tunnels window, the tab bar's indicator and the palette:
+//! The tunnels panel, docked at the right edge of a terminal window (one at a time with the
+//! file panel), and the tunnels list it shares with the tab bar's indicator and the palette:
 //! every tunnel of every SSH profile, grouped by profile (the highlighted profile first),
 //! with its addresses and state. The rows are derived from the profiles and the tunnel
 //! registry (`crate::tunnels`) every time they are drawn, as plain data so their rules are
 //! testable without a GUI.
+//!
+//! - **Per window.** Each terminal window opens and closes its own panel ([`state`]); the
+//!   tab bar's button, the `Tunnels` action and the palette's `Tunnels` row toggle it in the
+//!   window they are used in. Used from a window without terminals (profile editor, Settings,
+//!   Color schemes, export and import), the action opens the panel in the terminal window
+//!   focused last and brings that window forward.
+//! - **Questions** of a tunnel switched on (or retried) from the panel are asked over the
+//!   panel's window.
 
 use fbterm_config::{ProfileId, ProfileKind, ProfileStore, TunnelDef, TunnelKind};
 use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
+use iced::{Task, window};
 
+use crate::app::{App, Message};
 use crate::palette::{Fuzzy, PaletteItem};
 use crate::tunnels::Tunnels;
 
+pub(crate) mod state;
+pub mod view;
+
 #[cfg(test)]
 mod tests;
+
+pub(crate) use state::TunnelsPanels;
+
+/// The search bar's placeholder.
+pub const SEARCH_PLACEHOLDER: &str = "Search tunnels";
+/// What the panel says when no profile has a tunnel.
+pub const EMPTY: &str = "No tunnels yet. Add them to an SSH profile in the profile editor.";
+/// What the panel says when the search matches nothing.
+pub const NO_MATCHES: &str = "No matching tunnels";
+/// The marker on a running tunnel whose definition changed.
+pub const RESTART_TO_APPLY: &str = "Restart to apply";
+
+/// What a window's tunnels panel asks for (it opens through `Action::Tunnels`).
+#[derive(Debug, Clone)]
+// Until the dock draws the panel, only tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
+pub enum TunnelsMsg {
+    /// The close button.
+    Close(window::Id),
+    Query(window::Id, String),
+    /// The switch: on or off.
+    Toggle(window::Id, TunnelKey),
+    Retry(window::Id, TunnelKey),
+    /// Dragging the resize handle: the new width.
+    Resize(f32),
+    /// The drag ended: the width is remembered.
+    ResizeEnd,
+}
+
+impl App {
+    /// The terminal window focused last; any terminal window when that one is gone.
+    pub(crate) fn last_terminal_window(&self) -> Option<window::Id> {
+        self.last_terminal
+            .filter(|id| self.windows.contains_key(id))
+            .or_else(|| self.windows.keys().next().copied())
+    }
+
+    /// Open `wid`'s panel if closed, close it if open.
+    pub(crate) fn toggle_tunnels_panel(&mut self, wid: window::Id) -> Task<Message> {
+        if self.tunnels_panels.is_open(wid) {
+            self.close_tunnels_panel(wid);
+            Task::none()
+        } else {
+            self.open_tunnels_panel(wid)
+        }
+    }
+
+    /// Open `wid`'s panel (closing its file panel) with its search focused.
+    pub(crate) fn open_tunnels_panel(&mut self, wid: window::Id) -> Task<Message> {
+        if !self.windows.contains_key(&wid) {
+            return Task::none();
+        }
+        if self.file_panels.is_open(wid) {
+            self.close_file_panel(wid);
+        }
+        let input = self.tunnels_panels.show(wid);
+        iced::widget::operation::focus(input)
+    }
+
+    pub(crate) fn close_tunnels_panel(&mut self, wid: window::Id) {
+        self.tunnels_panels.hide(wid);
+    }
+
+    /// The `Tunnels` action used in `from`: a terminal window toggles its own panel; any
+    /// other window opens the panel in the terminal window focused last and raises it.
+    pub(crate) fn tunnels_action(&mut self, from: Option<window::Id>) -> Task<Message> {
+        if let Some(wid) = from.filter(|w| self.windows.contains_key(w)) {
+            return self.toggle_tunnels_panel(wid);
+        }
+        match self.last_terminal_window() {
+            Some(wid) => Task::batch([window::gain_focus(wid), self.open_tunnels_panel(wid)]),
+            None => Task::none(),
+        }
+    }
+
+    pub(crate) fn tunnels_msg(&mut self, msg: TunnelsMsg) -> Task<Message> {
+        match msg {
+            TunnelsMsg::Close(wid) => self.close_tunnels_panel(wid),
+            TunnelsMsg::Query(wid, q) => {
+                if self.windows.contains_key(&wid) {
+                    self.tunnels_panels.query.insert(wid, q);
+                }
+            }
+            TunnelsMsg::Toggle(wid, key) => return self.tunnel_toggle_in(wid, &key),
+            TunnelsMsg::Retry(wid, key) => return self.tunnel_retry_in(wid, &key),
+            TunnelsMsg::Resize(width) => self.tunnels_panels.width = state::clamp_width(width),
+            TunnelsMsg::ResizeEnd => self.save_state(),
+        }
+        Task::none()
+    }
+}
 
 /// How a state reads at a glance: the color of its dot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +128,7 @@ pub enum Tone {
     Off,
 }
 
-/// One tunnel as the window lists it.
+/// One tunnel as the panel lists it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub key: TunnelKey,
@@ -49,7 +154,7 @@ pub struct Group {
     pub highlighted: bool,
 }
 
-/// A state as the window, the palette and the tunnel's row say it.
+/// A state as the panel, the palette and the tunnel's row say it.
 pub fn state_label(state: &TunnelState) -> String {
     match state {
         TunnelState::Off => "Off".into(),
@@ -73,6 +178,8 @@ fn tone(state: &TunnelState) -> Tone {
     }
 }
 
+// Until the dock draws the panel, only tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
 /// `bind:port`, an IPv6 bind in brackets.
 fn endpoint(bind: &str, port: u16) -> String {
     let bind = bind.trim();
@@ -87,6 +194,8 @@ fn endpoint(bind: &str, port: u16) -> String {
 /// `remote …` for a remote one, `SOCKS {bind}:{port}`, then `via` the jump hops, if any.
 /// `listening`: the port a running instance listens on, shown for a definition that let the
 /// system (or the server) pick one.
+// Until the dock draws the panel, only tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn address(
     store: &ProfileStore,
     key: &TunnelKey,
@@ -147,7 +256,9 @@ fn defined(store: &ProfileStore) -> impl Iterator<Item = (&str, TunnelKey, &Tunn
     })
 }
 
-/// Whether any profile has a tunnel (else the window shows how to add one).
+/// Whether any profile has a tunnel (else the panel says where to add one).
+// Unused until the dock draws the panel.
+#[allow(dead_code)]
 pub fn any_defined(store: &ProfileStore) -> bool {
     defined(store).next().is_some()
 }
@@ -166,6 +277,8 @@ fn status(tunnels: &Tunnels, key: &TunnelKey, def: &TunnelDef) -> (String, Tone,
 /// matches `query` (all of them for a blank query). The group of `highlight` comes first and is
 /// marked; the others keep the profiles' order. A `highlight` that matches no group (unknown
 /// profile, a local one, one without tunnels, or filtered out by `query`) marks nothing.
+// Until the dock draws the panel, only tests use it.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn groups(
     store: &ProfileStore,
     tunnels: &Tunnels,

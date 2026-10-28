@@ -38,7 +38,7 @@ use crate::settings_window::{SettingsMsg, SettingsState};
 use crate::tabs::{Pane, TabState, WindowState};
 use crate::theme;
 use crate::tunnels::{Tunnels, tunnel_stream};
-use crate::tunnels_window::{TunnelsMsg, TunnelsState};
+use crate::tunnels_panel::{TunnelsMsg, TunnelsPanels};
 use crate::visibility;
 use crate::watch::{self, Changed, ConfigDir};
 
@@ -49,7 +49,7 @@ pub enum TabBarMsg {
     Close(usize),
     New,
     Profiles,
-    /// The tunnels indicator: opens the Tunnels window.
+    /// The tunnels indicator: shows or hides the window's tunnels panel.
     Tunnels,
     /// The files button: shows or hides the window's file panel.
     Files,
@@ -169,7 +169,7 @@ pub enum Message {
     Settings(SettingsMsg),
     /// The Color schemes window.
     Schemes(SchemesMsg),
-    /// The Tunnels window.
+    /// A window's tunnels panel.
     Tunnels(TunnelsMsg),
     /// The export and import window.
     Archive(ArchiveMsg),
@@ -233,8 +233,20 @@ pub(crate) enum ShotWindow {
     Editor,
     Settings,
     Schemes,
-    Tunnels,
     Archive,
+}
+
+impl ShotWindow {
+    /// What `FBTERM_SCREENSHOT_WINDOW` names; the terminal window for anything else.
+    pub(crate) fn parse(name: Option<&str>) -> Self {
+        match name {
+            Some("editor") => Self::Editor,
+            Some("settings") => Self::Settings,
+            Some("schemes") => Self::Schemes,
+            Some("archive") => Self::Archive,
+            _ => Self::Terminal,
+        }
+    }
 }
 
 pub struct App {
@@ -265,6 +277,8 @@ pub struct App {
     pub(crate) file_panels: crate::file_panel::FilePanels,
     /// The file panel's background work: opening SFTP sessions and reading folders.
     pub(crate) file_panel_work: crate::file_panel::Work,
+    /// The tunnels panel of every window (see [`crate::tunnels_panel`]).
+    pub(crate) tunnels_panels: TunnelsPanels,
     pub(crate) events: EventSink,
     pub(crate) receiver: EventReceiver,
     pub(crate) visibility: visibility::Changes,
@@ -284,8 +298,8 @@ pub struct App {
     pub(crate) resize_generation: u64,
     /// The window that last had focus: where unscoped actions go.
     pub focused: Option<window::Id>,
-    /// The terminal window that last had focus: where questions go while another of our
-    /// windows (the Tunnels window, say) has it.
+    /// The terminal window that last had focus: where questions go, and where the `Tunnels`
+    /// action opens the panel, while another of our windows (Settings, say) has it.
     pub(crate) last_terminal: Option<window::Id>,
     /// Open quick-launch palettes, by window.
     pub palettes: Palettes,
@@ -312,8 +326,6 @@ pub struct App {
     pub settings_win: Option<(window::Id, SettingsState)>,
     /// The Color schemes window, when open.
     pub schemes_win: Option<(window::Id, SchemesState)>,
-    /// The Tunnels window, when open.
-    pub tunnels_win: Option<(window::Id, TunnelsState)>,
     /// The export and import window, when open.
     pub archive_win: Option<(window::Id, ArchiveState)>,
     /// Numbers the archive window's dialogs and background jobs, so a late answer for one it
@@ -388,7 +400,7 @@ pub struct App {
     pub theme: Theme,
     pub tokens: &'static theme::Tokens,
     pub(crate) screenshot: Option<PathBuf>,
-    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|tunnels|archive` (debug aid): capture
+    /// `FBTERM_SCREENSHOT_WINDOW=editor|settings|schemes|archive` (debug aid): capture
     /// that window instead.
     pub(crate) screenshot_window: ShotWindow,
     pub(crate) shooting: bool,
@@ -637,6 +649,7 @@ impl App {
                 saved.file_panel_show_hidden.unwrap_or(true),
             ),
             file_panel_work: crate::file_panel::Work::new(pool.clone()),
+            tunnels_panels: TunnelsPanels::new(saved.tunnels_panel_width),
             tunnel_retries,
             bindings: Bindings::current(&settings.keys.map),
             theme: theme::graphite_theme(settings.theme),
@@ -676,7 +689,6 @@ impl App {
             exit_waiting: false,
             settings_win: None,
             schemes_win: None,
-            tunnels_win: None,
             archive_win: None,
             archive_seq: 0,
             blocking_inline: false,
@@ -713,14 +725,11 @@ impl App {
             app_active: true,
             style,
             screenshot: debug_env("FBTERM_SCREENSHOT").map(PathBuf::from),
-            screenshot_window: match debug_env("FBTERM_SCREENSHOT_WINDOW") {
-                Some(w) if w == "editor" => ShotWindow::Editor,
-                Some(w) if w == "settings" => ShotWindow::Settings,
-                Some(w) if w == "schemes" => ShotWindow::Schemes,
-                Some(w) if w == "tunnels" => ShotWindow::Tunnels,
-                Some(w) if w == "archive" => ShotWindow::Archive,
-                _ => ShotWindow::Terminal,
-            },
+            screenshot_window: ShotWindow::parse(
+                debug_env("FBTERM_SCREENSHOT_WINDOW")
+                    .as_deref()
+                    .and_then(std::ffi::OsStr::to_str),
+            ),
             shooting: false,
             demo_tip: debug_env("FBTERM_DEMO_TOOLTIP")
                 .and_then(|v| crate::tooltip::DemoTip::parse(&v.to_string_lossy())),
@@ -806,9 +815,6 @@ impl App {
         }
         if self.schemes_window() == Some(id) {
             return "Color schemes · fbterm".into();
-        }
-        if self.tunnels_window() == Some(id) {
-            return "Tunnels · fbterm".into();
         }
         if self.archive_window() == Some(id) {
             return self.archive_title().into();
@@ -951,7 +957,6 @@ impl App {
             ShotWindow::Editor if self.editor.is_none() => return false,
             ShotWindow::Settings if self.settings_win.is_none() => return false,
             ShotWindow::Schemes if self.schemes_win.is_none() => return false,
-            ShotWindow::Tunnels if self.tunnels_win.is_none() => return false,
             ShotWindow::Archive if self.archive_win.is_none() => return false,
             _ => {}
         }
@@ -1140,9 +1145,6 @@ impl App {
                 if self.schemes_window() == Some(id) {
                     self.schemes_win = None;
                 }
-                if self.tunnels_window() == Some(id) {
-                    self.tunnels_win = None;
-                }
                 // Dropping the state wipes typed passwords and an opened archive.
                 if self.archive_window() == Some(id) {
                     self.archive_win = None;
@@ -1186,6 +1188,7 @@ impl App {
                 self.palettes.remove(&id);
                 self.file_panels.open.remove(&id);
                 self.file_panels.ui.remove(&id);
+                self.tunnels_panels.forget(id);
                 // A save dialog it had open answers nothing now.
                 self.file_panels.saving.remove(&id);
                 // Nor does its picker; its drops and undecided uploads are forgotten.
@@ -1220,7 +1223,6 @@ impl App {
                     && self.editor.is_none()
                     && self.settings_win.is_none()
                     && self.schemes_win.is_none()
-                    && self.tunnels_win.is_none()
                     && self.archive_win.is_none()
                 {
                     self.exit_when_idle()
@@ -1403,7 +1405,6 @@ impl App {
             ShotWindow::Editor => self.editor_window(),
             ShotWindow::Settings => self.settings_window(),
             ShotWindow::Schemes => self.schemes_window(),
-            ShotWindow::Tunnels => self.tunnels_window(),
             ShotWindow::Archive => self.archive_window(),
             ShotWindow::Terminal => self.windows.keys().next().copied(),
         };

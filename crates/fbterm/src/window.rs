@@ -155,29 +155,6 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
             bindings: &app.bindings,
         });
     }
-    if let Some((tid, state)) = &app.tunnels_win
-        && *tid == id
-    {
-        let mut content = column![];
-        if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
-        }
-        let groups = crate::tunnels_panel::groups(&app.profiles, &app.tunnels, &state.query, None);
-        let any = crate::tunnels_panel::any_defined(&app.profiles);
-        let content = content.push(crate::tunnels_window::view::view(
-            t,
-            &state.query,
-            &state.input,
-            groups,
-            any,
-        ));
-        return Element::new(Shortcuts {
-            content: content.into(),
-            window: id,
-            mode: Mode::Tunnels,
-            bindings: &app.bindings,
-        });
-    }
     if let Some((aid, state)) = &app.archive_win
         && *aid == id
     {

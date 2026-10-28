@@ -256,6 +256,7 @@ impl App {
         let mut state = restore::snapshot(&self.windows, &self.sizes, &self.recency);
         state.file_panel_width = self.file_panels.saved_width();
         state.file_panel_show_hidden = self.file_panels.saved_show_hidden();
+        state.tunnels_panel_width = self.tunnels_panels.saved_width();
         if let Err(e) = state.save(&self.paths.state()) {
             tracing::warn!(error = %e, "could not save the session state");
         }
@@ -293,7 +294,6 @@ impl App {
             .chain(self.editor_window())
             .chain(self.settings_window())
             .chain(self.schemes_window())
-            .chain(self.tunnels_window())
             .chain(self.archive_window())
             .collect();
         self.closing.extend(ids.iter().copied());
@@ -330,7 +330,6 @@ impl App {
         if self.editor_window() == Some(id)
             || self.settings_window() == Some(id)
             || self.schemes_window() == Some(id)
-            || self.tunnels_window() == Some(id)
             || self.archive_window() == Some(id)
         {
             self.close_window(id)

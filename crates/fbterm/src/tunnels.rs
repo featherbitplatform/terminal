@@ -2,10 +2,11 @@
 //! its state as the runtime reports it (`fbterm_session::ssh::tunnel`).
 //!
 //! - **Starting and stopping.** [`App::tunnel_toggle`] switches a tunnel on or off;
-//!   [`App::tunnel_retry`] starts a failed (or changed) one again. A start from the UI asks its
-//!   questions over the focused terminal window, or the one used last while the Tunnels window
-//!   has focus, and raises it; with no terminal window open, a tunnel that needs to ask fails
-//!   with [`NO_WINDOW`]. A tunnel whose definition does not validate is never started: it
+//!   [`App::tunnel_retry_in`] starts a failed (or changed) one again. A start from the UI asks its
+//!   questions over the window it was used in: the tunnels panel's window
+//!   ([`App::tunnel_toggle_in`]), else the focused terminal window, or the one used last while
+//!   another window has focus, and raises it; with no terminal window open, a tunnel that
+//!   needs to ask fails with [`NO_WINDOW`]. A tunnel whose definition does not validate is never started: it
 //!   fails with the validation message. A stopped tunnel reports nothing more, so the registry
 //!   sets `Off` itself.
 //! - **Restarts wait for the old instance.** A stopped tunnel releases its port, remote forward
@@ -319,12 +320,35 @@ impl App {
     /// Switch `key` on or off. Switching on a `with_shell` tunnel with no shell of its profile
     /// connected makes that run on-demand (`manual`): it outlives the shells.
     pub(crate) fn tunnel_toggle(&mut self, key: &TunnelKey) -> Task<Message> {
+        self.tunnel_toggle_over(key, self.focused_window())
+    }
+
+    /// [`App::tunnel_toggle`] from the tunnels panel of `wid`: its questions are asked there.
+    pub(crate) fn tunnel_toggle_in(&mut self, wid: window::Id, key: &TunnelKey) -> Task<Message> {
+        let over = self.over(wid);
+        self.tunnel_toggle_over(key, over)
+    }
+
+    /// [`App::tunnel_retry`] from the tunnels panel of `wid`: its questions are asked there.
+    pub(crate) fn tunnel_retry_in(&mut self, wid: window::Id, key: &TunnelKey) -> Task<Message> {
+        let over = self.over(wid);
+        self.tunnel_retry_over(key, over)
+    }
+
+    /// The window a start from `wid` asks over: `wid` while it is a terminal window.
+    fn over(&self, wid: window::Id) -> Option<window::Id> {
+        Some(wid)
+            .filter(|w| self.windows.contains_key(w))
+            .or_else(|| self.focused_window())
+    }
+
+    fn tunnel_toggle_over(&mut self, key: &TunnelKey, over: Option<window::Id>) -> Task<Message> {
         if self.tunnels.running(key) {
             self.tunnels.stop(key);
             self.tunnels.off_by_hand.insert(key.clone());
         } else if let Some(def) = definition(&self.profiles, key) {
             let manual = def.start == StartMode::OnDemand || self.shell_count(key.profile) == 0;
-            self.launch(key, self.focused_window(), manual);
+            self.launch(key, over, manual);
         }
         self.refresh_palettes();
         Task::none()
@@ -332,7 +356,12 @@ impl App {
 
     /// Start `key` again with its current definition (Retry, or restart to apply): the old
     /// instance, if any, is stopped and released first.
+    #[cfg(test)]
     pub(crate) fn tunnel_retry(&mut self, key: &TunnelKey) -> Task<Message> {
+        self.tunnel_retry_over(key, self.focused_window())
+    }
+
+    fn tunnel_retry_over(&mut self, key: &TunnelKey, over: Option<window::Id>) -> Task<Message> {
         let Some(def) = definition(&self.profiles, key) else {
             return Task::none();
         };
@@ -340,7 +369,7 @@ impl App {
             || def.start == StartMode::OnDemand
             || self.shell_count(key.profile) == 0;
         self.tunnels.stop(key);
-        self.launch(key, self.focused_window(), manual);
+        self.launch(key, over, manual);
         self.refresh_palettes();
         Task::none()
     }

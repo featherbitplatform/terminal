@@ -231,6 +231,7 @@ pub fn snapshot(
         recency: recency.clone().into(),
         file_panel_width: None,
         file_panel_show_hidden: None,
+        tunnels_panel_width: None,
     }
 }
 

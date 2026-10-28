@@ -18,7 +18,6 @@ use crate::prompts::PromptMsg;
 use crate::saved_secrets::VaultMsg;
 use crate::schemes_window::{ImportChoice, SchemesMsg, UpdateChoice};
 use crate::settings_window::SettingsMsg;
-use crate::tunnels_window::TunnelsMsg;
 
 /// How a [`Shortcuts`] wrapper treats keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -73,9 +72,6 @@ pub(crate) enum Mode {
     /// installs it as a copy, Escape cancels, and no other key reaches a field behind the
     /// question or acts as a shortcut.
     SchemesUpdate,
-    /// The Tunnels window: Cmd+W closes it, Settings, the profile editor, Color schemes and
-    /// Quit work; other shortcuts do nothing (typing goes to the search bar).
-    Tunnels,
     /// The export and import window: Cmd+W closes it, Settings, the profile editor, Color
     /// schemes, Tunnels and Quit work, and so do the export and import actions (they switch
     /// its mode); other shortcuts do nothing (typing goes to its fields).
@@ -251,15 +247,6 @@ fn press_message(
                 _ => None,
             })
         }
-        Mode::Tunnels => shortcut.map(|action| match action {
-            Action::CloseTab if !repeat => Some(Message::Tunnels(TunnelsMsg::Close)),
-            Action::Quit | Action::Settings | Action::EditProfiles | Action::EditSchemes
-                if !repeat =>
-            {
-                Some(Message::Shortcut(w, action))
-            }
-            _ => None,
-        }),
         Mode::Archive => shortcut.map(|action| match action {
             Action::CloseTab if !repeat => Some(Message::Archive(ArchiveMsg::Close)),
             Action::Quit
@@ -1120,19 +1107,6 @@ mod tests {
             Some(None)
         ));
         assert!(matches!(press(Mode::SchemesUpdate, "w", false), Some(None)));
-    }
-
-    #[test]
-    fn the_tunnels_window_closes_and_reaches_the_others() {
-        assert!(matches!(
-            press(Mode::Tunnels, "w", false),
-            Some(Some(Message::Tunnels(TunnelsMsg::Close)))
-        ));
-        assert!(matches!(
-            press(Mode::Tunnels, ",", true),
-            Some(Some(Message::Shortcut(_, Action::EditProfiles)))
-        ));
-        assert!(matches!(press(Mode::Tunnels, "t", false), Some(None)));
     }
 
     #[test]

@@ -1,8 +1,11 @@
-//! The Tunnels window's look: a title and search bar, then a card per profile with a row per
+//! The tunnels list's look: a title and search bar, then a card per profile with a row per
 //! tunnel (state dot, name, addresses in Geist Mono, state, Retry or Restart to apply, switch).
+//! Still laid out as the former Tunnels window's page; the panel view builds on it.
+// Nothing draws the panel yet; the panel view task wires this into the dock and drops the allow.
+#![allow(dead_code)]
 
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input, toggler};
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding, window};
 
 use super::{EMPTY, NO_MATCHES, RESTART_TO_APPLY, SEARCH_PLACEHOLDER, TunnelsMsg};
 use crate::app::Message;
@@ -19,6 +22,7 @@ fn msg(m: TunnelsMsg) -> Message {
 /// `groups`: the list for the current query; `any`: whether any profile has a tunnel at all.
 pub fn view<'a>(
     t: &'static Tokens,
+    wid: window::Id,
     query: &'a str,
     input: &iced::widget::Id,
     groups: Vec<Group>,
@@ -26,7 +30,7 @@ pub fn view<'a>(
 ) -> Element<'a, Message> {
     let search = text_input(SEARCH_PLACEHOLDER, query)
         .id(input.clone())
-        .on_input(|q| msg(TunnelsMsg::Query(q)))
+        .on_input(move |q| msg(TunnelsMsg::Query(wid, q)))
         .font(UI_FONT)
         .size(13.5)
         .padding(Padding {
@@ -56,7 +60,7 @@ pub fn view<'a>(
         );
     }
     for g in groups {
-        body = body.push(group(t, g));
+        body = body.push(group(t, wid, g));
     }
     let page = scrollable(
         container(container(body).max_width(CONTENT_WIDTH))
@@ -93,11 +97,11 @@ pub fn view<'a>(
 }
 
 /// A profile's tunnels: its name over a card of rows separated by hairlines.
-fn group<'a>(t: &'static Tokens, g: Group) -> Element<'a, Message> {
+fn group<'a>(t: &'static Tokens, wid: window::Id, g: Group) -> Element<'a, Message> {
     let mut list = column![];
     let count = g.rows.len();
     for (i, r) in g.rows.into_iter().enumerate() {
-        list = list.push(tunnel_row(t, r));
+        list = list.push(tunnel_row(t, wid, r));
         if i + 1 < count {
             list = list.push(container(Space::new()).width(Length::Fill).height(1).style(
                 move |_| container::Style {
@@ -154,7 +158,7 @@ fn small_button<'a>(
         .into()
 }
 
-fn tunnel_row<'a>(t: &'static Tokens, r: Row) -> Element<'a, Message> {
+fn tunnel_row<'a>(t: &'static Tokens, wid: window::Id, r: Row) -> Element<'a, Message> {
     let color = tone_color(t, r.tone);
     let state_color = if r.tone == Tone::Failed {
         t.danger
@@ -181,7 +185,7 @@ fn tunnel_row<'a>(t: &'static Tokens, r: Row) -> Element<'a, Message> {
         actions = actions.push(small_button(
             t,
             RESTART_TO_APPLY,
-            msg(TunnelsMsg::Retry(r.key.clone())),
+            msg(TunnelsMsg::Retry(wid, r.key.clone())),
             restart_style,
         ));
     }
@@ -189,14 +193,14 @@ fn tunnel_row<'a>(t: &'static Tokens, r: Row) -> Element<'a, Message> {
         actions = actions.push(small_button(
             t,
             "Retry",
-            msg(TunnelsMsg::Retry(r.key.clone())),
+            msg(TunnelsMsg::Retry(wid, r.key.clone())),
             ui::secondary,
         ));
     }
     let key = r.key;
     actions = actions.push(
         toggler(r.on)
-            .on_toggle(move |_| msg(TunnelsMsg::Toggle(key.clone())))
+            .on_toggle(move |_| msg(TunnelsMsg::Toggle(wid, key.clone())))
             .size(18)
             .style(move |_, status| crate::settings_window::view::toggler_style(t, status, false)),
     );
