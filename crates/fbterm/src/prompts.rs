@@ -274,6 +274,8 @@ pub enum PromptMsg {
     /// The picker of key file question `id` closed: the chosen file, or `None` (cancelled,
     /// the question stays).
     KeyChosen(window::Id, PromptId, Option<PathBuf>),
+    /// The update question's answer: `Check automatically` (`true`) or `Not now`.
+    AnswerUpdates(window::Id, bool),
 }
 
 /// An upload whose name exists in its folder: `"{name}" already exists in {folder}.`
@@ -337,6 +339,9 @@ pub enum Dialog {
         reply: Option<oneshot::Sender<Option<SecretAnswer>>>,
         input: iced::widget::Id,
     },
+    /// The first-launch update question: `Check automatically` or `Not now` (see
+    /// [`crate::update`]).
+    CheckUpdates,
     /// Which key file for a key profile that names none: `Choose…` or `Cancel`.
     KeyFile {
         profile: String,
@@ -425,7 +430,8 @@ impl Dialog {
             Self::Changed { .. }
             | Self::CloseTab { .. }
             | Self::Clash(_)
-            | Self::Transfers { .. } => {}
+            | Self::Transfers { .. }
+            | Self::CheckUpdates => {}
         }
     }
 }
@@ -666,7 +672,7 @@ impl PromptQueues {
         })
     }
 
-    #[cfg(test)]
+    /// Whether no window has a dialog.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }

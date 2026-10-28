@@ -162,6 +162,10 @@ pub struct Settings {
     pub max_fps: MaxFps,
     /// Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
     pub tunnel_max_retries: u32,
+    /// Check GitHub once a day for a newer release. `None`: never answered (absent from the
+    /// file), which counts as off; the app asks once at launch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_updates: Option<bool>,
     /// Where saved secrets live. Changed through the Settings window, which moves them; a
     /// hand edit applies on the next launch and moves nothing.
     pub secret_storage: SecretStorage,
@@ -183,6 +187,7 @@ impl Default for Settings {
             window_decorations: WindowDecorations::Fbterm,
             max_fps: MaxFps::default(),
             tunnel_max_retries: 10,
+            check_updates: None,
             secret_storage: SecretStorage::Auto,
             keys: KeyOverrides::default(),
         }
@@ -412,6 +417,10 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 # Automatic reconnect attempts for a tunnel whose connection dropped (0 = off).
 #tunnel_max_retries = 10
 
+# Check GitHub once a day for a newer fbterm and show a dot on the settings button when one
+# is out (true or false). Nothing is downloaded or installed. Left out, fbterm asks once.
+#check_updates = false
+
 # Where saved passwords and key passphrases live: "auto" (the system keychain where it
 # works, else the encrypted vault), "keychain" or "vault" (an encrypted file opened with a
 # main password). Change it in the Settings window, which moves the saved secrets across.
@@ -428,6 +437,11 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 "##;
 
 impl Settings {
+    /// Whether the update check runs: only when the user said yes.
+    pub fn checks_updates(&self) -> bool {
+        self.check_updates == Some(true)
+    }
+
     /// Write [`SETTINGS_TEMPLATE`] to `path` unless something is already there (a file, or a
     /// symlink, even a dangling one). Returns whether it was written. The target is created
     /// exclusively, so an existing file is never touched, even if it appears concurrently.

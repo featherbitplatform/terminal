@@ -49,6 +49,11 @@ age = { version = "0.11.5", default-features = false }
 zeroize = { version = "1.9.1", features = ["serde"] }
 # Key file bytes inside the archive TOML.
 base64 = "0.22.1"
+# The update check's HTTPS GET (`fbterm/src/net.rs`): rustls with ring (already here through
+# russh) and the bundled webpki roots, so no OpenSSL or other system library is linked.
+ureq = { version = "3.5.0", default-features = false, features = ["rustls"] }
+# Comparing release versions for the update check (already in the lockfile through rustc_version).
+semver = "1"
 
 [profile.release]
 lto = "thin"
