@@ -63,7 +63,8 @@ impl MenuItem {
 }
 
 /// The open menu: over which window and pane, where the right-click was, whether the pane
-/// had a selection to copy, which item the keyboard is on.
+/// had a selection to copy, which item the keyboard is on (`Copy` when it is enabled, else
+/// `Paste`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ContextMenu {
     pub window: window::Id,
@@ -82,7 +83,11 @@ impl ContextMenu {
             pane,
             at,
             can_copy,
-            selected: MenuItem::Paste,
+            selected: if can_copy {
+                MenuItem::Copy
+            } else {
+                MenuItem::Paste
+            },
         }
     }
 
@@ -680,9 +685,13 @@ mod tests {
         let (mut app, wid, pane) = app_with_pane();
         let term = select_word(&mut app, wid, pane);
         open_menu(&mut app, wid, pane, true);
-        // The keyboard reaches Copy.
+        // The keyboard starts on Copy and moves between both items.
+        let selected = |app: &App| app.context_menu.as_ref().unwrap().selected;
+        assert_eq!(selected(&app), MenuItem::Copy);
+        let _ = app.update(Message::ContextMenu(wid, MenuMsg::Down));
+        assert_eq!(selected(&app), MenuItem::Paste);
         let _ = app.update(Message::ContextMenu(wid, MenuMsg::Up));
-        assert_eq!(app.context_menu.as_ref().unwrap().selected, MenuItem::Copy);
+        assert_eq!(selected(&app), MenuItem::Copy);
         assert_eq!(app.selected_text(wid, pane).as_deref(), Some("word"));
         let task = app.update(Message::ContextMenu(wid, MenuMsg::Submit));
         // The clipboard write (the widget's Copy report needs no work of the app).
@@ -700,6 +709,7 @@ mod tests {
     fn without_a_selection_copy_is_disabled() {
         let (mut app, wid, pane) = app_with_pane();
         open_menu(&mut app, wid, pane, false);
+        assert_eq!(app.context_menu.as_ref().unwrap().selected, MenuItem::Paste);
         let _ = app.update(Message::ContextMenu(wid, MenuMsg::Up));
         assert_eq!(app.context_menu.as_ref().unwrap().selected, MenuItem::Paste);
         let task = app.update(Message::ContextMenu(wid, MenuMsg::Choose(MenuItem::Copy)));
