@@ -3,7 +3,9 @@
 //! macOS uses a unified title bar: the OS title strip is transparent and hidden, the content
 //! runs under it, and the tab bar (or the editor's header) takes its place with the native
 //! window buttons drawn over its leading end. Empty space in that bar moves the window and a
-//! double click zooms it.
+//! double click zooms it. While the pointer is over a tab or a button of the bar, the window
+//! is not movable by the system ([`Chrome::system_may_drag`], [`set_system_drag`]), so dragging
+//! a tab drags only the tab.
 //!
 //! Windows and Linux draw their own: the window has no OS decorations, the tab bar (or the
 //! editor's header) is the title bar and holds drawn minimize, maximize and close controls
@@ -687,6 +689,9 @@ pub enum BarAction {
     Close,
     /// Resize the window from that edge or corner with the pointer.
     ResizeFrom(Direction),
+    /// The pointer is now over a widget of the bar that takes a press (a tab, a button), or
+    /// no longer is. Only the unified bar reports it (see [`Chrome::system_may_drag`]).
+    PointerOverWidget(bool),
 }
 
 impl PartialEq for BarAction {
@@ -695,6 +700,7 @@ impl PartialEq for BarAction {
         match (self, other) {
             // `Direction` has no `PartialEq`; it has no fields either.
             (Self::ResizeFrom(a), Self::ResizeFrom(b)) => discriminant(a) == discriminant(b),
+            (Self::PointerOverWidget(a), Self::PointerOverWidget(b)) => a == b,
             _ => discriminant(self) == discriminant(other),
         }
     }
@@ -744,6 +750,25 @@ impl Chrome {
     /// Whether fbterm draws the window controls (and resizes from the edges) itself.
     pub fn draws_controls(self) -> bool {
         self == Self::Drawn
+    }
+
+    /// Whether the system itself may move the window from a press in its bar, with the pointer
+    /// over a widget that takes the press (`over_widget`: a tab, a button) or not. Not over a
+    /// widget of the unified bar: the tab strip lies in AppKit's title-bar drag region (the
+    /// content runs under the transparent title strip and the content view never declines
+    /// `mouseDownCanMoveWindow`), so the Window Server would move the window from a press on a
+    /// tab while the app drags the tab. The pointer moves onto a widget before it presses
+    /// there, so the window is made not movable then ([`set_system_drag`]) and movable again
+    /// when the pointer leaves it. Empty bar space keeps the system's own move.
+    pub fn system_may_drag(self, over_widget: bool) -> bool {
+        self != Self::Unified || !over_widget
+    }
+
+    /// What a unified bar reports when the pointer's place changes: `Some(over)` when `over`
+    /// (over a widget that takes a press) differs from what it last reported (`reported`,
+    /// `None` before the first report). Other bars report nothing.
+    pub fn pointer_report(self, reported: Option<bool>, over: bool) -> Option<bool> {
+        (self == Self::Unified && reported != Some(over)).then_some(over)
     }
 
     /// What a left press in the bar means. `captured` is whether a widget in the bar (a tab, a
@@ -1001,15 +1026,65 @@ fn set_acrylic_backdrop(window: &dyn window::Window) {
     }
 }
 
+/// Let the system move window `id` from a press in its bar (`movable`), or not: on macOS the
+/// window's `movable` flag, which turns the Window Server's title-bar drag on or off (see
+/// [`Chrome::system_may_drag`]). Nothing elsewhere.
+pub fn set_system_drag<T: Send + 'static>(id: window::Id, movable: bool) -> iced::Task<T> {
+    #[cfg(target_os = "macos")]
+    {
+        window::run(id, move |w| {
+            if let Some(ns_window) = ns_window(w) {
+                ns_window.setMovable(movable);
+            }
+        })
+        .discard()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (id, movable);
+        iced::Task::none()
+    }
+}
+
+/// The AppKit window behind `w`; `None` off the main thread or for a non-AppKit handle.
+#[cfg(target_os = "macos")]
+pub(crate) fn ns_window(
+    w: &dyn window::Window,
+) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
+    use iced::window::raw_window_handle::RawWindowHandle;
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSView;
+    // Window callbacks run on the main thread, as AppKit requires.
+    MainThreadMarker::new()?;
+    let handle = w.window_handle().ok()?;
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return None;
+    };
+    // SAFETY: the handle points at the window's live content view for the duration of
+    // this callback, and we are on the main thread.
+    let view: &NSView = unsafe { handle.ns_view.cast().as_ref() };
+    view.window()
+}
+
+/// Whether a widget showing `interaction` under the pointer takes a press there (a tab or a
+/// button shows the pointer hand); empty bar space shows none.
+pub fn takes_press(interaction: mouse::Interaction) -> bool {
+    !matches!(
+        interaction,
+        mouse::Interaction::None | mouse::Interaction::Idle
+    )
+}
+
 /// The task for a bar action on window `id`. [`BarAction::Close`] is the app's to handle (it
 /// may ask before closing), so it does nothing here.
-pub fn perform<T>(id: window::Id, action: BarAction) -> iced::Task<T> {
+pub fn perform<T: Send + 'static>(id: window::Id, action: BarAction) -> iced::Task<T> {
     match action {
         BarAction::Drag => window::drag(id),
         BarAction::ToggleMaximize => window::toggle_maximize(id),
         BarAction::Minimize => window::minimize(id, true),
         BarAction::ResizeFrom(direction) => window::drag_resize(id, direction),
-        BarAction::Close => iced::Task::none(),
+        // The app's to handle: it keeps track of which windows it made not movable.
+        BarAction::Close | BarAction::PointerOverWidget(_) => iced::Task::none(),
     }
 }
 
@@ -1200,6 +1275,8 @@ struct TitleBar<'a, Message> {
 #[derive(Default)]
 struct State {
     previous: Option<mouse::Click>,
+    /// What the bar last reported with [`BarAction::PointerOverWidget`].
+    reported_over: Option<bool>,
 }
 
 impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TitleBar<'_, Message> {
@@ -1267,6 +1344,38 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TitleBar<'_, Mess
             shell,
             viewport,
         );
+        // Where the pointer is, when it can have changed: over a widget that takes a press or
+        // not. The pointer gets there before it presses, so the report comes first.
+        let over = match event {
+            Event::Mouse(
+                mouse::Event::CursorMoved { .. }
+                | mouse::Event::CursorEntered
+                | mouse::Event::ButtonReleased(_),
+            ) => Some(
+                cursor.is_over(layout.bounds())
+                    && takes_press(self.content.as_widget().mouse_interaction(
+                        &tree.children[0],
+                        layout,
+                        cursor,
+                        viewport,
+                        renderer,
+                    )),
+            ),
+            Event::Mouse(mouse::Event::CursorLeft) => Some(false),
+            Event::Window(window::Event::Focused | window::Event::Unfocused) => {
+                // The app makes the window movable when it loses focus: report afresh.
+                tree.state.downcast_mut::<State>().reported_over = None;
+                None
+            }
+            _ => None,
+        };
+        if let Some(over) = over {
+            let state = tree.state.downcast_mut::<State>();
+            if let Some(report) = self.chrome.pointer_report(state.reported_over, over) {
+                state.reported_over = Some(report);
+                shell.publish((self.on_action)(BarAction::PointerOverWidget(report)));
+            }
+        }
         let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event else {
             return;
         };
@@ -1384,6 +1493,48 @@ mod tests {
         ] {
             assert_eq!(Chrome::Unified.bar_press(true, false, kind), None);
         }
+    }
+
+    #[test]
+    fn a_unified_window_is_held_still_only_over_a_widget() {
+        assert!(!Chrome::Unified.system_may_drag(true));
+        assert!(Chrome::Unified.system_may_drag(false));
+        // Drawn bars are no title bar to the system; OS title bars are the system's own.
+        for c in [Chrome::Drawn, Chrome::Native] {
+            assert!(c.system_may_drag(true) && c.system_may_drag(false));
+        }
+    }
+
+    #[test]
+    fn the_unified_bar_reports_only_changes_of_the_pointers_place() {
+        let c = Chrome::Unified;
+        // The first place is always reported (also after focus changes reset it).
+        assert_eq!(c.pointer_report(None, true), Some(true));
+        assert_eq!(c.pointer_report(None, false), Some(false));
+        // Onto a tab, along it, off it.
+        assert_eq!(c.pointer_report(Some(false), true), Some(true));
+        assert_eq!(c.pointer_report(Some(true), true), None);
+        assert_eq!(c.pointer_report(Some(true), false), Some(false));
+        assert_eq!(c.pointer_report(Some(false), false), None);
+    }
+
+    #[test]
+    fn other_bars_never_report_the_pointer() {
+        for c in [Chrome::Drawn, Chrome::Native] {
+            for reported in [None, Some(false), Some(true)] {
+                for over in [false, true] {
+                    assert_eq!(c.pointer_report(reported, over), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tabs_and_buttons_take_presses_empty_space_does_not() {
+        assert!(takes_press(mouse::Interaction::Pointer));
+        assert!(takes_press(mouse::Interaction::Grabbing));
+        assert!(!takes_press(mouse::Interaction::None));
+        assert!(!takes_press(mouse::Interaction::Idle));
     }
 
     #[test]

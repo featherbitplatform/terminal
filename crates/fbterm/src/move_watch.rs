@@ -564,6 +564,48 @@ mod tests {
     }
 
     #[test]
+    fn a_unified_window_is_held_still_only_while_the_pointer_is_over_a_tab() {
+        let (mut app, _dir) = app();
+        app.chrome = Box::leak(Box::new(ChromeCell::starting(Chrome::Unified)));
+        let w = window::Id::unique();
+        // Opening a window leaves it movable.
+        assert_eq!(app.update(Message::AnyWindowOpened(w)).units(), 0);
+        let over = |app: &mut App, over| {
+            app.update(Message::TitleBar(w, BarAction::PointerOverWidget(over)))
+                .units()
+        };
+        // On macOS each change is one call to AppKit; nothing when nothing changes.
+        let call = usize::from(cfg!(target_os = "macos"));
+        assert_eq!(over(&mut app, false), 0);
+        assert_eq!(over(&mut app, true), call);
+        assert!(app.held_still.contains(&w));
+        assert_eq!(over(&mut app, true), 0);
+        // Off the tab: movable again.
+        assert_eq!(over(&mut app, false), call);
+        assert!(app.held_still.is_empty());
+        // Losing focus over a tab: movable again.
+        assert_eq!(over(&mut app, true), call);
+        assert_eq!(app.update(Message::WindowUnfocused(w)).units(), call);
+        assert!(app.held_still.is_empty());
+        assert_eq!(app.update(Message::WindowUnfocused(w)).units(), 0);
+    }
+
+    #[test]
+    fn other_chrome_never_holds_a_window_still() {
+        let (mut app, _dir) = app();
+        let w = window::Id::unique();
+        for chrome in [Chrome::Drawn, Chrome::Native] {
+            app.chrome = Box::leak(Box::new(ChromeCell::starting(chrome)));
+            for over in [true, false, true] {
+                let task = app.update(Message::TitleBar(w, BarAction::PointerOverWidget(over)));
+                assert_eq!(task.units(), 0);
+                assert!(app.held_still.is_empty());
+            }
+            assert_eq!(app.update(Message::WindowUnfocused(w)).units(), 0);
+        }
+    }
+
+    #[test]
     fn a_window_opened_across_a_switch_gets_the_current_decorations() {
         let (mut app, _dir) = app();
         let (late, fine) = (window::Id::unique(), window::Id::unique());

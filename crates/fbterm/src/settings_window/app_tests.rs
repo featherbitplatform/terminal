@@ -544,3 +544,15 @@ fn open_windows_remember_whether_they_were_created_opaque() {
     app.windows.remove(&first);
     assert!(!app.opaque_window_open());
 }
+
+#[test]
+fn the_key_log_never_listens_while_it_is_off() {
+    use fbterm_config::keys::Action;
+    let (mut app, _paths) = app();
+    assert_eq!(app.recording_window(), None);
+    assert!(!app.key_log_listening());
+    send(&mut app, SettingsMsg::Record(Action::Palette));
+    // A recorder is active, but FBTERM_LOG_KEYS is not set in tests: no listener.
+    assert!(app.recording_window().is_some());
+    assert!(!app.key_log_listening());
+}
