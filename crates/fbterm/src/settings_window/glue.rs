@@ -47,7 +47,8 @@ impl App {
     /// The look of one pane: the colors of its scheme ([`App::scheme_for`]), the scheme's font
     /// and size where it sets them (else the settings'), at the pane's own zoom; focused (keys
     /// go to it, solid cursor) only for the focused pane of the focused window while its find
-    /// bar is closed. No accent border: the tiles draw the focus outline.
+    /// bar is closed and neither docked panel has the keyboard. No accent border: the tiles
+    /// draw the focus outline.
     pub(crate) fn pane_style(&self, wid: window::Id, tab: &Tab, pane: &Pane) -> TerminalStyle {
         let scheme = self.scheme_for(pane);
         let (lo, hi) = fbterm_config::settings::FONT_SIZE_RANGE;
@@ -70,7 +71,8 @@ impl App {
                 && self.focused == Some(wid)
                 && tab.focused == pane.id
                 && pane.find.is_none()
-                && !self.file_panels.has_focus(wid),
+                && !self.file_panels.has_focus(wid)
+                && !self.tunnels_panels.has_focus(wid),
             accent: None,
             ..self.style.clone()
         }

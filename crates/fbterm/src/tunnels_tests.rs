@@ -1379,3 +1379,302 @@ fn no_tunnels_window_exists() {
     assert!(w.app.schemes_window().is_none());
     assert!(w.app.archive_window().is_none());
 }
+
+// The panel in its window: keyboard, focus and the tab bar's button.
+
+/// A key press with the text it types and the modifiers held.
+fn key_press(
+    key: iced::keyboard::Key,
+    mods: iced::keyboard::Modifiers,
+    text: Option<&str>,
+) -> iced::Event {
+    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: key.clone(),
+        modified_key: key,
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyA),
+        location: iced::keyboard::Location::Standard,
+        modifiers: mods,
+        text: text.map(Into::into),
+        repeat: false,
+    })
+}
+
+fn typed(c: &str) -> iced::Event {
+    key_press(
+        iced::keyboard::Key::Character(c.into()),
+        iced::keyboard::Modifiers::empty(),
+        Some(c),
+    )
+}
+
+fn escape() -> iced::Event {
+    key_press(
+        iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        iced::keyboard::Modifiers::empty(),
+        None,
+    )
+}
+
+/// The default New tab chord.
+fn new_tab_chord() -> iced::Event {
+    use iced::keyboard::Modifiers;
+    let mods = if cfg!(target_os = "macos") {
+        Modifiers::LOGO
+    } else {
+        Modifiers::CTRL | Modifiers::SHIFT
+    };
+    key_press(iced::keyboard::Key::Character("t".into()), mods, None)
+}
+
+/// `wid`'s window as drawn, laid out 1000 x 600: `focus` (a field's id) takes the keyboard
+/// first, then `events` run through it. Returns what was published.
+fn window_events(
+    app: &App,
+    wid: window::Id,
+    focus: Option<iced::widget::Id>,
+    events: &[iced::Event],
+) -> Vec<Message> {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::widget::operation::focusable;
+    use iced::advanced::{Shell, clipboard};
+    use iced::{Pixels, Rectangle, Size, mouse};
+    const WINDOW: Size = Size::new(1000.0, 600.0);
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let mut element = crate::window::view(app, wid);
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, WINDOW));
+    if let Some(id) = focus {
+        let mut op = focusable::focus::<()>(id);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    }
+    let mut messages = Vec::new();
+    for event in events {
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            event,
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(WINDOW),
+        );
+    }
+    messages
+}
+
+/// Whether the field `id` is drawn in `wid`'s window, and focused: `None` when not drawn.
+fn field_focused(app: &App, wid: window::Id, id: &iced::widget::Id, focus: bool) -> Option<bool> {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::widget::operation::{Operation, focusable};
+    use iced::{Pixels, Size};
+    let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        Pixels(16.0),
+    ));
+    let mut element = crate::window::view(app, wid);
+    let mut tree = Tree::new(&element);
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &Limits::new(Size::ZERO, Size::new(1000.0, 600.0)),
+    );
+    if focus {
+        let mut op = focusable::focus::<()>(id.clone());
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    }
+    struct IsFocused(iced::widget::Id, Option<bool>);
+    impl Operation for IsFocused {
+        fn focusable(
+            &mut self,
+            id: Option<&iced::widget::Id>,
+            _bounds: iced::Rectangle,
+            state: &mut dyn focusable::Focusable,
+        ) {
+            if id == Some(&self.0) {
+                self.1 = Some(state.is_focused());
+            }
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+    }
+    let mut op = IsFocused(id.clone(), None);
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut op);
+    op.1
+}
+
+fn reaches_terminal(messages: &[Message]) -> bool {
+    messages.iter().any(|m| matches!(m, Message::Terminal(..)))
+}
+
+#[test]
+fn typing_in_panel_search_stays_in_the_panel() {
+    use crate::tunnels_panel::TunnelsMsg;
+    let (mut w, _) = panel_world();
+    let pane = w.open_shell();
+    let wid = w.wid;
+    let _ = shortcut(&mut w, wid, crate::keys::Action::Tunnels);
+    assert!(
+        w.app.tunnels_panels.has_focus(wid),
+        "the panel has the keyboard"
+    );
+    let input = w.app.tunnels_panels.input[&wid].clone();
+
+    // The search field has the keyboard: what is typed goes into it, never to the terminal.
+    let messages = window_events(&w.app, wid, Some(input.clone()), &[typed("w")]);
+    assert!(
+        messages.iter().any(
+            |m| matches!(m, Message::Tunnels(TunnelsMsg::Query(id, q)) if *id == wid && q == "w")
+        ),
+        "typed into the search: {messages:?}"
+    );
+    assert!(!reaches_terminal(&messages));
+
+    // App shortcuts still act.
+    let messages = window_events(&w.app, wid, Some(input.clone()), &[new_tab_chord()]);
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, Message::Shortcut(_, crate::keys::Action::NewTab))),
+        "{messages:?}"
+    );
+    assert!(!reaches_terminal(&messages));
+
+    // The field let go of the keyboard (a click elsewhere in the panel): typing still goes to
+    // the search, and the field takes the keyboard again.
+    let messages = window_events(&w.app, wid, None, &[typed("e")]);
+    assert!(!reaches_terminal(&messages), "{messages:?}");
+    let typed_into: Vec<&String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Tunnels(TunnelsMsg::Type(id, s)) if *id == wid => Some(s),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(typed_into, ["e"]);
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Query(wid, "w".into())));
+    let task = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Type(wid, "e".into())));
+    assert_eq!(w.app.tunnels_panels.query(wid), "we");
+    assert!(task.units() >= 1, "the search field takes the keyboard");
+
+    // Meanwhile the terminal is drawn without the keyboard.
+    let win = &w.app.windows[&wid];
+    let tab = win.active_tab().unwrap();
+    let (_, p) = win.locate(pane).unwrap();
+    assert!(!w.app.pane_style(wid, tab, &tab.panes[p]).focused);
+}
+
+#[test]
+fn escape_clears_search_then_returns_the_keyboard() {
+    use crate::tunnels_panel::TunnelsMsg;
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    let _ = shortcut(&mut w, wid, crate::keys::Action::Tunnels);
+    let input = w.app.tunnels_panels.input[&wid].clone();
+    let _ = w
+        .app
+        .update(Message::Tunnels(TunnelsMsg::Query(wid, "web".into())));
+
+    // Escape is the panel's, before the focused field sees it.
+    let messages = window_events(&w.app, wid, Some(input.clone()), &[escape()]);
+    assert!(
+        messages
+            .iter()
+            .any(|m| matches!(m, Message::Tunnels(TunnelsMsg::Escape(id)) if *id == wid)),
+        "{messages:?}"
+    );
+    assert!(!reaches_terminal(&messages));
+
+    // First it clears the search; the panel keeps the keyboard.
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Escape(wid)));
+    assert_eq!(w.app.tunnels_panels.query(wid), "");
+    assert!(w.app.tunnels_panels.has_focus(wid));
+    // Then it gives the keyboard back to the terminal; the panel stays open.
+    let task = w.app.update(Message::Tunnels(TunnelsMsg::Escape(wid)));
+    assert!(!w.app.tunnels_panels.has_focus(wid));
+    assert!(w.app.tunnels_panels.is_open(wid));
+    assert!(
+        task.units() >= 1,
+        "the search field lets go of the keyboard"
+    );
+    let messages = window_events(&w.app, wid, None, &[typed("x")]);
+    assert!(
+        !messages.iter().any(|m| matches!(m, Message::Tunnels(_))),
+        "keys go to the terminal again: {messages:?}"
+    );
+
+    // A click in the panel takes the keyboard again; closing the panel gives it back.
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Focus(wid, true)));
+    assert!(w.app.tunnels_panels.has_focus(wid));
+    let _ = w.app.update(Message::Tunnels(TunnelsMsg::Close(wid)));
+    assert!(!w.app.tunnels_panels.has_focus(wid));
+    let _ = shortcut(&mut w, wid, crate::keys::Action::Tunnels);
+    assert!(
+        w.app.tunnels_panels.has_focus(wid),
+        "reopened with the keyboard"
+    );
+
+    // Another tab taking focus gives the keyboard back too, as with the file panel.
+    let _ = w.open_shell();
+    assert!(!w.app.tunnels_panels.has_focus(wid));
+    assert!(w.app.tunnels_panels.is_open(wid));
+}
+
+#[test]
+fn tunnels_button_shows_active_while_open() {
+    use crate::keys::Action;
+    let (mut w, a, b) = two_windows();
+    assert!(!w.app.tunnels_button_active(a) && !w.app.tunnels_button_active(b));
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    assert!(w.app.tunnels_button_active(a));
+    assert!(!w.app.tunnels_button_active(b), "only in its own window");
+    // The file panel takes the edge: the button is no longer active.
+    let _ = shortcut(&mut w, a, Action::FilePanel);
+    assert!(!w.app.tunnels_button_active(a));
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    let _ = shortcut(&mut w, a, Action::Tunnels);
+    assert!(!w.app.tunnels_button_active(a));
+}
+
+#[test]
+fn search_gets_focus_on_open() {
+    use crate::keys::Action;
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    // Opening returns one task: the focus of the panel's search field.
+    let task = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(task.units(), 1);
+    let input = w.app.tunnels_panels.input[&wid].clone();
+    // That id is the search field drawn in the panel, and focusing it gives it the keyboard.
+    assert_eq!(field_focused(&w.app, wid, &input, false), Some(false));
+    assert_eq!(field_focused(&w.app, wid, &input, true), Some(true));
+    // Reopened, the same field is focused again.
+    let _ = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(field_focused(&w.app, wid, &input, false), None, "closed");
+    let task = shortcut(&mut w, wid, Action::Tunnels);
+    assert_eq!(task.units(), 1);
+    assert_eq!(w.app.tunnels_panels.input[&wid], input);
+    assert_eq!(field_focused(&w.app, wid, &input, true), Some(true));
+}

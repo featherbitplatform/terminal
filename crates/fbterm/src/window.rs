@@ -24,6 +24,7 @@ use crate::tab_look::{Surroundings, look};
 use crate::tabs::{Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
+use crate::tunnels_panel::TunnelsMsg;
 use crate::ui::{ICON_FOLDER, ICON_PLUS, ICON_SETTINGS, ICON_TUNNELS, ICON_USERS, ICON_X, icon};
 use crate::windows::{Carry, DragMsg};
 
@@ -201,17 +202,9 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     let menu = app.context_menu.as_ref().filter(|m| m.window == id);
     let modal = palette.is_some() || find_box.is_some() || asking || menu.is_some();
     let carry = app.carry_in(id);
-    // The file panel docks at the active tab's right edge, outside the tiles: they lay out in
-    // what is left, as they would in a narrower window.
-    let panel = win
-        .active_tab()
-        .and_then(|_| crate::file_panel::view::panel(app, id))
-        .map(|(panel, width)| Docked {
-            panel,
-            width,
-            window: id,
-            focused: app.file_panels.has_focus(id),
-        });
+    // The file panel or the tunnels panel docks at the active tab's right edge, outside the
+    // tiles: they lay out in what is left, as they would in a narrower window.
+    let panel = docked(app, id);
     // The panel's rule outlines the content's right side; the bar carries that line on along
     // the content's top and around the active tab, ending where the rule's right edge is.
     let outline_end = panel.as_ref().and_then(|p| {
@@ -235,6 +228,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         bindings: &app.bindings,
         carry,
         tunnels_up: app.tunnels.up_count(),
+        tunnels_open: app.tunnels_button_active(id),
         files: app.files_button(id),
         update_dot: app.update_dot(),
         outline_end,
@@ -311,7 +305,13 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
             ..container::Style::default()
         })
         .into();
-    let panel_focused = panel.as_ref().is_some_and(|p| p.focused);
+    let panel_mode = panel
+        .as_ref()
+        .filter(|p| p.focused)
+        .map(|p| match p.content {
+            DockContent::Files => Mode::Panel,
+            DockContent::Tunnels => Mode::TunnelsPanel,
+        });
     body = body.push(dock(terminal_area, panel));
     // Under an overlay nothing reaches the terminal; only the palette and find-in-all-tabs
     // toggles still work, and not while a dialog waits for an answer.
@@ -337,8 +337,8 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         window: id,
         mode: if modal {
             covered
-        } else if panel_focused {
-            Mode::Panel
+        } else if let Some(mode) = panel_mode {
+            mode
         } else if find.is_some() {
             Mode::Find
         } else {
@@ -397,22 +397,79 @@ pub(crate) const MIN_TERMINAL_WIDTH: f32 = 200.0;
 /// on the panel's side of the edge, so it never takes a press meant for the terminal.
 pub(crate) const DOCK_GRAB: f32 = 6.0;
 
-/// How wide a file panel asking for `width` is docked in a window `total` wide: it never
-/// squeezes the terminal below [`MIN_TERMINAL_WIDTH`].
+/// How wide a panel asking for `width` is docked in a window `total` wide: it never squeezes
+/// the terminal below [`MIN_TERMINAL_WIDTH`].
 fn docked_width(width: f32, total: f32) -> f32 {
     width.min(total - MIN_TERMINAL_WIDTH).max(0.0).round()
 }
 
-/// The file panel as docked beside a window's content.
+/// Which panel the right edge shows: one at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DockContent {
+    Files,
+    Tunnels,
+}
+
+impl DockContent {
+    /// Dragging the panel's edge: its new width.
+    fn resize(self, width: f32) -> Message {
+        match self {
+            Self::Files => Message::FilePanel(FilePanelMsg::Resize(width)),
+            Self::Tunnels => Message::Tunnels(TunnelsMsg::Resize(width)),
+        }
+    }
+
+    /// The drag ended.
+    fn resize_end(self) -> Message {
+        match self {
+            Self::Files => Message::FilePanel(FilePanelMsg::ResizeEnd),
+            Self::Tunnels => Message::Tunnels(TunnelsMsg::ResizeEnd),
+        }
+    }
+
+    /// The panel takes the keyboard (`true`) or gives it back to the content.
+    fn focus(self, window: window::Id, focused: bool) -> Message {
+        match self {
+            Self::Files => Message::FilePanel(FilePanelMsg::Focus(window, focused)),
+            Self::Tunnels => Message::Tunnels(TunnelsMsg::Focus(window, focused)),
+        }
+    }
+}
+
+/// A panel as docked beside a window's content.
 pub(crate) struct Docked<'a> {
     pub panel: Element<'a, Message>,
     pub width: f32,
     pub window: window::Id,
     /// The panel has the keyboard: key presses go to it, never to the content.
     pub focused: bool,
+    /// Which panel it is: where the dock reports drags and clicks.
+    pub content: DockContent,
 }
 
-/// `content` with the file panel (and its width) docked at its right edge. Without a panel
+/// The panel docked in window `id`, if any: the tunnels panel or the file panel (never
+/// both), only while the window has an active tab.
+pub(crate) fn docked(app: &App, id: window::Id) -> Option<Docked<'_>> {
+    app.windows.get(&id)?.active_tab()?;
+    if let Some((panel, width)) = crate::tunnels_panel::view::panel(app, id) {
+        return Some(Docked {
+            panel,
+            width,
+            window: id,
+            focused: app.tunnels_panels.has_focus(id),
+            content: DockContent::Tunnels,
+        });
+    }
+    crate::file_panel::view::panel(app, id).map(|(panel, width)| Docked {
+        panel,
+        width,
+        window: id,
+        focused: app.file_panels.has_focus(id),
+        content: DockContent::Files,
+    })
+}
+
+/// `content` with a panel (and its width) docked at its right edge. Without a panel
 /// the content is laid out exactly as it would be on its own. The same widget is used either
 /// way, so showing or hiding the panel keeps the content's widget state (terminal views, the
 /// find bar's focus).
@@ -420,9 +477,9 @@ pub(crate) fn dock<'a>(
     content: Element<'a, Message>,
     panel: Option<Docked<'a>>,
 ) -> Element<'a, Message> {
-    let (panel, width, window, focused) = match panel {
-        Some(d) => (Some(d.panel), d.width, Some(d.window), d.focused),
-        None => (None, 0.0, None, false),
+    let (panel, width, window, focused, kind) = match panel {
+        Some(d) => (Some(d.panel), d.width, Some(d.window), d.focused, d.content),
+        None => (None, 0.0, None, false, DockContent::Files),
     };
     Element::new(Dock {
         content,
@@ -430,15 +487,16 @@ pub(crate) fn dock<'a>(
         width,
         window,
         focused,
+        kind,
     })
 }
 
-/// The active tab's content and, when shown, the file panel beside it, whose left edge drags
-/// to resize it (reported as [`FilePanelMsg::Resize`], then [`FilePanelMsg::ResizeEnd`]; a
-/// drag also ends when the pointer leaves the window or the window loses focus).
+/// The active tab's content and, when shown, the file panel or the tunnels panel beside it,
+/// whose left edge drags to resize it (reported to that panel as `Resize`, then `ResizeEnd`;
+/// a drag also ends when the pointer leaves the window or the window loses focus).
 ///
 /// It also decides who has the keyboard: a press in the panel gives it to the panel, a press
-/// in the content gives it back ([`FilePanelMsg::Focus`]); key presses and releases go only to
+/// in the content gives it back (that panel's `Focus`); key presses and releases go only to
 /// the side that has it, so the terminal never sees the panel's keys and the panel never
 /// sees the terminal's.
 struct Dock<'a> {
@@ -447,6 +505,8 @@ struct Dock<'a> {
     width: f32,
     window: Option<window::Id>,
     focused: bool,
+    /// Which panel `panel` is.
+    kind: DockContent,
 }
 
 #[derive(Default)]
@@ -574,13 +634,13 @@ impl<'a> Widget<Message, iced::Theme, iced::Renderer> for Dock<'a> {
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) if state.dragging => {
                 let width = bounds.x + bounds.width - position.x;
-                shell.publish(Message::FilePanel(FilePanelMsg::Resize(width)));
+                shell.publish(self.kind.resize(width));
                 shell.capture_event();
                 return;
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
                 state.dragging = false;
-                shell.publish(Message::FilePanel(FilePanelMsg::ResizeEnd));
+                shell.publish(self.kind.resize_end());
                 shell.capture_event();
                 return;
             }
@@ -588,7 +648,7 @@ impl<'a> Widget<Message, iced::Theme, iced::Renderer> for Dock<'a> {
             // ends here, keeping the width it reached.
             e if state.dragging && crate::tiles::cancels_drag(e) => {
                 state.dragging = false;
-                shell.publish(Message::FilePanel(FilePanelMsg::ResizeEnd));
+                shell.publish(self.kind.resize_end());
             }
             _ => {}
         }
@@ -603,7 +663,7 @@ impl<'a> Widget<Message, iced::Theme, iced::Renderer> for Dock<'a> {
                 .next()
                 .is_some_and(|c| c.bounds().contains(at));
             if in_panel != self.focused && (in_panel || in_content) {
-                shell.publish(Message::FilePanel(FilePanelMsg::Focus(window, in_panel)));
+                shell.publish(self.kind.focus(window, in_panel));
             }
         }
         let keys = matches!(
@@ -793,11 +853,13 @@ struct TabBar<'b> {
     carry: Option<Carry>,
     /// How many tunnels are up (the indicator's count).
     tunnels_up: usize,
+    /// The window's tunnels panel is open: the button shows its active style.
+    tunnels_open: bool,
     /// The files button: `None` hidden, else whether the window's file panel is open.
     files: Option<bool>,
     /// A newer release is out: a red dot on the settings button (see [`crate::update`]).
     update_dot: bool,
-    /// With the file panel docked: where its left rule ends (window x), so the outline along
+    /// With a panel docked: where its left rule ends (window x), so the outline along
     /// the content's top and around the active tab meets it. `None` draws no outline.
     outline_end: Option<f32>,
 }
@@ -818,6 +880,7 @@ fn tab_bar<'a>(
         demo_tip,
         bindings,
         tunnels_up,
+        tunnels_open,
         files,
         update_dot,
         ..
@@ -844,7 +907,9 @@ fn tab_bar<'a>(
         .on_press(msg(TabBarMsg::Profiles))
         .padding(7)
         .style(move |_, status| ghost(t, status));
-    let mut indicator = row![icon(ICON_TUNNELS, 14.0, t.text_muted)]
+    // Active while the window's panel is open, as the files button.
+    let tunnels_color = if tunnels_open { t.accent } else { t.text_muted };
+    let mut indicator = row![icon(ICON_TUNNELS, 14.0, tunnels_color)]
         .spacing(5)
         .align_y(Alignment::Center);
     if let Some(n) = crate::tunnels_panel::indicator_count(tunnels_up) {
@@ -1609,7 +1674,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
                 renderer.with_layer(clip, |renderer| renderer.fill_quad(disc, background));
             }
         }
-        // With the file panel docked, its rule's line carries on along the content's top
+        // With a panel docked, its rule's line carries on along the content's top
         // and around the active tab. From the window's left edge, over drawn controls on the
         // left too (drawn before the bar).
         if let Some(end) = self.outline_end {
@@ -2234,6 +2299,7 @@ mod tests {
                 carry,
                 // The indicator with a count sits after the tabs; tabs are measured as before.
                 tunnels_up: 3,
+                tunnels_open: true,
                 // So is the files button.
                 files: Some(true),
                 // And the settings button with its update dot.

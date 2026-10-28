@@ -977,9 +977,14 @@ impl App {
         self.ask_update_question();
         self.sync_update_state();
         crate::key_log::set_recording(self.recording_window());
-        match self.sync_panel_focus() {
-            Some(unfocus) => Task::batch([task, unfocus]),
-            None => task,
+        let unfocus: Vec<Task<Message>> = [self.sync_panel_focus(), self.sync_tunnels_focus()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if unfocus.is_empty() {
+            task
+        } else {
+            Task::batch(std::iter::once(task).chain(unfocus))
         }
     }
 

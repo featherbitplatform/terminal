@@ -1,6 +1,7 @@
-//! The tunnels panel's state, free of the UI: which terminal windows show it, each window's
-//! search (kept while its panel is closed, forgotten with the window) and the panel's width,
-//! the same in every window. The width limits are the file panel's.
+//! The tunnels panel's state, free of the UI: which terminal windows show it, which of those
+//! panels have the keyboard, each window's search (kept while its panel is closed, forgotten
+//! with the window) and the panel's width, the same in every window. The width limits are the
+//! file panel's.
 
 use std::collections::{HashMap, HashSet};
 
@@ -20,6 +21,13 @@ pub(crate) struct TunnelsPanels {
     pub query: HashMap<window::Id, String>,
     /// Each window's search field, focused when its panel opens.
     pub input: HashMap<window::Id, iced::widget::Id>,
+    /// Open panels with the keyboard: keys go to the panel, not the terminal (the panel
+    /// opening or a click in it; a click in the terminal, Escape, another pane or tab taking
+    /// focus or the panel closing gives them back).
+    pub focused: HashSet<window::Id>,
+    /// Each open panel's window's focused pane, as last seen: when another pane or tab takes
+    /// focus, the keyboard goes back to the terminal.
+    pub pane: HashMap<window::Id, crate::layout::PaneId>,
     /// The panel's width, the same in every window (remembered in `state.toml`).
     pub width: f32,
 }
@@ -30,6 +38,8 @@ impl TunnelsPanels {
             open: HashSet::new(),
             query: HashMap::new(),
             input: HashMap::new(),
+            focused: HashSet::new(),
+            pane: HashMap::new(),
             width: width.map_or(DEFAULT_WIDTH, clamp_width),
         }
     }
@@ -38,23 +48,29 @@ impl TunnelsPanels {
         self.open.contains(&window)
     }
 
-    /// Show `window`'s panel; its search field, to focus.
+    /// Show `window`'s panel, with the keyboard; its search field, to focus.
     pub(crate) fn show(&mut self, window: window::Id) -> iced::widget::Id {
         self.open.insert(window);
+        self.focused.insert(window);
         self.input
             .entry(window)
             .or_insert_with(iced::widget::Id::unique)
             .clone()
     }
 
-    /// Hide `window`'s panel; its search stays.
+    /// Hide `window`'s panel, giving the keyboard back; its search stays.
     pub(crate) fn hide(&mut self, window: window::Id) {
         self.open.remove(&window);
+        self.focused.remove(&window);
+        self.pane.remove(&window);
+    }
+
+    /// Whether `window`'s panel has the keyboard.
+    pub(crate) fn has_focus(&self, window: window::Id) -> bool {
+        self.is_open(window) && self.focused.contains(&window)
     }
 
     /// `window`'s search text.
-    // Until the dock draws the panel, only tests use it.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn query(&self, window: window::Id) -> &str {
         self.query.get(&window).map_or("", String::as_str)
     }
@@ -64,6 +80,8 @@ impl TunnelsPanels {
         self.open.remove(&window);
         self.query.remove(&window);
         self.input.remove(&window);
+        self.focused.remove(&window);
+        self.pane.remove(&window);
     }
 
     /// The width to remember: `None` while it is the default.

@@ -1,9 +1,11 @@
 //! Shared chrome pieces for the editor and the dialogs: Graphite controls (radius 6), cards
 //! (radius 8), overlays (radius 12), Lucide icons.
 
+use iced::advanced::widget::{Id, Operation, operation::Focusable};
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input};
 use iced::{
-    Alignment, Background, Border, Color, Element, Font, Length, Padding, Shadow, Vector, window,
+    Alignment, Background, Border, Color, Element, Font, Length, Padding, Rectangle, Shadow, Task,
+    Vector, window,
 };
 
 use crate::app::Message;
@@ -472,4 +474,21 @@ mod tests {
             assert_eq!(edge_scrollbar_margin(false, margin), margin);
         }
     }
+}
+
+/// Lets go of the keyboard in the fields `ids` only (other fields and windows keep theirs).
+pub(crate) fn unfocus(ids: Vec<Id>) -> Task<Message> {
+    struct Unfocus(Vec<Id>);
+    impl<T> Operation<T> for Unfocus {
+        fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
+            if id.is_some_and(|id| self.0.contains(id)) {
+                state.unfocus();
+            }
+        }
+
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
+            operate(self);
+        }
+    }
+    iced::advanced::widget::operate(Unfocus(ids))
 }

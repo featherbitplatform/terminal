@@ -7,12 +7,11 @@ use std::time::SystemTime;
 
 use chrono::Datelike;
 use fbterm_session::ssh::sftp::{Entry, EntryKind, SortKey};
-use iced::advanced::widget::{Id, Operation, operation::Focusable};
 use iced::widget::{
     Space, button, column, container, mouse_area, progress_bar, responsive, row, scrollable, text,
     text_input, toggler,
 };
-use iced::{Alignment, Border, Element, Length, Padding, Rectangle, Size, Task, window};
+use iced::{Alignment, Border, Element, Length, Padding, Size, Task, window};
 
 use super::state::{self, Direction, PARENT, RowState, TransferRow, WindowPanel};
 use super::{Body, FilePanelMsg, ProfilePanel, REVEAL_LABEL, plain_name};
@@ -171,19 +170,7 @@ pub(crate) fn scroll_into_view(index: usize, offset: f32, height: f32) -> Option
 
 /// Lets go of the keyboard in `ui`'s fields only (the find bar and other windows keep theirs).
 pub(crate) fn unfocus_fields(ui: &WindowPanel) -> Task<Message> {
-    struct Unfocus(Vec<Id>);
-    impl<T> Operation<T> for Unfocus {
-        fn focusable(&mut self, id: Option<&Id>, _bounds: Rectangle, state: &mut dyn Focusable) {
-            if id.is_some_and(|id| self.0.contains(id)) {
-                state.unfocus();
-            }
-        }
-
-        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<T>)) {
-            operate(self);
-        }
-    }
-    iced::advanced::widget::operate(Unfocus(vec![ui.filter_id.clone(), ui.path_id.clone()]))
+    crate::ui::unfocus(vec![ui.filter_id.clone(), ui.path_id.clone()])
 }
 
 /// `wid`'s panel and its width, when it is open.

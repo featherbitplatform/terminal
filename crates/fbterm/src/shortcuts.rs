@@ -18,6 +18,7 @@ use crate::prompts::PromptMsg;
 use crate::saved_secrets::VaultMsg;
 use crate::schemes_window::{ImportChoice, SchemesMsg, UpdateChoice};
 use crate::settings_window::SettingsMsg;
+use crate::tunnels_panel::TunnelsMsg;
 
 /// How a [`Shortcuts`] wrapper treats keys.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,12 @@ pub(crate) enum Mode {
     /// go of the keyboard): it leaves the path field, else clears the filter, else gives the
     /// keyboard back.
     Panel,
+    /// A window whose tunnels panel has the keyboard: application shortcuts act, keys go to
+    /// the panel's search field, and typing the field did not take (it let go of the
+    /// keyboard) goes to the search. Nothing reaches the terminal (the dock sends key presses
+    /// to the panel only). Escape is the panel's before the field sees it: it clears the
+    /// search, else gives the keyboard back.
+    TunnelsPanel,
     /// A connection dialog: Escape cancels, Enter submits; other keys go to its field.
     Prompt,
     /// A main password dialog (`crate::saved_secrets`): Escape cancels, Enter submits, no
@@ -180,6 +187,12 @@ fn press_message(
             keyboard::Key::Named(Named::Escape) if !repeat => Some(Some(Message::FilePanel(
                 FilePanelMsg::Key(w, PanelKey::Escape),
             ))),
+            _ => press_message(bindings, Mode::Normal, w, press, repeat, text),
+        },
+        Mode::TunnelsPanel => match key {
+            keyboard::Key::Named(Named::Escape) if !repeat => {
+                Some(Some(Message::Tunnels(TunnelsMsg::Escape(w))))
+            }
             _ => press_message(bindings, Mode::Normal, w, press, repeat, text),
         },
         Mode::Prompt => match key {
@@ -555,6 +568,14 @@ impl Widget<Message, iced::Theme, iced::Renderer> for Shortcuts<'_> {
             && let Some(key) = panel_key(event)
         {
             shell.publish(Message::FilePanel(FilePanelMsg::Key(self.window, key)));
+            shell.capture_event();
+        }
+        // Typing the search field did not take (it let go of the keyboard): the search takes it.
+        if self.mode == Mode::TunnelsPanel
+            && !shell.is_event_captured()
+            && let Some(text) = typed_text(event)
+        {
+            shell.publish(Message::Tunnels(TunnelsMsg::Type(self.window, text)));
             shell.capture_event();
         }
         // Typing the bar's field did not take (it lost focus to a click): the bar takes it.

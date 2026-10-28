@@ -12,6 +12,10 @@
 //!   focused last and brings that window forward.
 //! - **Questions** of a tunnel switched on (or retried) from the panel are asked over the
 //!   panel's window.
+//! - **Keyboard**, as in the file panel: the panel opens with its search field focused; a
+//!   click in the panel gives it the keyboard, a click in the terminal, Escape on an empty
+//!   search, another pane or tab taking focus or the panel closing gives it back. While the
+//!   panel has it, typing goes to the search (never to the terminal) and app shortcuts act.
 
 use fbterm_config::{ProfileId, ProfileKind, ProfileStore, TunnelDef, TunnelKind};
 use fbterm_session::ssh::tunnel::{TunnelKey, TunnelState};
@@ -40,12 +44,17 @@ pub const RESTART_TO_APPLY: &str = "Restart to apply";
 
 /// What a window's tunnels panel asks for (it opens through `Action::Tunnels`).
 #[derive(Debug, Clone)]
-// Until the dock draws the panel, only tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub enum TunnelsMsg {
     /// The close button.
     Close(window::Id),
     Query(window::Id, String),
+    /// The panel takes the keyboard (`true`, a click in it) or gives it back to the terminal
+    /// (`false`, a click in the terminal).
+    Focus(window::Id, bool),
+    /// Escape while the panel has the keyboard: clears the search, else gives it back.
+    Escape(window::Id),
+    /// Text typed while the panel has the keyboard but its search field does not.
+    Type(window::Id, String),
     /// The switch: on or off.
     Toggle(window::Id, TunnelKey),
     Retry(window::Id, TunnelKey),
@@ -85,8 +94,63 @@ impl App {
         iced::widget::operation::focus(input)
     }
 
+    /// Hide `wid`'s panel; the keyboard goes back to the terminal.
     pub(crate) fn close_tunnels_panel(&mut self, wid: window::Id) {
         self.tunnels_panels.hide(wid);
+    }
+
+    /// The tab bar's tunnels button shows its active style: `wid`'s panel is open.
+    pub(crate) fn tunnels_button_active(&self, wid: window::Id) -> bool {
+        self.tunnels_panels.is_open(wid)
+    }
+
+    /// The profile `wid`'s panel highlights: its focused pane's.
+    pub(crate) fn tunnels_highlight(&self, wid: window::Id) -> Option<ProfileId> {
+        let tab = self.windows.get(&wid)?.active_tab()?;
+        Some(tab.focused_pane().profile)
+    }
+
+    /// Give `wid`'s panel the keyboard, or give it back to the terminal; the search field lets
+    /// go of it then, so nothing types into it or blinks there.
+    fn focus_tunnels_panel(&mut self, wid: window::Id, focused: bool) -> Task<Message> {
+        if !self.tunnels_panels.is_open(wid) {
+            return Task::none();
+        }
+        if focused {
+            self.tunnels_panels.focused.insert(wid);
+            return Task::none();
+        }
+        self.tunnels_panels.focused.remove(&wid);
+        match self.tunnels_panels.input.get(&wid) {
+            Some(input) => crate::ui::unfocus(vec![input.clone()]),
+            None => Task::none(),
+        }
+    }
+
+    /// A panel keeps the keyboard only while its window's focused pane stays the same:
+    /// another pane or tab taking focus gives it back to the terminal (as for the file panel).
+    /// Returns the task that lets go of the search fields of panels that lost it, if any.
+    pub(crate) fn sync_tunnels_focus(&mut self) -> Option<Task<Message>> {
+        if self.tunnels_panels.open.is_empty() {
+            return None;
+        }
+        let mut tasks = Vec::new();
+        let open: Vec<window::Id> = self.tunnels_panels.open.iter().copied().collect();
+        for wid in open {
+            let pane = self
+                .windows
+                .get(&wid)
+                .and_then(crate::tabs::WindowState::active_tab)
+                .map(|tab| tab.focused);
+            let before = match pane {
+                Some(p) => self.tunnels_panels.pane.insert(wid, p),
+                None => self.tunnels_panels.pane.remove(&wid),
+            };
+            if before.is_some() && before != pane && self.tunnels_panels.has_focus(wid) {
+                tasks.push(self.focus_tunnels_panel(wid, false));
+            }
+        }
+        (!tasks.is_empty()).then(|| Task::batch(tasks))
     }
 
     /// The `Tunnels` action used in `from`: a terminal window toggles its own panel; any
@@ -107,6 +171,29 @@ impl App {
             TunnelsMsg::Query(wid, q) => {
                 if self.windows.contains_key(&wid) {
                     self.tunnels_panels.query.insert(wid, q);
+                }
+            }
+            TunnelsMsg::Focus(wid, focused) => return self.focus_tunnels_panel(wid, focused),
+            TunnelsMsg::Escape(wid) => {
+                if !self.tunnels_panels.has_focus(wid) {
+                    return Task::none();
+                }
+                if self.tunnels_panels.query(wid).is_empty() {
+                    return self.focus_tunnels_panel(wid, false);
+                }
+                self.tunnels_panels.query.insert(wid, String::new());
+            }
+            TunnelsMsg::Type(wid, typed) => {
+                if !self.tunnels_panels.has_focus(wid) {
+                    return Task::none();
+                }
+                let query = format!("{}{typed}", self.tunnels_panels.query(wid));
+                self.tunnels_panels.query.insert(wid, query);
+                if let Some(input) = self.tunnels_panels.input.get(&wid) {
+                    return Task::batch([
+                        iced::widget::operation::focus(input.clone()),
+                        iced::widget::operation::move_cursor_to_end(input.clone()),
+                    ]);
                 }
             }
             TunnelsMsg::Toggle(wid, key) => return self.tunnel_toggle_in(wid, &key),
@@ -178,8 +265,6 @@ fn tone(state: &TunnelState) -> Tone {
     }
 }
 
-// Until the dock draws the panel, only tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
 /// `bind:port`, an IPv6 bind in brackets.
 fn endpoint(bind: &str, port: u16) -> String {
     let bind = bind.trim();
@@ -194,8 +279,6 @@ fn endpoint(bind: &str, port: u16) -> String {
 /// `remote …` for a remote one, `SOCKS {bind}:{port}`, then `via` the jump hops, if any.
 /// `listening`: the port a running instance listens on, shown for a definition that let the
 /// system (or the server) pick one.
-// Until the dock draws the panel, only tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn address(
     store: &ProfileStore,
     key: &TunnelKey,
@@ -257,8 +340,6 @@ fn defined(store: &ProfileStore) -> impl Iterator<Item = (&str, TunnelKey, &Tunn
 }
 
 /// Whether any profile has a tunnel (else the panel says where to add one).
-// Unused until the dock draws the panel.
-#[allow(dead_code)]
 pub fn any_defined(store: &ProfileStore) -> bool {
     defined(store).next().is_some()
 }
@@ -277,8 +358,6 @@ fn status(tunnels: &Tunnels, key: &TunnelKey, def: &TunnelDef) -> (String, Tone,
 /// matches `query` (all of them for a blank query). The group of `highlight` comes first and is
 /// marked; the others keep the profiles' order. A `highlight` that matches no group (unknown
 /// profile, a local one, one without tunnels, or filtered out by `query`) marks nothing.
-// Until the dock draws the panel, only tests use it.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn groups(
     store: &ProfileStore,
     tunnels: &Tunnels,

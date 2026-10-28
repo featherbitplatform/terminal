@@ -219,3 +219,210 @@ fn local_profile_highlights_nothing() {
         [s("srv", false), s("warehouse", false)]
     );
 }
+
+// The panel as drawn in the dock.
+
+fn renderer() -> iced::Renderer {
+    iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+        iced::Font::DEFAULT,
+        iced::Pixels(16.0),
+    ))
+}
+
+/// A tab of `profile` (not connected) in `w`'s window, focused.
+fn focus_tab_of(w: &mut World, profile: &fbterm_config::Profile) {
+    use crate::tabs::{Pane, Tab};
+    w.app
+        .windows
+        .get_mut(&w.wid)
+        .unwrap()
+        .push(Tab::single(Pane::for_profile(profile)));
+}
+
+/// Every text the docked panel of `w`'s window draws, laid out `size`.
+fn drawn_texts(w: &World, size: iced::Size) -> Vec<String> {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::{Id, Operation, Tree};
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn text(&mut self, _id: Option<&Id>, _bounds: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+            operate(self);
+        }
+    }
+    let renderer = renderer();
+    let docked = crate::window::docked(&w.app, w.wid).expect("a docked panel");
+    let mut element = docked.panel;
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(iced::Size::ZERO, size));
+    let mut texts = Texts(Vec::new());
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    texts.0
+}
+
+#[test]
+fn panel_draws_title_and_the_focused_profile_first() {
+    let (mut w, warehouse) = panel_world();
+    focus_tab_of(&mut w, &warehouse);
+    let wid = w.wid;
+    let _ = w
+        .app
+        .update(Message::Shortcut(wid, crate::keys::Action::Tunnels));
+    let content = crate::window::docked(&w.app, wid).expect("docked").content;
+    assert_eq!(content, crate::window::DockContent::Tunnels);
+    let texts = drawn_texts(&w, iced::Size::new(300.0, 700.0));
+    assert_eq!(texts.first().map(String::as_str), Some("Tunnels"));
+    let at = |s: &str| texts.iter().position(|t| t == s);
+    assert!(
+        at("warehouse") < at("srv"),
+        "the focused profile first: {texts:?}"
+    );
+    assert!(at("hook").is_some() && at("web").is_some());
+    assert_eq!(w.app.tunnels_highlight(wid), Some(warehouse.id));
+
+    // A search that hides every tunnel says so; with no tunnels at all, where to add them.
+    let _ = w.app.update(Message::Tunnels(super::TunnelsMsg::Query(
+        wid,
+        "zzzz".into(),
+    )));
+    assert!(drawn_texts(&w, iced::Size::new(300.0, 700.0)).contains(&super::NO_MATCHES.into()));
+}
+
+#[test]
+fn panel_width_is_clamped_like_the_file_panel() {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::widget::Space;
+    use iced::{Element, Length, Size};
+
+    use super::state::{MAX_WIDTH, MIN_WIDTH};
+    let (mut w, _) = panel_world();
+    let _ = w.open_shell();
+    let wid = w.wid;
+    let _ = w
+        .app
+        .update(Message::Shortcut(wid, crate::keys::Action::Tunnels));
+    // The panel docks at its shared width, clamped to the file panel's limits.
+    let _ = w
+        .app
+        .update(Message::Tunnels(super::TunnelsMsg::Resize(5000.0)));
+    let width = |w: &World| crate::window::docked(&w.app, wid).expect("docked").width;
+    assert_eq!(width(&w), MAX_WIDTH);
+    assert_eq!(
+        (MIN_WIDTH, MAX_WIDTH),
+        (
+            crate::file_panel::state::MIN_WIDTH,
+            crate::file_panel::state::MAX_WIDTH
+        )
+    );
+    let _ = w
+        .app
+        .update(Message::Tunnels(super::TunnelsMsg::Resize(1.0)));
+    assert_eq!(width(&w), MIN_WIDTH);
+
+    // A narrow window keeps the terminal usable, as beside the file panel.
+    let _ = w
+        .app
+        .update(Message::Tunnels(super::TunnelsMsg::Resize(5000.0)));
+    let docked = crate::window::docked(&w.app, wid).unwrap();
+    let content: Element<'_, Message> =
+        Space::new().width(Length::Fill).height(Length::Fill).into();
+    let mut element = crate::window::dock(content, Some(docked));
+    let mut tree = Tree::new(&element);
+    let narrow = Size::new(600.0, 400.0);
+    let renderer = renderer();
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, narrow));
+    let layout = Layout::new(&node);
+    let mut children = layout.children();
+    let content = children.next().unwrap().bounds();
+    let panel = children.next().unwrap().bounds();
+    assert!(content.width >= crate::window::MIN_TERMINAL_WIDTH);
+    assert_eq!(content.width + panel.width, narrow.width);
+}
+
+#[test]
+fn dock_reports_resize_and_focus_to_the_tunnels_panel() {
+    use iced::advanced::layout::{Layout, Limits};
+    use iced::advanced::widget::Tree;
+    use iced::advanced::{Shell, clipboard};
+    use iced::widget::Space;
+    use iced::{Element, Event, Length, Point, Rectangle, Size, mouse};
+    const WINDOW: Size = Size::new(1000.0, 600.0);
+    let fill = || -> Element<'static, Message> {
+        Space::new().width(Length::Fill).height(Length::Fill).into()
+    };
+    let wid = iced::window::Id::unique();
+    let mut element = crate::window::dock(
+        fill(),
+        Some(crate::window::Docked {
+            panel: fill(),
+            width: 300.0,
+            window: wid,
+            focused: false,
+            content: crate::window::DockContent::Tunnels,
+        }),
+    );
+    let renderer = renderer();
+    let mut tree = Tree::new(&element);
+    let node =
+        element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &Limits::new(Size::ZERO, WINDOW));
+    let mut messages = Vec::new();
+    let edge = Point::new(702.0, 300.0);
+    let inside = Point::new(800.0, 300.0);
+    for (event, at) in [
+        (
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            inside,
+        ),
+        (
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            edge,
+        ),
+        (
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: Point::new(600.0, 300.0),
+            }),
+            Point::new(600.0, 300.0),
+        ),
+        (
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+            edge,
+        ),
+    ] {
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Available(at),
+            &renderer,
+            &mut clipboard::Null,
+            &mut shell,
+            &Rectangle::with_size(WINDOW),
+        );
+    }
+    let seen: Vec<String> = messages
+        .iter()
+        .map(|m| match m {
+            Message::Tunnels(super::TunnelsMsg::Focus(id, on)) if *id == wid => {
+                format!("focus {on}")
+            }
+            Message::Tunnels(super::TunnelsMsg::Resize(w)) => format!("resize {w}"),
+            Message::Tunnels(super::TunnelsMsg::ResizeEnd) => "end".into(),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(seen, ["focus true", "resize 400", "end"]);
+}

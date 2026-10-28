@@ -6,9 +6,9 @@
 //!   questions over the window it was used in: the tunnels panel's window
 //!   ([`App::tunnel_toggle_in`]), else the focused terminal window, or the one used last while
 //!   another window has focus, and raises it; with no terminal window open, a tunnel that
-//!   needs to ask fails with [`NO_WINDOW`]. A tunnel whose definition does not validate is never started: it
-//!   fails with the validation message. A stopped tunnel reports nothing more, so the registry
-//!   sets `Off` itself.
+//!   needs to ask fails with [`NO_WINDOW`]. A tunnel whose definition does not validate is
+//!   never started: it fails with the validation message. A stopped tunnel reports nothing
+//!   more, so the registry sets `Off` itself.
 //! - **Restarts wait for the old instance.** A stopped tunnel releases its port, remote forward
 //!   and connection in its own task. A start under the same key while that is under way waits
 //!   for it (or a fixed-port remote forward would be refused as taken): a waiter task sends
