@@ -162,8 +162,8 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         if Chrome::current().draws_title_bar() {
             content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
         }
-        let groups = crate::tunnels_window::groups(&app.profiles, &app.tunnels, &state.query);
-        let any = crate::tunnels_window::any_defined(&app.profiles);
+        let groups = crate::tunnels_panel::groups(&app.profiles, &app.tunnels, &state.query, None);
+        let any = crate::tunnels_panel::any_defined(&app.profiles);
         let content = content.push(crate::tunnels_window::view::view(
             t,
             &state.query,
@@ -859,7 +859,7 @@ fn tab_bar<'a>(
     let mut indicator = row![icon(ICON_TUNNELS, 14.0, t.text_muted)]
         .spacing(5)
         .align_y(Alignment::Center);
-    if let Some(n) = crate::tunnels_window::indicator_count(tunnels_up) {
+    if let Some(n) = crate::tunnels_panel::indicator_count(tunnels_up) {
         indicator = indicator.push(
             text(n)
                 .font(UI_FONT)

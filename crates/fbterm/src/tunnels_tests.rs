@@ -80,18 +80,18 @@ fn srv_on(port: u16) -> Profile {
     }
 }
 
-fn key(p: &Profile, name: &str) -> TunnelKey {
+pub(crate) fn key(p: &Profile, name: &str) -> TunnelKey {
     TunnelKey {
         profile: p.id,
         name: name.into(),
     }
 }
 
-struct World {
-    app: App,
+pub(crate) struct World {
+    pub(crate) app: App,
     fake: Arc<Fake>,
-    wid: window::Id,
-    srv: Profile,
+    pub(crate) wid: window::Id,
+    pub(crate) srv: Profile,
 }
 
 fn world() -> World {
@@ -121,7 +121,7 @@ fn world_at(paths: Paths, srv: Profile) -> World {
 
 impl World {
     /// A new tab of `srv` whose shell has connected.
-    fn open_shell(&mut self) -> PaneId {
+    pub(crate) fn open_shell(&mut self) -> PaneId {
         let pane = Pane::for_profile(&self.srv);
         let id = pane.id;
         self.app
@@ -175,7 +175,7 @@ impl World {
         let _ = self.app.close_tab(self.wid, t);
     }
 
-    fn running(&self, name: &str) -> bool {
+    pub(crate) fn running(&self, name: &str) -> bool {
         self.app.tunnels.running(&key(&self.srv, name))
     }
 
@@ -183,12 +183,12 @@ impl World {
         self.app.tunnels.state(&key(&self.srv, name))
     }
 
-    fn toggle(&mut self, name: &str) {
+    pub(crate) fn toggle(&mut self, name: &str) {
         let k = key(&self.srv, name);
         let _ = self.app.tunnel_toggle(&k);
     }
 
-    fn edit(&mut self, f: impl FnOnce(&mut Profile)) {
+    pub(crate) fn edit(&mut self, f: impl FnOnce(&mut Profile)) {
         let p = self
             .app
             .profiles
@@ -201,7 +201,7 @@ impl World {
     }
 }
 
-fn tunnels_of(p: &mut Profile) -> &mut Vec<TunnelDef> {
+pub(crate) fn tunnels_of(p: &mut Profile) -> &mut Vec<TunnelDef> {
     match &mut p.kind {
         ProfileKind::Ssh(s) => &mut s.tunnels,
         ProfileKind::Local(_) => unreachable!(),
@@ -730,7 +730,7 @@ fn closing_the_last_pane_stops_with_shell_tunnels() {
 
 /// `srv` (tunnels `web` and `db`), a `bastion` without tunnels, and `warehouse` reached through
 /// it with a remote forward `hook` and a SOCKS proxy `proxy`.
-fn panel_world() -> (World, Profile) {
+pub(crate) fn panel_world() -> (World, Profile) {
     let srv = srv();
     let bastion = Profile {
         kind: ProfileKind::Ssh(SshProfile {
@@ -780,142 +780,6 @@ fn panel_world() -> (World, Profile) {
         warehouse.clone(),
     ]);
     (world_at(paths, srv), warehouse)
-}
-
-fn groups(w: &World, query: &str) -> Vec<crate::tunnels_window::Group> {
-    crate::tunnels_window::groups(&w.app.profiles, &w.app.tunnels, query)
-}
-
-fn names(groups: &[crate::tunnels_window::Group]) -> Vec<(String, Vec<String>)> {
-    groups
-        .iter()
-        .map(|g| {
-            (
-                g.profile.clone(),
-                g.rows.iter().map(|r| r.name.clone()).collect(),
-            )
-        })
-        .collect()
-}
-
-#[test]
-fn panel_lists_tunnels_grouped_by_profile() {
-    use crate::tunnels_window::Tone;
-    let (mut w, _) = panel_world();
-    let g = groups(&w, "");
-    assert_eq!(
-        names(&g),
-        [
-            ("srv".to_string(), vec!["web".to_string(), "db".to_string()]),
-            (
-                "warehouse".to_string(),
-                vec!["hook".to_string(), "proxy".to_string()]
-            ),
-        ],
-        "profiles without tunnels are left out; definition order within a profile"
-    );
-    let web = &g[0].rows[0];
-    assert_eq!(web.address, "127.0.0.1:18080 \u{2192} db.internal:5432");
-    assert_eq!(web.state, "Off");
-    assert_eq!(web.tone, Tone::Off);
-    assert!(!web.on && !web.retry && !web.restart_to_apply);
-    // A with-the-shell tunnel waiting for its shell says so.
-    assert_eq!(g[0].rows[1].state, "Starts with the shell");
-    assert_eq!(
-        g[1].rows[0].address,
-        "remote 127.0.0.1:9000 \u{2192} localhost:3000 via bastion"
-    );
-    assert_eq!(g[1].rows[1].address, "SOCKS 127.0.0.1:1080 via bastion");
-
-    // Every state, its label and tone.
-    w.toggle("web");
-    let row = |w: &World| groups(w, "")[0].rows[0].clone();
-    assert_eq!(
-        (row(&w).state.as_str(), row(&w).tone, row(&w).on),
-        ("Starting", Tone::Busy, true)
-    );
-    let web_key = key(&w.srv, "web");
-    for (state, label, tone) in [
-        (TunnelState::Up { connections: 0 }, "Up", Tone::Up),
-        (
-            TunnelState::Up { connections: 1 },
-            "Up \u{b7} 1 connection",
-            Tone::Up,
-        ),
-        (
-            TunnelState::Up { connections: 3 },
-            "Up \u{b7} 3 connections",
-            Tone::Up,
-        ),
-        (
-            TunnelState::Reconnecting {
-                attempt: 2,
-                max: 10,
-            },
-            "Reconnecting (attempt 2 of 10)",
-            Tone::Busy,
-        ),
-    ] {
-        let _ = w.app.update(Message::Tunnel(web_key.clone(), state));
-        assert_eq!((row(&w).state.as_str(), row(&w).tone), (label, tone));
-    }
-    // A changed definition marks the running tunnel.
-    w.edit(|p| {
-        if let TunnelKind::Local { host_port, .. } = &mut tunnels_of(p)[0].kind {
-            *host_port = 5433;
-        }
-    });
-    assert!(row(&w).restart_to_apply);
-    // While it runs the address is what is actually listening, not the pending edit.
-    assert_eq!(row(&w).address, "127.0.0.1:18080 \u{2192} db.internal:5432");
-    // A failure: red, switched off, with Retry.
-    let _ = w.app.update(Message::Tunnel(
-        web_key,
-        TunnelState::Failed("port 18080 already in use".into()),
-    ));
-    let r = row(&w);
-    // Off, it shows the definition the next start uses.
-    assert_eq!(r.address, "127.0.0.1:18080 \u{2192} db.internal:5433");
-    assert_eq!(r.state, "Failed: port 18080 already in use");
-    assert_eq!(r.tone, Tone::Failed);
-    assert!(!r.on && r.retry && !r.restart_to_apply);
-
-    // A with-the-shell tunnel switched off by hand while its shell is open is plainly off.
-    let _ = w.open_shell();
-    assert!(w.running("db"));
-    w.toggle("db");
-    assert_eq!(groups(&w, "")[0].rows[1].state, "Off");
-}
-
-#[test]
-fn search_filters_by_tunnel_and_profile() {
-    let (w, _) = panel_world();
-    // A tunnel name: only that row, under its profile.
-    assert_eq!(
-        names(&groups(&w, "proxy")),
-        [("warehouse".to_string(), vec!["proxy".to_string()])]
-    );
-    // A profile name: every tunnel of that profile.
-    assert_eq!(
-        names(&groups(&w, "wareh")),
-        [(
-            "warehouse".to_string(),
-            vec!["hook".to_string(), "proxy".to_string()]
-        )]
-    );
-    // Fuzzy, like the palette, and words may span profile and tunnel.
-    assert_eq!(
-        names(&groups(&w, "srv db")),
-        [("srv".to_string(), vec!["db".to_string()])]
-    );
-    assert_eq!(
-        names(&groups(&w, "wb")),
-        [("srv".to_string(), vec!["web".to_string()])]
-    );
-    assert!(groups(&w, "nothing-like-this").is_empty());
-    // Addresses are not searched.
-    assert!(groups(&w, "1080").is_empty());
-    assert_eq!(groups(&w, "  ").len(), 2, "a blank query lists everything");
 }
 
 #[test]
@@ -978,7 +842,7 @@ fn toggle_from_panel_and_palette() {
 
 #[test]
 fn indicator_counts_up_tunnels() {
-    use crate::tunnels_window::indicator_count;
+    use crate::tunnels_panel::indicator_count;
     let (mut w, warehouse) = panel_world();
     assert_eq!(w.app.tunnels.up_count(), 0);
     assert_eq!(indicator_count(0), None, "nothing up: no count");

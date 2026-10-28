@@ -4,11 +4,10 @@
 use iced::widget::{Space, button, column, container, row, scrollable, text, text_input, toggler};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding};
 
-use super::{
-    EMPTY, Group, NO_MATCHES, RESTART_TO_APPLY, Row, SEARCH_PLACEHOLDER, Tone, TunnelsMsg,
-};
+use super::{EMPTY, NO_MATCHES, RESTART_TO_APPLY, SEARCH_PLACEHOLDER, TunnelsMsg};
 use crate::app::Message;
 use crate::theme::{Tokens, UI_FONT};
+use crate::tunnels_panel::{Group, Row, Tone};
 use crate::ui::{self, MONO};
 
 const CONTENT_WIDTH: f32 = 600.0;

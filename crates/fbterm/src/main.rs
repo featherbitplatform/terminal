@@ -115,6 +115,7 @@ mod theme;
 mod tiles;
 mod tooltip;
 mod tunnels;
+mod tunnels_panel;
 #[cfg(test)]
 mod tunnels_tests;
 mod tunnels_window;

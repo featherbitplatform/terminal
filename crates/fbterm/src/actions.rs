@@ -121,7 +121,7 @@ impl App {
     pub(crate) fn palette_items(&self) -> Vec<PaletteItem> {
         palette::items(
             &self.profiles,
-            crate::tunnels_window::palette_rows(&self.profiles, &self.tunnels),
+            crate::tunnels_panel::palette_rows(&self.profiles, &self.tunnels),
         )
     }
 
