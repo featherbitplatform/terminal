@@ -42,13 +42,28 @@ Open it with **Edit schemes…** next to the **Color scheme** row in Settings (o
 
 For your own schemes, if the text against the background, any of the ANSI colors 1 to 6 and 9 to 14 against the background, or the selection against the text falls below the readability bar above, the editor shows "Text may be hard to read on this background." The hint is only a warning and never stops you from saving.
 
+## The theme gallery
+
+Next to the editor, the Color schemes window has an **Editor | Gallery** switch. The gallery lists ready-made schemes made by others, so you can try a look without building it by hand.
+
+- **Browsing.** Rows are sorted by name. The search box matches the name, the project and the author, and **All**, **Dark** and **Light** narrow the list. Each row shows a preview, its credit (project, author and license) and a **Project page** link.
+- **Install.** **Install** saves the theme as a scheme of yours, a file named `gallery-<id>.toml` in the `schemes/` folder, and the button then reads **Installed**. It appears in Settings and the profile editor like any other scheme, and you can duplicate or edit it.
+- **Update.** When the catalog has a newer version, the button reads **Update** and replaces the installed file in place: profiles keep using it and open panes recolor. If you changed the theme on this machine, fbterm asks first: **Replace my changes**, **Install as a copy** (the default, on `Enter`) or **Cancel**. A theme that the catalog no longer offers shows **No longer offered**; the installed copy keeps working.
+- **Credits.** An installed theme keeps its credit in its file (the `[credit]` table), shows it in the editor and keeps it when you export the scheme. This works offline.
+
+### What the gallery contacts
+
+The gallery reads one file, `https://raw.githubusercontent.com/featherbitplatform/terminal-themes/main/catalog.toml`, and only when you open the gallery or press **Refresh**. Nothing is fetched at startup or in the background, no check repeats, and nothing is cached on disk. Programs running in your sessions can never trigger it. If you are offline, the gallery shows one error line with **Retry**; your installed themes keep working.
+
+The themes come from [terminal-themes](https://github.com/featherbitplatform/terminal-themes), each under a permissive license with credit to its author. The full credits, and how to propose a new theme by pull request, are in that repository.
+
 ## Fonts in schemes
 
 A scheme that names a font gives its sessions that family and size instead of the global font in Settings. The size of a character cell follows the font, so the rows and columns of those panes change with it, and the program (or the SSH channel) is told the new size once. Panes with different fonts can sit in the same split tab. Saving a scheme with a different font reflows its open sessions once.
 
 ## Files and sharing
 
-Each scheme of yours is one file in the `schemes/` folder of the [configuration directory](files#configuration-directory), named after its id: `<id>.toml`. Built-in schemes are part of the app and are not files. Edits to these files while the app runs are picked up at once.
+Each scheme of yours is one file in the `schemes/` folder of the [configuration directory](files#configuration-directory), named after its id: `<id>.toml`. Built-in schemes are part of the app and are not files. Themes installed from the [gallery](#the-theme-gallery) are files named `gallery-<id>.toml`. Edits to these files while the app runs are picked up at once.
 
 Ids of your schemes look like `user-` followed by a random UUID; the built-in ids are `graphite`, `graphite-light`, `harbor` and `ember`. Scheme files are plain text, hold no secrets and are limited to 64 KiB. The file name must match the id inside. To share a scheme, use **Export…** and send the file; the other person uses **Import…**.
 
