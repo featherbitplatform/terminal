@@ -50,6 +50,7 @@ background_blur = false
 window_decorations = "fbterm"
 max_fps = 60
 tunnel_max_retries = 10
+check_updates = false
 secret_storage = "auto"
 ```
 
@@ -66,6 +67,7 @@ secret_storage = "auto"
 | `window_decorations` | `"fbterm"` or `"system"` | `"fbterm"` | Linux only; other systems ignore it. Who draws the window's title bar: `"fbterm"` draws it in the tab bar, `"system"` uses the desktop's. In the file it is written as `# Window title bar on Linux: "fbterm" draws it in the tab bar, "system" uses the desktop's.` In Settings this is **Title bar**. If the desktop refuses to let fbterm move its window, the session uses the system title bar anyway and says so once; the setting stays as you wrote it. See [Install on Linux](install-linux#title-bar). |
 | `max_fps` | integer, `30` to `240`, or `"display"` | `60` | Most redraws per second caused by program output. Typing, scrolling, selecting and resizing always redraw at once. `"display"` follows the refresh rate of the screen your windows are on (the fastest one, if they are on several screens); where the rate cannot be detected (Linux and Windows for now) it means `60`. Higher values use more CPU while output streams. Applies at once. |
 | `tunnel_max_retries` | integer, `0` to `100` | `10` | How many times a [tunnel](tunnels#reconnecting) tries to reconnect on its own after its connection drops. `0` turns automatic reconnecting off. In the Settings window this is **Reconnect attempts** under Tunnels. Applies at once. |
+| `check_updates` | `true` or `false` | not set (off) | Check for a newer fbterm once a day. See [Update check](#update-check). In the Settings window this is **Check for updates automatically** under Updates. Applies at once. |
 | `secret_storage` | `"auto"`, `"keychain"` or `"vault"` | `"auto"` | Where [saved secrets](saved-secrets) are kept: the system storage where there is one (else the encrypted vault), the system storage, or the vault. In the Settings window this is **Saved secrets**, which also moves the secrets when you change it. A change made by hand while the app runs takes effect at the next launch and moves nothing, so prefer Settings. |
 
 ### Redraw rate
@@ -73,6 +75,12 @@ secret_storage = "auto"
 When a program prints a lot (a log stream, a build), the terminal does not redraw for every piece of output: it draws at most `max_fps` times per second and shows everything that arrived in between. What you type is different: a keypress, and the echo that comes back from it, are drawn right away whatever the setting. The default of `60` is smooth on most screens and keeps CPU use low. On a 120 Hz screen, `max_fps = 120` or `max_fps = "display"` makes fast-scrolling output smoother, at the cost of more CPU while output is streaming (no extra cost while nothing prints). In the Settings window this is **Redraw rate** under Terminal: 30, 60, 120 or **Match display**, plus your own number if `settings.toml` has another one.
 
 A value outside its range does not reject the file: the app uses the nearest allowed value (for example `font_size = 100` gives `72`; a `max_fps` that is neither a whole number nor `"display"` gives `60`) and reports the field, the file and the line the same way it reports a syntax error. The file itself is left as you wrote it.
+
+### Update check
+
+fbterm can tell you when a newer version is out. It is off until you turn it on: on the first launch without `check_updates` in `settings.toml` (including the first launch after upgrading from a version without it), fbterm asks once, in a small dialog over the terminal window, **Check for updates?**, with **Check automatically** and **Not now**. Either answer is written to `settings.toml` as `check_updates = true` or `false` and the question never comes back; closing the dialog with Escape counts as **Not now**. If another question is open (a host key, a password, the main password), it waits until that one is answered.
+
+While `check_updates = true`, fbterm checks once at launch (or right when you turn it on) and then every 24 hours while it runs. A check is one HTTPS request to `https://api.github.com/repos/featherbitplatform/terminal/releases/latest`, which returns the latest published release (drafts and prereleases are never offered); it sends only the usual request headers, with `fbterm/<version>` as the user agent. When that release is newer than the one you run, a red dot appears on the settings button in the tab bar of every window, and Settings shows `Version X.Y.Z is available.` under the switch, with a **Download** button that opens the release page on GitHub in your browser. fbterm never downloads or installs anything by itself. The dot stays until you run that version or turn the check off. A check that fails (offline, rate-limited) changes nothing on screen and is noted in `fbterm.log`; the next one runs a day later. Apart from your SSH connections, this is the only network access fbterm makes.
 
 ### Keyboard shortcuts
 

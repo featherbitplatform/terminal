@@ -60,6 +60,22 @@ pub fn icon<'a>(glyph: &'static str, size: f32, color: Color) -> Element<'a, Mes
         .into()
 }
 
+/// A filled circle `size` across: the update dot on the settings button and in Settings.
+pub fn dot<'a>(color: Color, size: f32) -> Element<'a, Message> {
+    container(Space::new())
+        .width(size)
+        .height(size)
+        .style(move |_| container::Style {
+            background: Some(color.into()),
+            border: Border {
+                radius: (size / 2.0).into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        })
+        .into()
+}
+
 pub fn label<'a>(t: &Tokens, s: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(s).font(UI_FONT).size(12).color(t.text_secondary)
 }

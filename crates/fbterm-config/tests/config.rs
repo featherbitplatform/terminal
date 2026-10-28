@@ -581,12 +581,16 @@ fn settings_template_parses_to_defaults_with_every_setting_uncommented() {
     let path = tmp("settings.toml");
     std::fs::write(&path, &uncommented).unwrap();
     let (loaded, warning) = Settings::load_checked(&path).unwrap();
-    assert_eq!(loaded, Settings::default());
+    // `check_updates` left out means "never asked"; written out, it is the answer "no".
+    let answered = Settings {
+        check_updates: Some(false),
+        ..Settings::default()
+    };
+    assert_eq!(loaded, answered);
     assert!(warning.is_none());
     // Every field of Settings is written out.
     let table: toml::Table = toml::from_str(&uncommented).unwrap();
-    let defaults: toml::Table =
-        toml::from_str(&toml::to_string(&Settings::default()).unwrap()).unwrap();
+    let defaults: toml::Table = toml::from_str(&toml::to_string(&answered).unwrap()).unwrap();
     let mut keys: Vec<_> = table.keys().collect();
     let mut want: Vec<_> = defaults.keys().collect();
     keys.sort();
@@ -1227,4 +1231,26 @@ fn duplicate_profile_action_is_named_and_unbound_by_default() {
     assert_eq!(Action::DuplicateProfile.title(), "Duplicate profile");
     assert_eq!(default_chord(true, Action::DuplicateProfile), None);
     assert_eq!(default_chord(false, Action::DuplicateProfile), None);
+}
+
+#[test]
+fn check_updates_is_unasked_until_written() {
+    assert_eq!(Settings::default().check_updates, None);
+    assert!(!Settings::default().checks_updates());
+    let path = tmp("settings.toml");
+    std::fs::write(&path, "font_size = 14.0\n").unwrap();
+    assert_eq!(Settings::load(&path).unwrap().check_updates, None);
+    Settings::write_field(&path, &SettingChange::CheckUpdates(true)).unwrap();
+    let s = Settings::load(&path).unwrap();
+    assert_eq!(s.check_updates, Some(true));
+    assert!(s.checks_updates());
+    Settings::write_field(&path, &SettingChange::CheckUpdates(false)).unwrap();
+    assert_eq!(Settings::load(&path).unwrap().check_updates, Some(false));
+    assert!(SETTINGS_TEMPLATE.contains("#check_updates = false"));
+    // Never asked: nothing about it is saved.
+    assert!(
+        !toml::to_string(&Settings::default())
+            .unwrap()
+            .contains("check_updates")
+    );
 }
