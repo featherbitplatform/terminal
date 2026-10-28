@@ -202,6 +202,8 @@ original (no license), Material Theme (license could not be confirmed).
 
 - Themes in a separate repo, `featherbitplatform/terminal-themes`.
 - Browse and install from inside fbterm (not bundled at build time).
+- `terminal-themes` publishes on merge: pull requests go straight into `main`, gated by its CI;
+  no `develop` branch and no tags. What is on `main` is what users see.
 - An installed theme with a newer catalog version shows an **Update** button in the gallery.
 - Only permissive licenses; every theme credits author, project link and license.
 - The first catalog holds every theme that qualified.
