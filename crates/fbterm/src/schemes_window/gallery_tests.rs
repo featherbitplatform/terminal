@@ -10,7 +10,7 @@ use iced::Task;
 use parking_lot::Mutex;
 
 use super::gallery::{GalleryIo, GalleryLoad, UpdateChoice};
-use super::{SchemesMsg, SchemesState};
+use super::{Entry, SchemesMsg, SchemesState};
 use crate::app::{App, Message};
 use crate::schemes_tests::{app_with, rgb, style, with_scheme};
 
@@ -105,7 +105,8 @@ fn file(app: &App, id: &str) -> std::path::PathBuf {
 /// Run the fetch the way the blocking task does and hand its result to the window.
 fn finish_fetch(app: &mut App) {
     let result = app.gallery_job()();
-    let _ = send(app, SchemesMsg::GalleryFetched(result));
+    let generation = app.gallery_generation;
+    let _ = send(app, SchemesMsg::GalleryFetched(generation, result));
 }
 
 /// Open the window and its gallery, fetching `bytes` as the catalog.
@@ -444,4 +445,105 @@ fn credit_link_only_https() {
         calls.lock().opened,
         vec!["https://example.org/x".to_owned()]
     );
+}
+
+fn close_window(app: &mut App) {
+    let id = app.schemes_window().expect("schemes window open");
+    let _ = app.update(Message::WindowClosed(id));
+    assert!(app.schemes_win.is_none());
+}
+
+fn theme_names(app: &App) -> Vec<String> {
+    match &win(app).gallery {
+        GalleryLoad::Loaded(c) => c.themes.iter().map(|t| t.id.clone()).collect(),
+        other => panic!("not loaded: {other:?}"),
+    }
+}
+
+#[test]
+fn reopen_during_loading_and_stale_results() {
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[]);
+    let _ = fake_io(&mut app, Ok(catalog(&[entry("a", 1, "#101010", false)])));
+    let _ = send(&mut app, SchemesMsg::Open);
+    assert_eq!(send(&mut app, SchemesMsg::ShowGallery(true)).units(), 1);
+    let first = app.gallery_generation;
+    // Closed and opened again while the fetch runs: still Loading, no second fetch.
+    close_window(&mut app);
+    let _ = send(&mut app, SchemesMsg::Open);
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loading));
+    assert_eq!(send(&mut app, SchemesMsg::ShowGallery(true)).units(), 0);
+    assert_eq!(send(&mut app, SchemesMsg::RefreshGallery).units(), 0);
+    assert_eq!(app.gallery_generation, first);
+    finish_fetch(&mut app);
+    assert_eq!(theme_names(&app), ["a"]);
+
+    // A newer fetch: an older result arriving meanwhile or afterwards changes nothing.
+    let _ = fake_io(&mut app, Ok(catalog(&[entry("b", 1, "#101010", false)])));
+    assert_eq!(send(&mut app, SchemesMsg::RefreshGallery).units(), 1);
+    let stale = || Ok(catalog(&[entry("old", 1, "#101010", false)]));
+    let _ = send(&mut app, SchemesMsg::GalleryFetched(first, stale()));
+    assert!(matches!(win(&app).gallery, GalleryLoad::Loading));
+    finish_fetch(&mut app);
+    assert_eq!(theme_names(&app), ["b"]);
+    let _ = send(&mut app, SchemesMsg::GalleryFetched(first, stale()));
+    let _ = send(
+        &mut app,
+        SchemesMsg::GalleryFetched(first, Err("late".into())),
+    );
+    assert_eq!(theme_names(&app), ["b"]);
+    let cached = app.gallery_catalog.as_ref().unwrap();
+    assert_eq!(cached.themes[0].id, "b");
+}
+
+#[test]
+fn refresh_clears_pending_update() {
+    let v2 = catalog(&[entry("x", 2, "#203040", false)]);
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", &[edited_v1()]);
+    let _ = open_gallery(&mut app, v2.clone());
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    let _ = fake_io(&mut app, Ok(v2));
+    let _ = send(&mut app, SchemesMsg::RefreshGallery);
+    assert!(win(&app).pending_update.is_none());
+    finish_fetch(&mut app);
+    // A late answer to the dropped question does nothing.
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Replace));
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), edited_v1());
+}
+
+#[test]
+fn unsaved_draft_of_gallery_scheme_asks() {
+    let v1 = catalog(&[entry("x", 1, "#101010", false)]);
+    let v2 = catalog(&[entry("x", 2, "#203040", false)]);
+    let installed = installed_form(&v1);
+    let (mut app, _, _, _) = app_with(&[profile("a")], "", std::slice::from_ref(&installed));
+    let _ = open_gallery(&mut app, v2.clone());
+    let _ = send(&mut app, SchemesMsg::Select("gallery-x".into()));
+    let _ = send(
+        &mut app,
+        SchemesMsg::Color(Entry::Background, rgb(0x555555)),
+    );
+    assert!(win(&app).is_dirty("gallery-x"));
+    // An earlier error line goes when the question shows.
+    let _ = send(&mut app, SchemesMsg::Rename(String::new()));
+    let _ = send(&mut app, SchemesMsg::Save);
+    assert!(win(&app).error.is_some());
+    let _ = send(&mut app, SchemesMsg::Update("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    assert!(win(&app).error.is_none());
+    assert!(win(&app).notice.is_none());
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), installed);
+    // Install asks the same way.
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Cancel));
+    assert!(win(&app).is_dirty("gallery-x"), "Cancel keeps the draft");
+    let _ = send(&mut app, SchemesMsg::Install("x".into()));
+    assert_eq!(win(&app).pending_update.as_deref(), Some("x"));
+    // Replace discards the draft: the window shows the new version, nothing unsaved.
+    let _ = send(&mut app, SchemesMsg::UpdateChoice(UpdateChoice::Replace));
+    let new = installed_form(&v2);
+    assert_eq!(read_file(&file(&app, "gallery-x")).unwrap(), new);
+    assert!(!win(&app).is_dirty("gallery-x"));
+    assert_eq!(win(&app).draft("gallery-x"), Some(&new));
+    assert_eq!(win(&app).hex_text(Entry::Background), "#203040");
+    assert!(!win(&app).renaming);
 }

@@ -194,8 +194,9 @@ pub enum SchemesMsg {
         allow(dead_code, reason = "sent by the gallery view, which comes next")
     )]
     RefreshGallery,
-    /// The catalog as fetched on the blocking pool.
-    GalleryFetched(Result<Vec<u8>, String>),
+    /// The catalog as fetched on the blocking pool, with the fetch's generation (only the
+    /// latest fetch's result is used).
+    GalleryFetched(u64, Result<Vec<u8>, String>),
     /// Install the catalog theme with this id.
     #[cfg_attr(
         not(test),
@@ -593,6 +594,16 @@ impl SchemesState {
         match self.saved.iter_mut().find(|s| s.id == scheme.id) {
             Some(s) => *s = scheme.clone(),
             None => self.saved.push(scheme.clone()),
+        }
+    }
+
+    /// `scheme` was written over whatever the window held for its id: the draft and its
+    /// unsaved edits are dropped for it, and the form shows it if selected.
+    pub(super) fn discard_draft(&mut self, scheme: &Scheme) {
+        self.mark_saved(scheme);
+        if self.selected == scheme.id {
+            self.renaming = false;
+            self.sync_hex();
         }
     }
 

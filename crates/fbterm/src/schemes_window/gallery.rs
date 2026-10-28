@@ -143,16 +143,22 @@ impl App {
         move || fetch(CATALOG_URL, MAX_CATALOG_BYTES)
     }
 
-    /// Fetch the catalog on the blocking pool, unless a fetch is under way; the result comes
-    /// back as [`SchemesMsg::GalleryFetched`].
+    /// Fetch the catalog on the blocking pool, unless a fetch is under way (in this or an
+    /// earlier Color schemes window); the result comes back as
+    /// [`SchemesMsg::GalleryFetched`] with this fetch's generation. A question about an
+    /// edited theme is dropped: its catalog is about to change.
     fn fetch_gallery(&mut self) -> Task<Message> {
+        if self.gallery_loading {
+            return Task::none();
+        }
         let Some((_, state)) = &mut self.schemes_win else {
             return Task::none();
         };
-        if matches!(state.gallery, GalleryLoad::Loading) {
-            return Task::none();
-        }
         state.gallery = GalleryLoad::Loading;
+        state.pending_update = None;
+        self.gallery_loading = true;
+        self.gallery_generation += 1;
+        let generation = self.gallery_generation;
         let job = self.gallery_job();
         Task::perform(
             async move {
@@ -160,7 +166,7 @@ impl App {
                     .await
                     .unwrap_or_else(|e| Err(e.to_string()))
             },
-            |r| Message::Schemes(SchemesMsg::GalleryFetched(r)),
+            move |r| Message::Schemes(SchemesMsg::GalleryFetched(generation, r)),
         )
     }
 
@@ -169,8 +175,8 @@ impl App {
         let task = match msg {
             SchemesMsg::ShowGallery(show) => self.show_gallery(show),
             SchemesMsg::RefreshGallery => self.fetch_gallery(),
-            SchemesMsg::GalleryFetched(result) => {
-                self.gallery_fetched(result);
+            SchemesMsg::GalleryFetched(generation, result) => {
+                self.gallery_fetched(generation, result);
                 Task::none()
             }
             SchemesMsg::Install(id) | SchemesMsg::Update(id) => self.install_theme(&id),
@@ -197,9 +203,15 @@ impl App {
         Task::none()
     }
 
-    /// A fetch finished. A good catalog is kept for the rest of the run; a failure shows its
-    /// line and leaves installed schemes alone.
-    fn gallery_fetched(&mut self, result: Result<Vec<u8>, String>) {
+    /// A fetch finished. Only the latest fetch counts; an older result is dropped. A good
+    /// catalog is kept for the rest of the run; a failure shows its line and leaves installed
+    /// schemes alone.
+    fn gallery_fetched(&mut self, generation: u64, result: Result<Vec<u8>, String>) {
+        if generation != self.gallery_generation || !self.gallery_loading {
+            tracing::debug!(generation, "stale theme catalog result dropped");
+            return;
+        }
+        self.gallery_loading = false;
         let load = load_result(result);
         if let GalleryLoad::Loaded(catalog) = &load {
             self.gallery_catalog = Some(catalog.clone());
@@ -220,7 +232,8 @@ impl App {
 
     /// Install or Update theme `id`: written in place when nothing would be lost, asked
     /// about when the installed scheme was edited (or its file has no gallery block or does
-    /// not load), and nothing at all when the theme is installed already or withdrawn.
+    /// not load, or the window holds unsaved edits of it), and nothing at all when the theme
+    /// is installed already or withdrawn.
     fn install_theme(&mut self, id: &str) -> Task<Message> {
         let Some(theme) = self.catalog_theme(id) else {
             return Task::none();
@@ -231,12 +244,20 @@ impl App {
             // A file that did not load would be overwritten: treat it as edited.
             st = Status::Update { edited: true };
         }
+        let unsaved = self
+            .schemes_win
+            .as_ref()
+            .is_some_and(|(_, state)| state.is_dirty(&theme.scheme.id));
+        if unsaved && matches!(st, Status::Available | Status::Update { .. }) {
+            st = Status::Update { edited: true };
+        }
         let updating = installed.is_some();
         match st {
             Status::Installed | Status::Withdrawn { .. } => Task::none(),
             Status::Update { edited: true } => {
                 if let Some((_, state)) = &mut self.schemes_win {
                     state.notice = None;
+                    state.error = None;
                     state.pending_update = Some(theme.id);
                 }
                 Task::none()
@@ -298,8 +319,9 @@ impl App {
         state.error = None;
         let verb = if updating { "Updated" } else { "Installed" };
         state.notice = Some(format!("{verb} \"{}\"", scheme.name.trim()));
-        // The file is the truth now: an open draft of the same id takes this version.
-        state.mark_saved(&scheme);
+        // The file is the truth now: an open draft of the same id (unsaved edits too, which
+        // Replace was asked about) is discarded for this version.
+        state.discard_draft(&scheme);
         // Reloading compares every pane's colors before and after, so the panes using a
         // replaced scheme recolor and nothing else is touched.
         self.reload_schemes()

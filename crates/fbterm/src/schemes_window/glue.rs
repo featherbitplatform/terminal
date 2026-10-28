@@ -40,7 +40,10 @@ impl App {
             Some(&select),
             crate::settings_window::installed_monospace(),
         );
-        if let Some(catalog) = &self.gallery_catalog {
+        if self.gallery_loading {
+            // The fetch started before the window closed is still running.
+            state.gallery = super::GalleryLoad::Loading;
+        } else if let Some(catalog) = &self.gallery_catalog {
             // The catalog of this run: shown again without a fetch.
             state.gallery = super::GalleryLoad::Loaded(catalog.clone());
         }
