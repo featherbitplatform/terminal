@@ -220,7 +220,9 @@ fn sidebar<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messa
             ),
         ],
     );
-    container(
+    // Only a rule along the right edge sets the sidebar apart: the window header's rule
+    // runs above it and the footer's beside it, and a border all around would double both.
+    container(row![
         column![
             container(
                 column![
@@ -237,17 +239,14 @@ fn sidebar<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messa
             }),
             scrollable(container(list).padding(Padding::from([0.0, 8.0]))).height(Length::Fill),
         ]
+        .width(Length::Fill)
         .height(Length::Fill),
-    )
+        ui::vertical_rule(t),
+    ])
     .width(SIDEBAR_WIDTH)
     .height(Length::Fill)
     .style(move |_| container::Style {
         background: Some(t.surface.into()),
-        border: Border {
-            color: t.border,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
         ..container::Style::default()
     })
     .into()
@@ -674,7 +673,8 @@ fn footer<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messag
                 .color(t.text_muted),
         );
     }
-    container(
+    // A rule along the top only: the sidebar's rule runs down its left side.
+    let buttons = container(
         row![
             ui::text_button(
                 t,
@@ -700,17 +700,14 @@ fn footer<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messag
         .align_y(Alignment::Center),
     )
     .padding(Padding::from([12.0, 20.0]))
-    .width(Length::Fill)
-    .style(move |_| container::Style {
-        background: Some(t.surface.into()),
-        border: Border {
-            color: t.border,
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        ..container::Style::default()
-    })
-    .into()
+    .width(Length::Fill);
+    container(column![ui::horizontal_rule(t), buttons])
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(t.surface.into()),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// The delete question, over the window like the connection dialogs.
