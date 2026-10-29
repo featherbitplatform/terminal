@@ -40,6 +40,7 @@ pub fn view<'a>(
     state: &'a SchemesState,
     base: &TerminalStyle,
     installed: &SchemeSet,
+    scale: f32,
 ) -> Element<'a, Message> {
     let pane = if state.showing_gallery {
         Some(gallery(t, state, installed))
@@ -63,15 +64,20 @@ pub fn view<'a>(
         .into(),
         None => container(text("")).height(Length::Fill).into(),
     };
-    let page =
-        container(row![sidebar(t, state), column![form, footer(t, state)]].height(Length::Fill))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(move |_| container::Style {
-                background: Some(t.app.into()),
-                text_color: Some(t.text),
-                ..container::Style::default()
-            });
+    let page = container(
+        row![
+            sidebar(t, state, scale),
+            column![form, footer(t, state, scale)]
+        ]
+        .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(t.app.into()),
+        text_color: Some(t.text),
+        ..container::Style::default()
+    });
     if let Some(ask) = &state.confirm {
         stack![page, confirm(t, ask)].into()
     } else if let Some(ask) = &state.import {
@@ -195,7 +201,8 @@ fn segmented<'a>(
         .into()
 }
 
-fn sidebar<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Message> {
+/// `scale`: the window's physical scale, for the hairline rule.
+fn sidebar<'a>(t: &'static Tokens, state: &'a SchemesState, scale: f32) -> Element<'a, Message> {
     let mut list = column![].spacing(2);
     for s in state.drafts() {
         list = list.push(scheme_row(
@@ -241,7 +248,7 @@ fn sidebar<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messa
         ]
         .width(Length::Fill)
         .height(Length::Fill),
-        ui::vertical_rule(t),
+        ui::vertical_rule(t, scale),
     ])
     .width(SIDEBAR_WIDTH)
     .height(Length::Fill)
@@ -646,7 +653,7 @@ fn font<'a>(t: &'static Tokens, state: &'a SchemesState, editable: bool) -> Elem
     .into()
 }
 
-fn footer<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Message> {
+fn footer<'a>(t: &'static Tokens, state: &'a SchemesState, scale: f32) -> Element<'a, Message> {
     let editable = state.editable();
     let dirty = state.is_dirty(&state.selected);
     let mut messages = column![].spacing(3).width(Length::Fill);
@@ -701,7 +708,7 @@ fn footer<'a>(t: &'static Tokens, state: &'a SchemesState) -> Element<'a, Messag
     )
     .padding(Padding::from([12.0, 20.0]))
     .width(Length::Fill);
-    container(column![ui::horizontal_rule(t), buttons])
+    container(column![ui::horizontal_rule(t, scale), buttons])
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(t.surface.into()),
