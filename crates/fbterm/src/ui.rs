@@ -310,16 +310,39 @@ pub fn window_header<'a>(
             background: Some(t.surface.into()),
             ..container::Style::default()
         });
-    let rule = container(text(""))
+    chrome::title_bar(
+        chrome,
+        column![header, horizontal_rule(t)],
+        false,
+        move |a| Message::TitleBar(window, a),
+    )
+}
+
+/// A one-pixel line in the border color, as wide as its place: the edge between two surfaces
+/// stacked one above the other (a header over the content, the content over a footer).
+/// Surfaces that touch draw one rule on one side only, never a border all around, so two
+/// lines never add up where a sidebar meets a footer or a header.
+pub fn horizontal_rule<'a, M: 'a>(t: &'static Tokens) -> Element<'a, M> {
+    container(Space::new())
         .width(Length::Fill)
         .height(1)
         .style(move |_| container::Style {
             background: Some(t.border.into()),
             ..container::Style::default()
-        });
-    chrome::title_bar(chrome, column![header, rule], false, move |a| {
-        Message::TitleBar(window, a)
-    })
+        })
+        .into()
+}
+
+/// The vertical [`horizontal_rule`]: as tall as its place, between surfaces side by side.
+pub fn vertical_rule<'a, M: 'a>(t: &'static Tokens) -> Element<'a, M> {
+    container(Space::new())
+        .width(1)
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(t.border.into()),
+            ..container::Style::default()
+        })
+        .into()
 }
 
 /// The Windows close button's hover color, white glyph on it.

@@ -1030,15 +1030,23 @@ fn tab_bar<'a>(
     });
     // Drawn controls sit beside the tabs' row, on a plate of the bar's color: beside the
     // background, never under it (a translucent bar would show twice), and never in the row,
-    // whose first children `BarBackground` measures as the tabs.
+    // whose first children `BarBackground` measures as the tabs. The plate is drawn after the
+    // background, whose content outline runs along the bar's whole bottom edge, so it stops
+    // short of that row: the outline shows under the controls as it does under the tabs.
     let bar = if chrome.draws_controls() {
-        let plate = container(crate::ui::window_controls(t, window, maximized, height))
-            .height(height)
-            .align_y(Alignment::Center)
-            .style(move |_| container::Style {
-                background: Some(bar_bg.into()),
-                ..container::Style::default()
-            });
+        let plate_height = height - outline_width(tabs_bar.scale);
+        let plate = container(crate::ui::window_controls(
+            t,
+            window,
+            maximized,
+            plate_height,
+        ))
+        .height(plate_height)
+        .align_y(Alignment::Center)
+        .style(move |_| container::Style {
+            background: Some(bar_bg.into()),
+            ..container::Style::default()
+        });
         match chrome::setup().controls.side {
             chrome::Side::Left => row![plate, bar].into(),
             chrome::Side::Right => row![bar, plate].into(),
@@ -2278,13 +2286,28 @@ mod tests {
             drive_with(Chrome::Unified, tabs, carry, |b, _| steps(b))
         }
 
+        /// The drawn controls as laid out: their plate and each button's bounds (none
+        /// without drawn chrome). Reads as the buttons' slice.
+        #[derive(Debug, Default)]
+        struct DrawnControls {
+            plate: Option<Rectangle>,
+            buttons: Vec<Rectangle>,
+        }
+
+        impl std::ops::Deref for DrawnControls {
+            type Target = [Rectangle];
+            fn deref(&self) -> &[Rectangle] {
+                &self.buttons
+            }
+        }
+
         /// [`drive`] with the bar drawn by `chrome`; `steps` also gets the drawn controls'
         /// bounds (none without them).
         fn drive_with(
             chrome: Chrome,
             tabs: &[Tab],
             carry: Option<Carry>,
-            steps: impl FnOnce(&[Rectangle], &[Rectangle]) -> Vec<(Event, Point)>,
+            steps: impl FnOnce(&[Rectangle], &DrawnControls) -> Vec<(Event, Point)>,
         ) -> Vec<Message> {
             let bindings = Bindings::defaults(cfg!(target_os = "macos"));
             let t = &crate::theme::DARK;
@@ -2331,18 +2354,21 @@ mod tests {
             let (background, controls) = if chrome.draws_controls() {
                 let mut parts = root.children();
                 let background = parts.next().expect("the background");
-                let controls: Vec<Rectangle> = parts
-                    .next()
-                    .expect("the plate")
+                let plate = parts.next().expect("the plate");
+                let buttons: Vec<Rectangle> = plate
                     .children()
                     .next()
                     .expect("the controls")
                     .children()
                     .map(|l| l.bounds())
                     .collect();
+                let controls = DrawnControls {
+                    plate: Some(plate.bounds()),
+                    buttons,
+                };
                 (background, controls)
             } else {
-                (root, Vec::new())
+                (root, DrawnControls::default())
             };
             let buttons: Vec<Rectangle> = background
                 .children()
@@ -2580,6 +2606,30 @@ mod tests {
                 vec![(press(), at), (moved(far), far), (release(), at)]
             });
             assert_eq!(drags(&messages)[0], DragMsg::StartTab(id));
+        }
+
+        #[test]
+        fn drawn_controls_end_above_the_content_outline() {
+            // The plate under the controls is drawn after the bar's background, so it would
+            // cover the outline's row along the bar's bottom edge: it stops one outline
+            // width short of the bottom, and so do the controls on it.
+            let tabs = tabs();
+            drive_with(Chrome::Drawn, &tabs, None, |_, c| {
+                assert_eq!(c.len(), 3, "{c:?}");
+                let limit = Chrome::Drawn.bar_height() - outline_width(1.0);
+                let plate = c.plate.expect("the plate");
+                assert!(
+                    plate.y + plate.height <= limit + 0.001,
+                    "{plate:?} reaches below {limit}"
+                );
+                for r in c.iter() {
+                    assert!(
+                        r.y + r.height <= limit + 0.001,
+                        "{r:?} reaches below {limit}"
+                    );
+                }
+                Vec::new()
+            });
         }
 
         #[test]
