@@ -83,7 +83,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         let schemes = app.scheme_choices(true);
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
+            content = content.push(crate::ui::window_header(
+                t,
+                id,
+                app.maximized.contains(&id),
+                app.physical_scale(id),
+            ));
         }
         let content = content.push(crate::editor::view::view(
             t,
@@ -91,6 +96,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
             schemes,
             app.storage(),
             app.editor_job.is_some(),
+            app.physical_scale(id),
         ));
         return Element::new(Shortcuts {
             content: content.into(),
@@ -104,7 +110,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
+            content = content.push(crate::ui::window_header(
+                t,
+                id,
+                app.maximized.contains(&id),
+                app.physical_scale(id),
+            ));
         }
         let notice = app.settings_notice.as_deref();
         let schemes = app.scheme_choices(false);
@@ -133,13 +144,19 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
+            content = content.push(crate::ui::window_header(
+                t,
+                id,
+                app.maximized.contains(&id),
+                app.physical_scale(id),
+            ));
         }
         let content = content.push(crate::schemes_window::view::view(
             t,
             state,
             &app.style,
             &app.schemes,
+            app.physical_scale(id),
         ));
         return Element::new(Shortcuts {
             content: content.into(),
@@ -161,7 +178,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     {
         let mut content = column![];
         if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(t, id, app.maximized.contains(&id)));
+            content = content.push(crate::ui::window_header(
+                t,
+                id,
+                app.maximized.contains(&id),
+                app.physical_scale(id),
+            ));
         }
         let content = content.push(crate::archive_window::view::view(
             t,
@@ -210,7 +232,9 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     // The outline along the content's top and around the active tab always shows: with a panel
     // docked it ends where the panel's rule starts, else at the window's right edge.
     let outline_end = app.sizes.get(&id).map(|&(total, _)| match panel.as_ref() {
-        Some(p) => total - docked_width(p.width, total) + crate::file_panel::view::RULE_WIDTH,
+        Some(p) => {
+            total - docked_width(p.width, total) + crate::ui::hairline(app.physical_scale(id))
+        }
         None => total,
     });
     let bar = TabBar {
@@ -234,6 +258,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         files: app.files_button(id),
         update_dot: app.update_dot(),
         outline_end,
+        outline_to_edge: panel.is_none(),
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -869,6 +894,9 @@ struct TabBar<'b> {
     /// the docked panel's left rule, else the window's right edge. `None` (size not known
     /// yet) draws no outline.
     outline_end: Option<f32>,
+    /// The outline reaches the window's right edge (no panel docked), so it passes under
+    /// drawn controls on the right.
+    outline_to_edge: bool,
 }
 
 fn tab_bar<'a>(
@@ -1031,22 +1059,38 @@ fn tab_bar<'a>(
     // Drawn controls sit beside the tabs' row, on a plate of the bar's color: beside the
     // background, never under it (a translucent bar would show twice), and never in the row,
     // whose first children `BarBackground` measures as the tabs. The plate is drawn after the
-    // background, whose content outline runs along the bar's whole bottom edge, so it stops
-    // short of that row: the outline shows under the controls as it does under the tabs.
+    // background, so it would cover the content outline's row along the bar's bottom edge:
+    // the controls stop short of that row, and the strip under them shows the outline where
+    // it reaches the window's edge. With a panel docked the outline ends at the panel's rule
+    // and the strip keeps the plate's color, flush with the panel's surface below it.
     let bar = if chrome.draws_controls() {
-        let plate_height = height - outline_width(tabs_bar.scale);
-        let plate = container(crate::ui::window_controls(
+        let setup = chrome::setup();
+        let width = chrome::controls_width(setup.look, setup.controls.order.len());
+        let strip_height = outline_width(tabs_bar.scale);
+        let controls_height = height - strip_height;
+        let outline_to_edge = tabs_bar.outline_to_edge;
+        let strip = container(iced::widget::Space::new())
+            .width(width)
+            .height(strip_height)
+            .style(move |_| container::Style {
+                background: outline_to_edge.then_some(Background::Color(t.border)),
+                snap: true,
+                ..container::Style::default()
+            });
+        let controls = container(crate::ui::window_controls(
             t,
             window,
             maximized,
-            plate_height,
+            controls_height,
         ))
-        .height(plate_height)
-        .align_y(Alignment::Center)
-        .style(move |_| container::Style {
-            background: Some(bar_bg.into()),
-            ..container::Style::default()
-        });
+        .height(controls_height)
+        .align_y(Alignment::Center);
+        let plate = container(column![controls, strip])
+            .height(height)
+            .style(move |_| container::Style {
+                background: Some(bar_bg.into()),
+                ..container::Style::default()
+            });
         match chrome::setup().controls.side {
             chrome::Side::Left => row![plate, bar].into(),
             chrome::Side::Right => row![bar, plate].into(),
@@ -1239,7 +1283,7 @@ enum Stroke {
 
 /// The outline's width in window scale `scale`: one logical pixel, on whole physical pixels.
 fn outline_width(scale: f32) -> f32 {
-    whole_px(1.0, scale).max(1.0 / scale)
+    crate::ui::hairline(scale)
 }
 
 /// The content outline's pieces in the tab bar, `width` wide: along the bar's bottom edge
@@ -2286,11 +2330,12 @@ mod tests {
             drive_with(Chrome::Unified, tabs, carry, |b, _| steps(b))
         }
 
-        /// The drawn controls as laid out: their plate and each button's bounds (none
-        /// without drawn chrome). Reads as the buttons' slice.
+        /// The drawn controls as laid out: their plate, the strip under them and each
+        /// button's bounds (none without drawn chrome). Reads as the buttons' slice.
         #[derive(Debug, Default)]
         struct DrawnControls {
             plate: Option<Rectangle>,
+            strip: Option<Rectangle>,
             buttons: Vec<Rectangle>,
         }
 
@@ -2336,6 +2381,7 @@ mod tests {
                 update_dot: true,
                 // And the outline a docked file panel brings.
                 outline_end: Some(500.0),
+                outline_to_edge: false,
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
@@ -2349,21 +2395,27 @@ mod tests {
                 &layout::Limits::new(Size::ZERO, SIZE),
             );
             // title bar -> background -> container -> row -> tabs; with drawn controls
-            // (on the right in tests) title bar -> row -> [background, plate -> controls].
+            // (on the right in tests) title bar -> row -> [background, plate -> column ->
+            // [container -> controls, strip]].
             let root = Layout::new(&node);
             let (background, controls) = if chrome.draws_controls() {
                 let mut parts = root.children();
                 let background = parts.next().expect("the background");
                 let plate = parts.next().expect("the plate");
-                let buttons: Vec<Rectangle> = plate
+                let mut column = plate.children().next().expect("the column").children();
+                let buttons: Vec<Rectangle> = column
+                    .next()
+                    .expect("the controls' container")
                     .children()
                     .next()
                     .expect("the controls")
                     .children()
                     .map(|l| l.bounds())
                     .collect();
+                let strip = column.next().expect("the strip").bounds();
                 let controls = DrawnControls {
                     plate: Some(plate.bounds()),
+                    strip: Some(strip),
                     buttons,
                 };
                 (background, controls)
@@ -2611,23 +2663,25 @@ mod tests {
         #[test]
         fn drawn_controls_end_above_the_content_outline() {
             // The plate under the controls is drawn after the bar's background, so it would
-            // cover the outline's row along the bar's bottom edge: it stops one outline
-            // width short of the bottom, and so do the controls on it.
+            // cover the outline's row along the bar's bottom edge: the controls stop one
+            // outline width short of the bottom, and the strip under them is that row (the
+            // plate still fills the bar, so nothing behind it shows through).
             let tabs = tabs();
             drive_with(Chrome::Drawn, &tabs, None, |_, c| {
                 assert_eq!(c.len(), 3, "{c:?}");
-                let limit = Chrome::Drawn.bar_height() - outline_width(1.0);
+                let bar = Chrome::Drawn.bar_height();
+                let limit = bar - outline_width(1.0);
                 let plate = c.plate.expect("the plate");
-                assert!(
-                    plate.y + plate.height <= limit + 0.001,
-                    "{plate:?} reaches below {limit}"
-                );
+                assert_eq!(plate.y + plate.height, bar, "{plate:?}");
                 for r in c.iter() {
                     assert!(
                         r.y + r.height <= limit + 0.001,
                         "{r:?} reaches below {limit}"
                     );
                 }
+                let strip = c.strip.expect("the strip");
+                assert_eq!((strip.y, strip.y + strip.height), (limit, bar), "{strip:?}");
+                assert_eq!((strip.x, strip.width), (plate.x, plate.width), "{strip:?}");
                 Vec::new()
             });
         }
