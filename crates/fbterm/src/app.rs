@@ -1046,7 +1046,6 @@ impl App {
                     Task::batch([
                         visibility::watch(id, &self.visibility),
                         display_rate::watch(id, &self.display),
-                        window::scale_factor(id).map(move |s| Message::WindowScale(id, s)),
                         blur,
                     ])
                 } else {
@@ -1057,12 +1056,17 @@ impl App {
                 self.open_windows.insert(id);
                 // The chrome switched after this window was asked for: give it the current
                 // decorations, as the switch gave every window already open.
-                match chrome::take_created(id) {
+                let decorations = match chrome::take_created(id) {
                     Some(made) if chrome::needs_toggle(made, self.chrome.get()) => {
                         window::toggle_decorations(id)
                     }
                     _ => Task::none(),
-                }
+                };
+                // And read its scale (changes arrive as `Rescaled` events).
+                Task::batch([
+                    decorations,
+                    window::scale_factor(id).map(move |s| Message::WindowScale(id, s)),
+                ])
             }
             Message::WindowVisible(id, visible) => {
                 if visible {
@@ -1139,6 +1143,7 @@ impl App {
             Message::MoveCheck(token) => self.check_move(token),
             Message::WindowClosed(id) => {
                 self.close_context_menu(id);
+                self.os_scales.remove(&id);
                 if self.editor_window() == Some(id) {
                     self.editor = None;
                 }
@@ -1270,7 +1275,10 @@ impl App {
             }
             Message::WindowScale(id, s) => {
                 tracing::info!(window = ?id, scale = s, "window scale");
-                if self.windows.contains_key(&id) && s.is_finite() && s > 0.0 {
+                // Kept for every open window: the editor, Settings and Color schemes windows
+                // draw their hairlines from it too (`physical_scale`).
+                let open = self.open_windows.contains(&id) || self.windows.contains_key(&id);
+                if open && s.is_finite() && s > 0.0 {
                     self.os_scales.insert(id, s);
                 }
                 Task::none()

@@ -27,6 +27,7 @@ pub fn view<'a>(
     schemes: Vec<SchemeChoice>,
     storage: fbterm_secrets::Storage,
     busy: bool,
+    scale: f32,
 ) -> Element<'a, Message> {
     let editable = state.read_only.is_none();
     let mut main = column![];
@@ -59,8 +60,8 @@ pub fn view<'a>(
     };
     main = main.push(
         row![
-            sidebar(t, state, editable),
-            column![form, footer(t, state, editable, busy)]
+            sidebar(t, state, editable, scale),
+            column![form, footer(t, state, editable, busy, scale)]
         ]
         .height(Length::Fill),
     );
@@ -132,7 +133,13 @@ fn swatch<'a>(color: Option<Color>, size: f32) -> container::Container<'a, Messa
         })
 }
 
-fn sidebar<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> Element<'a, Message> {
+/// `scale`: the window's physical scale, for the hairline rule.
+fn sidebar<'a>(
+    t: &'static Tokens,
+    state: &'a EditorState,
+    editable: bool,
+    scale: f32,
+) -> Element<'a, Message> {
     let add = |caption: &'a str, m: EditorMsg| {
         button(
             row![
@@ -182,7 +189,7 @@ fn sidebar<'a>(t: &'static Tokens, state: &'a EditorState, editable: bool) -> El
         ]
         .width(Length::Fill)
         .height(Length::Fill),
-        ui::vertical_rule(t),
+        ui::vertical_rule(t, scale),
     ])
     .width(SIDEBAR_WIDTH)
     .height(Length::Fill)
@@ -497,6 +504,7 @@ fn footer<'a>(
     state: &'a EditorState,
     editable: bool,
     busy: bool,
+    scale: f32,
 ) -> Element<'a, Message> {
     let mut messages = column![].spacing(3).width(Length::Fill);
     for e in &state.errors {
@@ -549,7 +557,7 @@ fn footer<'a>(
     )
     .padding(Padding::from([12.0, 20.0]))
     .width(Length::Fill);
-    container(column![ui::horizontal_rule(t), buttons])
+    container(column![ui::horizontal_rule(t, scale), buttons])
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(t.surface.into()),

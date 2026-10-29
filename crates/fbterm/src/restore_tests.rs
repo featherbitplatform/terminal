@@ -979,3 +979,23 @@ fn merged_layout_survives_save_and_reload() {
     let back = SavedState::load_or_default(&paths.state());
     assert_eq!(back.windows[0].tabs, vec![merged]);
 }
+
+#[test]
+fn every_window_reports_its_own_os_scale() {
+    // The editor, Settings and Color schemes windows draw hairlines from their physical
+    // scale too, so the OS scale is kept for any open window, not only terminal ones, and
+    // dropped when the window closes.
+    let paths = paths_with(&[profile("a")]);
+    let (mut app, _) = App::build(paths, true);
+    let other = iced::window::Id::unique();
+    assert!(!app.windows.contains_key(&other));
+    let _ = app.update(Message::AnyWindowOpened(other));
+    let _ = app.update(Message::WindowScale(other, 2.0));
+    assert_eq!(app.physical_scale(other), 2.0 * app.ui_scale);
+    let _ = app.update(Message::WindowClosed(other));
+    assert_eq!(
+        app.physical_scale(other),
+        app.ui_scale,
+        "forgotten on close"
+    );
+}

@@ -568,8 +568,8 @@ mod tests {
         let (mut app, _dir) = app();
         app.chrome = Box::leak(Box::new(ChromeCell::starting(Chrome::Unified)));
         let w = window::Id::unique();
-        // Opening a window leaves it movable.
-        assert_eq!(app.update(Message::AnyWindowOpened(w)).units(), 0);
+        // Opening a window leaves it movable (the one task reads the window's scale).
+        assert_eq!(app.update(Message::AnyWindowOpened(w)).units(), 1);
         let over = |app: &mut App, over| {
             app.update(Message::TitleBar(w, BarAction::PointerOverWidget(over)))
                 .units()
@@ -614,10 +614,11 @@ mod tests {
         chrome::record_created(fine, Chrome::Native);
         let _ = app.fall_back_to_system_chrome();
         assert_eq!(app.chrome.get(), Chrome::Native);
-        assert_eq!(app.update(Message::AnyWindowOpened(late)).units(), 1);
-        assert_eq!(app.update(Message::AnyWindowOpened(fine)).units(), 0);
+        // Every opened window reads its scale (one task); `late` also gets its decorations.
+        assert_eq!(app.update(Message::AnyWindowOpened(late)).units(), 2);
+        assert_eq!(app.update(Message::AnyWindowOpened(fine)).units(), 1);
         assert!(app.open_windows.contains(&late) && app.open_windows.contains(&fine));
-        // Recorded once: a second report changes nothing.
-        assert_eq!(app.update(Message::AnyWindowOpened(late)).units(), 0);
+        // Recorded once: a second report changes nothing but the scale read.
+        assert_eq!(app.update(Message::AnyWindowOpened(late)).units(), 1);
     }
 }

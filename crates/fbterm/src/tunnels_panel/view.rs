@@ -9,7 +9,6 @@ use iced::{Alignment, Background, Border, Color, Element, Length, Padding, windo
 
 use super::{EMPTY, NO_MATCHES, RESTART_TO_APPLY, SEARCH_PLACEHOLDER, TunnelsMsg};
 use crate::app::{App, Message};
-use crate::file_panel::view::RULE_WIDTH;
 use crate::theme::{Tokens, UI_FONT};
 use crate::tunnels_panel::{Group, Row, Tone};
 use crate::ui::{self, ICON_SEARCH, ICON_X, MONO, icon};
@@ -123,13 +122,8 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
     let content = column![header, search, list]
         .width(Length::Fill)
         .height(Length::Fill);
-    let rule = container(Space::new())
-        .width(RULE_WIDTH)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(t.border.into()),
-            ..container::Style::default()
-        });
+    // The rule along the panel's left edge, as the file panel's.
+    let rule = crate::ui::vertical_rule(t, app.physical_scale(wid));
     let surface = t.surface.scale_alpha(app.settings.background_opacity);
     let panel = container(content)
         .width(Length::Fill)

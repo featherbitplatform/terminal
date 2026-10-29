@@ -25,8 +25,6 @@ use crate::ui::{
 
 /// The fewest characters of a link's target worth showing (a shorter target shows whole).
 const MIN_TARGET: usize = 8;
-/// Width of the rule along the panel's left edge, the content's outline on that side.
-pub(crate) const RULE_WIDTH: f32 = 1.0;
 /// The height of one list row, in logical pixels.
 pub(crate) const ROW_HEIGHT: f32 = 24.0;
 /// The list's height assumed before it has reported one.
@@ -236,13 +234,8 @@ pub(crate) fn panel(app: &App, wid: window::Id) -> Option<(Element<'_, Message>,
     {
         content = content.push(transfers(t, wid, rows, drawn));
     }
-    let rule = container(Space::new())
-        .width(RULE_WIDTH)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(t.border.into()),
-            ..container::Style::default()
-        });
+    // The rule along the panel's left edge: the content's outline on that side.
+    let rule = crate::ui::vertical_rule(t, app.physical_scale(wid));
     let opacity = app.settings.background_opacity;
     let surface = t.surface.scale_alpha(opacity);
     let panel = container(content)

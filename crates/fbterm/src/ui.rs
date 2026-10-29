@@ -291,6 +291,7 @@ pub fn window_header<'a>(
     t: &'static Tokens,
     window: window::Id,
     maximized: bool,
+    scale: f32,
 ) -> Element<'a, Message> {
     let chrome = Chrome::current();
     let height = chrome.bar_height();
@@ -312,34 +313,45 @@ pub fn window_header<'a>(
         });
     chrome::title_bar(
         chrome,
-        column![header, horizontal_rule(t)],
+        column![header, horizontal_rule(t, scale)],
         false,
         move |a| Message::TitleBar(window, a),
     )
 }
 
-/// A one-pixel line in the border color, as wide as its place: the edge between two surfaces
-/// stacked one above the other (a header over the content, the content over a footer).
-/// Surfaces that touch draw one rule on one side only, never a border all around, so two
-/// lines never add up where a sidebar meets a footer or a header.
-pub fn horizontal_rule<'a, M: 'a>(t: &'static Tokens) -> Element<'a, M> {
+/// The width of a hairline in a window of `scale` physical pixels per logical pixel: one
+/// logical pixel rounded to whole physical pixels, at least one (1 at scale 1, 0.8 at 1.25,
+/// 1 at 2). A rule one logical pixel wide at a fractional scale would land between pixels
+/// and show as two.
+pub fn hairline(scale: f32) -> f32 {
+    ((scale + 0.001).round() / scale).max(1.0 / scale)
+}
+
+/// A hairline in the border color, as wide as its place: the edge between two surfaces
+/// stacked one above the other (a header over the content, the content over a footer), in a
+/// window of `scale` (see [`hairline`]; snapped to the pixel grid). Surfaces that touch draw
+/// one rule on one side only, never a border all around, so two lines never add up where a
+/// sidebar meets a footer or a header.
+pub fn horizontal_rule<'a, M: 'a>(t: &'static Tokens, scale: f32) -> Element<'a, M> {
     container(Space::new())
         .width(Length::Fill)
-        .height(1)
+        .height(hairline(scale))
         .style(move |_| container::Style {
             background: Some(t.border.into()),
+            snap: true,
             ..container::Style::default()
         })
         .into()
 }
 
 /// The vertical [`horizontal_rule`]: as tall as its place, between surfaces side by side.
-pub fn vertical_rule<'a, M: 'a>(t: &'static Tokens) -> Element<'a, M> {
+pub fn vertical_rule<'a, M: 'a>(t: &'static Tokens, scale: f32) -> Element<'a, M> {
     container(Space::new())
-        .width(1)
+        .width(hairline(scale))
         .height(Length::Fill)
         .style(move |_| container::Style {
             background: Some(t.border.into()),
+            snap: true,
             ..container::Style::default()
         })
         .into()
@@ -499,8 +511,20 @@ mod icon_font_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::edge_scrollbar_margin;
+    use super::{edge_scrollbar_margin, hairline};
     use crate::chrome::EDGE_BAND;
+
+    #[test]
+    fn a_hairline_is_a_whole_number_of_physical_pixels_at_least_one() {
+        let physical = |scale: f32| hairline(scale) * scale;
+        assert_eq!(physical(1.0), 1.0);
+        // 1.25 physical pixels round down to one; 1.5 and 2 are two.
+        assert!((physical(1.25) - 1.0).abs() < 1e-5);
+        assert!((physical(1.5) - 2.0).abs() < 1e-5);
+        assert!((physical(2.0) - 2.0).abs() < 1e-5);
+        // Never thinner than one physical pixel.
+        assert!((physical(0.5) - 1.0).abs() < 1e-5);
+    }
 
     #[test]
     fn edge_scrollbars_clear_the_resize_band_only_where_drawn() {
