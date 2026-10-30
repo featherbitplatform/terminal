@@ -4,5 +4,6 @@
 .superpowers/
 *.dmg
 /website/.docusaurus
+/website/docs/changelog.md
 .DS_Store
 /sast-out

@@ -4,7 +4,10 @@
   "private": true,
   "scripts": {
     "docusaurus": "docusaurus",
+    "changelog": "node scripts/changelog.mjs",
+    "prestart": "npm run changelog",
     "start": "docusaurus start",
+    "prebuild": "npm run changelog",
     "build": "docusaurus build",
     "serve": "docusaurus serve",
     "clear": "docusaurus clear",

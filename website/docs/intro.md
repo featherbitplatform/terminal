@@ -32,3 +32,5 @@ featherbit terminal ships for macOS, Linux and Windows:
 - Windows 11: an `.msi` installer. See [Install on Windows](install-windows).
 
 On Linux and Windows the window's title bar is drawn in the tab bar; the shortcut and file location pages cover every system.
+
+What each version changed is in the [Changelog](changelog).
