@@ -202,14 +202,22 @@ fn setting<'a>(
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let mut words = column![text(label).font(UI_FONT).size(13).color(if dimmed {
-        t.text_secondary
+        t.text_muted
     } else {
         t.text
     })]
     .spacing(3)
     .width(Length::Fill);
     if let Some(h) = hint {
-        words = words.push(text(h).font(UI_FONT).size(12).color(t.text_muted));
+        let hint_color = if dimmed {
+            Color {
+                a: 0.5,
+                ..t.text_muted
+            }
+        } else {
+            t.text_muted
+        };
+        words = words.push(text(h).font(UI_FONT).size(12).color(hint_color));
     }
     row![words, control.into()]
         .spacing(16)
@@ -1108,7 +1116,7 @@ fn number<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlurRow {
     pub hint: &'static str,
-    /// Drawn muted: blur has no effect now (a switch that can be used is still saved).
+    /// Drawn muted: blur has no effect now.
     pub inert: bool,
     /// The switch can be used.
     pub enabled: bool,
@@ -1121,7 +1129,7 @@ pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
     let (hint, inert, enabled) = if !supported {
         ("Not supported on this system", true, false)
     } else if opacity >= 1.0 {
-        ("Needs opacity below 100%", true, true)
+        ("Needs opacity below 100%", true, false)
     } else {
         ("Applies to new windows", false, true)
     };
@@ -1132,7 +1140,7 @@ pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
     }
 }
 
-/// A toggle; `inert`: it still works, but is drawn muted because it has no effect right now.
+/// A toggle; `inert`: drawn muted because it has no effect right now.
 fn switch<'a>(
     t: &'static Tokens,
     on: bool,
