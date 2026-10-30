@@ -12,7 +12,7 @@ Full documentation: [featherbitplatform.github.io/terminal](https://featherbitpl
 
 ## Install
 
-Download from the [latest release](https://github.com/featherbitplatform/terminal/releases/latest); each file comes with a `.sha256` checksum, and releases from 0.3.0 on also carry CycloneDX SBOMs of the app and the docs site. Builds are not signed yet, so each system asks you to confirm the first launch.
+Download from the [latest release](https://github.com/featherbitplatform/terminal/releases/latest); each file comes with a `.sha256` checksum, and releases from 0.3.0 on also carry CycloneDX SBOMs of the app and the docs site. What each version changed is in the [changelog](CHANGELOG.md). Builds are not signed yet, so each system asks you to confirm the first launch.
 
 - **macOS:** the universal `.dmg` for Apple Silicon and Intel Macs. See [Install on macOS](https://featherbitplatform.github.io/terminal/install-macos).
 - **Linux:** `.deb` (Debian 12 and Ubuntu 22.04 and newer), `.rpm` (Fedora 39 and RHEL 9 and newer) or `.tar.gz`, for x86_64 and aarch64. See [Install on Linux](https://featherbitplatform.github.io/terminal/install-linux).
