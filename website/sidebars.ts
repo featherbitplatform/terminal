@@ -15,6 +15,7 @@ const sidebars: SidebarsConfig = {
     'saved-secrets',
     'keyboard-shortcuts',
     'files',
+    'changelog',
   ],
 };
 
