@@ -295,7 +295,7 @@ fn appearance<'a>(
             SettingsMsg::FontSizeText,
             SettingsMsg::FontSizeSubmit
         ),
-        unit(t, "pt"),
+        unit(t, "pt", UNIT_WIDTH),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -316,7 +316,7 @@ fn appearance<'a>(
             SettingsMsg::OpacityText,
             SettingsMsg::OpacitySubmit
         ),
-        unit(t, "%"),
+        unit(t, "%", UNIT_WIDTH),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -446,7 +446,7 @@ fn terminal<'a>(
             .width(110)
             .align_x(Alignment::End)
             .style(move |_, s| ui::input_style(t, s)),
-        unit(t, "lines"),
+        unit(t, "lines", Length::Shrink),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -493,7 +493,7 @@ fn tunnels<'a>(
             .width(110)
             .align_x(Alignment::End)
             .style(move |_, s| ui::input_style(t, s)),
-        unit(t, "attempts"),
+        unit(t, "attempts", Length::Shrink),
     ]
     .spacing(10)
     .align_y(Alignment::Center);
@@ -1072,11 +1072,17 @@ pub(crate) fn fixed_choice<'a>(
     .into()
 }
 
-fn unit<'a>(t: &'static Tokens, s: &'a str) -> Element<'a, Message> {
+/// The unit after a typed number. `width`: [`UNIT_WIDTH`] in a slider row, so the sliders of
+/// neighbouring rows line up whatever the unit; `Length::Shrink` in a row with the input alone,
+/// so a long unit never runs past the card.
+fn unit<'a>(t: &'static Tokens, s: &'a str, width: impl Into<Length>) -> Element<'a, Message> {
     container(text(s).font(UI_FONT).size(12).color(t.text_muted))
-        .width(32)
+        .width(width)
         .into()
 }
+
+/// Width of a unit next to a slider: fits the short units those rows use.
+const UNIT_WIDTH: f32 = 32.0;
 
 /// A short typed number next to a slider.
 fn number<'a>(
