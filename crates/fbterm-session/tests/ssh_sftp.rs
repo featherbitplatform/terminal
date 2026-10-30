@@ -58,6 +58,7 @@ fn key_profile(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
 
 fn key_profile_at(name: &str, host: &str, port: u16, jump: Vec<ProfileId>) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,

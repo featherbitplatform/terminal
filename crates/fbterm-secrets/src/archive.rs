@@ -266,6 +266,7 @@ mod tests {
 
     fn sample() -> Archive {
         let bastion = Profile {
+            icon: None,
             id: ProfileId::new(),
             name: "bastion".into(),
             group: Some("prod".into()),
@@ -285,6 +286,7 @@ mod tests {
             }),
         };
         let db = Profile {
+            icon: None,
             id: ProfileId::new(),
             name: "db".into(),
             group: None,
@@ -334,6 +336,7 @@ mod tests {
             profiles: vec![bastion.id],
         }];
         let shell = Profile {
+            icon: None,
             id: ProfileId::new(),
             name: "zsh".into(),
             group: None,

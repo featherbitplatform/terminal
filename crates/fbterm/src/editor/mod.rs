@@ -84,6 +84,8 @@ pub enum EditorMsg {
     Name(String),
     Group(String),
     Accent(Option<Rgb>),
+    /// A name from `ui::PROFILE_ICONS`; none is the default for the kind.
+    Icon(Option<&'static str>),
     AccentStyle(AccentStyle),
     /// The profile's own scheme id, or `None` to follow the global one.
     ColorScheme(Option<String>),
@@ -332,6 +334,7 @@ pub struct Draft {
     pub group: String,
     pub accent: Option<Rgb>,
     pub accent_style: AccentStyle,
+    pub icon: Option<String>,
     /// Carried through unchanged until the form edits it.
     pub color_scheme: Option<String>,
     pub kind: DraftKind,
@@ -383,6 +386,7 @@ impl Draft {
             group: p.group.clone().unwrap_or_default(),
             accent: p.accent,
             accent_style: p.accent_style,
+            icon: p.icon.clone(),
             color_scheme: p.color_scheme.clone(),
             kind,
         }
@@ -432,6 +436,7 @@ impl Draft {
             } else {
                 AccentStyle::default()
             },
+            icon: self.icon.clone(),
             color_scheme: self.color_scheme.clone(),
             kind,
         }
@@ -720,6 +725,7 @@ impl EditorState {
             group: String::new(),
             accent: None,
             accent_style: AccentStyle::default(),
+            icon: None,
             color_scheme: None,
             kind,
         };
@@ -1125,6 +1131,7 @@ fn edit(d: &mut Draft, msg: EditorMsg) -> bool {
         (EditorMsg::Name(v), _) => d.name = v,
         (EditorMsg::Group(v), _) => d.group = v,
         (EditorMsg::Accent(v), _) => d.accent = v,
+        (EditorMsg::Icon(v), _) => d.icon = v.map(str::to_owned),
         (EditorMsg::AccentStyle(v), _) => d.accent_style = v,
         (EditorMsg::ColorScheme(v), _) => d.color_scheme = v,
         (EditorMsg::Host(v), DraftKind::Ssh(s)) => s.host = v,

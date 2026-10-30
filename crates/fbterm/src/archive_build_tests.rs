@@ -21,6 +21,7 @@ const ARCHIVE_PASSWORD: &str = "archive password";
 
 fn ssh(name: &str, auth: AuthMethod, jump: Vec<ProfileId>) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,
@@ -47,6 +48,7 @@ fn key(path: &Path, passphrase: bool) -> AuthMethod {
 
 fn local(name: &str) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,

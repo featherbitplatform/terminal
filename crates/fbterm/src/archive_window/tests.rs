@@ -30,6 +30,7 @@ const KEY_BYTES: &[u8] = b"-----BEGIN OPENSSH PRIVATE KEY-----\nsample-5e21\n";
 
 fn ssh(name: &str, auth: AuthMethod, jump: Vec<ProfileId>) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,

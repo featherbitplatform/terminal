@@ -347,6 +347,7 @@ fn osc_query_answers_with_pane_scheme() {
 #[test]
 fn new_ssh_or_restarted_terminal_gets_pane_scheme() {
     let ssh = Profile {
+        icon: None,
         id: ProfileId::new(),
         name: "remote".into(),
         group: None,

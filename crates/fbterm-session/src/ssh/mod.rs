@@ -1073,6 +1073,7 @@ mod tests {
             prompter: Arc::new(Slow(Duration::ZERO)),
         };
         let profile = Profile {
+            icon: None,
             id: fbterm_config::ProfileId::new(),
             name: "silent".into(),
             group: None,
@@ -1127,6 +1128,7 @@ mod tests {
     #[test]
     fn hop_errors_name_the_hop() {
         let mut p = Profile {
+            icon: None,
             id: fbterm_config::ProfileId::new(),
             name: "bastion-1".into(),
             group: None,

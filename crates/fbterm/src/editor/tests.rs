@@ -75,6 +75,7 @@ fn typed_secret(ed: &EditorState, id: ProfileId) -> String {
 
 fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,
@@ -94,6 +95,7 @@ fn ssh(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
 
 fn local(name: &str) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,

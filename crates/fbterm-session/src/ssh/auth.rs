@@ -617,6 +617,7 @@ mod tests {
 
         fn profile() -> Profile {
             Profile {
+                icon: None,
                 id: ProfileId::new(),
                 name: "db".into(),
                 group: None,

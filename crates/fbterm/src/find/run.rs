@@ -453,6 +453,7 @@ mod tests {
         let wid = window::Id::unique();
         let mut w = WindowState::new();
         let profile = Profile {
+            icon: None,
             id: ProfileId::new(),
             name: "sh".into(),
             group: None,

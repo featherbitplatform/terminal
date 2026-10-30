@@ -151,6 +151,7 @@ fn shared_copy(profile: &Profile) -> Option<Profile> {
         group,
         accent,
         accent_style,
+        icon,
         color_scheme,
         kind,
     } = profile;
@@ -183,6 +184,7 @@ fn shared_copy(profile: &Profile) -> Option<Profile> {
         group: group.clone(),
         accent: *accent,
         accent_style: *accent_style,
+        icon: icon.clone(),
         color_scheme: color_scheme.clone(),
         kind: ProfileKind::Ssh(SshProfile {
             host: host.clone(),

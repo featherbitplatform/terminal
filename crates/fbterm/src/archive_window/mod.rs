@@ -745,6 +745,7 @@ fn create_key_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 pub(crate) fn demo_archive(local: &ProfileStore) -> Archive {
     use fbterm_config::profile::{AuthMethod, SshProfile, StartMode, TunnelDef, TunnelKind};
     let ssh = |name: &str, auth: AuthMethod, jump: Vec<ProfileId>| Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: Some("staging".into()),

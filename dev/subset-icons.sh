@@ -8,7 +8,7 @@
 set -euo pipefail
 
 VERSION=1.54.0
-ICONS=(x plus users chevron-up chevron-down copy shield-alert lock settings rotate-ccw triangle-alert grip-horizontal cable search folder file folder-symlink file-symlink corner-left-up file-question-mark minus square download upload)
+ICONS=(x plus users chevron-up chevron-down copy shield-alert lock settings rotate-ccw triangle-alert grip-horizontal cable search folder file folder-symlink file-symlink corner-left-up file-question-mark minus square download upload terminal server database cloud globe container square-terminal shield cpu hard-drive router laptop rocket)
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)

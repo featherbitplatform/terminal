@@ -51,6 +51,7 @@ fn keys_dir() -> PathBuf {
 
 fn key_profile(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,

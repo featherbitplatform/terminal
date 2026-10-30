@@ -27,6 +27,7 @@ const SAVED: &str = "saved-pw-9e07";
 
 fn ssh(name: &str) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,
