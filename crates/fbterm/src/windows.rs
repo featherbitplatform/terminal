@@ -127,14 +127,18 @@ impl App {
         self.start(wid, id)
     }
 
+    /// The window and index of the open `page` tab.
+    fn page_tab(&self, page: Page) -> Option<(window::Id, usize)> {
+        self.windows.iter().find_map(|(wid, w)| {
+            let i = w.tabs.iter().position(|t| t.page == Some(page))?;
+            Some((*wid, i))
+        })
+    }
+
     /// Show the `page` tab: select it where it is open, else add it to the focused window (or
     /// the first; a new one when none is open). Returns its window with the task.
     pub(crate) fn show_page(&mut self, page: Page) -> (window::Id, Task<Message>) {
-        let open = self.windows.iter().find_map(|(wid, w)| {
-            let i = w.tabs.iter().position(|t| t.page == Some(page))?;
-            Some((*wid, i))
-        });
-        let (wid, make) = match open {
+        let (wid, make) = match self.page_tab(page) {
             Some((wid, i)) => {
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.select(i);
@@ -161,11 +165,7 @@ impl App {
 
     /// Close the `page` tab, if one is open.
     pub(crate) fn close_page(&mut self, page: Page) -> Task<Message> {
-        let found = self.windows.iter().find_map(|(wid, w)| {
-            let i = w.tabs.iter().position(|t| t.page == Some(page))?;
-            Some((*wid, i))
-        });
-        match found {
+        match self.page_tab(page) {
             Some((wid, i)) => self.close_tab(wid, i),
             None => Task::none(),
         }
