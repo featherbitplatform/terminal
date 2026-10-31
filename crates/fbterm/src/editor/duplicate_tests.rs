@@ -328,6 +328,28 @@ fn the_action_from_a_terminal_window_duplicates_the_focused_panes_profile() {
 }
 
 #[test]
+fn the_action_from_a_terminal_tab_ignores_a_background_profiles_tab() {
+    let a = ssh("a", AuthMethod::Agent);
+    let b = ssh("b", AuthMethod::Agent);
+    let mut app = app_with(&[a.clone(), b.clone()]);
+    let wid = window::Id::unique();
+    let mut w = WindowState::new();
+    w.push(Tab::single(Pane::new(a.id, "a", None)));
+    app.windows.insert(wid, w);
+    app.focused = Some(wid);
+    editor(&mut app, EditorMsg::Open);
+    editor(&mut app, EditorMsg::Select(b.id));
+    assert_eq!(app.editor_window(), Some(wid));
+    // The Profiles tab is open in `wid`, but the terminal tab is the active one.
+    app.windows.get_mut(&wid).unwrap().select(0);
+    let _ = app.update(Message::Shortcut(wid, Action::DuplicateProfile));
+    let store = on_disk(&app);
+    copy_of(&store, &a, "a copy");
+    let copies = names(&store).into_iter().filter(|n| n.ends_with(" copy"));
+    assert_eq!(copies.count(), 1, "only a was copied");
+}
+
+#[test]
 fn the_action_from_a_terminal_window_never_copies_the_editors_selection() {
     let a = ssh("a", AuthMethod::Agent);
     let b = ssh("b", AuthMethod::Agent);
