@@ -241,12 +241,8 @@ mod tests {
             "New tab (⌘T)"
         );
         assert_eq!(
-            tooltip_text(
-                "Edit profiles",
-                Action::EditProfiles,
-                &Bindings::defaults(true)
-            ),
-            "Edit profiles (⇧⌘,)"
+            tooltip_text("Profiles", Action::EditProfiles, &Bindings::defaults(true)),
+            "Profiles (⇧⌘,)"
         );
         assert_eq!(
             tooltip_text("Close tab", Action::CloseTab, &Bindings::defaults(true)),

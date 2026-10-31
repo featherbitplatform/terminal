@@ -236,7 +236,7 @@ impl Action {
             Self::Palette => "Command palette".into(),
             Self::NewWindow => "New window".into(),
             Self::Quit => "Quit".into(),
-            Self::EditProfiles => "Edit profiles".into(),
+            Self::EditProfiles => "Profiles".into(),
             Self::DuplicateProfile => "Duplicate profile".into(),
             Self::Settings => "Settings".into(),
             Self::EditSchemes => "Color schemes".into(),

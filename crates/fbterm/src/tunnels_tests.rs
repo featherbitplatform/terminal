@@ -1207,7 +1207,6 @@ fn query_is_kept_while_closed_and_dropped_with_the_window() {
 #[test]
 fn tunnels_action_from_settings_opens_in_last_terminal_window() {
     use crate::keys::Action;
-    use crate::settings_window::SettingsMsg;
     let (mut w, a, b) = two_windows();
     // Opened from B: what opening the panel there costs, raising nothing.
     let in_place = shortcut(&mut w, b, Action::Tunnels).units();
@@ -1215,13 +1214,13 @@ fn tunnels_action_from_settings_opens_in_last_terminal_window() {
     let _ = w.app.update(Message::WindowFocused(a));
     let _ = w.app.update(Message::WindowFocused(b));
     assert_eq!(w.app.last_terminal_window(), Some(b));
-    let _ = w.app.update(Message::Settings(SettingsMsg::Open));
-    let settings = w.app.settings_window().expect("the Settings window");
+    let _ = w.app.open_schemes(None);
+    let settings = w.app.schemes_window().expect("the Color schemes window");
     let _ = w.app.update(Message::WindowFocused(settings));
     assert_eq!(
         w.app.last_terminal_window(),
         Some(b),
-        "Settings is no terminal"
+        "Color schemes is no terminal"
     );
 
     let task = shortcut(&mut w, settings, Action::Tunnels);

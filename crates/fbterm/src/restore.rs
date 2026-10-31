@@ -127,6 +127,7 @@ pub fn build_tab(saved: &SavedTab, store: &ProfileStore) -> Option<Tab> {
             recent.extend(order.into_iter().filter(|&p| p != focused));
             Some(Tab {
                 id: TabId::next(),
+                page: None,
                 layout,
                 panes,
                 focused,
@@ -221,11 +222,19 @@ pub fn snapshot(
     SavedState {
         windows: windows
             .iter()
-            .filter(|(_, w)| !w.tabs.is_empty())
-            .map(|(id, w)| SavedWindow {
-                tabs: w.tabs.iter().map(save_tab).collect(),
-                active: w.active.min(w.tabs.len() - 1),
-                size: sizes.get(id).copied().unwrap_or(DEFAULT_SIZE),
+            .filter_map(|(id, w)| {
+                // Page tabs are not saved; the selection moves to the tab left in their place.
+                let tabs: Vec<_> = w.tabs.iter().filter(|t| t.page.is_none()).collect();
+                let active = w.tabs[..=w.active.min(w.tabs.len().checked_sub(1)?)]
+                    .iter()
+                    .filter(|t| t.page.is_none())
+                    .count()
+                    .saturating_sub(1);
+                (!tabs.is_empty()).then(|| SavedWindow {
+                    tabs: tabs.into_iter().map(save_tab).collect(),
+                    active,
+                    size: sizes.get(id).copied().unwrap_or(DEFAULT_SIZE),
+                })
             })
             .collect(),
         recency: recency.clone().into(),

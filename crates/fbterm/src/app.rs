@@ -807,12 +807,6 @@ impl App {
     }
 
     pub fn title(&self, id: window::Id) -> String {
-        if self.editor_window() == Some(id) {
-            return "Profiles · fbterm".into();
-        }
-        if self.settings_window() == Some(id) {
-            return "Settings · fbterm".into();
-        }
         if self.schemes_window() == Some(id) {
             return "Color schemes · fbterm".into();
         }

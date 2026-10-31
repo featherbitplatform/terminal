@@ -12,7 +12,7 @@ use parking_lot::Mutex;
 use super::{SettingsMsg, SettingsState, WRITE_DEBOUNCE, Write, fonts, thousands};
 use crate::app::{App, Message, SettingsSource};
 use crate::chrome::Chrome;
-use crate::tabs::{Pane, Tab};
+use crate::tabs::{Page, Pane, Tab};
 use crate::theme;
 
 /// `name` as a `'static` str: iced wants font names that live for the whole process. Each
@@ -85,13 +85,7 @@ impl App {
     pub(crate) fn settings_msg(&mut self, msg: SettingsMsg) -> Task<Message> {
         match msg {
             SettingsMsg::Open => self.open_settings(),
-            SettingsMsg::Close => {
-                self.write_pending_settings();
-                match self.settings_window() {
-                    Some(id) => self.close_window(id),
-                    None => Task::none(),
-                }
-            }
+            SettingsMsg::Close => self.close_page(Page::Settings),
             SettingsMsg::OpenFile => {
                 crate::config_files::open_settings_file(&self.paths);
                 Task::none()
@@ -171,21 +165,16 @@ impl App {
 
     /// Open the Settings window, or bring it to the front.
     pub(crate) fn open_settings(&mut self) -> Task<Message> {
-        if let Some(id) = self.settings_window() {
-            return window::gain_focus(id);
+        if self.settings_win.is_some() {
+            return self.show_page(Page::Settings).1;
         }
-        let (id, open) = crate::chrome::open_window(window::Settings {
-            size: iced::Size::new(640.0, 720.0),
-            min_size: Some(iced::Size::new(520.0, 420.0)),
-            exit_on_close_request: false,
-            ..window::Settings::default()
-        });
+        let (id, open) = self.show_page(Page::Settings);
         let read_only = Settings::load(&self.paths.settings()).err();
         let mut state = SettingsState::new(&self.settings, fonts::installed_monospace(), read_only);
         state.display_hz = self.display_hz();
         state.max_open_history = self.max_open_history();
         self.settings_win = Some((id, state));
-        open.discard()
+        open
     }
 
     /// Write the Settings window's unwritten changes to `settings.toml`, each key in place.
