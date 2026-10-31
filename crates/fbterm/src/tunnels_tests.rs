@@ -1239,6 +1239,20 @@ fn tunnels_action_from_settings_opens_in_last_terminal_window() {
 }
 
 #[test]
+fn tunnels_action_from_the_settings_tab_opens_the_panel_beside_it() {
+    use crate::keys::Action;
+    let (mut w, a, b) = two_windows();
+    let _ = w.app.update(Message::WindowFocused(b));
+    let _ = w.app.open_settings();
+    assert_eq!(w.app.settings_window(), Some(b), "Settings is a tab of B");
+    let _ = shortcut(&mut w, b, Action::Tunnels);
+    assert!(w.app.tunnels_panels.is_open(b), "opened beside the tab");
+    assert!(!w.app.tunnels_panels.is_open(a));
+    let _ = shortcut(&mut w, b, Action::Tunnels);
+    assert!(!w.app.tunnels_panels.is_open(b), "and the action closes it");
+}
+
+#[test]
 fn switch_from_panel_asks_over_its_window() {
     use crate::tunnels_panel::TunnelsMsg;
     let rt = tokio::runtime::Builder::new_multi_thread()

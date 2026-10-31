@@ -308,25 +308,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         window: id,
         mode: if modal {
             covered
-        } else if let Some(page) = page {
-            match page {
-                Page::Profiles => Mode::Editor,
-                Page::Settings
-                    if app
-                        .settings_win
-                        .as_ref()
-                        .is_some_and(|(_, s)| s.recording.is_some()) =>
-                {
-                    Mode::Recording
-                }
-                Page::Settings => Mode::Settings,
-            }
-        } else if let Some(mode) = panel_mode {
-            mode
-        } else if find.is_some() {
-            Mode::Find
         } else {
-            Mode::Normal
+            let recording = app
+                .settings_win
+                .as_ref()
+                .is_some_and(|(_, s)| s.recording.is_some());
+            key_mode(page, recording, panel_mode, find.is_some())
         },
         bindings: &app.bindings,
     });
@@ -2132,9 +2119,48 @@ pub fn save_png(path: &Path, shot: &Screenshot) -> Result<(), String> {
     w.write_image_data(&shot.rgba).map_err(|e| e.to_string())
 }
 
+/// How the window's keys are handled (outside modals): a page tab's own mode, except that a
+/// panel docked beside it has the keyboard while it is focused.
+fn key_mode(page: Option<Page>, recording: bool, panel: Option<Mode>, find: bool) -> Mode {
+    match (page, panel) {
+        (Some(Page::Settings), _) if recording => Mode::Recording,
+        (_, Some(panel)) => panel,
+        (Some(Page::Profiles), _) => Mode::Editor,
+        (Some(Page::Settings), _) => Mode::Settings,
+        (None, _) if find => Mode::Find,
+        (None, _) => Mode::Normal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_focused_panel_keeps_its_keys_beside_a_page_tab() {
+        let panel = Some(Mode::TunnelsPanel);
+        for page in [Page::Settings, Page::Profiles] {
+            assert!(matches!(
+                key_mode(Some(page), false, panel, false),
+                Mode::TunnelsPanel
+            ));
+        }
+        assert!(matches!(
+            key_mode(Some(Page::Settings), false, None, false),
+            Mode::Settings
+        ));
+        assert!(matches!(
+            key_mode(Some(Page::Profiles), false, None, false),
+            Mode::Editor
+        ));
+        // Recording a shortcut still wins.
+        assert!(matches!(
+            key_mode(Some(Page::Settings), true, panel, false),
+            Mode::Recording
+        ));
+        assert!(matches!(key_mode(None, false, None, true), Mode::Find));
+        assert!(matches!(key_mode(None, false, None, false), Mode::Normal));
+    }
 
     const OUTER: Rectangle = Rectangle {
         x: 0.0,
