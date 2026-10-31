@@ -202,14 +202,22 @@ fn setting<'a>(
     control: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     let mut words = column![text(label).font(UI_FONT).size(13).color(if dimmed {
-        t.text_secondary
+        t.text_muted
     } else {
         t.text
     })]
     .spacing(3)
     .width(Length::Fill);
     if let Some(h) = hint {
-        words = words.push(text(h).font(UI_FONT).size(12).color(t.text_muted));
+        let hint_color = if dimmed {
+            Color {
+                a: 0.5,
+                ..t.text_muted
+            }
+        } else {
+            t.text_muted
+        };
+        words = words.push(text(h).font(UI_FONT).size(12).color(hint_color));
     }
     row![words, control.into()]
         .spacing(16)
@@ -1252,8 +1260,11 @@ pub(crate) fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) ->
         background: Background::Color(track),
         background_border_width: if disabled { 1.0 } else { 0.0 },
         background_border_color: t.border,
-        foreground: Background::Color(if disabled || inert {
+        foreground: Background::Color(if disabled || (inert && !on) {
             t.text_muted
+        } else if inert {
+            // On, muted: the knob must not vanish into the muted track.
+            t.app
         } else {
             Color::WHITE
         }),

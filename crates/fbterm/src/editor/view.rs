@@ -153,6 +153,19 @@ fn sidebar<'a>(
         .padding(Padding::from([5.0, 9.0]))
         .style(move |_, s| ui::secondary(t, s))
     };
+    let transfer = |caption: &'a str, icon: &'static str, m: EditorMsg| {
+        button(
+            row![
+                ui::icon(icon, 13.0, t.text_secondary),
+                text(caption).font(UI_FONT).size(12.5)
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .on_press(msg(m))
+        .padding(Padding::from([5.0, 9.0]))
+        .style(move |_, s| ui::ghost(t, s))
+    };
     let mut list = column![].spacing(2);
     for (group, drafts) in state.groups() {
         let title = if group.is_empty() {
@@ -186,6 +199,12 @@ fn sidebar<'a>(
             .align_y(Alignment::Center)
             .padding(Padding::from([12.0, 12.0])),
             scrollable(container(list).padding(Padding::from([0.0, 8.0]))).height(Length::Fill),
+            row![
+                transfer("Export", ui::ICON_UPLOAD, EditorMsg::Export),
+                transfer("Import", ui::ICON_DOWNLOAD, EditorMsg::Import),
+            ]
+            .spacing(6)
+            .padding(Padding::from([12.0, 12.0])),
         ]
         .width(Length::Fill)
         .height(Length::Fill),
@@ -201,14 +220,18 @@ fn sidebar<'a>(
 }
 
 fn profile_row<'a>(t: &'static Tokens, d: &'a Draft, selected: bool) -> Element<'a, Message> {
-    let dot = swatch(d.accent.map(ui::to_color).or(Some(t.border)), 8.0);
+    let icon = ui::icon(
+        ui::profile_icon(d.icon.as_deref(), matches!(d.kind, DraftKind::Ssh(_))),
+        14.0,
+        d.accent.map(ui::to_color).unwrap_or(t.text_muted),
+    );
     let name = if d.name.trim().is_empty() {
         "Untitled".to_owned()
     } else {
         d.name.clone()
     };
     let content = row![
-        dot,
+        icon,
         column![
             text(name)
                 .font(UI_FONT)
@@ -370,6 +393,7 @@ fn form<'a>(
             .spacing(6),
         ]
         .spacing(24),
+        column![ui::label(t, "Icon"), icons(t, d, editable)].spacing(6),
         column![
             ui::label(t, "Color scheme"),
             scheme_pick(t, d, schemes, editable)
@@ -458,6 +482,41 @@ fn color_as<'a>(t: &'static Tokens, current: AccentStyle, editable: bool) -> Ele
     .into()
 }
 
+/// The profile's icon: its kind's default first, then the other choices.
+fn icons<'a>(t: &'static Tokens, d: &Draft, editable: bool) -> Element<'a, Message> {
+    let ssh = matches!(d.kind, DraftKind::Ssh(_));
+    let shown = ui::profile_icon(d.icon.as_deref(), ssh);
+    let mut r = row![].spacing(4).align_y(Alignment::Center);
+    for (i, (name, glyph)) in ui::PROFILE_ICONS.iter().enumerate() {
+        // The other kind's default is a choice like any other; this kind's is "no icon".
+        let value = (i != usize::from(ssh)).then_some(*name);
+        let selected = shown == *glyph;
+        r = r.push(
+            button(ui::icon(
+                glyph,
+                15.0,
+                if selected { t.text } else { t.text_muted },
+            ))
+            .on_press_maybe(editable.then(|| msg(EditorMsg::Icon(value))))
+            .padding(6)
+            .style(move |_, _| button::Style {
+                background: selected.then(|| t.accent_soft.into()),
+                border: Border {
+                    color: if selected {
+                        t.accent_edge
+                    } else {
+                        Color::TRANSPARENT
+                    },
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..button::Style::default()
+            }),
+        );
+    }
+    r.into()
+}
+
 fn accents<'a>(t: &'static Tokens, current: Option<Rgb>, editable: bool) -> Element<'a, Message> {
     let choice = |value: Option<Rgb>| {
         let selected = current == value;
@@ -541,8 +600,6 @@ fn footer<'a>(
                 (editable && has_selection && !busy).then(|| msg(EditorMsg::Duplicate)),
                 ui::ghost
             ),
-            ui::text_button(t, "Export\u{2026}", Some(msg(EditorMsg::Export)), ui::ghost),
-            ui::text_button(t, "Import\u{2026}", Some(msg(EditorMsg::Import)), ui::ghost),
             messages,
             ui::text_button(t, "Close", Some(msg(EditorMsg::Close)), ui::secondary),
             ui::text_button(

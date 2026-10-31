@@ -247,6 +247,7 @@ mod tests {
             profiles: ids
                 .iter()
                 .map(|&id| Profile {
+                    icon: None,
                     id,
                     name: id.to_string(),
                     group: None,

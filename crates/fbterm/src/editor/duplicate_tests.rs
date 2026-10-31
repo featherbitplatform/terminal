@@ -25,6 +25,7 @@ const PP: &str = "saved-pp-dup-19f0";
 
 fn ssh(name: &str, auth: AuthMethod) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: Some("prod".into()),

@@ -21,6 +21,7 @@ fn dir() -> PathBuf {
 /// `Disconnected`), so "was started" is observable without spawning anything.
 pub(crate) fn profile(name: &str) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,

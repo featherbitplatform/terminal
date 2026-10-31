@@ -1465,6 +1465,12 @@ impl BarBackground<'_> {
                         })
                     });
             }
+            // A wheel click on a tab closes it, as in a browser.
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) if !self.modal => {
+                if let Some(index) = cursor.position_over(bounds).and_then(under) {
+                    shell.publish(Message::TabBar(self.window, TabBarMsg::Close(index)));
+                }
+            }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                 if let (Some(press), Some(p)) = (&mut state.press, cursor.position()) {
                     if !press.dragging && p.distance(press.origin) >= TAB_DRAG_THRESHOLD {

@@ -128,6 +128,7 @@ impl App {
         for i in 0..count {
             let id = ProfileId::new();
             self.profiles.profiles.push(Profile {
+                icon: None,
                 id,
                 name: format!("perf-{}", i + 1),
                 group: None,

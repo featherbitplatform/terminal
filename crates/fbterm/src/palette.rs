@@ -16,6 +16,7 @@ use crate::keys::{Action, Bindings};
 use crate::layout::{Drop, PaneId, Side};
 use crate::tabs::{Tab, TabId, WindowState};
 use crate::theme::{Tokens, UI_FONT};
+use crate::ui;
 
 /// The footer line: what Shift+Enter does.
 pub const SPLIT_HINT: &str = "Shift+Enter opens in a split";
@@ -47,6 +48,8 @@ pub enum PaletteItem {
         name: String,
         /// `user@host` (plus ` via <hops>`) for SSH, the program path for local shells.
         detail: String,
+        /// The row's icon glyph (`ui::profile_icon`).
+        icon: &'static str,
     },
     /// A tunnel: choosing it switches it on or off.
     Tunnel {
@@ -304,6 +307,7 @@ pub fn items(store: &ProfileStore, tunnels: Vec<PaletteItem>) -> Vec<PaletteItem
                 id: p.id,
                 name: p.name.clone(),
                 detail,
+                icon: ui::profile_icon(p.icon.as_deref(), matches!(p.kind, ProfileKind::Ssh(_))),
             }
         })
         .collect();
@@ -606,15 +610,17 @@ fn item_row<'a>(
         | PaletteItem::Action { label, .. }
         | PaletteItem::Choice { label, .. } => (label.as_str(), None),
     };
-    let mut content = row![
+    let mut content = row![].spacing(12).align_y(Alignment::Center);
+    if let PaletteItem::Profile { icon, .. } = item {
+        content = content.push(ui::icon(icon, 14.0, t.text_muted));
+    }
+    content = content.push(
         text(label)
             .font(UI_FONT)
             .size(13.5)
             .wrapping(text::Wrapping::None)
-            .color(t.text)
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center);
+            .color(t.text),
+    );
     match (detail, item) {
         (_, PaletteItem::Tunnel { state, .. }) => {
             content = content.push(
@@ -701,6 +707,7 @@ mod tests {
             id: ProfileId::new(),
             name: name.into(),
             detail: detail.into(),
+            icon: ui::ICON_TERMINAL,
         }
     }
 
@@ -887,6 +894,7 @@ mod tests {
     fn items_describe_ssh_profiles_with_their_jump_chain() {
         use fbterm_config::{AuthMethod, Profile, SshProfile};
         let ssh = |name: &str, host: &str, jump: Vec<ProfileId>| Profile {
+            icon: None,
             id: ProfileId::new(),
             name: name.into(),
             group: None,

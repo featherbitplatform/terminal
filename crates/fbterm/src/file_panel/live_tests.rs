@@ -60,6 +60,7 @@ impl Prompter for TrustAny {
 fn profile() -> Profile {
     let key = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../dev/ssh-test/keys/fb_test_ed25519");
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: "panel-live".into(),
         group: None,

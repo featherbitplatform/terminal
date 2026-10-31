@@ -103,6 +103,10 @@ pub struct Profile {
     /// How the accent shows on tabs (`"stripe"` or `"tab"`); written only when not the default.
     #[serde(default, skip_serializing_if = "AccentStyle::is_default")]
     pub accent_style: AccentStyle,
+    /// Name of the icon shown beside the profile (the app's list of names); none shows the
+    /// default for its kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
     /// Id of the color scheme this profile's sessions use; none follows the global scheme.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_scheme: Option<String>,

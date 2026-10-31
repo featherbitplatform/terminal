@@ -11,6 +11,7 @@ fn tmp(name: &str) -> PathBuf {
 
 fn ssh(name: &str, jump: Vec<ProfileId>) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: None,
@@ -30,6 +31,7 @@ fn ssh(name: &str, jump: Vec<ProfileId>) -> Profile {
 
 fn local(name: &str) -> Profile {
     Profile {
+        icon: None,
         id: ProfileId::new(),
         name: name.into(),
         group: Some("shells".into()),
@@ -939,6 +941,7 @@ fn blank_target_port_blocks_save() {
     use fbterm_config::{StartMode, TunnelDef, TunnelKind, ValidationError};
     let mut store = ProfileStore::default();
     let mut p = Profile {
+        icon: None,
         id: ProfileId::new(),
         name: "web".into(),
         group: None,
@@ -1253,4 +1256,18 @@ fn check_updates_is_unasked_until_written() {
             .unwrap()
             .contains("check_updates")
     );
+}
+
+#[test]
+fn icon_is_written_only_when_set() {
+    let path = tmp("profiles.toml");
+    let mut db = local("db");
+    db.icon = Some("database".into());
+    let store = ProfileStore {
+        profiles: vec![local("plain"), db],
+    };
+    store.save(&path).unwrap();
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("icon").count(), 1, "{text}");
+    assert_eq!(ProfileStore::load(&path).unwrap(), store);
 }

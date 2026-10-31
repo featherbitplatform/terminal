@@ -46,6 +46,35 @@ pub const ICON_PARENT: &str = "\u{e0a4}"; // corner-left-up
 pub const ICON_FILE_OTHER: &str = "\u{e322}"; // file-question-mark
 pub const ICON_MINUS: &str = "\u{e11c}"; // minimize
 pub const ICON_SQUARE: &str = "\u{e167}"; // maximize (`copy` restores)
+pub const ICON_DOWNLOAD: &str = "\u{e0b2}";
+pub const ICON_UPLOAD: &str = "\u{e19e}";
+pub const ICON_TERMINAL: &str = "\u{e181}";
+pub const ICON_SERVER: &str = "\u{e153}";
+
+/// The icons a profile can pick, by the name written in `profiles.toml`; the first two are the
+/// defaults of a local and an SSH profile.
+pub const PROFILE_ICONS: [(&str, &str); 13] = [
+    ("terminal", ICON_TERMINAL),
+    ("server", ICON_SERVER),
+    ("database", "\u{e0ad}"),
+    ("cloud", "\u{e088}"),
+    ("globe", "\u{e0e8}"),
+    ("container", "\u{e4d5}"),
+    ("square-terminal", "\u{e20a}"),
+    ("shield", "\u{e158}"),
+    ("cpu", "\u{e0a9}"),
+    ("hard-drive", "\u{e0ed}"),
+    ("router", "\u{e3bf}"),
+    ("laptop", "\u{e1cd}"),
+    ("rocket", "\u{e286}"),
+];
+
+/// The glyph for a profile's saved icon name; an unknown or missing name (a file edited by
+/// hand, an archive from a newer version) falls back to the default for its kind.
+pub fn profile_icon(name: Option<&str>, ssh: bool) -> &'static str {
+    let found = PROFILE_ICONS.iter().find(|(n, _)| Some(*n) == name);
+    found.map_or(PROFILE_ICONS[usize::from(ssh)].1, |(_, glyph)| glyph)
+}
 
 /// An icon `size` pixels square. The font draws each icon on the full em square (the 24-unit
 /// SVG grid scaled to the em, baseline at the bottom), so a one-em line holds it exactly.
@@ -506,6 +535,10 @@ mod icon_font_tests {
             seen += 1;
         }
         assert!(seen >= 8, "found only {seen} ICON_ constants");
+        for (name, glyph) in super::PROFILE_ICONS {
+            let ch = glyph.chars().next().unwrap();
+            assert!(cmap.map_codepoint(ch).is_some(), "missing glyph of {name}");
+        }
     }
 }
 
@@ -537,5 +570,18 @@ mod tests {
         for margin in [0.0, 1.0, 3.0] {
             assert_eq!(edge_scrollbar_margin(false, margin), margin);
         }
+    }
+}
+
+#[cfg(test)]
+mod profile_icon_tests {
+    use super::*;
+
+    #[test]
+    fn unknown_or_missing_names_fall_back_to_the_kind_default() {
+        assert_eq!(profile_icon(None, false), ICON_TERMINAL);
+        assert_eq!(profile_icon(None, true), ICON_SERVER);
+        assert_eq!(profile_icon(Some("nope"), true), ICON_SERVER);
+        assert_eq!(profile_icon(Some("database"), false), PROFILE_ICONS[2].1);
     }
 }

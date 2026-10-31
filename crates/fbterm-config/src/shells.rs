@@ -58,6 +58,7 @@ fn profile_name(program: &std::path::Path) -> String {
 fn local_profile(program: PathBuf) -> Profile {
     let name = profile_name(&program);
     Profile {
+        icon: None,
         id: stable_id(&program),
         name,
         group: None,

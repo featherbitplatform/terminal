@@ -1352,6 +1352,7 @@ mod tests {
             start: StartMode::OnDemand,
         };
         let profile = Profile {
+            icon: None,
             kind: ProfileKind::Ssh(SshProfile {
                 host: "127.0.0.1".into(),
                 port: silent.local_addr().unwrap().port(),
