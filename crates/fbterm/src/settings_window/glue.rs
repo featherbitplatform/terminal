@@ -1,4 +1,4 @@
-//! The app side of settings: the Settings window, applying settings live, and reloading
+//! The app side of settings: the Settings tab, applying settings live, and reloading
 //! `settings.toml` when it changes on disk.
 
 use std::collections::HashMap;
@@ -163,7 +163,7 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Open the Settings window, or bring it to the front.
+    /// Open the Settings tab, or select it where it is open.
     pub(crate) fn open_settings(&mut self) -> Task<Message> {
         if self.settings_win.is_some() {
             return self.show_page(Page::Settings).1;
@@ -177,7 +177,7 @@ impl App {
         open
     }
 
-    /// Write the Settings window's unwritten changes to `settings.toml`, each key in place.
+    /// Write the Settings tab's unwritten changes to `settings.toml`, each key in place.
     /// Our own write is remembered so the file watcher does not reload it. If the file was
     /// edited on disk since we last saw it (and the watcher has not reported it yet), that edit
     /// is not ours to hide: after writing, the file is reloaded as for any edit on disk.
@@ -240,7 +240,7 @@ impl App {
     }
 
     /// `settings.toml` changed on disk: apply it, or keep the previous settings and say why.
-    /// An open Settings window shows the new values (or turns read-only while it does not load).
+    /// An open Settings tab shows the new values (or turns read-only while it does not load).
     pub(crate) fn settings_file_changed(&mut self) -> Task<Message> {
         let path = self.paths.settings();
         let text = std::fs::read_to_string(&path).ok();

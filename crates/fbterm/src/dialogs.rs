@@ -1,4 +1,4 @@
-//! The app side of the profile editor window and the connection dialogs.
+//! The app side of the Profiles tab (the profile editor) and the connection dialogs.
 
 use std::path::{Path, PathBuf};
 
