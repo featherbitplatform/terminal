@@ -53,6 +53,10 @@ impl App {
         else {
             return Task::none();
         };
+        // A page tab's one pane is a stand-in that is never drawn or saved.
+        if tab.page.is_some() {
+            return Task::none();
+        }
         let focused = tab.focused;
         let new = match profile {
             Some(id) => {

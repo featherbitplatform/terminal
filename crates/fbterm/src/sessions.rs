@@ -812,6 +812,21 @@ pub(crate) mod pane_tests {
     }
 
     #[test]
+    fn page_tab_refuses_splits() {
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(Tab::page(crate::tabs::Page::Settings));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+        let _ = app.split_pane(wid, Side::Right);
+        let _ = app.open_in_split(wid, p.id, Side::Right);
+        assert_eq!(app.windows[&wid].tabs[0].panes.len(), 1);
+    }
+
+    #[test]
     fn split_pane_starts_at_its_rect_grid() {
         let p = profile("a");
         let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
