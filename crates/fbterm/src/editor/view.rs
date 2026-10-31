@@ -61,12 +61,7 @@ pub fn view<'a>(
     main = main.push(
         row![
             sidebar(t, state, editable, scale),
-            column![form].extend(
-                state
-                    .selected
-                    .is_some()
-                    .then(|| footer(t, state, editable, busy, scale))
-            )
+            column![form, footer(t, state, editable, busy, scale)]
         ]
         .height(Length::Fill),
     );
@@ -589,19 +584,20 @@ fn footer<'a>(
                 .color(t.text_muted),
         );
     }
+    let has_selection = state.selected.is_some();
     // A rule along the top only: the sidebar's rule runs down its left side.
     let buttons = container(
         row![
             ui::text_button(
                 t,
                 "Delete",
-                editable.then(|| msg(EditorMsg::Delete)),
+                (editable && has_selection).then(|| msg(EditorMsg::Delete)),
                 ui::danger_ghost
             ),
             ui::text_button(
                 t,
                 "Duplicate",
-                (editable && !busy).then(|| msg(EditorMsg::Duplicate)),
+                (editable && has_selection && !busy).then(|| msg(EditorMsg::Duplicate)),
                 ui::ghost
             ),
             messages,
