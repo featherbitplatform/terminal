@@ -812,6 +812,23 @@ pub(crate) mod pane_tests {
     }
 
     #[test]
+    fn page_tab_opens_in_the_last_terminal_window_while_another_window_has_focus() {
+        let (mut app, _) = App::build(paths_with(&[]), true);
+        app.state_saving_enabled = false;
+        let (a, b) = (window::Id::unique(), window::Id::unique());
+        app.windows.clear();
+        app.windows.insert(a, WindowState::new());
+        app.windows.insert(b, WindowState::new());
+        // The Color schemes window has focus; `b` was the terminal window focused last.
+        app.focused = Some(window::Id::unique());
+        app.last_terminal = Some(b);
+        let (wid, _) = app.show_page(crate::tabs::Page::Settings);
+        assert_eq!(wid, b);
+        assert_eq!(app.windows[&b].tabs.len(), 1);
+        assert!(app.windows[&a].tabs.is_empty());
+    }
+
+    #[test]
     fn page_tab_refuses_splits() {
         let p = profile("a");
         let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);

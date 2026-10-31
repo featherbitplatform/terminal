@@ -142,12 +142,9 @@ impl App {
                 (wid, Task::none())
             }
             None => {
-                let (wid, make) = match self.focused.filter(|w| self.windows.contains_key(w)) {
+                let (wid, make) = match self.focused_window() {
                     Some(wid) => (wid, Task::none()),
-                    None => match self.windows.keys().next().copied() {
-                        Some(wid) => (wid, Task::none()),
-                        None => self.new_window(restore::DEFAULT_SIZE),
-                    },
+                    None => self.new_window(restore::DEFAULT_SIZE),
                 };
                 if let Some(w) = self.windows.get_mut(&wid) {
                     w.push(Tab::page(page));
