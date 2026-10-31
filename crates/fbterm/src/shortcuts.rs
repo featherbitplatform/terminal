@@ -221,6 +221,12 @@ fn press_message(
             }
             shortcut.map(|action| match action {
                 Action::CloseTab if !repeat => Some(Message::Editor(EditorMsg::Close)),
+                Action::NextTab | Action::PrevTab => Some(Message::Shortcut(w, action)),
+                Action::SelectTab(_) | Action::NewTab | Action::NewWindow | Action::Palette
+                    if !repeat =>
+                {
+                    Some(Message::Shortcut(w, action))
+                }
                 Action::Quit
                 | Action::DuplicateProfile
                 | Action::Settings
@@ -237,6 +243,12 @@ fn press_message(
         }
         Mode::Settings => shortcut.map(|action| match action {
             Action::CloseTab if !repeat => Some(Message::Settings(SettingsMsg::Close)),
+            Action::NextTab | Action::PrevTab => Some(Message::Shortcut(w, action)),
+            Action::SelectTab(_) | Action::NewTab | Action::NewWindow | Action::Palette
+                if !repeat =>
+            {
+                Some(Message::Shortcut(w, action))
+            }
             Action::Quit | Action::EditProfiles | Action::EditSchemes | Action::Tunnels
                 if !repeat =>
             {
@@ -1181,7 +1193,11 @@ mod tests {
             press(Mode::Settings, ",", true),
             Some(Some(Message::Shortcut(_, Action::EditProfiles)))
         ));
-        assert!(matches!(press(Mode::Settings, "t", false), Some(None)));
+        // Settings is a tab: tab shortcuts work there.
+        assert!(matches!(
+            press(Mode::Settings, "t", false),
+            Some(Some(Message::Shortcut(_, Action::NewTab)))
+        ));
         let (key, mods) = if cfg!(target_os = "macos") {
             (
                 keyboard::Key::Character(",".into()),

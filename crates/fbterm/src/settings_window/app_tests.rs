@@ -455,6 +455,8 @@ fn lowering_scrollback_refreshes_an_open_find_bar() {
     use crate::find::FindMsg;
     let (mut app, _paths, term) = app_with_history(500);
     let wid = *app.windows.keys().next().unwrap();
+    // Settings is a tab of its own: find works in the terminal tab beside it.
+    app.windows.get_mut(&wid).unwrap().select(0);
     let _ = app.find(wid, FindMsg::Open);
     let _ = app.find(wid, FindMsg::Query("line".into()));
     finish_search(&mut app, wid, &term);

@@ -11,7 +11,7 @@ use crate::chrome::Chrome;
 use crate::layout::{Drop, Layout, PaneId};
 use crate::prompts::Closing;
 use crate::restore;
-use crate::tabs::{self, Pane, Tab, TabId, TabState, WindowState};
+use crate::tabs::{self, Page, Pane, Tab, TabId, TabState, WindowState};
 
 /// How long a carried tab hovers over another tab's button before that tab is shown.
 pub(crate) const HOVER_SWITCH: Duration = Duration::from_millis(500);
@@ -127,6 +127,62 @@ impl App {
         self.start(wid, id)
     }
 
+    /// The window and index of the open `page` tab.
+    fn page_tab(&self, page: Page) -> Option<(window::Id, usize)> {
+        self.windows.iter().find_map(|(wid, w)| {
+            let i = w.tabs.iter().position(|t| t.page == Some(page))?;
+            Some((*wid, i))
+        })
+    }
+
+    /// Show the `page` tab: select it where it is open, else add it to the focused window (or
+    /// the first; a new one when none is open). Returns its window with the task.
+    pub(crate) fn show_page(&mut self, page: Page) -> (window::Id, Task<Message>) {
+        let (wid, make) = match self.page_tab(page) {
+            Some((wid, i)) => {
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.select(i);
+                }
+                (wid, Task::none())
+            }
+            None => {
+                let (wid, make) = match self.focused_window() {
+                    Some(wid) => (wid, Task::none()),
+                    None => self.new_window(restore::DEFAULT_SIZE),
+                };
+                if let Some(w) = self.windows.get_mut(&wid) {
+                    w.push(Tab::page(page));
+                }
+                (wid, make)
+            }
+        };
+        self.save_state();
+        (
+            wid,
+            Task::batch([make, window::gain_focus(wid), self.shown(wid)]),
+        )
+    }
+
+    /// Close the `page` tab, if one is open.
+    pub(crate) fn close_page(&mut self, page: Page) -> Task<Message> {
+        match self.page_tab(page) {
+            Some((wid, i)) => self.close_tab(wid, i),
+            None => Task::none(),
+        }
+    }
+
+    /// What a closed page tab leaves behind: the editor's drafts go, Settings writes what is
+    /// still waiting.
+    pub(crate) fn page_closed(&mut self, page: Page) {
+        match page {
+            Page::Profiles => self.editor = None,
+            Page::Settings => {
+                self.write_pending_settings();
+                self.settings_win = None;
+            }
+        }
+    }
+
     /// The tab's close button: a tab whose closing would end running transfers asks first
     /// (`Dialog::Transfers`), then a tab with several live panes (`Dialog::CloseTab`);
     /// anything else closes at once. Bulk closes call `close_tab` directly.
@@ -179,6 +235,9 @@ impl App {
         let Some(closed) = window.close(index) else {
             return Task::none();
         };
+        if let Some(page) = closed.tab.page {
+            self.page_closed(page);
+        }
         let freed = crate::memory::weak_terminals(closed.tab.panes.iter());
         let gone: Vec<_> = closed.tab.panes.iter().map(|p| p.id).collect();
         self.forget_panes(&gone);
@@ -291,8 +350,6 @@ impl App {
             .windows
             .keys()
             .copied()
-            .chain(self.editor_window())
-            .chain(self.settings_window())
             .chain(self.schemes_window())
             .chain(self.archive_window())
             .collect();
@@ -327,11 +384,7 @@ impl App {
         if self.settings_window() == Some(id) {
             self.write_pending_settings();
         }
-        if self.editor_window() == Some(id)
-            || self.settings_window() == Some(id)
-            || self.schemes_window() == Some(id)
-            || self.archive_window() == Some(id)
-        {
+        if self.schemes_window() == Some(id) || self.archive_window() == Some(id) {
             self.close_window(id)
         } else if self.windows.len() > 1 {
             if self.ask_before_closing_window(id) {
@@ -457,6 +510,9 @@ impl App {
             return None;
         }
         let (source, target) = (&w.tabs[w.find(source)?], &w.tabs[w.find(target)?]);
+        if source.page.is_some() || target.page.is_some() {
+            return None;
+        }
         let mut merged = target.layout.clone();
         merged.insert(source.layout.clone(), at);
         self.fits_in(wid, target.focused, &merged).then_some(merged)

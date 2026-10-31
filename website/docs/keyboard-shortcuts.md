@@ -127,9 +127,9 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Find in pane | Open the focused pane's find bar. |
 | Find in all tabs | Open the search over every tab. |
 | Find in this tab | Open the same search restricted to the panes of the current tab. |
-| Edit profiles | Open the profile editor. |
-| Duplicate profile | Save a copy of the focused pane's profile (in the profile editor, of the selected one) and open it in the editor; see [Duplicating a profile](profiles#duplicating-a-profile). It has no shortcut by default. |
-| Settings | Open the Settings window. |
+| Profiles | Open the Profiles tab (the profile editor), or select it where it is open. |
+| Duplicate profile | Save a copy of the focused pane's profile (in the Profiles tab, of the selected one) and open it in the editor; see [Duplicating a profile](profiles#duplicating-a-profile). It has no shortcut by default. |
+| Settings | Open the Settings tab, or select it where it is open. |
 | Tunnels | Show or hide the [tunnels panel](tunnels#the-tunnels-panel) beside the terminal. It has no shortcut by default. |
 | File panel | Show or hide the [file panel](file-panel) beside the focused pane's terminal. |
 | Tunnel: _profile_ / _name_ | One row per tunnel, with its state on the right. Choosing a row switches that tunnel on or off. |

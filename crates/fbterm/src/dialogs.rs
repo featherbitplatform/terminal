@@ -1,4 +1,4 @@
-//! The app side of the profile editor window and the connection dialogs.
+//! The app side of the Profiles tab (the profile editor) and the connection dialogs.
 
 use std::path::{Path, PathBuf};
 
@@ -15,6 +15,7 @@ use crate::prompts::{
     Ask, Clash, Dialog, PromptEvent, PromptId, PromptMsg, Rename, key_file_title,
 };
 use crate::saved_secrets::Kind;
+use crate::tabs::Page;
 use crate::tunnels::NO_WINDOW;
 
 impl App {
@@ -25,10 +26,7 @@ impl App {
     pub(crate) fn editor_msg(&mut self, msg: EditorMsg) -> Task<Message> {
         match msg {
             EditorMsg::Open => self.open_editor(),
-            EditorMsg::Close => match self.editor_window() {
-                Some(id) => self.close_window(id),
-                None => Task::none(),
-            },
+            EditorMsg::Close => self.close_page(Page::Profiles),
             EditorMsg::Save => self.save_profiles(true),
             EditorMsg::SaveNoAsk => self.save_profiles(false),
             EditorMsg::EditSchemes => {
@@ -74,15 +72,10 @@ impl App {
     }
 
     pub(crate) fn open_editor(&mut self) -> Task<Message> {
-        if let Some(id) = self.editor_window() {
-            return window::gain_focus(id);
+        if self.editor.is_some() {
+            return self.show_page(Page::Profiles).1;
         }
-        let (id, open) = crate::chrome::open_window(window::Settings {
-            size: iced::Size::new(920.0, 720.0),
-            min_size: Some(iced::Size::new(640.0, 420.0)),
-            exit_on_close_request: false,
-            ..window::Settings::default()
-        });
+        let (id, open) = self.show_page(Page::Profiles);
         let mut state = EditorState::new(
             &self.profiles,
             self.secrets.clone(),
@@ -93,7 +86,7 @@ impl App {
             state.notice = Some(SAVING.into());
         }
         self.editor = Some((id, state));
-        open.discard()
+        open
     }
 
     /// Validate, write `profiles.toml` atomically and use the new profiles everywhere, then

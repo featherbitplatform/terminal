@@ -21,7 +21,7 @@ use crate::keys::{Action, Bindings};
 use crate::palette;
 use crate::shortcuts::{Mode, Shortcuts};
 use crate::tab_look::{Surroundings, look};
-use crate::tabs::{Pane, Tab, TabId, TabState};
+use crate::tabs::{Page, Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
 use crate::tunnels_panel::TunnelsMsg;
@@ -77,68 +77,6 @@ fn vault_layer<'a>(
 
 fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     let t = app.tokens;
-    if let Some((eid, state)) = &app.editor
-        && *eid == id
-    {
-        let schemes = app.scheme_choices(true);
-        let mut content = column![];
-        if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(
-                t,
-                id,
-                app.maximized.contains(&id),
-                app.physical_scale(id),
-            ));
-        }
-        let content = content.push(crate::editor::view::view(
-            t,
-            state,
-            schemes,
-            app.storage(),
-            app.editor_job.is_some(),
-            app.physical_scale(id),
-        ));
-        return Element::new(Shortcuts {
-            content: content.into(),
-            window: id,
-            mode: Mode::Editor,
-            bindings: &app.bindings,
-        });
-    }
-    if let Some((sid, state)) = &app.settings_win
-        && *sid == id
-    {
-        let mut content = column![];
-        if Chrome::current().draws_title_bar() {
-            content = content.push(crate::ui::window_header(
-                t,
-                id,
-                app.maximized.contains(&id),
-                app.physical_scale(id),
-            ));
-        }
-        let notice = app.settings_notice.as_deref();
-        let schemes = app.scheme_choices(false);
-        let content = content.push(crate::settings_window::view::view(
-            t,
-            state,
-            schemes,
-            notice,
-            app.secrets_section(),
-            app.chrome_fell_back,
-            app.opaque_window_open(),
-        ));
-        return Element::new(Shortcuts {
-            content: content.into(),
-            window: id,
-            mode: if state.recording.is_some() {
-                Mode::Recording
-            } else {
-                Mode::Settings
-            },
-            bindings: &app.bindings,
-        });
-    }
     if let Some((sid, state)) = &app.schemes_win
         && *sid == id
     {
@@ -270,7 +208,9 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
     }
     // Only the active tab builds terminal views (one per pane on screen); background tabs
     // render nothing.
+    let page = win.active_tab().and_then(|t| t.page);
     let content: Element<'_, Message> = match win.active_tab() {
+        Some(_) if page.is_some() => page_view(app, id, page),
         Some(tab) => {
             // In the tab's own pane order, not the layout's: moving a tile then keeps each
             // pane's widget state (find field, selection drag) with its pane.
@@ -324,7 +264,11 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         None => text("").into(),
     };
     let terminal_area: Element<'_, Message> = container(content)
-        .padding(TERMINAL_PADDING)
+        .padding(if page.is_some() {
+            Padding::ZERO
+        } else {
+            TERMINAL_PADDING
+        })
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_| container::Style {
@@ -364,12 +308,12 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         window: id,
         mode: if modal {
             covered
-        } else if let Some(mode) = panel_mode {
-            mode
-        } else if find.is_some() {
-            Mode::Find
         } else {
-            Mode::Normal
+            let recording = app
+                .settings_win
+                .as_ref()
+                .is_some_and(|(_, s)| s.recording.is_some());
+            key_mode(page, recording, panel_mode, find.is_some())
         },
         bindings: &app.bindings,
     });
@@ -415,6 +359,37 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         }));
     }
     layers.into()
+}
+
+/// The body of a page tab: the profile editor or the Settings, drawn where the terminals go.
+fn page_view(app: &App, id: window::Id, page: Option<Page>) -> Element<'_, Message> {
+    let t = app.tokens;
+    match page {
+        Some(Page::Profiles) => match &app.editor {
+            Some((_, state)) => crate::editor::view::view(
+                t,
+                state,
+                app.scheme_choices(true),
+                app.storage(),
+                app.editor_job.is_some(),
+                app.physical_scale(id),
+            ),
+            None => text("").into(),
+        },
+        Some(Page::Settings) => match &app.settings_win {
+            Some((_, state)) => crate::settings_window::view::view(
+                t,
+                state,
+                app.scheme_choices(false),
+                app.settings_notice.as_deref(),
+                app.secrets_section(),
+                app.chrome_fell_back,
+                app.opaque_window_open(),
+            ),
+            None => text("").into(),
+        },
+        None => text("").into(),
+    }
 }
 
 /// The narrowest the terminal area gets beside the file panel.
@@ -1001,7 +976,7 @@ fn tab_bar<'a>(
     let profiles = tip(
         t,
         profiles,
-        tooltip_text("Edit profiles", Action::EditProfiles, bindings),
+        tooltip_text("Profiles", Action::EditProfiles, bindings),
         demo_tip == Some(DemoTip::Profiles),
     );
     let tunnels = tip(
@@ -2047,7 +2022,11 @@ fn tab_button<'a>(
         },
         demo_tip,
     );
-    let mut inner = row![stripe, dot(state_color(t, tab.state()))];
+    let mut inner = row![stripe];
+    // A page tab has no session to show.
+    if tab.page.is_none() {
+        inner = inner.push(dot(state_color(t, tab.state())));
+    }
     // A background pane that lost its session: a second dot, the theme's warning color.
     if tab.trouble() {
         inner = inner.push(dot(t.warning));
@@ -2140,9 +2119,48 @@ pub fn save_png(path: &Path, shot: &Screenshot) -> Result<(), String> {
     w.write_image_data(&shot.rgba).map_err(|e| e.to_string())
 }
 
+/// How the window's keys are handled (outside modals): a page tab's own mode, except that a
+/// panel docked beside it has the keyboard while it is focused.
+fn key_mode(page: Option<Page>, recording: bool, panel: Option<Mode>, find: bool) -> Mode {
+    match (page, panel) {
+        (Some(Page::Settings), _) if recording => Mode::Recording,
+        (_, Some(panel)) => panel,
+        (Some(Page::Profiles), _) => Mode::Editor,
+        (Some(Page::Settings), _) => Mode::Settings,
+        (None, _) if find => Mode::Find,
+        (None, _) => Mode::Normal,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_focused_panel_keeps_its_keys_beside_a_page_tab() {
+        let panel = Some(Mode::TunnelsPanel);
+        for page in [Page::Settings, Page::Profiles] {
+            assert!(matches!(
+                key_mode(Some(page), false, panel, false),
+                Mode::TunnelsPanel
+            ));
+        }
+        assert!(matches!(
+            key_mode(Some(Page::Settings), false, None, false),
+            Mode::Settings
+        ));
+        assert!(matches!(
+            key_mode(Some(Page::Profiles), false, None, false),
+            Mode::Editor
+        ));
+        // Recording a shortcut still wins.
+        assert!(matches!(
+            key_mode(Some(Page::Settings), true, panel, false),
+            Mode::Recording
+        ));
+        assert!(matches!(key_mode(None, false, None, true), Mode::Find));
+        assert!(matches!(key_mode(None, false, None, false), Mode::Normal));
+    }
 
     const OUTER: Rectangle = Rectangle {
         x: 0.0,

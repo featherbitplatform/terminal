@@ -261,7 +261,7 @@ impl App {
         let Some(tab) = self.windows.get(&wid).and_then(WindowState::active_tab) else {
             return Task::none();
         };
-        if tab.panes.len() < 2 {
+        if tab.page.is_some() || tab.panes.len() < 2 {
             return Task::none();
         }
         let (pane, into) = (tab.focused, tab.id);

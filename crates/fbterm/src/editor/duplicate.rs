@@ -13,6 +13,7 @@ use iced::{Task, window};
 
 use super::{EditorMsg, JobKind, SecretJob};
 use crate::app::{App, Message};
+use crate::tabs::Page;
 
 pub const DUPLICATED: &str = "Duplicated";
 pub const DUPLICATING: &str = "Duplicating\u{2026}";
@@ -58,13 +59,18 @@ pub fn copy_secrets(
 }
 
 impl App {
-    /// The `Duplicate profile` action. In the profile editor (or with no terminal window) it
-    /// copies the selected profile; from a terminal window only the focused pane's profile,
+    /// The `Duplicate profile` action. With the Profiles tab active (or with no terminal window)
+    /// it copies the selected profile; from a terminal tab only the focused pane's profile,
     /// opening (or raising) the editor on the copy. A pane whose profile is not saved copies
     /// nothing: the editor says why, and its selection is never copied instead.
     pub(crate) fn duplicate_action(&mut self, from: Option<window::Id>) -> Task<Message> {
-        let in_editor = from.is_some() && from == self.editor_window();
-        let terminal = self.focused_window().and_then(|w| self.windows.get(&w));
+        let terminal = from
+            .and_then(|w| self.windows.get(&w))
+            .or_else(|| self.focused_window().and_then(|w| self.windows.get(&w)));
+        // The editor is a tab: it counts only while it is the active one.
+        let in_editor = terminal
+            .and_then(|w| w.active_tab())
+            .is_some_and(|t| t.page == Some(Page::Profiles));
         let target = match terminal {
             Some(w) if !in_editor => w
                 .active_tab()
