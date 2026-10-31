@@ -1116,7 +1116,7 @@ fn number<'a>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlurRow {
     pub hint: &'static str,
-    /// Drawn muted: blur has no effect now.
+    /// Drawn muted: blur has no effect now (a switch that can be used is still saved).
     pub inert: bool,
     /// The switch can be used.
     pub enabled: bool,
@@ -1129,7 +1129,7 @@ pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
     let (hint, inert, enabled) = if !supported {
         ("Not supported on this system", true, false)
     } else if opacity >= 1.0 {
-        ("Needs opacity below 100%", true, false)
+        ("Needs opacity below 100%", true, true)
     } else {
         ("Applies to new windows", false, true)
     };
@@ -1140,7 +1140,7 @@ pub fn blur_row(supported: bool, opacity: f32) -> BlurRow {
     }
 }
 
-/// A toggle; `inert`: drawn muted because it has no effect right now.
+/// A toggle; `inert`: it still works, but is drawn muted because it has no effect right now.
 fn switch<'a>(
     t: &'static Tokens,
     on: bool,
@@ -1260,8 +1260,11 @@ pub(crate) fn toggler_style(t: &Tokens, status: toggler::Status, inert: bool) ->
         background: Background::Color(track),
         background_border_width: if disabled { 1.0 } else { 0.0 },
         background_border_color: t.border,
-        foreground: Background::Color(if disabled || inert {
+        foreground: Background::Color(if disabled || (inert && !on) {
             t.text_muted
+        } else if inert {
+            // On, muted: the knob must not vanish into the muted track.
+            t.app
         } else {
             Color::WHITE
         }),

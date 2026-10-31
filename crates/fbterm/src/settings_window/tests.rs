@@ -202,7 +202,7 @@ fn blur_says_when_it_has_no_effect() {
     let row = view::blur_row(true, 1.0);
     assert_eq!(
         (row.hint, row.inert, row.enabled),
-        ("Needs opacity below 100%", true, false)
+        ("Needs opacity below 100%", true, true)
     );
 }
 
