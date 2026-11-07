@@ -541,6 +541,7 @@ fn item_view<'a>(
         text(item.title()).font(UI_FONT).size(13).color(color),
         Space::new().width(Length::Fill),
     ]
+    .height(Length::Fill)
     .align_y(Alignment::Center);
     if let Some(chord) = item.chord_label() {
         line = line.push(text(chord).font(MONO).size(11.5).color(t.text_muted));
@@ -901,6 +902,66 @@ mod tests {
         );
         let captured = shell.is_event_captured();
         (messages, captured)
+    }
+
+    /// Every item's title sits on the item's vertical middle, not along its top.
+    #[test]
+    fn an_items_title_is_centered_on_its_height() {
+        use iced::Pixels;
+        use iced::advanced::layout::{self, Layout};
+        use iced::advanced::widget::Tree;
+        let t = crate::theme::tokens(fbterm_config::ThemeMode::Dark);
+        let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
+            iced::Font::DEFAULT,
+            Pixels(16.0),
+        ));
+        let size = Size::new(800.0, 600.0);
+        let wid = window::Id::unique();
+        let menu = ContextMenu::for_tab(wid, TabId::next(), Point::new(100.0, 100.0), true);
+        let mut element = view(t, wid, &menu, Some(size));
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, size),
+        );
+        // The items (nodes one item high) and the texts inside each (its leaf nodes with
+        // a width: the filling space is a leaf too, but the only one spanning the item).
+        fn items(layout: Layout<'_>, out: &mut Vec<(Rectangle, Vec<Rectangle>)>) {
+            if layout.bounds().height == ITEM_HEIGHT {
+                let mut texts = Vec::new();
+                leaves(layout, &mut texts);
+                out.push((layout.bounds(), texts));
+            } else {
+                for child in layout.children() {
+                    items(child, out);
+                }
+            }
+        }
+        fn leaves(layout: Layout<'_>, out: &mut Vec<Rectangle>) {
+            let mut children = layout.children().peekable();
+            if children.peek().is_none() {
+                let b = layout.bounds();
+                if b.width > 0.0 && b.height > 0.0 && b.height < ITEM_HEIGHT {
+                    out.push(b);
+                }
+            }
+            for child in children {
+                leaves(child, out);
+            }
+        }
+        let mut found = Vec::new();
+        items(Layout::new(&node), &mut found);
+        assert_eq!(found.len(), 2, "Copy password and Close tab");
+        for (item, texts) in found {
+            assert!(!texts.is_empty());
+            for text in texts {
+                assert!(
+                    (text.center_y() - item.center_y()).abs() < 1.0,
+                    "text {text:?} is not centered in item {item:?}"
+                );
+            }
+        }
     }
 
     #[test]
