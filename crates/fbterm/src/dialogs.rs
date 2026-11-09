@@ -470,6 +470,10 @@ impl App {
                     }
                     return Task::none();
                 }
+                // Enter in the rename tab dialog is `Rename`.
+                if let Some(Dialog::RenameTab { .. }) = self.prompts.front(w) {
+                    return self.rename_tab_submit(w);
+                }
                 self.prompts.submit(w);
                 self.focus_prompt(w)
             }
@@ -540,6 +544,12 @@ impl App {
                     None => Task::none(),
                 };
                 Task::batch([close, self.focus_prompt(w)])
+            }
+            PromptMsg::TabName(w, typed) => {
+                if let Some(Dialog::RenameTab { value, .. }) = self.prompts.front_mut(w) {
+                    *value = typed;
+                }
+                Task::none()
             }
             PromptMsg::Input(w, v) => {
                 if let Some(Dialog::Secret { value, .. }) = self.prompts.front_mut(w) {

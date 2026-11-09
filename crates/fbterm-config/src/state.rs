@@ -27,8 +27,8 @@ pub struct SavedWindow {
     pub collapsed_groups: Vec<String>,
 }
 
-/// One tab to bring back. A bare profile id (what 0.1.0 wrote, and what a single unzoomed pane
-/// still writes) is a one-pane tab.
+/// One tab to bring back. A bare profile id (what 0.1.0 wrote, and what a single unzoomed,
+/// unrenamed pane still writes) is a one-pane tab.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SavedTab {
@@ -43,6 +43,9 @@ pub struct SavedSplitTab {
     /// The focused pane, as an index in reading order.
     #[serde(default)]
     pub focused: usize,
+    /// The name the user gave the tab, when renamed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +159,30 @@ mod tests {
         let back: SavedState = toml::from_str(&text).unwrap();
         assert_eq!(back.windows[0].sidebar_width, Some(300.0));
         assert_eq!(back.windows[1].sidebar_width, None);
+    }
+
+    #[test]
+    fn a_tab_name_round_trips_and_none_is_not_written() {
+        let named = SavedTab::Split(SavedSplitTab {
+            layout: SavedLayout::Pane {
+                profile: ProfileId::new(),
+                zoom: 0,
+            },
+            focused: 0,
+            name: Some("build box".into()),
+        });
+        let state = SavedState {
+            windows: vec![SavedWindow {
+                tabs: vec![named.clone(), SavedTab::Profile(ProfileId::new())],
+                ..window(None)
+            }],
+            ..Default::default()
+        };
+        let text = toml::to_string_pretty(&state).unwrap();
+        assert_eq!(text.matches("name").count(), 1, "{text}");
+        let back: SavedState = toml::from_str(&text).unwrap();
+        assert_eq!(back.windows[0].tabs[0], named);
+        assert!(matches!(back.windows[0].tabs[1], SavedTab::Profile(_)));
     }
 
     #[test]

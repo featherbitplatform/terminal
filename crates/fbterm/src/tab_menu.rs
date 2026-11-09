@@ -1,5 +1,6 @@
 //! The right-click menu on a tab (bar or sidebar): `Copy password` for a password SSH
-//! profile's tab, and `Close tab`. Only the user's own right-click opens it.
+//! profile's tab, `Rename tab` for a session tab, and `Close tab`. Only the user's own
+//! right-click opens it.
 
 use std::time::Duration;
 
@@ -11,6 +12,7 @@ use zeroize::Zeroizing;
 use crate::app::{App, Delivered, Message};
 use crate::context_menu::{ContextMenu, MenuItem};
 use crate::keys::Action;
+use crate::prompts::Dialog;
 use crate::tabs::TabId;
 
 /// How long a copied password stays on the clipboard before fbterm clears it, if it is
@@ -189,7 +191,8 @@ impl App {
         let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
             return Task::none();
         };
-        let (tab, panes) = (tab.id, tab.panes.len());
+        // Page tabs (Profiles, Settings, Welcome) keep their own names.
+        let (tab, panes, rename) = (tab.id, tab.panes.len(), tab.page.is_none());
         let active = self.windows[&wid].active == index;
         let password = self.tab_password_profile(wid, tab).is_some();
         let mut chords = Vec::new();
@@ -204,8 +207,62 @@ impl App {
                 }
             }
         }
-        self.context_menu = Some(ContextMenu::for_tab(wid, tab, at, password, chords));
+        self.context_menu = Some(ContextMenu::for_tab(wid, tab, at, password, rename, chords));
         Task::none()
+    }
+
+    /// `Rename tab`: ask for a new name for `tab` over window `wid`, starting from the name the
+    /// tab shows now (all of it selected, so typing replaces it). A page tab, a tab that is
+    /// gone, or one already being asked about asks nothing.
+    pub(crate) fn ask_rename_tab(&mut self, wid: window::Id, tab: TabId) -> Task<Message> {
+        let Some(t) = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.tabs.iter().find(|t| t.id == tab))
+        else {
+            return Task::none();
+        };
+        if t.page.is_some() || self.prompts.has_rename(wid, tab) {
+            return Task::none();
+        }
+        // The name as shown: the column lists titles, the bar profile names.
+        let value = if self.settings.tabs_left() {
+            t.title().to_owned()
+        } else {
+            t.name().to_owned()
+        };
+        let input = iced::widget::Id::unique();
+        let dialog = Dialog::RenameTab {
+            tab,
+            value,
+            input: input.clone(),
+        };
+        if !self.prompts.push(wid, None, dialog) {
+            // Another dialog is up: this one shows (and takes the focus) after it.
+            return Task::none();
+        }
+        Task::batch([
+            iced::widget::operation::focus(input.clone()),
+            iced::widget::operation::select_all(input),
+        ])
+    }
+
+    /// The rename tab dialog's `Rename` (or Enter): name the tab what was typed (an empty name
+    /// gives back the automatic title) and save the layout, which keeps tab names. A tab
+    /// closed meanwhile is left alone.
+    pub(crate) fn rename_tab_submit(&mut self, wid: window::Id) -> Task<Message> {
+        let Some((tab, typed)) = self.prompts.confirm_rename(wid) else {
+            return Task::none();
+        };
+        let renamed = self
+            .windows
+            .get_mut(&wid)
+            .and_then(|w| w.tabs.iter_mut().find(|t| t.id == tab))
+            .is_some_and(|t| t.rename(&typed));
+        if renamed {
+            self.save_state();
+        }
+        self.focus_prompt(wid)
     }
 
     /// The `Copy password` shortcut: the active tab's, as the tab menu's item would.
@@ -247,6 +304,7 @@ mod tests {
     use crate::context_menu::{MenuItem, MenuMsg};
     use crate::keys::Action;
     use crate::layout::Side;
+    use crate::prompts::{Dialog, PromptMsg};
     use crate::restore_tests::{paths_with, profile};
     use crate::saved_secrets::Purpose;
     use crate::tabs::{Page, Pane, Tab, WindowState};
@@ -301,7 +359,11 @@ mod tests {
         let m = app.context_menu.clone().unwrap();
         assert_eq!(
             m.items,
-            vec![(MenuItem::CopyPassword, true), (MenuItem::CloseTab, true)]
+            vec![
+                (MenuItem::CopyPassword, true),
+                (MenuItem::RenameTab, true),
+                (MenuItem::CloseTab, true)
+            ]
         );
         assert_eq!(m.selected, MenuItem::CopyPassword);
         assert_eq!(m.at, at);
@@ -312,8 +374,9 @@ mod tests {
         let _ = app.open_tab_menu(wid, 1, at);
         assert_eq!(
             app.context_menu.clone().unwrap().items,
-            vec![(MenuItem::CloseTab, true)]
+            vec![(MenuItem::RenameTab, true), (MenuItem::CloseTab, true)]
         );
+        // A page tab keeps its name: no Rename tab.
         let _ = app.open_tab_menu(wid, 2, at);
         assert_eq!(
             app.context_menu.clone().unwrap().items,
@@ -408,8 +471,89 @@ mod tests {
         let _ = app.open_tab_menu(wid, 0, Point::ORIGIN);
         assert_eq!(
             app.context_menu.clone().unwrap().items,
-            vec![(MenuItem::CloseTab, true)]
+            vec![(MenuItem::RenameTab, true), (MenuItem::CloseTab, true)]
         );
+    }
+
+    /// Right-click tab `index` and choose `Rename tab`.
+    fn choose_rename(app: &mut App, wid: window::Id, index: usize) {
+        let _ = app.open_tab_menu(wid, index, Point::ORIGIN);
+        let _ = app.update(Message::ContextMenu(
+            wid,
+            MenuMsg::Choose(MenuItem::RenameTab),
+        ));
+    }
+
+    #[test]
+    fn rename_tab_asks_for_a_name_and_the_tab_shows_it() {
+        let (a, b) = (profile("a"), profile("b"));
+        let (mut app, wid) = app_with_tabs(&[a.clone(), b.clone()], &[a, b]);
+        choose_rename(&mut app, wid, 1);
+        assert!(app.context_menu.is_none());
+        let tab = app.windows[&wid].tabs[1].id;
+        match app.prompts.front(wid) {
+            Some(Dialog::RenameTab { tab: t, value, .. }) => {
+                assert_eq!((*t, value.as_str()), (tab, "b"), "starts from the shown name");
+            }
+            _ => panic!("the rename dialog"),
+        }
+        assert_eq!(
+            app.windows[&wid].active, 0,
+            "renaming does not select the tab"
+        );
+        // While the dialog is up, no menu opens and a second rename asks nothing more.
+        let _ = app.open_tab_menu(wid, 1, Point::ORIGIN);
+        assert!(app.context_menu.is_none());
+        let _ = app.ask_rename_tab(wid, tab);
+        let _ = app.update(Message::Prompt(PromptMsg::TabName(wid, " logs ".into())));
+        let _ = app.update(Message::Prompt(PromptMsg::Submit(wid)));
+        assert!(app.prompts.front(wid).is_none(), "one dialog, now answered");
+        let t = &app.windows[&wid].tabs[1];
+        assert_eq!((t.name(), t.title()), ("logs", "logs"));
+        assert_eq!(app.windows[&wid].tabs[0].name(), "a", "only that tab");
+        // Renamed again to nothing: the automatic name comes back.
+        choose_rename(&mut app, wid, 1);
+        let _ = app.update(Message::Prompt(PromptMsg::TabName(wid, String::new())));
+        let _ = app.update(Message::Prompt(PromptMsg::Submit(wid)));
+        assert_eq!(app.windows[&wid].tabs[1].name(), "b");
+    }
+
+    #[test]
+    fn cancelling_the_rename_keeps_the_name() {
+        let a = profile("a");
+        let (mut app, wid) = app_with_tabs(std::slice::from_ref(&a), std::slice::from_ref(&a));
+        choose_rename(&mut app, wid, 0);
+        let _ = app.update(Message::Prompt(PromptMsg::TabName(wid, "other".into())));
+        let _ = app.update(Message::Prompt(PromptMsg::Cancel(wid)));
+        assert!(app.prompts.front(wid).is_none());
+        assert_eq!(app.windows[&wid].tabs[0].name(), "a");
+        assert_eq!(app.windows[&wid].tabs[0].label, None);
+    }
+
+    #[test]
+    fn a_tab_closed_while_its_name_is_asked_is_left_alone() {
+        let (a, b) = (profile("a"), profile("b"));
+        let (mut app, wid) = app_with_tabs(&[a.clone(), b.clone()], &[a, b]);
+        choose_rename(&mut app, wid, 1);
+        let _ = app.update(Message::TabBar(wid, TabBarMsg::Close(1)));
+        let _ = app.update(Message::Prompt(PromptMsg::TabName(wid, "x".into())));
+        let _ = app.update(Message::Prompt(PromptMsg::Submit(wid)));
+        assert!(app.prompts.front(wid).is_none());
+        assert_eq!(app.windows[&wid].tabs.len(), 1);
+        assert_eq!(app.windows[&wid].tabs[0].name(), "a");
+    }
+
+    #[test]
+    fn a_page_tab_cannot_be_renamed() {
+        let a = profile("a");
+        let (mut app, wid) = app_with_tabs(std::slice::from_ref(&a), std::slice::from_ref(&a));
+        app.windows
+            .get_mut(&wid)
+            .unwrap()
+            .push(Tab::page(Page::Settings));
+        let page = app.windows[&wid].tabs[1].id;
+        let _ = app.ask_rename_tab(wid, page);
+        assert!(app.prompts.front(wid).is_none());
     }
 
     #[test]

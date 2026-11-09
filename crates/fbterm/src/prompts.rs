@@ -1,8 +1,8 @@
 //! Connection prompts: the [`Prompter`] that asks through the UI, and the per-window queue of
 //! dialogs it feeds (trust this host?, changed host key, password or passphrase, which key
 //! file), and the app's
-//! own questions in the same queue (closing a split tab, an upload's name clash, closing while
-//! transfers run).
+//! own questions in the same queue (closing a split tab, renaming a tab, an upload's name clash,
+//! closing while transfers run).
 //!
 //! A dial asks from its own task: [`UiPrompter`] sends the question with a `oneshot` reply
 //! channel to the update loop and waits. Dropping the reply (window closed, dialog dismissed)
@@ -259,6 +259,8 @@ pub enum PromptMsg {
     Copy(String),
     /// Close the tab the shown close confirmation names.
     CloseTab(window::Id),
+    /// Typing in the rename tab dialog's name field (Enter is [`PromptMsg::Submit`]).
+    TabName(window::Id, String),
     /// The clash dialog's `Replace`.
     ClashReplace(window::Id),
     /// The clash dialog's `Rename`: show the name field.
@@ -318,6 +320,13 @@ pub enum Dialog {
     Changed { host: String, port: u16 },
     /// Closing a whole tab that has `panes` panes, more than one of them live: asked first.
     CloseTab { tab: TabId, panes: usize },
+    /// The tab menu's `Rename tab`: a name for `tab`, starting from the one it shows. An
+    /// empty name gives the tab back its automatic title.
+    RenameTab {
+        tab: TabId,
+        value: String,
+        input: iced::widget::Id,
+    },
     /// An upload's name exists in its folder: `Replace`, `Rename` or `Cancel`.
     Clash(Clash),
     /// Closing (or quitting) would end `count` running transfers: asked first. With
@@ -396,7 +405,7 @@ impl Dialog {
     /// The field to focus when this dialog is shown.
     pub fn input(&self) -> Option<iced::widget::Id> {
         match self {
-            Self::Secret { input, .. } => Some(input.clone()),
+            Self::Secret { input, .. } | Self::RenameTab { input, .. } => Some(input.clone()),
             Self::Clash(Clash {
                 rename: Some(r), ..
             }) => Some(r.input.clone()),
@@ -424,6 +433,7 @@ impl Dialog {
             }
             Self::Changed { .. }
             | Self::CloseTab { .. }
+            | Self::RenameTab { .. }
             | Self::Clash(_)
             | Self::Transfers { .. } => {}
         }
@@ -594,6 +604,26 @@ impl PromptQueues {
             q.iter()
                 .any(|p| matches!(&p.dialog, Dialog::CloseTab { tab: t, .. } if *t == tab))
         })
+    }
+
+    /// Whether `window` already asks for a new name for `tab`.
+    pub fn has_rename(&self, window: window::Id, tab: TabId) -> bool {
+        self.0.get(&window).is_some_and(|q| {
+            q.iter()
+                .any(|p| matches!(&p.dialog, Dialog::RenameTab { tab: t, .. } if *t == tab))
+        })
+    }
+
+    /// Take the shown rename tab dialog off the queue: the tab and the name typed. Other
+    /// dialogs are left alone.
+    pub fn confirm_rename(&mut self, window: window::Id) -> Option<(TabId, String)> {
+        if !matches!(self.front(window), Some(Dialog::RenameTab { .. })) {
+            return None;
+        }
+        match self.pop(window) {
+            Some(Dialog::RenameTab { tab, value, .. }) => Some((tab, value)),
+            _ => None,
+        }
     }
 
     /// Whether `window` already asks about closing with transfers running for `then`.

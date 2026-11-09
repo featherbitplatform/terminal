@@ -31,6 +31,7 @@ Click a header to fold or unfold its group. A folded header shows how many tabs 
 Right-click a tab, on the bar or in the column, for a small menu:
 
 - **Copy password** puts the saved password of the tab's SSH profile on the clipboard. It appears only for an SSH profile that logs in with a password, and copies only what is saved: nothing is asked for, and nothing is read from the running session. See [Copying a password](saved-secrets#copying-a-password) for what happens when no password is saved, when the vault is locked, and how the clipboard is cleared afterwards.
+- **Rename tab** asks for a name for the tab, filled in with the name it shows now. The tab keeps that name whatever the program in it sets as its title, and windows restored on the next launch bring it back. Leave the name empty to show the automatic title again. The Profiles, Settings and Welcome tabs cannot be renamed.
 - **Close tab** does what the tab's close button does, asking first when the tab has several live panes.
 
 Each item shows its shortcut when the key would do the same thing: the menu of the active tab shows `Cmd+Shift+K` (`Ctrl+Shift+K`) beside **Copy password**, and `Cmd+W` (`Ctrl+Shift+W`) beside **Close tab** when the tab has one pane (with several, the key closes only the focused pane). The menu of another tab shows no shortcuts, because the keys act on the active tab.

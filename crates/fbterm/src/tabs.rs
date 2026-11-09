@@ -126,6 +126,10 @@ pub struct Tab {
     pub maximized: Option<PaneId>,
     /// Panes by most recent focus, latest first.
     pub recent: Vec<PaneId>,
+    /// The name the user gave the tab (the tab menu's `Rename tab`): shown instead of the
+    /// focused pane's title and profile name, whatever the program sets. `None` follows the
+    /// focused pane as usual. Saved with the tab.
+    pub label: Option<String>,
 }
 
 impl Tab {
@@ -140,7 +144,20 @@ impl Tab {
             focused: id,
             maximized: None,
             recent: vec![id],
+            label: None,
         }
+    }
+
+    /// Name the tab `typed`, trimmed; an empty name gives the tab back its automatic title.
+    /// Returns whether the shown name changed.
+    pub fn rename(&mut self, typed: &str) -> bool {
+        let typed = typed.trim();
+        let label = (!typed.is_empty()).then(|| typed.to_owned());
+        if label == self.label {
+            return false;
+        }
+        self.label = label;
+        true
     }
 
     /// A page tab.
@@ -247,14 +264,17 @@ impl Tab {
         self.focused_pane().terminal()
     }
 
-    /// The focused pane's title.
+    /// The user's name for the tab, else the focused pane's title.
     pub fn title(&self) -> &str {
-        &self.focused_pane().title
+        self.label
+            .as_deref()
+            .unwrap_or(&self.focused_pane().title)
     }
 
-    /// The focused pane's profile name (what the tab button shows).
+    /// The user's name for the tab, else the focused pane's profile name (what the tab
+    /// button shows).
     pub fn name(&self) -> &str {
-        &self.focused_pane().name
+        self.label.as_deref().unwrap_or(&self.focused_pane().name)
     }
 
     pub fn accent(&self) -> Option<Rgb> {
@@ -854,6 +874,22 @@ mod tests {
         assert_eq!(t.title, "vim notes.md");
         apply_event(&mut t, &SessionEvent::Title(String::new()));
         assert_eq!(t.title, "zsh");
+    }
+
+    #[test]
+    fn a_renamed_tab_shows_its_name_until_cleared() {
+        let mut t = tab("zsh");
+        t.focused_pane_mut().title = "vim notes.md".into();
+        assert!(t.rename("  build box  "));
+        assert_eq!((t.title(), t.name()), ("build box", "build box"));
+        assert!(!t.rename("build box"), "the same name changes nothing");
+        // A title the program sets later does not replace the user's name.
+        apply_event(t.focused_pane_mut(), &SessionEvent::Title("top".into()));
+        assert_eq!(t.title(), "build box");
+        // An empty (or blank) name gives the automatic title back.
+        assert!(t.rename("   "));
+        assert_eq!(t.label, None);
+        assert_eq!((t.title(), t.name()), ("top", "zsh"));
     }
 
     #[test]

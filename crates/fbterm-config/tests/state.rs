@@ -111,7 +111,11 @@ fn split_tab_round_trips() {
         windows: vec![SavedWindow {
             tabs: vec![
                 SavedTab::Profile(a),
-                SavedTab::Split(SavedSplitTab { layout, focused: 2 }),
+                SavedTab::Split(SavedSplitTab {
+                    layout,
+                    focused: 2,
+                    name: None,
+                }),
             ],
             active: 1,
             size: (900.0, 500.0),

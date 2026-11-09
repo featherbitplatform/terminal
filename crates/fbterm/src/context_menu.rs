@@ -1,5 +1,6 @@
 //! The terminal's right-click menu: `Copy` and `Paste` at the pointer; and, with the same
-//! layer, placement and keys, the tab menu (`tab_menu.rs`): `Copy password` and `Close tab`.
+//! layer, placement and keys, the tab menu (`tab_menu.rs`): `Copy password`, `Rename tab` and
+//! `Close tab`.
 //!
 //! On macOS every right-click asks for this menu ([`TerminalOutput::ContextMenu`]) and keeps
 //! the selection; `Copy` is enabled when there is one and copies it as the copy chord does,
@@ -36,6 +37,8 @@ pub(crate) enum MenuItem {
     Paste,
     /// The tab menu: the saved password of the tab's password SSH profile to the clipboard.
     CopyPassword,
+    /// The tab menu: ask for a name for the tab (an empty one gives back the automatic title).
+    RenameTab,
     /// The tab menu: what the tab's close button does.
     CloseTab,
 }
@@ -46,6 +49,7 @@ impl MenuItem {
             MenuItem::Copy => "Copy",
             MenuItem::Paste => "Paste",
             MenuItem::CopyPassword => "Copy password",
+            MenuItem::RenameTab => "Rename tab",
             MenuItem::CloseTab => "Close tab",
         }
     }
@@ -101,18 +105,23 @@ impl ContextMenu {
     }
 
     /// The tab menu for `tab`: `Copy password` when the tab is a password SSH profile's
-    /// (`password`), then `Close tab`; `chords` are shown beside those items (see
-    /// [`App::open_tab_menu`] for which ones).
+    /// (`password`), `Rename tab` when the tab can be named (`rename`: not a page tab), then
+    /// `Close tab`; `chords` are shown beside those items (see [`App::open_tab_menu`] for
+    /// which ones).
     pub fn for_tab(
         window: window::Id,
         tab: TabId,
         at: Point,
         password: bool,
+        rename: bool,
         chords: Vec<(MenuItem, String)>,
     ) -> Self {
         let mut items = Vec::new();
         if password {
             items.push((MenuItem::CopyPassword, true));
+        }
+        if rename {
+            items.push((MenuItem::RenameTab, true));
         }
         items.push((MenuItem::CloseTab, true));
         let mut menu = Self::build(window, MenuTarget::Tab(tab), at, items);
@@ -325,6 +334,7 @@ impl App {
                 }
             }
             (MenuItem::CopyPassword, MenuTarget::Tab(tab)) => self.copy_password(wid, tab),
+            (MenuItem::RenameTab, MenuTarget::Tab(tab)) => self.ask_rename_tab(wid, tab),
             _ => Task::none(),
         }
     }
@@ -660,15 +670,32 @@ mod tests {
     fn a_tab_menu_shows_only_the_chords_it_was_given() {
         let (w, tab) = (window::Id::unique(), TabId::next());
         let chords = vec![(MenuItem::CloseTab, "\u{2318}W".to_string())];
-        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, true, chords);
+        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, true, true, chords);
         assert_eq!(
             m.chord_label(MenuItem::CloseTab).as_deref(),
             Some("\u{2318}W")
         );
         assert!(m.chord_label(MenuItem::CopyPassword).is_none());
-        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, false, vec![]);
+        assert!(m.chord_label(MenuItem::RenameTab).is_none());
+        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, false, false, vec![]);
         assert!(m.chord_label(MenuItem::CloseTab).is_none());
         assert_eq!(m.items, vec![(MenuItem::CloseTab, true)]);
+    }
+
+    #[test]
+    fn the_tab_menu_lists_rename_between_copy_password_and_close() {
+        let (w, tab) = (window::Id::unique(), TabId::next());
+        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, true, true, vec![]);
+        assert_eq!(
+            m.items,
+            vec![
+                (MenuItem::CopyPassword, true),
+                (MenuItem::RenameTab, true),
+                (MenuItem::CloseTab, true),
+            ]
+        );
+        assert_eq!(MenuItem::RenameTab.title(), "Rename tab");
+        assert!(MenuItem::RenameTab.fixed_chord_label().is_none());
     }
 
     fn app_with_pane() -> (App, window::Id, PaneId) {
@@ -964,7 +991,14 @@ mod tests {
         ));
         let size = Size::new(800.0, 600.0);
         let wid = window::Id::unique();
-        let menu = ContextMenu::for_tab(wid, TabId::next(), Point::new(100.0, 100.0), true, vec![]);
+        let menu = ContextMenu::for_tab(
+            wid,
+            TabId::next(),
+            Point::new(100.0, 100.0),
+            true,
+            true,
+            vec![],
+        );
         let mut element = view(t, wid, &menu, Some(size));
         let mut tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(
@@ -999,7 +1033,7 @@ mod tests {
         }
         let mut found = Vec::new();
         items(Layout::new(&node), &mut found);
-        assert_eq!(found.len(), 2, "Copy password and Close tab");
+        assert_eq!(found.len(), 3, "Copy password, Rename tab and Close tab");
         for (item, texts) in found {
             assert!(!texts.is_empty());
             for text in texts {

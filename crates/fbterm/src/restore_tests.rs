@@ -812,6 +812,7 @@ fn split_tab(first: SavedLayout, second: SavedLayout, focused: usize) -> SavedTa
             second: Box::new(second),
         },
         focused,
+        name: None,
     })
 }
 
@@ -1028,6 +1029,7 @@ fn merged_layout_survives_save_and_reload() {
             }),
         },
         focused: 2,
+        name: None,
     });
     let on_disk = SavedState::load_or_default(&paths.state());
     assert_eq!(on_disk.windows[0].tabs, vec![merged.clone()]);

@@ -1,6 +1,6 @@
 //! The dialog drawn over a terminal window: trust a host key, a changed host key, a password /
-//! key passphrase, which key file, confirm closing a split tab, an upload's name clash,
-//! closing while transfers run, or the first-launch update question.
+//! key passphrase, which key file, confirm closing a split tab, a new name for a tab, an
+//! upload's name clash, closing while transfers run, or the first-launch update question.
 
 use fbterm_secrets::SecretKind;
 use iced::widget::{Space, button, checkbox, column, container, opaque, row, text, text_input};
@@ -137,6 +137,37 @@ pub fn view<'a>(
         ]
         .spacing(14)
         .into(),
+        Dialog::RenameTab { value, input, .. } => {
+            let field = text_input("Tab name", value)
+                .id(input.clone())
+                .on_input(move |v| msg(PromptMsg::TabName(window, v)))
+                .on_submit(msg(PromptMsg::Submit(window)))
+                .font(UI_FONT)
+                .size(13.5)
+                .padding(Padding::from([8.0, 10.0]))
+                .style(move |_, s| ui::input_style(t, s));
+            column![
+                text("Rename tab").font(UI_FONT).size(16).color(t.text),
+                text("Leave the name empty to show the session's own title again.")
+                    .font(UI_FONT)
+                    .size(13)
+                    .color(t.text_secondary),
+                field,
+                buttons(vec![
+                    ui::text_button(t, "Cancel", Some(msg(PromptMsg::Cancel(window))), ui::secondary)
+                        .into(),
+                    ui::text_button(
+                        t,
+                        "Rename",
+                        Some(msg(PromptMsg::Submit(window))),
+                        ui::primary,
+                    )
+                    .into(),
+                ]),
+            ]
+            .spacing(14)
+            .into()
+        }
         Dialog::Clash(clash) => clash_view(t, window, clash),
         Dialog::KeyFile {
             profile, choosing, ..

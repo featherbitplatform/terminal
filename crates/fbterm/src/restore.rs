@@ -54,7 +54,7 @@ pub fn plan(state: &SavedState, store: &ProfileStore) -> Vec<SavedWindow> {
 }
 
 /// The tab without the panes of missing profiles; `None` when no pane is left. A tab reduced to
-/// one unzoomed pane is a plain profile tab again.
+/// one unzoomed pane is a plain profile tab again, unless the user named it.
 fn prune_tab(tab: &SavedTab, store: &ProfileStore) -> Option<SavedTab> {
     match tab {
         SavedTab::Profile(id) => store.get(*id).map(|_| SavedTab::Profile(*id)),
@@ -66,9 +66,22 @@ fn prune_tab(tab: &SavedTab, store: &ProfileStore) -> Option<SavedTab> {
                 .iter()
                 .position(|&i| i >= split.focused)
                 .unwrap_or(kept.len() - 1);
+            // A blank name (a hand edit) is no name.
+            let name = split
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(str::to_owned);
             Some(match layout {
-                SavedLayout::Pane { profile, zoom: 0 } => SavedTab::Profile(profile),
-                layout => SavedTab::Split(SavedSplitTab { layout, focused }),
+                SavedLayout::Pane { profile, zoom: 0 } if name.is_none() => {
+                    SavedTab::Profile(profile)
+                }
+                layout => SavedTab::Split(SavedSplitTab {
+                    layout,
+                    focused,
+                    name,
+                }),
             })
         }
     }
@@ -115,7 +128,8 @@ fn prune_layout(
 }
 
 /// A live tab for a saved one: fresh pane ids, all panes not connected, `focused` by reading
-/// order. `None` if a profile is missing (the plan already dropped those).
+/// order, and the user's name for it. `None` if a profile is missing (the plan already dropped
+/// those).
 pub fn build_tab(saved: &SavedTab, store: &ProfileStore) -> Option<Tab> {
     use crate::tabs::{Pane, TabId};
     match saved {
@@ -135,6 +149,7 @@ pub fn build_tab(saved: &SavedTab, store: &ProfileStore) -> Option<Tab> {
                 focused,
                 maximized: None,
                 recent,
+                label: split.name.clone(),
             })
         }
     }
@@ -196,11 +211,12 @@ fn save_layout(layout: &Layout, tab: &Tab) -> SavedLayout {
     }
 }
 
-/// How a tab is written: a single unzoomed pane stays a bare profile id. Maximize is not saved.
+/// How a tab is written: a single unzoomed pane the user did not name stays a bare profile id.
+/// Maximize is not saved.
 fn save_tab(tab: &Tab) -> SavedTab {
     if let Layout::Pane(_) = tab.layout {
         let pane = tab.focused_pane();
-        if pane.zoom == 0 {
+        if pane.zoom == 0 && tab.label.is_none() {
             return SavedTab::Profile(pane.profile);
         }
     }
@@ -212,6 +228,7 @@ fn save_tab(tab: &Tab) -> SavedTab {
             .iter()
             .position(|&p| p == tab.focused)
             .unwrap_or(0),
+        name: tab.label.clone(),
     })
 }
 
@@ -415,7 +432,11 @@ mod tests {
 
     fn split_window(layout: SavedLayout, focused: usize) -> SavedWindow {
         SavedWindow {
-            tabs: vec![SavedTab::Split(SavedSplitTab { layout, focused })],
+            tabs: vec![SavedTab::Split(SavedSplitTab {
+                layout,
+                focused,
+                name: None,
+            })],
             active: 0,
             size: (900.0, 500.0),
             sidebar_width: None,
@@ -486,9 +507,52 @@ mod tests {
             state.windows[0].tabs[1],
             SavedTab::Split(SavedSplitTab {
                 layout: leaf(a, 2),
-                focused: 0
+                focused: 0,
+                name: None,
             })
         );
+    }
+
+    #[test]
+    fn a_renamed_tab_is_saved_with_its_name_and_comes_back_named() {
+        let a = ProfileId::new();
+        let w = window::Id::unique();
+        let mut win = WindowState::new();
+        let mut named = Tab::single(Pane::new(a, "a", None));
+        named.rename("build box");
+        win.push(named);
+        let windows = BTreeMap::from([(w, win)]);
+        let state = snapshot(
+            &windows,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            &Recency::new(),
+        );
+        let expected = SavedTab::Split(SavedSplitTab {
+            layout: leaf(a, 0),
+            focused: 0,
+            name: Some("build box".into()),
+        });
+        assert_eq!(state.windows[0].tabs[0], expected, "not a bare profile id");
+        // The plan keeps the name (and the one-pane tab as it is); a blank one is dropped.
+        let planned = plan(&state, &store(&[a]));
+        assert_eq!(planned[0].tabs[0], expected);
+        let tab = build_tab(&planned[0].tabs[0], &store(&[a])).unwrap();
+        assert_eq!(tab.label.as_deref(), Some("build box"));
+        assert_eq!(tab.name(), "build box");
+        let blank = SavedState {
+            windows: vec![SavedWindow {
+                tabs: vec![SavedTab::Split(SavedSplitTab {
+                    layout: leaf(a, 0),
+                    focused: 0,
+                    name: Some("  ".into()),
+                })],
+                ..saved(vec![], 0)
+            }],
+            ..Default::default()
+        };
+        assert_eq!(plan(&blank, &store(&[a]))[0].tabs[0], SavedTab::Profile(a));
     }
 
     #[test]

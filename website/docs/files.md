@@ -91,7 +91,7 @@ Shortcuts you change are kept in a `[keys]` table at the end of `settings.toml`;
 
 ## state.toml
 
-This file belongs to the app. It records which windows and tabs were open, each window's size, and the last time each profile was opened, so the layout can be restored and the palette can rank recent profiles first. The Profiles and Settings tabs are not recorded: they are not reopened at the next launch. It is safe to delete; the app then opens a default window. Do not edit it by hand.
+This file belongs to the app. It records which windows and tabs were open, the names you gave tabs with [Rename tab](tabs#the-tab-menu), each window's size, and the last time each profile was opened, so the layout can be restored and the palette can rank recent profiles first. The Profiles and Settings tabs are not recorded: they are not reopened at the next launch. It is safe to delete; the app then opens a default window. Do not edit it by hand.
 
 It also keeps the [file panel](file-panel#in-statetoml)'s width (`file_panel_width`) and, once you turn hidden files off, `file_panel_show_hidden = false`.
 
