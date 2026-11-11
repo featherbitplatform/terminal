@@ -865,12 +865,17 @@ fn pane_view<'a>(
         highlight,
         move |o| Message::Terminal(id, pid, o),
     );
-    match find {
+    let view = match find {
         Some(bar) => stack![
             view,
             crate::find::bar_view::view(app.tokens, id, bar, &app.bindings)
         ]
         .into(),
+        None => view,
+    };
+    // A dropped session gets a bar below its terminal saying why, with the way back.
+    match app.ended_bar(id, pane) {
+        Some(bar) => column![view, bar].into(),
         None => view,
     }
 }
