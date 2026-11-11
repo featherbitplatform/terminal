@@ -64,10 +64,18 @@ pub(crate) fn view<'a>(t: &'static Tokens, settings: &Settings) -> Element<'a, M
             .width(Length::Fill)
             .into()
     };
+    // `Done` follows the last question inside the content column, so it stays next to the
+    // choices however wide the window is.
+    let done = row![
+        Space::new().width(Length::Fill),
+        ui::text_button(t, "Done", Some(msg(WelcomeMsg::Close)), ui::primary),
+    ]
+    .align_y(Alignment::Center);
     let body = column![
         header,
         section(t, "Tabs", vec![padded(tabs.into())]),
         section(t, "Updates", vec![padded(updates.into())]),
+        done,
     ]
     .spacing(18)
     .width(Length::Fill);
@@ -80,16 +88,7 @@ pub(crate) fn view<'a>(t: &'static Tokens, settings: &Settings) -> Element<'a, M
     .direction(scrollable::Direction::Vertical(ui::edge_scrollbar(drawn)))
     .style(move |theme, status| ui::scroll_style(t, theme, status))
     .height(Length::Fill);
-    let footer = container(
-        row![
-            Space::new().width(Length::Fill),
-            ui::text_button(t, "Done", Some(msg(WelcomeMsg::Close)), ui::primary),
-        ]
-        .align_y(Alignment::Center),
-    )
-    .padding(Padding::from([12.0, 32.0]))
-    .width(Length::Fill);
-    container(column![page, footer])
+    container(page)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_| container::Style {
