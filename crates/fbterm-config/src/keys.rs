@@ -61,6 +61,10 @@ pub enum Action {
     /// Give the active tab a name of its own, as a double-click on it or the tab menu's
     /// `Rename tab` does (never a page tab): Cmd+Shift+R on macOS, Ctrl+Shift+R elsewhere.
     RenameTab,
+    /// Bring the active tab's dropped sessions back: reconnect its disconnected panes and
+    /// restart the ones whose program exited, as Enter on such a pane or the tab menu's
+    /// `Reconnect` does: Cmd+Shift+O on macOS, Ctrl+Shift+O elsewhere.
+    Reconnect,
     /// The active tab's find bar: Cmd+F on macOS, Ctrl+Shift+F elsewhere.
     Find,
     /// The search over every tab: Cmd+Shift+F on macOS, Ctrl+Alt+F elsewhere.
@@ -132,7 +136,7 @@ impl ActionGroup {
 
 impl Action {
     /// Every action, in the order the Settings tab lists them.
-    pub const ALL: [Action; 48] = [
+    pub const ALL: [Action; 49] = [
         Action::NewTab,
         Action::CloseTab,
         Action::NextTab,
@@ -149,6 +153,7 @@ impl Action {
         Action::RenameTab,
         Action::ExportTab,
         Action::CopyPassword,
+        Action::Reconnect,
         Action::MergeTab,
         Action::SplitRight,
         Action::SplitDown,
@@ -216,6 +221,7 @@ impl Action {
             Self::ExportTab => "export_tab",
             Self::CopyPassword => "copy_password",
             Self::RenameTab => "rename_tab",
+            Self::Reconnect => "reconnect",
             Self::Find => "find",
             Self::FindAll => "find_all",
             Self::FindNext => "find_next",
@@ -268,6 +274,7 @@ impl Action {
             Self::ExportTab => "Export tab to file".into(),
             Self::CopyPassword => "Copy password".into(),
             Self::RenameTab => "Rename tab".into(),
+            Self::Reconnect => "Reconnect".into(),
             Self::Find => "Find in pane".into(),
             Self::FindAll => "Find in all tabs".into(),
             Self::FindNext => "Older match".into(),
@@ -299,6 +306,7 @@ impl Action {
             | Self::ExportTab
             | Self::CopyPassword
             | Self::RenameTab
+            | Self::Reconnect
             | Self::MergeTab => ActionGroup::Tabs,
             Self::SplitRight
             | Self::SplitDown
@@ -826,6 +834,7 @@ pub fn default_chord(mac: bool, action: Action) -> Option<Chord> {
         Action::VerticalTabs => ('b', true),
         Action::CopyPassword => ('k', true),
         Action::RenameTab => ('r', true),
+        Action::Reconnect => ('o', true),
         Action::SelectTab(n @ 1..=9) => (char::from(b'0' + n), false),
         Action::EditProfiles => (',', true),
         Action::Settings if !mac => return Some(ctrl_chord(',', false, false)),
@@ -1377,9 +1386,9 @@ mod tests {
         // Two overrides on one chord: both go, one by one.
         let mut k = KeyOverrides::default();
         k.map
-            .insert(Action::OpenSettingsFile, Some(c("cmd+shift+o")));
+            .insert(Action::OpenSettingsFile, Some(c("cmd+shift+j")));
         k.map
-            .insert(Action::RevealConfigFolder, Some(c("cmd+shift+o")));
+            .insert(Action::RevealConfigFolder, Some(c("cmd+shift+j")));
         let dropped = k.resolve_conflicts(true);
         assert_eq!(dropped.len(), 1);
         assert_eq!(k.map.len(), 1);
@@ -1631,6 +1640,25 @@ mod tests {
         assert_eq!(a.group(), ActionGroup::Tabs);
         assert_eq!(default_chord(true, a), Some(c("shift+cmd+r")));
         assert_eq!(default_chord(false, a), Some(c("ctrl+shift+r")));
+    }
+
+    /// `Reconnect` brings the active tab's dropped sessions back: Shift+Cmd+O on macOS,
+    /// Ctrl+Shift+O elsewhere (Shift+E is the file panel's).
+    #[test]
+    fn reconnect_is_an_action_with_a_default_chord() {
+        let a = Action::Reconnect;
+        assert!(Action::ALL.contains(&a));
+        assert_eq!(a.name(), "reconnect");
+        assert_eq!(Action::from_name("reconnect"), Some(a));
+        assert_eq!(a.title(), "Reconnect");
+        assert_eq!(a.group(), ActionGroup::Tabs);
+        assert_eq!(default_chord(true, a), Some(c("shift+cmd+o")));
+        assert_eq!(default_chord(false, a), Some(c("ctrl+shift+o")));
+        assert_eq!(Bindings::defaults(true).label(a).as_deref(), Some("⇧⌘O"));
+        assert_eq!(
+            Bindings::defaults(false).label(a).as_deref(),
+            Some("Ctrl+Shift+O")
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ These shortcuts cannot be changed; Settings lists them under **Fixed** at the en
 | Tabs down the left side, or back along the top ([vertical tabs](tabs#tabs-on-the-left)) | `Cmd+Shift+B` | `Ctrl+Shift+B` |
 | Copy the saved password of the active tab's SSH profile ([copying a password](saved-secrets#copying-a-password)) | `Cmd+Shift+K` | `Ctrl+Shift+K` |
 | Rename the active tab ([renaming a tab](tabs#renaming-a-tab)) | `Cmd+Shift+R` | `Ctrl+Shift+R` |
+| Reconnect or restart the active tab's ended sessions ([when a session ends](tabs#when-a-session-ends)) | `Cmd+Shift+O` | `Ctrl+Shift+O` |
 
 ## Panes
 
@@ -144,6 +145,7 @@ These actions are listed after your profiles, each with its shortcut when it has
 | Export tab to file… | Save the active tab's text to a file; see [Exporting a tab](#exporting-a-tab). |
 | Copy password | Put the saved password of the active tab's SSH profile on the clipboard, as the [tab menu](tabs#the-tab-menu) does; nothing happens for a key, agent or local profile. |
 | Rename tab | Give the active tab a name of its own; see [Renaming a tab](tabs#renaming-a-tab). |
+| Reconnect | Reconnect the active tab's dropped SSH panes and restart its exited local programs; see [When a session ends](tabs#when-a-session-ends). Panes still connected are left alone. |
 | Export profiles… | Open the [export window](export-import#exporting). It has no shortcut by default. |
 | Import profiles… | Open the [import window](export-import#importing). It has no shortcut by default. |
 | Quit | Save the layout and quit. |
@@ -200,6 +202,7 @@ A shortcut is its modifiers and a key joined by `+`. Modifiers are `ctrl`, `alt`
 | `export_tab` | Export tab to file (no default shortcut) |
 | `copy_password` | Copy the saved password of the active tab's SSH profile (`Cmd+Shift+K`, `Ctrl+Shift+K`) |
 | `rename_tab` | Rename the active tab (`Cmd+Shift+R`, `Ctrl+Shift+R`) |
+| `reconnect` | Reconnect or restart the active tab's ended sessions (`Cmd+Shift+O`, `Ctrl+Shift+O`) |
 | `export_profiles`, `import_profiles` | Export and import profiles (no default shortcuts) |
 | `duplicate_profile` | Duplicate profile (no default shortcut) |
 | `split_right`, `split_down`, `maximize_pane` | Split the focused pane, maximize it |

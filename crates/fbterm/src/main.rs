@@ -103,6 +103,7 @@ mod pane_actions;
 mod perf;
 mod prompt_view;
 mod prompts;
+mod reconnect;
 mod redact;
 mod restore;
 #[cfg(test)]

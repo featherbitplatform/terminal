@@ -166,6 +166,8 @@ pub enum Message {
     ContextMenu(window::Id, crate::context_menu::MenuMsg),
     /// The tab menu's own: the password copy and its clipboard clear.
     TabMenu(crate::tab_menu::TabMenuMsg),
+    /// The button on the bar over a dropped pane: bring that pane back.
+    Revive(window::Id, PaneId),
     /// Renaming a tab (see [`crate::tab_rename`]).
     Rename(crate::tab_rename::RenameMsg),
     /// The Welcome tab's.
@@ -1424,6 +1426,7 @@ impl App {
             Message::Palette(wid, msg) => self.palette(wid, msg),
             Message::ContextMenu(wid, msg) => self.context_menu_msg(wid, msg),
             Message::TabMenu(msg) => self.tab_menu_msg(msg),
+            Message::Revive(wid, pane) => self.revive_pane(wid, pane),
             Message::Rename(msg) => self.rename_msg(msg),
             Message::Welcome(msg) => self.welcome_msg(msg),
             Message::Find(wid, msg) => self.find(wid, msg),

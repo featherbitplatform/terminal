@@ -36,15 +36,28 @@ The name replaces the profile's name on the bar, and the program's title in the 
 
 The Profiles, Settings, Color schemes and Welcome tabs cannot be renamed. Only you can rename a tab: nothing a program in a terminal sends changes the name.
 
+## When a session ends
+
+When an SSH connection drops or fails, or a local program exits, the pane keeps its text and scrollback and shows a bar along its bottom saying why: `Disconnected (connection reset)`, `Could not connect: …` or `Process exited with code 1`. The bar has a **Reconnect** button for an SSH profile and **Restart** for a local one, with the shortcut beside it. The same line is written, dimmed, into the terminal, so the scrollback keeps a record of where the session ended.
+
+There are three ways back, and each continues in the same pane, below the old output:
+
+- Press `Enter` in the pane.
+- Click **Reconnect** (or **Restart**) on the bar. It brings back that pane only.
+- Press `Cmd+Shift+O` (`Ctrl+Shift+O` on Linux and Windows), or choose **Reconnect** from the [tab menu](#the-tab-menu). Both bring back every ended pane of the tab at once, so a split tab whose panes all lost the same server comes back in one step. Panes that are still connected are left alone. The palette lists it as **Reconnect** too.
+
+The tab's **With the shell** [tunnels](tunnels) start again once the shell is back. Nothing a program in a terminal sends can reconnect or restart a session.
+
 ## The tab menu
 
 Right-click a tab, on the bar or in the column, for a small menu:
 
+- **Reconnect** brings back every pane of the tab whose session ended; see [When a session ends](#when-a-session-ends). It appears only when one did, and reads **Restart** when only local programs exited.
 - **Rename tab** opens the field described in [Renaming a tab](#renaming-a-tab). It is not offered for the Profiles, Settings, Color schemes and Welcome tabs.
 - **Copy password** puts the saved password of the tab's SSH profile on the clipboard. It appears only for an SSH profile that logs in with a password, and copies only what is saved: nothing is asked for, and nothing is read from the running session. See [Copying a password](saved-secrets#copying-a-password) for what happens when no password is saved, when the vault is locked, and how the clipboard is cleared afterwards.
 - **Close tab** does what the tab's close button does, asking first when the tab has several live panes.
 
-Each item shows its shortcut when the key would do the same thing: the menu of the active tab shows `Cmd+Shift+R` (`Ctrl+Shift+R`) beside **Rename tab**, `Cmd+Shift+K` (`Ctrl+Shift+K`) beside **Copy password**, and `Cmd+W` (`Ctrl+Shift+W`) beside **Close tab** when the tab has one pane (with several, the key closes only the focused pane). The menu of another tab shows no shortcuts, because the keys act on the active tab.
+Each item shows its shortcut when the key would do the same thing: the menu of the active tab shows `Cmd+Shift+R` (`Ctrl+Shift+R`) beside **Rename tab**, `Cmd+Shift+K` (`Ctrl+Shift+K`) beside **Copy password**, `Cmd+Shift+O` (`Ctrl+Shift+O`) beside **Reconnect** or **Restart**, and `Cmd+W` (`Ctrl+Shift+W`) beside **Close tab** when the tab has one pane (with several, the key closes only the focused pane). The menu of another tab shows no shortcuts, because the keys act on the active tab.
 
 A right-click never selects the tab. Only your own right-click opens the menu: nothing a program in a terminal sends can.
 
