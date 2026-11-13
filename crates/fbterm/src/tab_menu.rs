@@ -212,6 +212,7 @@ impl App {
 
     /// The `Copy password` shortcut: the active tab's, as the tab menu's item would.
     pub(crate) fn copy_active_tab_password(&mut self, wid: window::Id) -> Task<Message> {
+        self.reveal_active_tab(wid);
         match self.windows.get(&wid).and_then(|w| w.active_tab()) {
             Some(tab) => self.copy_password(wid, tab.id),
             None => Task::none(),

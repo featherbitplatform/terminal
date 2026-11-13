@@ -10,6 +10,8 @@ Every open session is a tab. A tab shows its profile's name (or the [name you ga
 
 Tabs sit along the top of the window, with the buttons for a new tab, Profiles, tunnels, the file panel and Settings after them. Click a tab to show it, its close button or a wheel click to close it, and drag a tab left or right to reorder it. Dragging a tab onto another tab's terminal merges it as a pane there; dragging a pane's handle onto the bar makes it a tab of its own (see [Moving tiles](tiling#moving-tiles)).
 
+When the tabs no longer fit, they shrink to 80 pixels each and then scroll sideways, while the buttons stay in view next to the last tab, or at the end of the free space once the bar is full. Scroll with the mouse wheel or trackpad over the tabs, or click the `<` and `>` buttons that appear before the buttons (each click moves by one tab; one is dimmed when no tabs are hidden on its side). The tab you select, or open, scrolls into view, and dragging a tab or a pane's handle near either end of the bar scrolls it so you can drop further along. A window too narrow to show even the buttons is the only case where they run out of room; with many tabs, the [tabs on the left](#tabs-on-the-left) list scrolls instead.
+
 ## Tabs on the left
 
 With many sessions open, a row of tabs runs out of room. Choose **Tabs: Left** in Settings (Appearance) or press `Cmd+Shift+B` (`Ctrl+Shift+B` on Linux and Windows) to list the tabs down the left side of every window instead. The palette offers the same as **Vertical tabs**, and `tab_bar = "left"` in [`settings.toml`](files#settingstoml) does the same by hand; `"top"` puts them back.

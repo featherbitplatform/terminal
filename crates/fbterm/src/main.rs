@@ -122,6 +122,7 @@ mod tab_look;
 mod tab_menu;
 mod tab_rename;
 mod tab_sidebar;
+mod tab_strip;
 mod tabs;
 mod theme;
 #[cfg(test)]

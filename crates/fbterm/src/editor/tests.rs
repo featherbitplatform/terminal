@@ -1085,3 +1085,20 @@ fn port_filter_is_digits_only() {
         TunnelKind::Local { port: 0, .. }
     ));
 }
+
+#[test]
+fn the_footer_shows_two_errors_and_a_count_when_there_are_more_than_three() {
+    let errs = |n: usize| -> Vec<ValidationError> {
+        (0..n)
+            .map(|i| ValidationError::EmptyHost(format!("p{i}")))
+            .collect()
+    };
+    let lines = |n| view::error_lines(&errs(n));
+    assert!(lines(0).is_empty());
+    assert_eq!(lines(3).len(), 3, "three all show");
+    let many = lines(7);
+    assert_eq!(many.len(), 3);
+    assert_eq!(many[0], errs(1)[0].to_string());
+    assert_eq!(many[2], "5 more errors");
+    assert_eq!(lines(4)[2], "2 more errors");
+}

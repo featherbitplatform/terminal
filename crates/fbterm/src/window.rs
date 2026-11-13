@@ -23,13 +23,16 @@ use crate::shortcuts::{Mode, Shortcuts};
 use crate::tab_drag::{Axis, DragState, Strip, drag_event};
 use crate::tab_look::{Surroundings, look};
 use crate::tab_sidebar::SIDEBAR_WIDTH;
+use crate::tab_strip::{
+    TAB_MIN_WIDTH, TAB_SPACING, Viewport, WHEEL_LINE_PX, clamp_offset, strip_layout,
+};
 use crate::tabs::{Page, Pane, Tab, TabId, TabState};
 use crate::theme::{Tokens, UI_FONT};
 use crate::tooltip::{DemoTip, tip, tooltip_text};
 use crate::tunnels_panel::TunnelsMsg;
 use crate::ui::{
-    ICON_FOLDER, ICON_PALETTE, ICON_PLUS, ICON_SETTINGS, ICON_TERMINAL, ICON_TUNNELS, ICON_USERS,
-    ICON_X, icon,
+    ICON_FOLDER, ICON_LEFT, ICON_PALETTE, ICON_PLUS, ICON_RIGHT, ICON_SETTINGS, ICON_TERMINAL,
+    ICON_TUNNELS, ICON_USERS, ICON_X, icon,
 };
 use crate::windows::Carry;
 
@@ -179,6 +182,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
         renaming: app.renaming.as_ref().filter(|r| r.window == id),
         tabs_in_bar: sidebar.is_none(),
         outline_start: sidebar.unwrap_or(0.0),
+        strip_offset: app.stored_offset(id),
     };
     let mut body = column![tab_bar(t, bar, &win.tabs, win.active)];
     let notices = app.visible_notices();
@@ -951,16 +955,15 @@ struct TabBar<'b> {
     /// Where the outline along the content's top starts (window x): the sidebar's rule
     /// with tabs on the left, else the window's left edge.
     outline_start: f32,
+    /// How far the tab strip is scrolled (see `tab_strip`), as the app keeps it.
+    strip_offset: f32,
 }
 
-/// A tab's widest and narrowest width; tabs share the bar's room between them.
-const TAB_MAX_WIDTH: f32 = 196.0;
-const TAB_MIN_WIDTH: f32 = 90.0;
-const BUTTON_WIDTH: f32 = 28.0;
-const BAR_SPACING: f32 = 2.0;
+pub(crate) const BUTTON_WIDTH: f32 = 28.0;
+pub(crate) const BAR_SPACING: f32 = 2.0;
 const BAR_RIGHT_PADDING: f32 = 8.0;
 
-fn trailing_width(tunnels_up: usize, files: bool) -> f32 {
+pub(crate) fn trailing_width(tunnels_up: usize, files: bool) -> f32 {
     let count = crate::tunnels_panel::indicator_count(tunnels_up)
         .map_or(0.0, |n| 5.0 + 8.0 * n.len() as f32);
     let buttons = [
@@ -972,27 +975,6 @@ fn trailing_width(tunnels_up: usize, files: bool) -> f32 {
     ];
     let shown = buttons.iter().filter(|w| **w > 0.0).count() as f32;
     buttons.iter().sum::<f32>() + shown * BAR_SPACING + BAR_RIGHT_PADDING
-}
-
-/// Each tab's width: full size, shrinking to the minimum as the bar fills.
-fn tab_width(
-    chrome: Chrome,
-    fullscreen: bool,
-    width: Option<f32>,
-    count: usize,
-    trailing: f32,
-) -> f32 {
-    let Some(width) = width else {
-        return TAB_MAX_WIDTH;
-    };
-    let controls = if chrome.draws_controls() {
-        let setup = chrome::setup();
-        chrome::controls_width(setup.look, setup.controls.order.len())
-    } else {
-        0.0
-    };
-    let room = width - chrome.leading_inset(fullscreen) - controls - trailing;
-    (room / count.max(1) as f32 - 2.0).clamp(TAB_MIN_WIDTH, TAB_MAX_WIDTH)
 }
 
 fn tab_bar<'a>(
@@ -1023,17 +1005,40 @@ fn tab_bar<'a>(
     // With tabs on the left the bar lists none: no buttons, no hole, nothing to drag.
     let tabs: &[Tab] = if tabs_bar.tabs_in_bar { tabs } else { &[] };
     let trailing = trailing_width(tunnels_up, files.is_some());
-    let tab_w = tab_width(chrome, fullscreen, tabs_bar.width, tabs.len(), trailing);
-    for (i, tab) in tabs.iter().enumerate() {
-        bar = bar.push(tab_button(
-            t,
-            tabs_bar,
-            tab,
-            i,
-            i == active,
-            height - TAB_TOP_GAP,
-            tab_w,
-        ));
+    let strip = strip_layout(chrome, fullscreen, tabs_bar.width, tabs.len(), trailing);
+    let offset = clamp_offset(tabs_bar.strip_offset, &strip);
+    // The tabs sit in a clipped strip, the first child of the bar's row (`tab_rects`).
+    if !tabs.is_empty() {
+        let mut tab_row = row![].spacing(TAB_SPACING).align_y(Alignment::End);
+        for (i, tab) in tabs.iter().enumerate() {
+            tab_row = tab_row.push(tab_button(
+                t,
+                tabs_bar,
+                tab,
+                i,
+                i == active,
+                height - TAB_TOP_GAP,
+                strip.tab_w,
+            ));
+        }
+        bar = bar.push(Viewport::new(tab_row.into(), strip.strip_w, offset));
+    }
+    if strip.chevrons {
+        let max = strip.content_w - strip.strip_w;
+        let chevron = |glyph: &'static str, dir: i8, enabled: bool| {
+            let color = if enabled {
+                t.text_muted
+            } else {
+                t.text_muted.scale_alpha(0.35)
+            };
+            let button = button(icon(glyph, 14.0, color))
+                .on_press_maybe(enabled.then(|| msg(TabBarMsg::StripStep(dir))))
+                .padding(7)
+                .style(move |_, status| ghost(t, status));
+            container(button).center_y(height)
+        };
+        bar = bar.push(chevron(ICON_LEFT, -1, offset > 0.5));
+        bar = bar.push(chevron(ICON_RIGHT, 1, offset < max - 0.5));
     }
     let new_tab = button(icon(ICON_PLUS, 14.0, t.text_muted))
         .on_press(msg(TabBarMsg::New))
@@ -1123,8 +1128,8 @@ fn tab_bar<'a>(
             .center_y(height),
     );
     bar = bar.push(container(profiles).center_y(height));
-    // After the tab buttons, like every trailing button: `BarBackground` measures the tabs as
-    // the row's first children.
+    // Every button comes after the strip: `BarBackground` finds the tabs in the row's first
+    // child (`strip_and_tabs`).
     bar = bar.push(container(tunnels).center_y(height));
     if let Some(files) = files {
         bar = bar.push(container(files).center_y(height));
@@ -1495,13 +1500,70 @@ pub(crate) fn page_icon(page: Page) -> &'static str {
     }
 }
 
-/// The tab buttons' bounds: the first `n` children of the bar's row (container -> row).
-fn tab_rects(layout: Layout<'_>, n: usize) -> Vec<Rectangle> {
-    layout
+/// How close to either end of the strip a drag scrolls it, and the most one pointer move
+/// scrolls: a move scrolls as far as the pointer travelled, so the speed follows the hand, not
+/// the device's event rate.
+const EDGE_SCROLL_BAND: f32 = 24.0;
+const EDGE_SCROLL_STEP: f32 = 24.0;
+
+/// The active tab's rectangle when the strip shows all of it: the bar's hole and flares are cut
+/// around a whole tab only. Cut at the strip's edge or scrolled out, the outline runs on.
+fn visible_hole(tab: Rectangle, strip: Rectangle) -> Option<Rectangle> {
+    let inside = tab.x >= strip.x - 0.01 && tab.x + tab.width <= strip.x + strip.width + 0.01;
+    (tab.width > 0.0 && tab.height > 0.0 && inside).then_some(tab)
+}
+
+/// Where the violet gap marker stands for a carried tab or tile that would land before `rects[gap]`
+/// (after the last one when `gap` is past the end), kept inside the strip.
+fn marker_x(rects: &[Rectangle], gap: usize, strip: Rectangle) -> f32 {
+    let x = match rects.get(gap) {
+        Some(next) => next.x - 2.0,
+        None => rects.last().map_or(strip.x, |r| r.x + r.width),
+    };
+    x.min(strip.x + strip.width - 2.0).max(strip.x)
+}
+
+/// The strip's bounds and its `n` tab buttons' bounds as laid out, scrolled out or not, in one
+/// walk of the layout: the strip is the bar's row's first child, the tabs its row's children
+/// (container -> row -> strip -> row).
+fn strip_and_tabs(layout: Layout<'_>, n: usize) -> (Rectangle, Vec<Rectangle>) {
+    let Some(strip) = layout
         .children()
         .next()
-        .map(|row| row.children().take(n).map(|tab| tab.bounds()).collect())
-        .unwrap_or_default()
+        .and_then(|row| row.children().next())
+    else {
+        return (Rectangle::default(), Vec::new());
+    };
+    let tabs = match strip.children().next() {
+        Some(row) if n > 0 => row.children().take(n).map(|tab| tab.bounds()).collect(),
+        _ => Vec::new(),
+    };
+    (strip.bounds(), tabs)
+}
+
+/// The tabs the strip `view` shows of `full` (see [`strip_and_tabs`]), whole or cut at its
+/// edge: the index of the first one and their bounds clipped to the strip, in order (the shown
+/// tabs are always a run). Tabs scrolled out have no place on screen and are left out.
+fn shown_tabs(view: Rectangle, full: &[Rectangle]) -> (usize, Vec<Rectangle>) {
+    let mut first = None;
+    let mut shown = Vec::new();
+    for (i, tab) in full.iter().enumerate() {
+        if let Some(r) = tab.intersection(&view).filter(|r| r.width > 0.0) {
+            first.get_or_insert(i);
+            shown.push(r);
+        }
+    }
+    (first.unwrap_or(0), shown)
+}
+
+/// Whether tabs are scrolled out of the strip on its left and on its right: a scroll toward a
+/// side with nothing hidden would change nothing, so it is never sent.
+fn hidden_sides(strip: Rectangle, full: &[Rectangle]) -> (bool, bool) {
+    (
+        full.first().is_some_and(|r| r.x < strip.x - 0.5),
+        full.last()
+            .is_some_and(|r| r.x + r.width > strip.x + strip.width + 0.5),
+    )
 }
 
 impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
@@ -1559,9 +1621,30 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
+        // The wheel over the strip scrolls it sideways, a vertical wheel too: the bar has no
+        // other axis. Scrolling down or right moves toward later tabs. Nothing is sent toward
+        // a side with no hidden tabs.
+        let (view, full) = strip_and_tabs(layout, self.ids.len());
+        if let Event::Mouse(mouse::Event::WheelScrolled { delta }) = event
+            && !self.modal
+            && !self.ids.is_empty()
+            && cursor.is_over(view)
+        {
+            let (x, y) = match *delta {
+                mouse::ScrollDelta::Lines { x, y } => (x * WHEEL_LINE_PX, y * WHEEL_LINE_PX),
+                mouse::ScrollDelta::Pixels { x, y } => (x, y),
+            };
+            let along = if x.abs() > y.abs() { -x } else { -y };
+            let (hidden_left, hidden_right) = hidden_sides(view, &full);
+            if (along < 0.0 && hidden_left) || (along > 0.0 && hidden_right) {
+                shell.publish(Message::TabBar(self.window, TabBarMsg::StripScroll(along)));
+            }
+            return;
+        }
         let state = tree.state.downcast_mut::<DragState>();
         // The bar lists every tab: rows and window indices are the same.
         let indices: Vec<usize> = (0..self.ids.len()).collect();
+        let (first, rects) = shown_tabs(view, &full);
         let strip = Strip {
             window: self.window,
             ids: &self.ids,
@@ -1574,8 +1657,41 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
             axis: Axis::X,
             scroll: 0.0,
             renaming: self.renaming,
+            first,
         };
-        let rects = tab_rects(layout, self.ids.len());
+        // A tab or tile dragged near either end of the strip, or past it anywhere over the bar
+        // (a fast pointer overshoots the band), scrolls it while tabs are hidden on that side,
+        // so it can be dropped further along: by how far the pointer moved toward that edge
+        // (at most `EDGE_SCROLL_STEP`; a move along the band or back toward the middle scrolls
+        // nothing), never a timer.
+        let dx = match event {
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let from = state.last_pointer.replace(*position);
+                from.map_or(0.0, |from| {
+                    (position.x - from.x).clamp(-EDGE_SCROLL_STEP, EDGE_SCROLL_STEP)
+                })
+            }
+            _ => 0.0,
+        };
+        if let Event::Mouse(mouse::Event::CursorMoved { position }) = event
+            && dx.abs() >= 0.5
+            && !self.modal
+            && !self.ids.is_empty()
+            && (state.press.as_ref().is_some_and(|p| p.dragging)
+                || matches!(self.carry, Some(Carry::Tile(_) | Carry::Tab(_))))
+        {
+            let bar = layout.bounds();
+            let (hidden_left, hidden_right) = hidden_sides(view, &full);
+            let over = position.y >= bar.y && position.y <= bar.y + bar.height;
+            let left = over && dx < 0.0 && hidden_left && position.x <= view.x + EDGE_SCROLL_BAND;
+            let right = over
+                && dx > 0.0
+                && hidden_right
+                && position.x >= view.x + view.width - EDGE_SCROLL_BAND;
+            if left || right {
+                shell.publish(Message::TabBar(self.window, TabBarMsg::StripScroll(dx)));
+            }
+        }
         // The button pressed at the start of a drag is let go without a click: it sees the
         // release with no pointer over it.
         let cursor = if drag_event(&strip, state, event, &rects, layout.bounds(), cursor, shell) {
@@ -1624,15 +1740,19 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
     ) {
         use iced::advanced::Renderer as _;
         let bounds = layout.bounds();
-        let buttons = tab_rects(layout, self.tabs.len());
+        let (view, full) = strip_and_tabs(layout, self.tabs.len());
+        let (first, buttons) = shown_tabs(view, &full);
         let tab_bounds: Vec<Rectangle> = buttons
             .iter()
             .map(|tab| snap_rect(*tab, self.scale))
             .collect();
+        // The hole (and the flares beside it) only around a tab the strip shows whole.
+        let strip = snap_rect(view, self.scale);
         let hole = self
             .hole
-            .and_then(|i| tab_bounds.get(i).copied())
-            .filter(|h| h.width > 0.0 && h.height > 0.0);
+            .and_then(|i| full.get(i).copied())
+            .map(|tab| snap_rect(tab, self.scale))
+            .and_then(|tab| visible_hole(tab, strip));
         let radius = tab_radius(self.scale);
         let flares = hole.map_or_else(Vec::new, |h| flares(bounds, h, radius));
         let mut holes: Vec<Rectangle> = hole.into_iter().collect();
@@ -1688,8 +1808,9 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
         }
         // Inactive tabs: hover and tint, never over a flare's tab-colored part (a neighbour
         // of the active tab only reaches into the flare's disc).
-        for (i, (&tab, &(accent, style))) in tab_bounds.iter().zip(&self.tabs).enumerate() {
-            if Some(i) == self.hole {
+        let shown = self.tabs.iter().skip(first);
+        for (i, (&tab, &(accent, style))) in tab_bounds.iter().zip(shown).enumerate() {
+            if Some(first + i) == self.hole {
                 continue;
             }
             let hovered = cursor.is_over(tab);
@@ -1772,10 +1893,7 @@ impl Widget<Message, iced::Theme, iced::Renderer> for BarBackground<'_> {
         // A carried tile or tab: a violet bar in the gap where it would land.
         let state = tree.state.downcast_ref::<DragState>();
         if let (Some(Carry::Tile(_) | Carry::Tab(_)), Some(gap)) = (self.carry, state.gap) {
-            let x = match buttons.get(gap) {
-                Some(next) => next.x - 2.0,
-                None => buttons.last().map_or(bounds.x, |r| r.x + r.width),
-            };
+            let x = marker_x(&buttons, gap.saturating_sub(first), view);
             let height = buttons.first().map_or(bounds.height, |r| r.height);
             let marker = snap_rect(
                 Rectangle {
@@ -2063,9 +2181,15 @@ fn tab_button<'a>(
     if tab.trouble() {
         inner = inner.push(dot(t.warning));
     }
+    let inner = inner.push(container(label).width(Length::Fill).clip(true));
+    // A tab shrunk below the usual minimum (a bar too narrow for the chevrons) has no room for
+    // the close button; the shortcut and the tab menu still close it.
+    let inner = if width >= TAB_MIN_WIDTH {
+        inner.push(close)
+    } else {
+        inner
+    };
     let inner = inner
-        .push(container(label).width(Length::Fill).clip(true))
-        .push(close)
         .spacing(8)
         .height(Length::Fill)
         .align_y(Alignment::Center);
@@ -2313,6 +2437,65 @@ mod tests {
     };
 
     #[test]
+    fn only_a_tab_fully_in_the_strip_keeps_its_hole() {
+        let strip = Rectangle::new(Point::new(100.0, 0.0), Size::new(300.0, 40.0));
+        let tab = |x: f32, w: f32| Rectangle::new(Point::new(x, 4.0), Size::new(w, 36.0));
+        assert_eq!(
+            visible_hole(tab(150.0, 90.0), strip),
+            Some(tab(150.0, 90.0))
+        );
+        assert_eq!(
+            visible_hole(tab(100.0, 90.0), strip),
+            Some(tab(100.0, 90.0)),
+            "flush"
+        );
+        assert_eq!(
+            visible_hole(tab(80.0, 90.0), strip),
+            None,
+            "cut on the left"
+        );
+        assert_eq!(
+            visible_hole(tab(350.0, 90.0), strip),
+            None,
+            "cut on the right"
+        );
+        assert_eq!(visible_hole(tab(500.0, 90.0), strip), None, "scrolled out");
+        assert_eq!(visible_hole(tab(150.0, 0.0), strip), None, "nothing of it");
+    }
+
+    #[test]
+    fn the_gap_marker_never_leaves_the_strip() {
+        let strip = Rectangle::new(Point::new(100.0, 0.0), Size::new(300.0, 40.0));
+        let rect = |x: f32, w: f32| Rectangle::new(Point::new(x, 4.0), Size::new(w, 36.0));
+        // Two hidden tabs left of the strip (zero wide at its edge), two visible, one hidden
+        // right of it.
+        let rects = [
+            rect(100.0, 0.0),
+            rect(100.0, 0.0),
+            rect(100.0, 80.0),
+            rect(182.0, 80.0),
+            rect(400.0, 0.0),
+        ];
+        assert_eq!(marker_x(&rects, 0, strip), 100.0, "before the hidden ones");
+        assert_eq!(
+            marker_x(&rects, 3, strip),
+            180.0,
+            "between two visible tabs"
+        );
+        assert_eq!(
+            marker_x(&rects, 4, strip),
+            398.0,
+            "kept inside the strip's end"
+        );
+        assert_eq!(marker_x(&rects, 5, strip), 398.0, "after the last tab");
+        assert_eq!(
+            marker_x(&[], 0, Rectangle::default()),
+            0.0,
+            "no tabs, no panic"
+        );
+    }
+
+    #[test]
     fn the_bar_background_leaves_the_active_tab_to_itself() {
         let pieces = around(OUTER, &[TAB]);
         let area = |r: &Rectangle| r.width * r.height;
@@ -2444,9 +2627,29 @@ mod tests {
         use super::*;
         use crate::chrome::BarAction;
         use crate::layout::PaneId;
+        use crate::tab_strip::WHEEL_LINE_PX;
         use crate::windows::{Carry, DragMsg};
 
         const SIZE: Size = Size::new(1000.0, 40.0);
+
+        /// Every tab's bounds clipped to the strip, zero wide at the strip's edge on their
+        /// side when scrolled out: the tests address tabs by index.
+        fn tab_rects(layout: Layout<'_>, n: usize) -> Vec<Rectangle> {
+            let (view, full) = strip_and_tabs(layout, n);
+            full.into_iter()
+                .map(|b| {
+                    b.intersection(&view).unwrap_or(Rectangle {
+                        x: if b.x < view.x {
+                            view.x
+                        } else {
+                            view.x + view.width
+                        },
+                        width: 0.0,
+                        ..b
+                    })
+                })
+                .collect()
+        }
 
         fn press() -> Event {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
@@ -2502,6 +2705,33 @@ mod tests {
             carry: Option<Carry>,
             steps: impl FnOnce(&[Rectangle], &DrawnControls) -> Vec<(Event, Point)>,
         ) -> Vec<Message> {
+            drive_full(chrome, tabs, carry, None, 0.0, |p| {
+                steps(&p.tabs, &p.controls)
+            })
+        }
+
+        /// What a bar's layout holds, for [`drive_full`]'s steps.
+        struct Parts {
+            /// Each tab's bounds, clipped to the strip (zero wide when hidden).
+            tabs: Vec<Rectangle>,
+            /// The strip's bounds.
+            strip: Rectangle,
+            /// The row's children after the strip: chevrons, then the buttons.
+            rest: Vec<Rectangle>,
+            controls: DrawnControls,
+        }
+
+        /// [`drive_with`] in a window `width` wide (`None`: the harness's 1000 px, tabs at full
+        /// size) with the strip scrolled by `strip_offset`.
+        fn drive_full(
+            chrome: Chrome,
+            tabs: &[Tab],
+            carry: Option<Carry>,
+            width: Option<f32>,
+            strip_offset: f32,
+            steps: impl FnOnce(&Parts) -> Vec<(Event, Point)>,
+        ) -> Vec<Message> {
+            let size = Size::new(width.unwrap_or(SIZE.width), SIZE.height);
             let bindings = Bindings::defaults(cfg!(target_os = "macos"));
             let t = crate::theme::graphite_tokens();
             let bar = TabBar {
@@ -2530,10 +2760,11 @@ mod tests {
                 // And the outline a docked file panel brings.
                 outline_end: Some(500.0),
                 outline_to_edge: false,
-                width: None,
+                width,
                 renaming: None,
                 tabs_in_bar: true,
                 outline_start: 0.0,
+                strip_offset,
             };
             let mut element = tab_bar(t, bar, tabs, 0);
             let renderer = iced::Renderer::Secondary(iced_tiny_skia::Renderer::new(
@@ -2544,7 +2775,7 @@ mod tests {
             let node = element.as_widget_mut().layout(
                 &mut tree,
                 &renderer,
-                &layout::Limits::new(Size::ZERO, SIZE),
+                &layout::Limits::new(Size::ZERO, size),
             );
             // title bar -> background -> container -> row -> tabs; with drawn controls
             // (on the right in tests) title bar -> row -> [background, plate -> column ->
@@ -2574,17 +2805,22 @@ mod tests {
             } else {
                 (root, DrawnControls::default())
             };
-            let buttons: Vec<Rectangle> = background
-                .children()
-                .next()
-                .expect("the row")
-                .children()
-                .take(tabs.len())
-                .map(|l| l.bounds())
-                .collect();
-            let viewport = Rectangle::with_size(SIZE);
+            let parts = Parts {
+                tabs: tab_rects(background, tabs.len()),
+                strip: strip_and_tabs(background, 0).0,
+                rest: background
+                    .children()
+                    .next()
+                    .expect("the row")
+                    .children()
+                    .skip(usize::from(!tabs.is_empty()))
+                    .map(|l| l.bounds())
+                    .collect(),
+                controls,
+            };
+            let viewport = Rectangle::with_size(size);
             let mut messages = Vec::new();
-            for (event, at) in steps(&buttons, &controls) {
+            for (event, at) in steps(&parts) {
                 let mut shell = Shell::new(&mut messages);
                 element.as_widget_mut().update(
                     &mut tree,
@@ -2643,6 +2879,391 @@ mod tests {
                 )),
                 "a press on a tab never drags the window"
             );
+        }
+
+        fn many_tabs(n: usize) -> Vec<Tab> {
+            (0..n)
+                .map(|i| {
+                    Tab::single(Pane::new(
+                        fbterm_config::ProfileId::new(),
+                        format!("tab {i}"),
+                        None,
+                    ))
+                })
+                .collect()
+        }
+
+        fn click(p: Point) -> Vec<(Event, Point)> {
+            vec![(moved(p), p), (press(), p), (release(), p)]
+        }
+
+        fn strip_steps(messages: &[Message]) -> Vec<i8> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::TabBar(_, TabBarMsg::StripStep(d)) => Some(*d),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn buttons_stay_inside_the_window_with_many_tabs() {
+            let tabs = many_tabs(40);
+            let _ = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, |p| {
+                assert_eq!(
+                    p.rest.len(),
+                    7,
+                    "two chevrons and five buttons: {:?}",
+                    p.rest
+                );
+                let last = p.rest.last().unwrap();
+                assert!(
+                    last.x + last.width <= 800.0 - BAR_RIGHT_PADDING + 0.5,
+                    "{last:?}"
+                );
+                assert!(p.strip.x + p.strip.width <= p.rest[0].x, "{:?}", p.strip);
+                vec![]
+            });
+        }
+
+        #[test]
+        fn buttons_follow_the_last_tab_until_the_end() {
+            let at = |n: usize, width: f32| {
+                let tabs = many_tabs(n);
+                let mut found = (0.0, 0.0);
+                let _ = drive_full(Chrome::Unified, &tabs, None, Some(width), 0.0, |p| {
+                    let last = p.tabs.last().unwrap();
+                    found = (last.x + last.width, p.rest[p.rest.len() - 5].x);
+                    vec![]
+                });
+                found
+            };
+            let (tab_end, plus) = at(3, 1600.0);
+            assert_eq!(plus, tab_end + TAB_SPACING, "right after the last tab");
+            let (_, many) = at(40, 800.0);
+            let (_, more) = at(80, 800.0);
+            assert_eq!(many, more, "stopped at the end of the free space");
+        }
+
+        #[test]
+        fn no_chevrons_while_everything_fits() {
+            let _ = drive_full(
+                Chrome::Unified,
+                &many_tabs(3),
+                None,
+                Some(1600.0),
+                0.0,
+                |p| {
+                    assert_eq!(p.rest.len(), 5, "{:?}", p.rest);
+                    vec![]
+                },
+            );
+        }
+
+        #[test]
+        fn a_tab_scrolled_out_cannot_be_clicked() {
+            let tabs = many_tabs(40);
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 500.0, |p| {
+                assert_eq!(p.tabs[0].width, 0.0, "the first tab is scrolled out");
+                // Where the hidden tab would be: left of the strip.
+                let mut steps = click(Point::new(p.strip.x - 10.0, 20.0));
+                let k = p
+                    .tabs
+                    .iter()
+                    .position(|r| r.width >= 80.0)
+                    .expect("a visible tab");
+                steps.extend(click(p.tabs[k].center()));
+                steps
+            });
+            let first_visible = (500.0_f32 / (TAB_MIN_WIDTH + TAB_SPACING)).ceil() as usize;
+            assert_eq!(selects(&messages), [first_visible], "only the visible tab");
+        }
+
+        #[test]
+        fn the_pointer_over_a_button_never_reaches_a_tab_under_it() {
+            let tabs = many_tabs(40);
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, |p| {
+                click(p.rest[2].center())
+            });
+            assert!(selects(&messages).is_empty(), "{messages:?}");
+        }
+
+        #[test]
+        fn the_left_chevron_ignores_presses_at_the_start_and_the_right_at_the_end() {
+            let tabs = many_tabs(40);
+            let l = strip_layout(
+                Chrome::Unified,
+                false,
+                Some(800.0),
+                40,
+                trailing_width(3, true),
+            );
+            let end = l.content_w - l.strip_w;
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, |p| {
+                let mut s = click(p.rest[0].center());
+                s.extend(click(p.rest[1].center()));
+                s
+            });
+            assert_eq!(
+                strip_steps(&messages),
+                [1],
+                "only the right one at the start"
+            );
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), end, |p| {
+                let mut s = click(p.rest[0].center());
+                s.extend(click(p.rest[1].center()));
+                s
+            });
+            assert_eq!(strip_steps(&messages), [-1], "only the left one at the end");
+        }
+
+        fn strip_scrolls(messages: &[Message]) -> Vec<f32> {
+            messages
+                .iter()
+                .filter_map(|m| match m {
+                    Message::TabBar(_, TabBarMsg::StripScroll(d)) => Some(*d),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn wheel(delta: mouse::ScrollDelta) -> Event {
+            Event::Mouse(mouse::Event::WheelScrolled { delta })
+        }
+
+        #[test]
+        fn a_wheel_over_the_strip_scrolls_it_sideways() {
+            let tabs = many_tabs(40);
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 300.0, |p| {
+                let at = p.strip.center();
+                vec![
+                    (wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }), at),
+                    (wheel(mouse::ScrollDelta::Lines { x: 1.0, y: 0.0 }), at),
+                    (wheel(mouse::ScrollDelta::Pixels { x: 0.0, y: -30.0 }), at),
+                ]
+            });
+            assert_eq!(
+                strip_scrolls(&messages),
+                [WHEEL_LINE_PX, -WHEEL_LINE_PX, 30.0]
+            );
+        }
+
+        #[test]
+        fn a_wheel_toward_a_side_with_nothing_hidden_sends_nothing() {
+            let toward_start = |p: &Parts| {
+                let at = p.strip.center();
+                vec![(wheel(mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 }), at)]
+            };
+            let toward_end = |p: &Parts| {
+                let at = p.strip.center();
+                vec![(wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 }), at)]
+            };
+            let tabs = many_tabs(40);
+            let l = strip_layout(
+                Chrome::Unified,
+                false,
+                Some(800.0),
+                40,
+                trailing_width(3, true),
+            );
+            let end = l.content_w - l.strip_w;
+            let at_start = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, toward_start);
+            assert!(strip_scrolls(&at_start).is_empty(), "{at_start:?}");
+            let at_end = drive_full(Chrome::Unified, &tabs, None, Some(800.0), end, toward_end);
+            assert!(strip_scrolls(&at_end).is_empty(), "{at_end:?}");
+            let few = many_tabs(3);
+            let fit = drive_full(Chrome::Unified, &few, None, Some(800.0), 0.0, toward_start);
+            assert!(strip_scrolls(&fit).is_empty(), "{fit:?}");
+            let fit = drive_full(Chrome::Unified, &few, None, Some(800.0), 0.0, toward_end);
+            assert!(strip_scrolls(&fit).is_empty(), "{fit:?}");
+        }
+
+        #[test]
+        fn a_wheel_off_the_strip_does_nothing() {
+            let tabs = many_tabs(40);
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, |p| {
+                let down = wheel(mouse::ScrollDelta::Lines { x: 0.0, y: -1.0 });
+                vec![
+                    // A chevron, the `+` button and the empty padding right of the buttons.
+                    (down.clone(), p.rest[0].center()),
+                    (down.clone(), p.rest[2].center()),
+                    (down, Point::new(799.0, 20.0)),
+                ]
+            });
+            assert!(strip_scrolls(&messages).is_empty(), "{messages:?}");
+        }
+
+        #[test]
+        fn dragging_near_the_strip_edge_scrolls_it() {
+            let tabs = many_tabs(40);
+            let mut edges = (0.0, 0.0);
+            // A tab dragged: past the threshold, then to the right edge, then the left, then
+            // the middle.
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 300.0, |p| {
+                edges = (p.strip.x, p.strip.x + p.strip.width);
+                let k = p.tabs.iter().position(|r| r.width >= 80.0).unwrap() + 1;
+                let from = p.tabs[k].center();
+                let mid = Point::new(p.strip.center().x, from.y);
+                let right = Point::new(p.strip.x + p.strip.width - 5.0, from.y);
+                let left = Point::new(p.strip.x + 5.0, from.y);
+                vec![
+                    (moved(from), from),
+                    (press(), from),
+                    (moved(mid), mid),
+                    (moved(right), right),
+                    (moved(left), left),
+                    (moved(mid), mid),
+                ]
+            });
+            assert!(edges.1 > edges.0);
+            assert_eq!(
+                strip_scrolls(&messages),
+                [EDGE_SCROLL_STEP, -EDGE_SCROLL_STEP],
+                "{messages:?}"
+            );
+        }
+
+        #[test]
+        fn a_drag_past_the_band_keeps_scrolling_and_stops_at_the_ends() {
+            let tabs = many_tabs(40);
+            let carried = Some(Carry::Tile(PaneId(7)));
+            let mut to_chevron = 0.0;
+            let past = |p: &Parts| {
+                // Above the tabs at the right edge, then over the right chevron, then left of
+                // the strip.
+                let above = Point::new(p.strip.x + p.strip.width - 5.0, p.strip.y - 4.0);
+                let chevron = Point::new(p.rest[1].center().x, p.strip.center().y);
+                let left = Point::new(p.strip.x - 1.0, p.strip.center().y);
+                to_chevron = (chevron.x - above.x).min(EDGE_SCROLL_STEP);
+                // A move to measure from first: the strip's middle scrolls nothing.
+                let start = p.strip.center();
+                vec![
+                    (moved(start), start),
+                    (moved(above), above),
+                    (moved(chevron), chevron),
+                    (moved(left), left),
+                ]
+            };
+            let messages = drive_full(Chrome::Unified, &tabs, carried, Some(800.0), 0.0, past);
+            assert!(to_chevron >= 0.5, "the chevron sits right of the strip");
+            assert_eq!(
+                strip_scrolls(&messages),
+                [EDGE_SCROLL_STEP, to_chevron],
+                "nothing hidden on the left at the start"
+            );
+            // Tabs that fit: nothing to scroll anywhere.
+            let few = many_tabs(3);
+            let messages = drive_full(Chrome::Unified, &few, carried, Some(800.0), 0.0, |p| {
+                let at = Point::new(p.strip.x + p.strip.width - 5.0, p.strip.center().y);
+                vec![(moved(at), at)]
+            });
+            assert!(strip_scrolls(&messages).is_empty(), "{messages:?}");
+        }
+
+        #[test]
+        fn edge_scroll_goes_by_the_distance_moved_not_the_event_count() {
+            let tabs = many_tabs(40);
+            let carried = Some(Carry::Tile(PaneId(7)));
+            // Twenty 1 px moves in the band (a fast mouse) scroll 20 px in all, one long move
+            // at most one step, and a pointer that stays put nothing.
+            let messages = drive_full(Chrome::Unified, &tabs, carried, Some(800.0), 0.0, |p| {
+                let y = p.strip.center().y;
+                let x0 = p.strip.x + p.strip.width - 22.0;
+                (0..=20)
+                    .map(|i| Point::new(x0 + i as f32, y))
+                    .chain([Point::new(x0 + 20.0, y)])
+                    .map(|at| (moved(at), at))
+                    .collect()
+            });
+            let scrolls = strip_scrolls(&messages);
+            assert_eq!(scrolls.len(), 20, "{scrolls:?}");
+            assert!(
+                scrolls.iter().all(|d| (d - 1.0).abs() < 0.01),
+                "{scrolls:?}"
+            );
+        }
+
+        #[test]
+        fn edge_scroll_follows_only_the_outward_horizontal_move() {
+            let tabs = many_tabs(40);
+            let carried = Some(Carry::Tile(PaneId(7)));
+            // In the right band: 6 px down, 3 px back toward the middle, then 4 px right and
+            // 8 px down at once. Only the last scrolls, and by its 4 px outward.
+            let messages = drive_full(Chrome::Unified, &tabs, carried, Some(800.0), 0.0, |p| {
+                let (x, y) = (p.strip.x + p.strip.width - 10.0, p.strip.y + 2.0);
+                [
+                    (x, y),
+                    (x, y + 6.0),
+                    (x - 3.0, y + 6.0),
+                    (x + 1.0, y + 14.0),
+                ]
+                .map(|(x, y)| Point::new(x, y))
+                .into_iter()
+                .map(|at| (moved(at), at))
+                .collect()
+            });
+            assert_eq!(strip_scrolls(&messages), [4.0], "{messages:?}");
+        }
+
+        #[test]
+        fn a_carried_tile_near_the_strip_edge_scrolls_it_and_nothing_carried_does_not() {
+            let tabs = many_tabs(40);
+            let near_right = |p: &Parts| {
+                let from = Point::new(p.strip.x + p.strip.width - 15.0, 20.0);
+                let at = Point::new(p.strip.x + p.strip.width - 5.0, 20.0);
+                vec![(moved(from), from), (moved(at), at)]
+            };
+            let carried = Some(Carry::Tile(PaneId(7)));
+            let messages = drive_full(
+                Chrome::Unified,
+                &tabs,
+                carried,
+                Some(800.0),
+                0.0,
+                near_right,
+            );
+            // The first move has nothing to measure from; the second went 10 px.
+            assert_eq!(strip_scrolls(&messages), [10.0]);
+            // Nothing carried and nothing dragged: a pointer at the edge does nothing.
+            let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, near_right);
+            assert!(strip_scrolls(&messages).is_empty(), "{messages:?}");
+        }
+
+        #[test]
+        fn a_drop_past_the_strip_lands_where_the_marker_shows() {
+            let tabs = many_tabs(40);
+            let pane = PaneId(9);
+            let drop = |at: fn(&Parts) -> Point| {
+                let mut visible = (0, 0);
+                let messages = drive_full(
+                    Chrome::Unified,
+                    &tabs,
+                    Some(Carry::Tile(pane)),
+                    Some(800.0),
+                    500.0,
+                    |p| {
+                        let first = p.tabs.iter().position(|r| r.width > 0.0).unwrap();
+                        let last = p.tabs.iter().rposition(|r| r.width > 0.0).unwrap();
+                        visible = (first, last);
+                        let at = at(p);
+                        vec![(moved(at), at), (release(), at)]
+                    },
+                );
+                (drags(&messages), visible)
+            };
+            // Over a chevron: after the last visible tab, not after the last hidden one.
+            let (dropped, (_, last)) = drop(|p| p.rest[0].center());
+            assert_eq!(
+                dropped,
+                [DragMsg::TileToTab {
+                    pane,
+                    index: last + 1
+                }]
+            );
+            // Left of the strip: before the first visible tab.
+            let (dropped, (first, _)) = drop(|p| Point::new(p.strip.x - 4.0, 20.0));
+            assert_eq!(dropped, [DragMsg::TileToTab { pane, index: first }]);
         }
 
         fn pointer_reports(messages: &[Message]) -> Vec<bool> {
@@ -3087,27 +3708,6 @@ mod tests {
 #[cfg(test)]
 mod tab_width_tests {
     use super::*;
-
-    #[test]
-    fn tabs_shrink_with_the_room_and_stop_at_the_minimum() {
-        let trailing = trailing_width(3, true);
-        let w = |width, count| tab_width(Chrome::Unified, false, Some(width), count, trailing);
-        assert_eq!(
-            tab_width(Chrome::Unified, false, None, 50, trailing),
-            TAB_MAX_WIDTH
-        );
-        assert_eq!(w(1600.0, 3), TAB_MAX_WIDTH, "plenty of room");
-        let (few, many) = (w(1000.0, 5), w(1000.0, 8));
-        assert!(TAB_MIN_WIDTH < few && few < TAB_MAX_WIDTH, "{few}");
-        assert!(many < few, "more tabs, narrower tabs");
-        assert!(w(1000.0, 5) > w(700.0, 5), "narrower window, narrower tabs");
-        assert_eq!(w(400.0, 30), TAB_MIN_WIDTH, "never below the minimum");
-        assert_eq!(
-            w(10.0, 0),
-            TAB_MIN_WIDTH,
-            "no room and no tabs is no division by zero"
-        );
-    }
 
     #[test]
     fn the_trailing_room_follows_the_files_button_and_the_tunnel_count() {

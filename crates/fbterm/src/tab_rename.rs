@@ -119,6 +119,7 @@ impl App {
 
     /// The `Rename tab` shortcut: the active tab of `wid`.
     pub(crate) fn rename_active_tab(&mut self, wid: window::Id) -> Task<Message> {
+        self.reveal_active_tab(wid);
         match self.windows.get(&wid).and_then(|w| w.active_tab()) {
             Some(tab) => self.start_rename(wid, tab.id),
             None => Task::none(),

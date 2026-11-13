@@ -657,7 +657,7 @@ pub(crate) const REVEAL_LABEL: &str = if cfg!(target_os = "macos") {
 
 /// What the panel asks of the app.
 #[derive(Debug, Clone)]
-pub enum FilePanelMsg {
+pub(crate) enum FilePanelMsg {
     Event(Delivered<PanelEvent>),
     /// The left edge is being dragged: the panel's new width.
     Resize(f32),
