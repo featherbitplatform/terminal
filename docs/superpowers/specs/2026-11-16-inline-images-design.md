@@ -28,7 +28,7 @@ The owner wants the standards and the protocols TUI software actually relies on,
 ## 3. Non-goals and anti-goals
 
 Non-goals:
-- **Animation** (kitty animation frames, animated GIF): the first frame only. **[builder's call]**
+- **Animation** (kitty animation frames, animated GIF over OSC 1337): the first frame only for now; animation is a planned future feature. **[owner, 2026-11-16]** When it is built: only the visible tab of a visible window animates and its timers stop when hidden (the one sanctioned exception to "no redraw without new output or input"), the frame rate is capped by `max_fps`, every decoded frame counts against the memory caps (an animation that does not fit falls back to its first frame), and a setting turns it off.
 - **ReGIS, other vector graphics, and the kitty file-transfer and shared-memory modes** (`t=f`, `t=t`, `t=s`): refused (see the anti-goals). **[builder's call, from fbterm's rules]**
 - **Copying or saving an image** from the terminal: no context-menu action yet. **[builder's call]**
 
