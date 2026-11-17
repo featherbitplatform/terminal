@@ -90,10 +90,14 @@ pub enum Lookup {
 enum Slot {
     Queued,
     Ready(u64, Arc<ResampledImage>),
-    /// The copy for this size was dropped the moment it was installed — it could not fit beside
-    /// its own source under the caps (see [`ImageStore::finish_resample`]). Draws answer
-    /// [`Lookup::Evicted`] for it until the source image is replaced or released; re-making a
-    /// copy that provably cannot fit would only burn the same work every frame.
+    /// This size has no copy and will not get one until its source changes: either the copy was
+    /// dropped the moment it was installed (it could not fit beside its own source under the
+    /// caps — see [`ImageStore::finish_resample`]), or another image's install-time enforcement
+    /// evicted it to make room, its whole image still being held (see [`Reason::Install`]). Draws
+    /// answer [`Lookup::Evicted`] for a refused size until the source image is replaced or
+    /// released — spec 6.3's placeholder rule; re-asking a size enforcement already proved it
+    /// cannot keep would only burn the same work every frame. Copies dropped by ordinary
+    /// submit- or decode-time enforcement stay re-makeable (plain LRU).
     Refused,
 }
 
@@ -541,12 +545,19 @@ impl ImageStore {
     /// Drop buffers until the caps hold again (the step after scrollback eviction ran dry or was
     /// impossible): least recently shown first — this owner's resampled copies, then its whole
     /// images, then other owners' resamples, then their whole images. Whole images become
-    /// [`Lookup::Evicted`] for later draws; released keys stay gone entirely.
+    /// [`Lookup::Evicted`] for later draws; released keys stay gone entirely. Any refusal this
+    /// queues for an evicted owed key is followed by a worker wake (see [`Job::Refuse`]).
     pub fn enforce_caps(&self, owner: u64) {
         // Declared before the lock guard so everything it collects is freed after the mutex goes.
         let mut freed = Freed::default();
         let mut inner = self.inner.lock();
-        Self::enforce_inner(&mut inner, owner, None, &mut freed);
+        let (_, queued_job) = Self::enforce_inner(&mut inner, owner, Reason::Routine, &mut freed);
+        drop(inner);
+        if queued_job {
+            // A refusal for an evicted owed key sits on the queue: do not let it wait for some
+            // other submit to happen to wake the worker.
+            self.wake.notify_one();
+        }
     }
 
     /// Decoded bytes, payloads and resamples the store holds across all owners.
@@ -608,28 +619,31 @@ impl ImageStore {
             .is_some_and(|o| o.bytes > inner.per_owner_cap)
     }
 
-    /// Evict until `owner`'s caps hold, in the order [`Self::enforce_caps`] documents, skipping
-    /// every candidate named by `protect`: that whole image and that one copy stay (a resample
-    /// result must not be evicted by the very enforcement its install triggers). Returns whether
-    /// the caps were met; `false` means only the protected image is left keeping them over, and
-    /// the caller must undo what it just installed (see [`Self::finish_resample`]).
+    /// Evict until `owner`'s caps hold, in the order [`Self::enforce_caps`] documents. Under
+    /// [`Reason::Install`] the named whole image and that one copy are skipped (a resample result
+    /// must not be evicted by the very enforcement its install triggers) and every other copy
+    /// this pass drops is marked refused (see [`Slot::Refused`]); [`Reason::Routine`] is plain
+    /// LRU. Returns whether the caps were met (`false`: only the protected image is left keeping
+    /// them over, and the caller must undo its install — see [`Self::finish_resample`]) and
+    /// whether a job was queued (a refusal for an evicted owed key; the caller wakes the worker).
     fn enforce_inner(
         inner: &mut Inner,
         owner: u64,
-        protect: Option<Protect>,
+        reason: Reason,
         freed: &mut Freed,
-    ) -> bool {
+    ) -> (bool, bool) {
+        let mut queued_job = false;
         while Self::over(inner, owner) {
-            let dropped = evict_resample(inner, owner, Scope::Own, protect, freed)
-                || evict_image(inner, owner, Scope::Own, protect, freed)
-                || evict_resample(inner, owner, Scope::Others, None, freed)
-                || evict_image(inner, owner, Scope::Others, None, freed);
+            let dropped = evict_resample(inner, owner, Scope::Own, reason, freed)
+                || evict_image(inner, owner, Scope::Own, reason, freed, &mut queued_job)
+                || evict_resample(inner, owner, Scope::Others, reason, freed)
+                || evict_image(inner, owner, Scope::Others, reason, freed, &mut queued_job);
             if !dropped {
-                // Nothing outside `protect` can go; never loop on a cap that cannot be met.
-                return false;
+                // Nothing outside the protected image can go; never loop on a cap that cannot be met.
+                return (false, queued_job);
             }
         }
-        true
+        (true, queued_job)
     }
 
     /// Notify idle waiters when nothing is left (called with the lock held).
@@ -743,6 +757,9 @@ impl ImageStore {
             /// The caps evicted the entry while the decode ran: answer `TooLarge`, drop the buffer.
             Refusal,
         }
+        // (bytes released, bytes installed): declared outside the block so a hookless install can
+        // still enforce the caps afterwards (see below).
+        let mut delta = (0usize, 0usize);
         let delivery = {
             let mut inner = self.inner.lock();
             let claim = inner
@@ -770,7 +787,6 @@ impl ImageStore {
             };
             // The result is dropped unused on a refusal: the payload's bytes went when it was
             // evicted, and this buffer has no place left to live in.
-            let mut delta = (0usize, 0usize); // (bytes released, bytes installed)
             let hooks = inner.owners.get_mut(&owner).map(|entry| {
                 if let Some(image) = entry.images.get_mut(&key)
                     && image.serial == serial
@@ -810,6 +826,13 @@ impl ImageStore {
             hooks.flatten().map(|hooks| (answer, hooks))
         };
         let Some((answer, hooks)) = delivery else {
+            // Nothing could be delivered — no hooks yet (the answer waits for a registration) or
+            // the entry is gone. A buffer installed anyway still counts against the caps, and
+            // nobody else runs enforcement before the next submit, so do it here. Scrollback
+            // reclaim needs the terminal; this stays plain cap enforcement.
+            if delta.1 > 0 {
+                self.enforce_caps(owner);
+            }
             return;
         };
         self.deliver(owner, key, answer, hooks);
@@ -930,6 +953,30 @@ impl ImageStore {
             });
             let stamp = self.next_stamp();
             let bytes = out.bytes();
+            // A copy that cannot fit beside its own source under the tightest cap is refused up
+            // front: no enforcement pass could free more than "everything except this pair", and
+            // evicting other images for a copy that comes back out anyway is pure collateral.
+            let cannot_fit = inner
+                .owners
+                .get(&owner)
+                .and_then(|e| e.images.get(&key))
+                .is_some_and(|image| {
+                    let State::Ready(src) = &image.state else {
+                        return false; // vanished with the queued slot: nothing to install onto
+                    };
+                    src.bytes() + bytes > inner.per_owner_cap.min(inner.total_cap)
+                });
+            if cannot_fit {
+                if let Some(image) = inner
+                    .owners
+                    .get_mut(&owner)
+                    .and_then(|e| e.images.get_mut(&key))
+                {
+                    image.resamples.insert(target, Slot::Refused);
+                }
+                freed.copies.push(out); // the made buffer goes after the mutex, untouched
+                return; // and nothing is woken: no draw could use what was refused
+            }
             if let Some(entry) = inner.owners.get_mut(&owner)
                 && let Some(image) = entry.images.get_mut(&key)
             {
@@ -940,14 +987,17 @@ impl ImageStore {
             inner.total += bytes;
             // Resampled bytes count against the caps too, so they are enforced here — with this
             // copy and its source image protected: what goes first is an older copy or an older
-            // picture, never the one just asked for. If only the protected picture is left and a
-            // cap is still over, the copy simply cannot fit beside its own source; it comes back
-            // out and the size is remembered as refused (`Slot::Refused`). Either way nothing is
-            // woken for an unsatisfiable install: a redraw would only queue the same copy again.
-            let satisfied = Self::enforce_inner(
+            // picture, never the one just asked for. Every other copy this drops is marked
+            // refused (see [`Reason::Install`]): a displaced on-screen size becomes its
+            // placeholder instead of resampling once per frame beside the new copy. If only the
+            // protected picture is left and a cap is still over — unreachable with the up-front
+            // check, which would have refused it before evicting anything for it — the copy comes
+            // back out and the size is refused all the same. A refusal this queues needs no wake
+            // of its own: this job's worker loop picks up whatever is next when it returns.
+            let (satisfied, _queued) = Self::enforce_inner(
                 &mut inner,
                 owner,
-                Some(Protect { owner, key, target }),
+                Reason::Install(Protect { owner, key, target }),
                 &mut freed,
             );
             if satisfied {
@@ -1110,6 +1160,21 @@ struct Protect {
     target: (u32, u32),
 }
 
+/// Why an enforcement pass runs, and what it is allowed to do about copies.
+///
+/// [`Reason::Routine`] is reclaim after a submit or a decode completion: plain LRU, and evicted
+/// copies stay re-makeable — the drawer may ask for them again and get them.
+/// [`Reason::Install`] names the copy being put in place: that copy and its source are skipped,
+/// and every *other* copy this pass drops is marked [`Slot::Refused`]. A copy of a still-held
+/// image displaced by an install must become its placeholder rather than resample once per frame
+/// — otherwise two placements whose copies cannot coexist evict each other forever (the loop the
+/// round-3 review calls N4).
+#[derive(Clone, Copy)]
+enum Reason {
+    Routine,
+    Install(Protect),
+}
+
 /// Whether `owner` is in an eviction scope for the owner that triggered it.
 fn covers(owner: u64, trigger: u64, scope: Scope) -> bool {
     match scope {
@@ -1118,14 +1183,16 @@ fn covers(owner: u64, trigger: u64, scope: Scope) -> bool {
     }
 }
 
-/// Drop the least recently shown resampled copy in scope, skipping any copy `protect` names (the
-/// scan filters it out; with no protection — or in the others' scope, which never passes one —
-/// this is exactly the plain LRU step). Returns whether anything went.
+/// Drop the least recently shown resampled copy in scope. The scan skips the copy `Reason::Install`
+/// names (with [`Reason::Routine`] — and for whole-image candidates, always — this is exactly the
+/// plain LRU step), and an install-time eviction marks the losing size [`Slot::Refused`]: a copy
+/// displaced to make room for a fresh install must not be re-made every frame. Returns whether
+/// anything went.
 fn evict_resample(
     inner: &mut Inner,
     trigger: u64,
     scope: Scope,
-    protect: Option<Protect>,
+    reason: Reason,
     freed: &mut Freed,
 ) -> bool {
     let mut best: Option<(u64, u64, ImageKey, (u32, u32))> = None; // (stamp, owner, key, target)
@@ -1138,7 +1205,7 @@ fn evict_resample(
                 let Slot::Ready(stamp, _) = slot else {
                     continue;
                 };
-                if matches!(protect, Some(p)
+                if matches!(reason, Reason::Install(p)
                     if p.owner == *owner && p.key == *key && p.target == *target)
                 {
                     continue; // the copy enforcement was just asked to keep
@@ -1159,23 +1226,31 @@ fn evict_resample(
         let bytes = out.bytes();
         entry.bytes -= bytes;
         image.resample_bytes -= bytes;
-        inner.total -= bytes;
         freed.copies.push(out); // dropped after the mutex goes
+        if matches!(reason, Reason::Install(..)) {
+            // The source is still held (only copies are evicted here), so this size draws its
+            // placeholder until the source changes — refusing it stops the ask-evict-ask loop.
+            image.resamples.insert(target, Slot::Refused);
+        }
+        inner.total -= bytes;
     }
     true
 }
 
 /// Drop the least recently shown whole image in scope: its buffer and every resampled copy of it
-/// (the source is gone). A pending decode counts as a whole image too, and evicting one must not
-/// strand its answer: its queued jobs are purged and a [`Job::Refuse`] takes their place (if the
-/// decode was already running, both exist and the exactly-once rule on [`Job`] picks one). The
-/// image `protect` names is skipped in the scan.
+/// (the source is gone — any refused sizes go with it, so they are asked afresh if the key is
+/// re-submitted). A pending decode counts as a whole image too, and evicting one must not strand
+/// its answer: its queued jobs are purged and a [`Job::Refuse`] takes their place (if the decode
+/// was already running, both exist and the exactly-once rule on [`Job`] picks one) — `queued_job`
+/// reports that push so the caller can wake the worker. The image `Reason::Install` names is
+/// skipped in the scan.
 fn evict_image(
     inner: &mut Inner,
     trigger: u64,
     scope: Scope,
-    protect: Option<Protect>,
+    reason: Reason,
     freed: &mut Freed,
+    queued_job: &mut bool,
 ) -> bool {
     let mut best: Option<(u64, u64, ImageKey)> = None; // (shown, owner, key)
     for (owner, entry) in &inner.owners {
@@ -1186,7 +1261,7 @@ fn evict_image(
             if matches!(image.state, State::Evicted) {
                 continue;
             }
-            if matches!(protect, Some(p) if p.owner == *owner && p.key == *key) {
+            if matches!(reason, Reason::Install(p) if p.owner == *owner && p.key == *key) {
                 continue; // the whole image enforcement was just asked to keep
             }
             if best.as_ref().is_none_or(|(s, ..)| image.shown < *s) {
@@ -1213,6 +1288,7 @@ fn evict_image(
     Freed::take_jobs(inner, |job| !job_is(job, owner, key), freed);
     if owed {
         inner.jobs.push_back(Job::Refuse { owner, key, serial });
+        *queued_job = true;
     }
     true
 }
@@ -1982,12 +2058,13 @@ mod tests {
         assert_books(&store);
     }
 
-    /// When only the protected picture is left and a cap is still over, the copy cannot fit beside
-    /// its own source: it is dropped, `wake` is not called (a redraw would only queue it again),
-    /// and the refusal is remembered for that `(key, target)` — every later draw answers
-    /// `Evicted` without queueing, until the source image is replaced or released. That memory is
-    /// the chosen loop guard: re-asking a size that provably cannot fit would burn the same work
-    /// forever.
+    /// A copy that cannot fit beside its own source is refused — up front when geometry alone
+    /// proves it (see [`ImageStore::finish_resample`]), or by dropping back out when enforcement
+    /// gets only as far as "nothing but the protected picture" — with no `wake` (a redraw would
+    /// only queue it again), and the refusal remembered for that `(key, target)`: every later draw
+    /// answers `Evicted` without queueing, until the source image is replaced or released. That
+    /// memory is the chosen loop guard: re-asking a size that provably cannot fit would burn the
+    /// same work forever.
     #[test]
     fn a_copy_that_cannot_fit_is_refused_once_and_stays_refused() {
         let per_owner = 16 * KB + 512; // room for a 16 KiB picture, not for a copy beside it
@@ -2001,7 +2078,8 @@ mod tests {
         store.submit(owner, ImageKey(1), rgba(64, 64, 1)); // 16 KiB: fits alone, under the cap
         assert_books(&store);
 
-        // A 16x16 copy (1 KiB) would put this owner at 17 KiB with nothing else to evict.
+        // A 16x16 copy (1 KiB): source plus copy exceed the cap on geometry alone, so it is
+        // refused outright.
         assert!(matches!(
             store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
             Lookup::Pending
@@ -2044,6 +2122,160 @@ mod tests {
             Lookup::Evicted
         ));
         assert_books(&store);
+    }
+
+    /// A copy that could never fit beside its own source is refused up front: no enforcement pass
+    /// runs for it, so nothing else — not even a small neighbour — is evicted to make room for a
+    /// buffer that would be dropped anyway.
+    #[test]
+    fn an_upfront_refusal_evicts_no_neighbours() {
+        let per_owner = 16 * KB + 512; // the source alone fits; source plus any copy never does
+        let store = ImageStore::with_caps(per_owner, 8 * per_owner);
+        let owner = 16;
+        let scale = 1.0f32.to_bits();
+        let term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let captured = Captured::default();
+        store.register_owner(owner, captured.hooks(&term));
+
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1)); // 16 KiB source
+        store.submit(owner, ImageKey(2), rgba(8, 8, 3)); // a 256-byte neighbour
+        assert_eq!(store.owner_bytes(owner), 16 * KB + 256);
+        assert_books(&store);
+
+        // 16 KiB + 1 KiB exceeds the owner's cap on its own: refused at once, nothing evicted.
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert_books(&store);
+        {
+            let inner = store.inner.lock();
+            assert!(
+                matches!(
+                    inner.owners[&owner].images[&ImageKey(2)].state,
+                    State::Ready(_)
+                ),
+                "the neighbour stayed held: an impossible copy is refused without evicting for it",
+            );
+        }
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
+            Lookup::Evicted
+        ));
+        assert_eq!(captured.wakes(), 0, "a refused install wakes nothing");
+        assert_eq!(
+            store.owner_bytes(owner),
+            16 * KB + 256,
+            "byte counts untouched"
+        );
+    }
+
+    /// A decode that finishes with no hooks registered still enforces the caps: the installed
+    /// buffer counts against them, and leaving the owner over until the next submit would make
+    /// enforcement depend on traffic that may never come. Scrollback reclaim needs a terminal, so
+    /// this path is plain `enforce_caps` — and every owed answer stays stashed for registration.
+    #[test]
+    fn hookless_decode_completions_enforce_the_caps() {
+        // A tiny PNG payload is 136 bytes; its decoded buffer is 64. Two payloads never fit
+        // under this cap, and submit deliberately leaves the owner over.
+        let store = ImageStore::with_caps(100, 8 * KB);
+        let owner = 17;
+        store.submit(owner, ImageKey(1), png(TINY_PNG));
+        store.submit(owner, ImageKey(2), png(TINY_PNG));
+        assert_eq!(store.owner_bytes(owner), 2 * TINY_PNG.len());
+        assert!(store.over_cap(owner));
+        assert_books(&store);
+
+        // No hooks, no terminal: each decode finishes into a stashed answer, and enforcement runs
+        // anyway — LRU takes the oldest first, and every evicted owed key queues its refusal.
+        store.run_jobs_until_idle();
+        assert!(
+            !store.over_cap(owner),
+            "the caps hold as soon as the decodes resolve"
+        );
+        assert_eq!(store.bytes_held(), 0);
+        assert_books(&store);
+        {
+            let inner = store.inner.lock();
+            let entry = &inner.owners[&owner];
+            for key in [ImageKey(1), ImageKey(2)] {
+                let image = &entry.images[&key];
+                assert!(
+                    matches!(image.state, State::Evicted),
+                    "key {key:?} was evicted"
+                );
+                assert!(
+                    image.owes_reply && image.pending_answer.is_some(),
+                    "the answer stays owed and waiting for a registration",
+                );
+            }
+        }
+    }
+
+    /// Copies of on-screen images under cap pressure settle instead of evicting each other every
+    /// frame: the install that displaces another image's copy marks that size refused, so its
+    /// drawer draws the placeholder and never re-queues it (spec 6.3's placeholder rule).
+    #[test]
+    fn install_time_evictions_of_other_copies_are_refused_not_remade() {
+        // Two whole 16 KiB pictures plus exactly one 1 KiB copy fit; both copies together do not.
+        let per_owner = 2 * 16 * KB + 1024;
+        let store: &'static ImageStore =
+            Box::leak(Box::new(ImageStore::with_caps(per_owner, 8 * per_owner)));
+        let owner = 15;
+        let scale = 1.0f32.to_bits();
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1));
+        store.submit(owner, ImageKey(2), rgba(64, 64, 2));
+        store.start();
+
+        let mut pending_asks = 0;
+        for round in 0..12 {
+            for key in [ImageKey(1), ImageKey(2)] {
+                if matches!(
+                    store.get(owner, key, (16, 16), (1, 1), scale),
+                    Lookup::Pending
+                ) {
+                    pending_asks += 1; // this ask queued a resample
+                }
+                assert!(
+                    store.wait_idle_for(Duration::from_secs(30)),
+                    "the worker should idle every round (round {round})"
+                );
+            }
+        }
+        // Exactly two resamples ever: the second install evicted the first copy, and that
+        // eviction marked the losing size refused — so no later ask queued a third.
+        assert_eq!(pending_asks, 2, "the two copies must settle after round 2");
+        assert!(store.inner.lock().jobs.is_empty());
+
+        // The last-installed copy is Ready; the displaced one answers its placeholder. Both whole
+        // images are still held (only sizes are refused, not pictures), and the books balance.
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(2), (16, 16), (1, 1), scale),
+                Lookup::Ready(_)
+            ),
+            "the newest copy stays",
+        );
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
+                Lookup::Evicted
+            ),
+            "the evicted size is refused, not re-made",
+        );
+        {
+            let inner = store.inner.lock();
+            let entry = &inner.owners[&owner];
+            for key in [ImageKey(1), ImageKey(2)] {
+                assert!(
+                    matches!(entry.images[&key].state, State::Ready(_)),
+                    "whole images stay held",
+                );
+            }
+        }
+        assert_eq!(store.owner_bytes(owner), per_owner); // two whole + one copy
+        assert_books(store);
     }
 
     /// A decode that finishes while no hooks are registered does not lose its answer: the key
