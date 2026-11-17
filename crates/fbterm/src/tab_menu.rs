@@ -190,6 +190,7 @@ impl App {
         let Some(tab) = self.windows.get(&wid).and_then(|w| w.tabs.get(index)) else {
             return Task::none();
         };
+        let revive = self.revive_kind(tab);
         let (tab, panes, rename) = (tab.id, tab.panes.len(), tab.page.is_none());
         let active = self.windows[&wid].active == index;
         let password = self.tab_password_profile(wid, tab).is_some();
@@ -200,13 +201,18 @@ impl App {
                 (MenuItem::CopyPassword, Action::CopyPassword, password),
                 (MenuItem::CloseTab, Action::CloseTab, panes == 1),
             ];
-            for (item, action, same) in shown {
+            // The `Reconnect` key brings back every dropped pane of the active tab, as the
+            // item does.
+            let revive_chord = revive.map(|r| (MenuItem::revive(r), Action::Reconnect, true));
+            for (item, action, same) in shown.into_iter().chain(revive_chord) {
                 if let Some(label) = self.bindings.label(action).filter(|_| same) {
                     chords.push((item, label));
                 }
             }
         }
-        self.context_menu = Some(ContextMenu::for_tab(wid, tab, at, rename, password, chords));
+        self.context_menu = Some(ContextMenu::for_tab(
+            wid, tab, at, revive, rename, password, chords,
+        ));
         Task::none()
     }
 

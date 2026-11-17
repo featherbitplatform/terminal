@@ -31,6 +31,7 @@ impl App {
             Action::CloseTab => self.on_window(wid, App::close_focused_pane),
             Action::CopyPassword => self.on_window(wid, App::copy_active_tab_password),
             Action::RenameTab => self.on_window(wid, App::rename_active_tab),
+            Action::Reconnect => self.on_window(wid, App::revive_active_tab),
             Action::SplitRight => self.on_window(wid, |app, wid| app.split_pane(wid, Side::Right)),
             Action::SplitDown => self.on_window(wid, |app, wid| app.split_pane(wid, Side::Bottom)),
             Action::FocusLeft => {
@@ -372,6 +373,7 @@ fn needs_terminal(action: Action) -> bool {
         | Action::SplitRight
         | Action::SplitDown
         | Action::RenameTab
+        | Action::Reconnect
         | Action::ExportTab => true,
         Action::NewTab
         | Action::CloseTab
