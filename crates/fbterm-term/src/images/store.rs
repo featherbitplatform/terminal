@@ -49,6 +49,14 @@ pub struct OwnerHooks {
     pub wake: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// The three hook fields of [`OwnerHooks`] cloned out together, ready to run with no store lock
+/// held (what [`ImageStore::deliver`] hands an answer to).
+type DeliveryHooks = (
+    Weak<Mutex<Terminal>>,
+    Arc<dyn Fn(Vec<TermEvent>) + Send + Sync>,
+    Arc<dyn Fn() + Send + Sync>,
+);
+
 /// A resampled copy of an image at one placement size. The drawer uploads it once; a GPU handle
 /// can hang off it later without changing what the cache keys on.
 #[derive(Debug)]
@@ -147,12 +155,8 @@ impl Freed {
     }
 
     /// Everything an entry held, ready to drop outside the lock.
-    fn drain_entry(&mut self, entry: Entry) {
-        for (_, slot) in entry.resamples {
-            if let Slot::Ready(_, out) = slot {
-                self.copies.push(out);
-            }
-        }
+    fn drain_entry(&mut self, mut entry: Entry) {
+        self.drain_resamples(std::mem::take(&mut entry.resamples));
         self.entries.push(entry);
     }
 
@@ -768,26 +772,18 @@ impl ImageStore {
     fn finish_refusal(&self, owner: u64, key: ImageKey, serial: u64) {
         let hooks = {
             let mut inner = self.inner.lock();
-            inner
-                .owners
-                .get_mut(&owner)
-                .map(|entry| {
-                    if let Some(image) = entry.images.get_mut(&key)
-                        && image.serial == serial
-                        && image.owes_reply
-                    {
-                        image.owes_reply = false; // claimed: the decode result will not answer
-                        entry
-                            .hooks
-                            .as_ref()
-                            .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()))
-                    } else {
-                        // Its running decode answered first, or the key is gone: nothing waits.
-                        None
-                    }
-                })
-                .flatten()
-                .flatten()
+            inner.owners.get_mut(&owner).and_then(|entry| {
+                let image = entry.images.get_mut(&key)?;
+                if image.serial != serial || !image.owes_reply {
+                    // Its running decode answered first, or the key is gone: nothing waits.
+                    return None;
+                }
+                image.owes_reply = false; // claimed: the decode result will not answer
+                entry
+                    .hooks
+                    .as_ref()
+                    .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()))
+            })
         };
         let Some(hooks) = hooks else { return };
         self.deliver(owner, key, Err(ImageDecodeError::TooLarge), hooks);
@@ -802,12 +798,9 @@ impl ImageStore {
         owner: u64,
         key: ImageKey,
         answer: Result<(), ImageDecodeError>,
-        (term, on_events, wake): (
-            Weak<Mutex<Terminal>>,
-            Arc<dyn Fn(Vec<TermEvent>) + Send + Sync>,
-            Arc<dyn Fn() + Send + Sync>,
-        ),
+        hooks: DeliveryHooks,
     ) {
+        let (term, on_events, wake) = hooks;
         reclaim(self, &term, owner);
         let Some(term) = term.upgrade() else { return };
         let events = {
@@ -909,7 +902,9 @@ impl Drop for ThreadExit {
 
 fn job_owner(job: &Job) -> u64 {
     match job {
-        Job::Decode { owner, .. } | Job::Resample { owner, .. } | Job::Refuse { owner, .. } => *owner,
+        Job::Decode { owner, .. } | Job::Resample { owner, .. } | Job::Refuse { owner, .. } => {
+            *owner
+        }
     }
 }
 
@@ -993,12 +988,7 @@ fn covers(owner: u64, trigger: u64, scope: Scope) -> bool {
 }
 
 /// Drop the least recently shown resampled copy in scope. Returns whether anything went.
-fn evict_resample(
-    inner: &mut Inner,
-    trigger: u64,
-    scope: Scope,
-    freed: &mut Freed,
-) -> bool {
+fn evict_resample(inner: &mut Inner, trigger: u64, scope: Scope, freed: &mut Freed) -> bool {
     let mut best: Option<(u64, u64, ImageKey, (u32, u32))> = None; // (stamp, owner, key, target)
     for (owner, entry) in &inner.owners {
         if !covers(*owner, trigger, scope) {
@@ -1140,6 +1130,43 @@ mod tests {
 
         fn events(&self) -> Vec<TermEvent> {
             self.0.lock().unwrap().clone()
+        }
+
+        /// Forget what was captured so far: assertions then speak about one transmission only.
+        fn clear(&self) {
+            self.0.lock().unwrap().clear();
+        }
+
+        /// The kitty answers the sink saw, as `(image id, status)` pairs in order — proof that a
+        /// client was answered exactly once for each transmission it made.
+        fn answers(&self) -> Vec<(u32, String)> {
+            let mut out = Vec::new();
+            for event in self.events() {
+                let TermEvent::PtyWrite(bytes) = event else {
+                    continue;
+                };
+                // Answer frames look like `\x1b_Gi=<id>;<status>\x1b\\`; several can share one write.
+                let text = String::from_utf8_lossy(&bytes);
+                for part in text.split("\x1b_G") {
+                    let Some(rest) = part.strip_prefix("i=") else {
+                        continue;
+                    };
+                    let Some((digits, status)) = rest.split_once(';') else {
+                        continue;
+                    };
+                    let Ok(id) = digits.parse::<u32>() else {
+                        continue;
+                    };
+                    let status: String = status
+                        .chars()
+                        .take_while(|c| c.is_ascii_alphabetic())
+                        .collect();
+                    if !status.is_empty() {
+                        out.push((id, status));
+                    }
+                }
+            }
+            out
         }
 
         fn wakes(&self) -> usize {
@@ -1394,13 +1421,15 @@ mod tests {
         );
         store.release(owner, key);
 
-        // A panicking decoder (test hook) behaves exactly like a corrupt one...
+        // A panicking decoder (test hook) behaves exactly like a corrupt one... The sink is
+        // cleared first so what is checked is this transmission's answer, not the older `EBADPNG`.
         store.set_decode_hook(Some(Arc::new(|data| {
             if matches!(data, ImageData::Encoded { .. }) {
                 panic!("test: the decoder panicked")
             }
             None
         })));
+        captured.clear();
         let feed = format!("\x1b_Gi=2,a=t,f=100;{}\x1b\\", b64(TINY_PNG));
         term.lock().feed(feed.as_bytes());
         let key2 = match term.lock().take_events().first() {
@@ -1409,13 +1438,15 @@ mod tests {
         };
         store.submit(owner, key2, png(TINY_PNG));
         store.run_jobs_until_idle();
-        assert!(
-            captured.saw_reply(b"EBADPNG"),
-            "a panicking decode must answer like a corrupt one"
+        assert_eq!(
+            captured.answers(),
+            vec![(2, "EBADPNG".to_string())],
+            "a panicking decode must answer like a corrupt one, exactly once",
         );
         store.set_decode_hook(None);
 
         // ...and the worker still serves the next job: a whole PNG now decodes and answers OK.
+        captured.clear();
         let feed = format!("\x1b_Gi=3,a=t,f=100;{}\x1b\\", b64(TINY_PNG));
         term.lock().feed(feed.as_bytes());
         let key3 = match term.lock().take_events().first() {
@@ -1424,7 +1455,11 @@ mod tests {
         };
         store.submit(owner, key3, png(TINY_PNG));
         store.run_jobs_until_idle();
-        assert!(captured.saw_reply(b"OK"), "no OK reply after a good decode");
+        assert_eq!(
+            captured.answers(),
+            vec![(3, "OK".to_string())],
+            "no single OK reply after a good decode",
+        );
         // The decoded pixels landed: a get fits them into the box and the worker resamples.
         let scale = 1.0f32.to_bits();
         assert!(matches!(
@@ -1541,6 +1576,278 @@ mod tests {
         assert!(fitted.0 >= 1 && fitted.1 >= 1);
         // A normal box is unaffected: exact scales pass through.
         assert_eq!(fit_capped(8, 8, 16, 16), (16, 16));
+    }
+
+    /// The caps must never strand a client: a key evicted while its decode is still queued is
+    /// answered exactly once anyway — `ENOMEM` — and the emulator then releases it, so its
+    /// pending-decode slot comes back. Four tiny PNG transmissions against a cap that holds two
+    /// payloads; the worker's queue ends up holding two decodes and two refusals.
+    #[test]
+    fn evicted_pending_decodes_answer_once_and_release() {
+        let term = Arc::new(Mutex::new(Terminal::new(size(), 100))); // 80x24: nothing scrolls off
+        let owner = term.lock().image_owner();
+        let store = ImageStore::with_caps(300, 4 * KB); // a tiny PNG payload is 136 bytes
+        let captured = Captured::default();
+        let weak = Arc::downgrade(&term);
+        store.register_owner(owner, captured.hooks(&term));
+
+        let mut keys = Vec::new();
+        for id in 1..=4u32 {
+            let feed = format!("\x1b_Gi={id},a=t,f=100;{}\x1b\\", b64(TINY_PNG));
+            term.lock().feed(feed.as_bytes());
+            term.lock().tick(Instant::now());
+            // Bound the events so the terminal lock is released before reclaim re-locks it.
+            let events = term.lock().take_events();
+            for event in events {
+                if let TermEvent::ImageReceived { key, data } = event {
+                    assert_eq!(keys.len(), usize::try_from(id).unwrap() - 1);
+                    keys.push((id, key));
+                    store.submit(owner, key, data);
+                    // Exactly what a session does after a submit, through the shared helper.
+                    reclaim(&store, &weak, owner);
+                }
+            }
+        }
+        assert_eq!(
+            keys.len(),
+            4,
+            "every transmission should have reached the store"
+        );
+        assert_eq!(
+            store.owner_bytes(owner),
+            2 * TINY_PNG.len(),
+            "two payloads fit under the cap; the older two were evicted while pending",
+        );
+
+        // Nothing has decoded yet: run the queue, which now holds two decodes and two refusals.
+        store.run_jobs_until_idle();
+        let mut answers = captured.answers();
+        answers.sort();
+        assert_eq!(
+            answers,
+            vec![
+                (1, "ENOMEM".to_string()),
+                (2, "ENOMEM".to_string()),
+                (3, "OK".to_string()),
+                (4, "OK".to_string()),
+            ],
+            "one answer per transmission, refusals for the evicted payloads",
+        );
+        // The refused keys are drawn as placeholders until released, and the emulator — told the
+        // decode failed — removed their placements and released them.
+        for (id, key) in &keys[..2] {
+            assert!(
+                matches!(
+                    store.get(owner, *key, (8, 16), (1, 1), 1.0f32.to_bits()),
+                    Lookup::Evicted
+                ),
+                "key {id} should stay known as evicted",
+            );
+            assert!(
+                captured.saw_release(*key),
+                "no release for refused key {id}"
+            );
+        }
+        for (id, key) in &keys[2..] {
+            assert!(
+                !matches!(
+                    store.get(owner, *key, (8, 16), (1, 1), 1.0f32.to_bits()),
+                    Lookup::Evicted
+                ),
+                "key {id} decoded",
+            );
+        }
+        // The two decoded buffers are what remains accounted; the refused payloads went with their
+        // eviction.
+        assert_eq!(store.owner_bytes(owner), 2 * tiny_rgba().len());
+        assert_eq!(store.bytes_held(), 2 * tiny_rgba().len());
+    }
+
+    /// Repeated draws at new placement sizes never push the store over its cap: every install is
+    /// enforced, and asking for a size supersedes the copy made for the previous one.
+    #[test]
+    fn resample_copies_never_push_the_store_over_cap() {
+        let per_owner = 20 * KB; // a 16 KiB picture plus room for one small copy
+        let total = 40 * KB;
+        let store = ImageStore::with_caps(per_owner, total);
+        let owner = 8;
+        let scale = 1.0f32.to_bits();
+        store.submit(owner, ImageKey(1), rgba(64, 64, 7));
+        assert_eq!(store.owner_bytes(owner), 16 * KB);
+
+        for cells in [(16u32, 16u32), (12, 12), (8, 8), (20, 20), (4, 4)] {
+            if matches!(
+                store.get(owner, ImageKey(1), (cells.0, cells.1), (1, 1), scale),
+                Lookup::Pending
+            ) {
+                store.run_jobs_until_idle();
+            }
+            assert!(
+                store.owner_bytes(owner) <= per_owner,
+                "the per-owner cap blew after asking for a {}x{} box",
+                cells.0,
+                cells.1,
+            );
+            assert!(store.bytes_held() <= total, "the app-wide total blew");
+        }
+
+        // Only the newest size is cached: each ask dropped its predecessor.
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(1), (4, 4), (1, 1), scale),
+                Lookup::Ready(_)
+            ),
+            "the last-asked size should be the cached one",
+        );
+        let asked_first = store.get(owner, ImageKey(1), (16, 16), (1, 1), scale);
+        assert!(
+            matches!(asked_first, Lookup::Pending),
+            "the superseded size is gone"
+        );
+    }
+
+    /// A session over its cap gives up its scrollback image before the store drops a buffer: the
+    /// oldest placement becomes a placeholder line and releases, the on-screen picture stays, and
+    /// the emulator's own release for the eviction is absorbed by the idempotent `release`.
+    #[test]
+    fn reclaim_takes_scrollback_images_first() {
+        let small = GridSize {
+            cols: 10,
+            rows: 3,
+            cell_width: 8.0,
+            cell_height: 16.0,
+        };
+        let term = Arc::new(Mutex::new(Terminal::new(small, 100)));
+        let owner = term.lock().image_owner();
+        // Keep scrollback images: the first picture survives into history instead of becoming a
+        // placeholder on its own.
+        term.lock().set_images(true, true);
+        let store = ImageStore::with_caps(12, 4 * KB); // two 8-byte pictures do not fit
+        let captured = Captured::default();
+        let weak = Arc::downgrade(&term);
+        store.register_owner(owner, captured.hooks(&term));
+
+        let transmit = |id: u32, pixels: [u8; 8]| -> (ImageKey, Vec<TermEvent>) {
+            // `a=T` (not `a=t`): feathercritty only places on transmission for the capital form.
+            // No `i=`: an image id is a reference of its own, and without one removing the
+            // placement is what takes the image's last reference — so the emulator announces
+            // the eviction with an `ImageReleased` of its own, which `release` must absorb.
+            let feed = format!("\x1b_Gf=32,s=2,v=1,a=T;{}\x1b\\", b64(&pixels));
+            term.lock().feed(feed.as_bytes());
+            term.lock().tick(Instant::now());
+            let events = term.lock().take_events();
+            let key = match events.first() {
+                Some(TermEvent::ImageReceived { key, data }) => {
+                    assert!(matches!(data, ImageData::Rgba { .. }));
+                    *key
+                }
+                other => panic!("expected an image event for {id}, got {other:?}"),
+            };
+            store.submit(
+                owner,
+                key,
+                ImageData::Rgba {
+                    width: 2,
+                    height: 1,
+                    pixels: pixels.to_vec(),
+                },
+            );
+            (key, events)
+        };
+
+        let (first, first_drain) = transmit(1, [9; 8]);
+        // Scroll the first picture's rows out of the viewport and into history.
+        term.lock().feed(b"a\r\nb\r\nc\r\nd\r\n");
+        term.lock().tick(Instant::now());
+        let scroll_drain = term.lock().take_events();
+
+        // A second picture pushes the owner over its 12-byte cap.
+        let (second, second_drain) = transmit(2, [4; 8]);
+        assert!(
+            store.over_cap(owner),
+            "the cap should be over before reclaiming"
+        );
+        reclaim(&store, &weak, owner);
+
+        // The scrollback image went first — released outright by the emulator, and then by us.
+        assert_eq!(
+            store.owner_bytes(owner),
+            8,
+            "only the on-screen picture is held"
+        );
+        assert!(
+            matches!(
+                store.get(owner, first, (8, 16), (1, 1), 1.0f32.to_bits()),
+                Lookup::Unknown
+            ),
+            "the evicted scrollback image was released outright",
+        );
+        let after_reclaim = term.lock().take_events();
+        let announced = |events: &[TermEvent]| {
+            events
+                .iter()
+                .any(|e| matches!(e, TermEvent::ImageReleased(k) if *k == first))
+        };
+        // The emulator's own release for the eviction rode out with the event drains (whichever
+        // one it landed in is an implementation detail of when the terminal flushes events).
+        let seen: Vec<&[TermEvent]> =
+            vec![&first_drain, &scroll_drain, &second_drain, &after_reclaim];
+        assert!(
+            seen.iter().copied().any(announced),
+            "the terminal should have announced the eviction's release too, saw {first_drain:?}",
+        );
+        // Routed like any other release: the duplicate is harmless.
+        store.release(owner, first);
+        assert_eq!(store.owner_bytes(owner), 8);
+        assert!(
+            !matches!(
+                store.get(owner, second, (8, 16), (1, 1), 1.0f32.to_bits()),
+                Lookup::Evicted | Lookup::Unknown
+            ),
+            "the on-screen picture should not have been the one dropped",
+        );
+    }
+
+    /// A pixel payload that does not match its declared dimensions is dropped: a zero-wide frame
+    /// would poison the nearest-neighbour path, and a truncated one draws garbage.
+    #[test]
+    fn malformed_rgba_payloads_are_dropped() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let owner = 9;
+        let cases = [
+            ImageData::Rgba {
+                width: 0,
+                height: 4,
+                pixels: vec![7; 4],
+            },
+            ImageData::Rgba {
+                width: 2,
+                height: 0,
+                pixels: Vec::new(),
+            },
+            // 2x2 RGBA8 needs 16 bytes: this one is short.
+            ImageData::Rgba {
+                width: 2,
+                height: 2,
+                pixels: vec![7; 12],
+            },
+        ];
+        for (i, data) in cases.into_iter().enumerate() {
+            store.submit(owner, ImageKey(1 + i as u64), data);
+        }
+        assert_eq!(store.owner_bytes(owner), 0);
+        for i in 1..=3u64 {
+            assert!(
+                matches!(
+                    store.get(owner, ImageKey(i), (8, 16), (1, 1), 1.0f32.to_bits()),
+                    Lookup::Unknown
+                ),
+                "malformed key {i} should not be stored",
+            );
+        }
+        // A well-formed payload of the same kind still lands.
+        store.submit(owner, ImageKey(4), rgba(2, 2, 5));
+        assert_eq!(store.owner_bytes(owner), 16);
     }
 
     /// Minimal standard-alphabet base64 (padding included) for building kitty frames in tests.
