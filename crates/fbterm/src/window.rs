@@ -1008,6 +1008,10 @@ fn tab_bar<'a>(
     let trailing = trailing_width(tunnels_up, files.is_some());
     let strip = strip_layout(chrome, fullscreen, tabs_bar.width, tabs.len(), trailing);
     let offset = clamp_offset(tabs_bar.strip_offset, &strip);
+    // The room trimmed off the strip stays empty bar before the chevrons and the group: left
+    // padding on whatever follows the strip, not a spacer, which would add the row's spacing
+    // too and be off by it whenever the trim is narrower.
+    let mut lead = if tabs.is_empty() { 0.0 } else { strip.trim };
     // The tabs sit in a clipped strip, the first child of the bar's row (`tab_rects`).
     if !tabs.is_empty() {
         let mut tab_row = row![].spacing(TAB_SPACING).align_y(Alignment::End);
@@ -1023,10 +1027,6 @@ fn tab_bar<'a>(
             ));
         }
         bar = bar.push(Viewport::new(tab_row.into(), strip.strip_w, offset));
-        // The room trimmed off the strip stays empty bar before the chevrons and the group.
-        if strip.trim > 0.5 {
-            bar = bar.push(iced::widget::Space::new().width((strip.trim - BAR_SPACING).max(0.0)));
-        }
     }
     if strip.chevrons {
         let max = strip.content_w - strip.strip_w;
@@ -1042,7 +1042,10 @@ fn tab_bar<'a>(
                 .style(move |_, status| ghost(t, status));
             container(button).center_y(height)
         };
-        bar = bar.push(chevron(ICON_LEFT, -1, offset > 0.5));
+        bar = bar.push(chevron(ICON_LEFT, -1, offset > 0.5).padding(Padding {
+            left: std::mem::take(&mut lead),
+            ..Padding::ZERO
+        }));
         bar = bar.push(chevron(ICON_RIGHT, 1, offset < max - 0.5));
     }
     let new_tab = button(icon(ICON_PLUS, 14.0, t.text_muted))
@@ -1129,7 +1132,10 @@ fn tab_bar<'a>(
     );
     bar = bar.push(
         container(new_tab)
-            .padding(Padding::from([0.0, 4.0]))
+            .padding(Padding {
+                left: 4.0 + lead,
+                ..Padding::from([0.0, 4.0])
+            })
             .center_y(height),
     );
     bar = bar.push(container(profiles).center_y(height));
@@ -2721,7 +2727,7 @@ mod tests {
             tabs: Vec<Rectangle>,
             /// The strip's bounds.
             strip: Rectangle,
-            /// The row's children after the strip (the trim's spacer left out): chevrons, then
+            /// The row's children after the strip: chevrons, then
             /// the buttons.
             rest: Vec<Rectangle>,
             controls: DrawnControls,
@@ -2821,8 +2827,6 @@ mod tests {
                     .children()
                     .skip(usize::from(!tabs.is_empty()))
                     .map(|l| l.bounds())
-                    // The trim's spacer is empty bar, not a control.
-                    .filter(|r| r.height > 0.0)
                     .collect(),
                 controls,
             };
@@ -2948,11 +2952,13 @@ mod tests {
                 end
             };
             // The strip's trim stays empty bar before the chevrons, so the group moves with the
-            // window's edge pixel for pixel instead of in tab-sized jumps.
+            // window's edge pixel for pixel instead of in tab-sized jumps, whatever the trim
+            // (half-pixel steps over more than a tab pitch, so trims under the bar's spacing
+            // come up too).
             let base = group_end(800.0);
-            for grow in [7.0, 31.0, 55.0] {
+            for grow in (1..=240).map(|n| n as f32 * 0.5) {
                 assert!(
-                    (group_end(800.0 + grow) - base - grow).abs() <= BAR_SPACING,
+                    (group_end(800.0 + grow) - base - grow).abs() < 0.01,
                     "{grow}"
                 );
             }
@@ -3031,9 +3037,11 @@ mod tests {
                 trailing_width(3, true),
             );
             let end = l.content_w - l.strip_w;
+            // On the buttons: the first one's container also holds the strip's trim, empty bar.
+            let on = |r: Rectangle| Point::new(r.x + r.width - BUTTON_WIDTH / 2.0, r.center_y());
             let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), 0.0, |p| {
-                let mut s = click(p.rest[0].center());
-                s.extend(click(p.rest[1].center()));
+                let mut s = click(on(p.rest[0]));
+                s.extend(click(on(p.rest[1])));
                 s
             });
             assert_eq!(
@@ -3042,8 +3050,8 @@ mod tests {
                 "only the right one at the start"
             );
             let messages = drive_full(Chrome::Unified, &tabs, None, Some(800.0), end, |p| {
-                let mut s = click(p.rest[0].center());
-                s.extend(click(p.rest[1].center()));
+                let mut s = click(on(p.rest[0]));
+                s.extend(click(on(p.rest[1])));
                 s
             });
             assert_eq!(strip_steps(&messages), [-1], "only the left one at the end");
