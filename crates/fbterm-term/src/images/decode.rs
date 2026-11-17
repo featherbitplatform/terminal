@@ -124,6 +124,20 @@ fn decode_inner(data: &ImageData) -> Result<Rgba8Image, DecodeError> {
     }
 }
 
+/// The `png` crate's errors, translated. Its `LimitsExceeded` means the decoder's own default
+/// 64 MiB allocation budget ran out — reachable when a well-formed stream carries a non-IDAT
+/// chunk bigger than that: IDAT is inflated as it arrives and bypasses the accounting, but any
+/// other chunk must be buffered whole, and only the decoder's internal accounting can see such a
+/// chunk (our header checks pass on it). That is "over our size limits", not corruption: the
+/// input is valid, just bigger than anything we would hold. Everything else says the bytes are
+/// not to be trusted.
+fn map_png_error(e: png::DecodingError) -> DecodeError {
+    match e {
+        png::DecodingError::LimitsExceeded => DecodeError::TooLarge,
+        _ => DecodeError::Corrupt,
+    }
+}
+
 /// PNG, decoded to RGBA8 through the `png` crate's own transforms: `ALPHA` expands palettes,
 /// gray and RGB sources to include an alpha channel, and `STRIP_16` takes the high byte of 16-bit
 /// samples, so every accepted frame is exactly `width * height * 4` bytes. The first frame of an
@@ -134,12 +148,12 @@ fn decode_png(bytes: &[u8]) -> Result<Rgba8Image, DecodeError> {
     // pixel memory has been touched yet.
     let (width, height) = decoder
         .read_header_info()
-        .map_err(|_| DecodeError::Corrupt)
+        .map_err(map_png_error)
         .map(|info| (info.width, info.height))?;
     check_dims(width, height)?;
 
     decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
-    let mut reader = decoder.read_info().map_err(|_| DecodeError::Corrupt)?;
+    let mut reader = decoder.read_info().map_err(map_png_error)?;
     // An APNG's first frame can declare dimensions the IHDR did not; re-check against what the
     // buffer will actually be before allocating it.
     let out_size = reader.output_buffer_size();
@@ -147,9 +161,7 @@ fn decode_png(bytes: &[u8]) -> Result<Rgba8Image, DecodeError> {
         return Err(DecodeError::TooLarge);
     }
     let mut buf = vec![0u8; out_size];
-    let info = reader
-        .next_frame(&mut buf)
-        .map_err(|_| DecodeError::Corrupt)?;
+    let info = reader.next_frame(&mut buf).map_err(map_png_error)?;
     buf.truncate(info.buffer_size());
     if buf.len() != usize::try_from(width * height).unwrap_or(usize::MAX) * 4 {
         return Err(DecodeError::Corrupt);
@@ -401,6 +413,90 @@ mod tests {
             decode(encoded(ImageFormat::Gif, &wide_gif)),
             Err(DecodeError::TooLarge)
         );
+    }
+
+    #[test]
+    fn giant_iccp_profile_answers_toolarge() {
+        // The png crate reports `LimitsExceeded` when its own default 64 MiB allocation budget
+        // runs out. IDAT streams are inflated as they arrive and bypass that accounting, but any
+        // other chunk must be buffered whole, and the buffering loop refuses to grow past the
+        // budget — a chunk declared larger than it is what trips it, deterministically, inside
+        // `read_info`. An iCCP profile is the natural such chunk: ours never needs the profile,
+        // so this input is perfectly well-formed and merely enormous — `TooLarge`, not `Corrupt`.
+        //
+        // The fixture: TINY_PNG's real signature and IHDR, then an iCCP chunk of ~67 MiB whose
+        // profile is a zlib stream of 1025 stored deflate blocks (valid all the way through; it
+        // would inflate to just over 64 MiB). The budget trips mid-chunk, before its CRC is even
+        // read — the checksum and profile are here so the fixture stays an honest PNG.
+        let file = giant_iccp_fixture();
+
+        assert_eq!(
+            decode(encoded(ImageFormat::Png, &file)),
+            Err(DecodeError::TooLarge),
+            "a 67 MiB iCCP chunk on a 4x4 frame must be refused as too large",
+        );
+    }
+
+    /// Builds the giant-iCCP fixture (see [`giant_iccp_profile_answers_toolarge`]).
+    fn giant_iccp_fixture() -> Vec<u8> {
+        let blocks = 1025usize; // 1025 * 65535 inflates just past the crate's 64 MiB budget
+        let mut file = TINY_PNG.to_vec();
+        // Walk to IDAT chunk by chunk: prefix keeps everything before it, tail is the original
+        // (small) IDAT and IEND, which the parse never reaches.
+        let mut at = 8; // past the signature
+        loop {
+            let len = u32::from_be_bytes(file[at..at + 4].try_into().unwrap()) as usize;
+            if &file[at + 4..at + 8] == b"IDAT" {
+                break;
+            }
+            at += 12 + len; // length, type, data, CRC
+        }
+        let tail = file[at..].to_vec();
+        file.truncate(at);
+
+        let block_len = 5 + 65535; // header (BFINAL=0, stored, LEN, NLEN) plus its payload run
+        let data_len = 2 + 1 + 2 + blocks * block_len; // "c\0" keyword, method byte, zlib header
+        file.extend((4 + data_len as u32).to_be_bytes()); // chunk length covers type too
+        let crc_start = file.len();
+        file.extend_from_slice(b"iCCP");
+        file.extend_from_slice(b"c\x00"); // profile name (null-terminated) and…
+        file.push(0x00); // …its compression method: deflate
+        file.extend_from_slice(&[0x78, 0x9c]); // zlib header: deflate, 32K window, no dictionary
+        let run_start = file.len();
+        file.extend_from_slice(&[0x00, 0xff, 0xff, 0x00, 0x00]); // first stored block's header
+        file.resize(run_start + block_len, 0x00); // its 65535 zero bytes of payload
+        let mut run = block_len;
+        while run < blocks * block_len {
+            file.extend_from_within(run_start..run_start + run); // doubling keeps block alignment
+            run *= 2;
+        }
+        file.truncate(run_start + blocks * block_len);
+        let crc = crc32(&file[crc_start..]);
+        file.extend(crc.to_be_bytes());
+        file.extend_from_slice(&tail);
+        file
+    }
+
+    /// CRC-32 (the PNG variant) over a byte slice — the fixture's chunks need real checksums.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut table = [0u32; 256];
+        for (i, slot) in table.iter_mut().enumerate() {
+            let mut c = i as u32;
+            for _ in 0..8 {
+                *slot = if c & 1 != 0 {
+                    0xedb8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+                // Reusing `slot` as the running value across the eight rounds.
+                c = *slot;
+            }
+        }
+        let mut crc = 0xffff_ffffu32;
+        for &b in bytes {
+            crc = table[((crc ^ u32::from(b)) & 0xff) as usize] ^ (crc >> 8);
+        }
+        !crc
     }
 
     #[test]
