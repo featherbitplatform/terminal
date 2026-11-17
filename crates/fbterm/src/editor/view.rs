@@ -1,6 +1,6 @@
 //! The profile editor tab: profiles by group on the left, the selected one's form on the right.
 
-use fbterm_config::{AccentStyle, Rgb};
+use fbterm_config::{AccentStyle, Rgb, ValidationError};
 use iced::widget::{
     Space, button, column, container, pick_list, row, scrollable, text, text_input,
 };
@@ -561,6 +561,17 @@ fn accents<'a>(t: &'static Tokens, current: Option<Rgb>, editable: bool) -> Elem
     r.into()
 }
 
+/// The error lines the footer shows. Three or fewer all show; more show the first two and a
+/// count, so a long list of failures cannot push the footer out of shape.
+pub(super) fn error_lines(errors: &[ValidationError]) -> Vec<String> {
+    let shown = if errors.len() > 3 { 2 } else { 3 };
+    let mut lines: Vec<String> = errors.iter().take(shown).map(|e| e.to_string()).collect();
+    if errors.len() > shown {
+        lines.push(format!("{} more errors", errors.len() - shown));
+    }
+    lines
+}
+
 /// The buttons and messages under the form. `busy`: a saved-secret write of an editor save
 /// or duplicate runs, so Save and Duplicate wait.
 fn footer<'a>(
@@ -571,8 +582,8 @@ fn footer<'a>(
     scale: f32,
 ) -> Element<'a, Message> {
     let mut messages = column![].spacing(3).width(Length::Fill);
-    for e in &state.errors {
-        messages = messages.push(text(e.to_string()).font(UI_FONT).size(12).color(t.danger));
+    for line in error_lines(&state.errors) {
+        messages = messages.push(text(line).font(UI_FONT).size(12).color(t.danger));
     }
     if let Some(n) = &state.notice {
         messages = messages.push(
@@ -606,7 +617,6 @@ fn footer<'a>(
                 ui::ghost
             ),
             messages,
-            ui::text_button(t, "Close", Some(msg(EditorMsg::Close)), ui::secondary),
             ui::text_button(
                 t,
                 "Save",
