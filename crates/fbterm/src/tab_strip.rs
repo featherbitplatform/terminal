@@ -35,6 +35,9 @@ pub(crate) struct StripLayout {
     pub tab_w: f32,
     /// The strip's visible width.
     pub strip_w: f32,
+    /// Room cut off the strip's end so it shows whole tabs: empty bar between the strip and
+    /// what follows it, so the chevrons and the button group stay at the bar's end.
+    pub trim: f32,
     /// All the tabs' width side by side.
     pub content_w: f32,
     /// The tabs do not all fit in the strip: it scrolls.
@@ -58,6 +61,7 @@ pub(crate) fn strip_layout(
             tab_w: TAB_MAX_WIDTH,
             strip_w: content_width(TAB_MAX_WIDTH, count),
             content_w: content_width(TAB_MAX_WIDTH, count),
+            trim: 0.0,
             overflow: false,
             chevrons: false,
         };
@@ -95,7 +99,7 @@ pub(crate) fn strip_layout(
     // A scrolling strip shows whole tabs only, so both its ends land on tab edges: at either
     // end no tab is cut, and the active one never keeps the strip from reaching it
     // (`keep_whole`). The rest of the room stays empty bar.
-    let strip_w = if overflow && strip_w >= tab_w {
+    let whole = if overflow && strip_w >= tab_w {
         let pitch = tab_w + TAB_SPACING;
         ((strip_w + TAB_SPACING) / pitch + 1e-3).floor() * pitch - TAB_SPACING
     } else {
@@ -103,7 +107,8 @@ pub(crate) fn strip_layout(
     };
     StripLayout {
         tab_w,
-        strip_w,
+        strip_w: whole,
+        trim: strip_w - whole,
         content_w,
         overflow,
         chevrons,
@@ -566,11 +571,23 @@ mod tests {
     }
 
     #[test]
+    fn the_trim_keeps_the_group_at_the_end() {
+        // Resizing an overflowing bar moves the strip's end with the window, pixel for pixel.
+        let at = |width| layout(Chrome::Unified, Some(width), 30);
+        for width in [600.0, 637.0, 651.5, 700.0] {
+            let (a, b) = (at(width), at(width + 13.0));
+            assert!(a.overflow && b.overflow && a.trim >= 0.0, "{a:?}");
+            assert!(((b.strip_w + b.trim) - (a.strip_w + a.trim) - 13.0).abs() < 0.01);
+        }
+    }
+
+    #[test]
     fn clamp_offset_never_leaves_a_blank_strip() {
         let l = StripLayout {
             tab_w: 80.0,
             strip_w: 300.0,
             content_w: 420.0,
+            trim: 0.0,
             overflow: true,
             chevrons: true,
         };

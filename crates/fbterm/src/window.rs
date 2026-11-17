@@ -1001,7 +1001,7 @@ fn tab_bar<'a>(
     let tabs_bar = bar;
     let height = chrome.bar_height();
     let msg = move |m| Message::TabBar(window, m);
-    let mut bar = row![].spacing(2).align_y(Alignment::End);
+    let mut bar = row![].spacing(BAR_SPACING).align_y(Alignment::End);
     // With tabs on the left the bar lists none: no buttons, no hole, nothing to drag.
     let tabs: &[Tab] = if tabs_bar.tabs_in_bar { tabs } else { &[] };
     let trailing = trailing_width(tunnels_up, files.is_some());
@@ -1022,6 +1022,10 @@ fn tab_bar<'a>(
             ));
         }
         bar = bar.push(Viewport::new(tab_row.into(), strip.strip_w, offset));
+        // The room trimmed off the strip stays empty bar before the chevrons and the group.
+        if strip.trim > 0.5 {
+            bar = bar.push(iced::widget::Space::new().width((strip.trim - BAR_SPACING).max(0.0)));
+        }
     }
     if strip.chevrons {
         let max = strip.content_w - strip.strip_w;
@@ -2716,7 +2720,8 @@ mod tests {
             tabs: Vec<Rectangle>,
             /// The strip's bounds.
             strip: Rectangle,
-            /// The row's children after the strip: chevrons, then the buttons.
+            /// The row's children after the strip (the trim's spacer left out): chevrons, then
+            /// the buttons.
             rest: Vec<Rectangle>,
             controls: DrawnControls,
         }
@@ -2815,6 +2820,8 @@ mod tests {
                     .children()
                     .skip(usize::from(!tabs.is_empty()))
                     .map(|l| l.bounds())
+                    // The trim's spacer is empty bar, not a control.
+                    .filter(|r| r.height > 0.0)
                     .collect(),
                 controls,
             };
@@ -2925,6 +2932,29 @@ mod tests {
                 assert!(p.strip.x + p.strip.width <= p.rest[0].x, "{:?}", p.strip);
                 vec![]
             });
+        }
+
+        #[test]
+        fn the_group_stays_at_the_end_while_the_window_resizes() {
+            let tabs = many_tabs(40);
+            let group_end = |width: f32| {
+                let mut end = 0.0;
+                let _ = drive_full(Chrome::Unified, &tabs, None, Some(width), 0.0, |p| {
+                    let last = p.rest.last().unwrap();
+                    end = last.x + last.width;
+                    vec![]
+                });
+                end
+            };
+            // The strip's trim stays empty bar before the chevrons, so the group moves with the
+            // window's edge pixel for pixel instead of in tab-sized jumps.
+            let base = group_end(800.0);
+            for grow in [7.0, 31.0, 55.0] {
+                assert!(
+                    (group_end(800.0 + grow) - base - grow).abs() <= BAR_SPACING,
+                    "{grow}"
+                );
+            }
         }
 
         #[test]
