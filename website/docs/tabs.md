@@ -10,6 +10,8 @@ Every open session is a tab. A tab shows its profile's name (or the [name you ga
 
 Tabs sit along the top of the window, with the buttons for a new tab, Profiles, tunnels, the file panel and Settings after them. Click a tab to show it, its close button or a wheel click to close it, and drag a tab left or right to reorder it. Dragging a tab onto another tab's terminal merges it as a pane there; dragging a pane's handle onto the bar makes it a tab of its own (see [Moving tiles](tiling#moving-tiles)).
 
+When the tabs no longer fit, they shrink to 80 pixels each and then scroll sideways, while the buttons stay in view next to the last tab, or at the end of the free space once the bar is full. Scroll with the mouse wheel or trackpad over the tabs, or click the `<` and `>` buttons that appear before the buttons (each click moves by one tab; one is dimmed when no tabs are hidden on its side). The tab you select, or open, scrolls into view, and dragging a tab or a pane's handle near either end of the bar scrolls it so you can drop further along. A window too narrow to show even the buttons is the only case where they run out of room; with many tabs, the [tabs on the left](#tabs-on-the-left) list scrolls instead.
+
 ## Tabs on the left
 
 With many sessions open, a row of tabs runs out of room. Choose **Tabs: Left** in Settings (Appearance) or press `Cmd+Shift+B` (`Ctrl+Shift+B` on Linux and Windows) to list the tabs down the left side of every window instead. The palette offers the same as **Vertical tabs**, and `tab_bar = "left"` in [`settings.toml`](files#settingstoml) does the same by hand; `"top"` puts them back.
@@ -36,15 +38,28 @@ The name replaces the profile's name on the bar, and the program's title in the 
 
 The Profiles, Settings, Color schemes and Welcome tabs cannot be renamed. Only you can rename a tab: nothing a program in a terminal sends changes the name.
 
+## When a session ends
+
+When an SSH connection drops or fails, or a local program exits, the pane keeps its text and scrollback and shows a bar along its bottom saying why: `Disconnected (connection reset)`, `Could not connect: …` or `Process exited with code 1`. The bar has a **Reconnect** button for an SSH profile and **Restart** for a local one, with the shortcut beside it. The same line is written, dimmed, into the terminal, so the scrollback keeps a record of where the session ended.
+
+There are three ways back, and each continues in the same pane, below the old output:
+
+- Press `Enter` in the pane.
+- Click **Reconnect** (or **Restart**) on the bar. It brings back that pane only.
+- Press `Cmd+Shift+O` (`Ctrl+Shift+O` on Linux and Windows), or choose **Reconnect** from the [tab menu](#the-tab-menu). Both bring back every ended pane of the tab at once, so a split tab whose panes all lost the same server comes back in one step. Panes that are still connected are left alone. The palette lists it as **Reconnect** too.
+
+The tab's **With the shell** [tunnels](tunnels) start again once the shell is back. Nothing a program in a terminal sends can reconnect or restart a session.
+
 ## The tab menu
 
 Right-click a tab, on the bar or in the column, for a small menu:
 
+- **Reconnect** brings back every pane of the tab whose session ended; see [When a session ends](#when-a-session-ends). It appears only when one did, and reads **Restart** when only local programs exited.
 - **Rename tab** opens the field described in [Renaming a tab](#renaming-a-tab). It is not offered for the Profiles, Settings, Color schemes and Welcome tabs.
 - **Copy password** puts the saved password of the tab's SSH profile on the clipboard. It appears only for an SSH profile that logs in with a password, and copies only what is saved: nothing is asked for, and nothing is read from the running session. See [Copying a password](saved-secrets#copying-a-password) for what happens when no password is saved, when the vault is locked, and how the clipboard is cleared afterwards.
 - **Close tab** does what the tab's close button does, asking first when the tab has several live panes.
 
-Each item shows its shortcut when the key would do the same thing: the menu of the active tab shows `Cmd+Shift+R` (`Ctrl+Shift+R`) beside **Rename tab**, `Cmd+Shift+K` (`Ctrl+Shift+K`) beside **Copy password**, and `Cmd+W` (`Ctrl+Shift+W`) beside **Close tab** when the tab has one pane (with several, the key closes only the focused pane). The menu of another tab shows no shortcuts, because the keys act on the active tab.
+Each item shows its shortcut when the key would do the same thing: the menu of the active tab shows `Cmd+Shift+R` (`Ctrl+Shift+R`) beside **Rename tab**, `Cmd+Shift+K` (`Ctrl+Shift+K`) beside **Copy password**, `Cmd+Shift+O` (`Ctrl+Shift+O`) beside **Reconnect** or **Restart**, and `Cmd+W` (`Ctrl+Shift+W`) beside **Close tab** when the tab has one pane (with several, the key closes only the focused pane). The menu of another tab shows no shortcuts, because the keys act on the active tab.
 
 A right-click never selects the tab. Only your own right-click opens the menu: nothing a program in a terminal sends can.
 

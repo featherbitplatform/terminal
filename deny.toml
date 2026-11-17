@@ -33,6 +33,9 @@ ignore = [
     # keys work. Exposure is limited to signing the auth request with a local RSA user key once
     # per connection, which gives a network observer one timing sample per login.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA user/host keys needed, see comment" },
+    # chrono is unmaintained (no vulnerability); russh and russh-sftp depend on it, so dropping our
+    # own use would not remove it. Revisit when they move to jiff or time.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, not vulnerable; pulled in by russh and russh-sftp" },
 ]
 
 [bans]
