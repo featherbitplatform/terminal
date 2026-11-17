@@ -124,6 +124,7 @@ impl App {
     pub(crate) fn new_terminal(&self, grid: GridSize) -> SharedTerminal {
         let mut term = Terminal::new(grid, self.settings.scrollback_lines);
         term.set_kitty_keyboard(self.settings.kitty_keyboard);
+        term.set_images(self.settings.inline_images, self.settings.scrollback_images);
         term.set_grapheme_clusters(self.settings.grapheme_clusters);
         term.set_history_compression(self.settings.history_compression_keep());
         term.reset_grapheme_clusters();

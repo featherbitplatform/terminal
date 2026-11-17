@@ -534,6 +534,54 @@ fn kitty_keyboard_setting_reaches_open_and_new_terminals() {
     assert!(!open(&app).lock().kitty_keyboard());
 }
 
+/// The picture settings reach a terminal built for a new pane and every open one, both switches
+/// together (the `kitty_keyboard` pattern).
+#[test]
+fn image_settings_reach_open_and_new_terminals() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let open = |app: &App| {
+        app.windows.values().next().unwrap().tabs[0]
+            .terminal()
+            .cloned()
+            .expect("started tab has a terminal")
+    };
+    assert!(app.settings.inline_images, "pictures show by default");
+    assert!(
+        !app.settings.scrollback_images,
+        "scrollback pictures are off by default"
+    );
+    assert!(open(&app).lock().images_enabled());
+    assert!(!open(&app).lock().scrollback_images());
+    let changed = Changed {
+        profiles: false,
+        settings: true,
+        schemes: false,
+    };
+    std::fs::write(
+        paths.settings(),
+        "inline_images = false\nscrollback_images = true\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert!(!open(&app).lock().images_enabled(), "open terminal updated");
+    assert!(open(&app).lock().scrollback_images());
+    let grid = open(&app).lock().size();
+    let fresh = app.new_terminal(grid);
+    assert!(
+        !fresh.lock().images_enabled(),
+        "a new pane's terminal gets both switches"
+    );
+    assert!(fresh.lock().scrollback_images());
+}
+
 #[test]
 fn out_of_range_settings_apply_clamped_and_say_so() {
     let paths = paths_with(&[profile("a")]);

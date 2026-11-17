@@ -309,6 +309,9 @@ impl Feeder {
                     }
                 }
                 TermEvent::Exit => {}
+                // Pictures are for the image store to take; nothing decodes or draws them here,
+                // and no reply belongs to one until its decode result goes back to the terminal.
+                TermEvent::ImageReceived { .. } | TermEvent::ImageReleased(_) => {}
             }
         }
         self.mark_dirty();

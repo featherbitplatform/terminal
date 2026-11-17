@@ -14,6 +14,7 @@ use crate::Selection;
 use feathercritty::index::Side;
 use feathercritty::selection::{Selection as EmuSelection, SelectionType};
 
+pub use feathercritty::event::{ImageData, ImageKey};
 pub use feathercritty::term::TermMode;
 
 /// Terminal size in cells plus the pixel size of one cell.
@@ -33,6 +34,16 @@ pub enum TermEvent {
     /// Replies (device attributes, status reports, ...) that must be written back to the session.
     PtyWrite(Vec<u8>),
     Exit,
+    /// A picture a program sent: the emulator parsed it, the host decodes (if needed) and draws
+    /// it. `key` names it from then on, and an `Encoded` payload is answered once the host
+    /// reports its decode result to the emulator.
+    ImageReceived {
+        key: ImageKey,
+        data: ImageData,
+    },
+    /// Nothing references this picture any more, so the host frees its copy. Raised exactly once
+    /// per key, when its last placement, placeholder or stored reference is gone.
+    ImageReleased(ImageKey),
 }
 
 struct Shared {
@@ -132,6 +143,9 @@ impl EventListener for EventProxy {
             }
             // Never read the clipboard on behalf of the program: reply with an empty payload.
             Event::ClipboardLoad(_, fmt) => TermEvent::PtyWrite(fmt("").into_bytes()),
+            // Pictures are the host's to decode and draw; releases tell it when to let go.
+            Event::ImageReceived { key, data } => TermEvent::ImageReceived { key, data },
+            Event::ImageReleased(key) => TermEvent::ImageReleased(key),
             _ => return,
         };
         sh.events.push(mapped);
@@ -168,6 +182,12 @@ pub struct Terminal {
     config: Config,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
+    /// The `inline_images` setting: whether pictures programs send are shown at all. The emulator
+    /// starts with image support on, like the default here.
+    images_enabled: bool,
+    /// The `scrollback_images` setting: whether a picture stays when its rows have all scrolled
+    /// off the screen. Off, like the default, it becomes a placeholder line and is released.
+    scrollback_images: bool,
     pub(crate) generation: u64,
     /// Calls of [`Terminal::drop_history_cache`] (tests: the read cache itself is not visible
     /// outside feathercritty).
@@ -201,6 +221,8 @@ impl Terminal {
             config,
             parser: Processor::new(),
             shared,
+            images_enabled: true,
+            scrollback_images: false,
             generation: 0,
             #[cfg(test)]
             cache_drops: 0,
@@ -326,6 +348,39 @@ impl Terminal {
         self.config.kitty_keyboard
     }
 
+    /// Show pictures programs send (`enabled`), and whether a picture whose rows have all scrolled
+    /// off the screen stays in the history or becomes a line saying how big it was
+    /// (`keep_scrollback`).
+    ///
+    /// Switching `enabled` off drops everything the emulator already stored or displayed: each
+    /// picture on screen gets one [`TermEvent::ImageReleased`] and its cells are freed; programs'
+    /// picture sequences are consumed and answered as unsupported from then on. Switching it back
+    /// on does not bring the pictures back. Unlike [`Terminal::set_kitty_keyboard`], nothing is
+    /// re-announced here, so no title event needs dropping.
+    pub fn set_images(&mut self, enabled: bool, keep_scrollback: bool) {
+        if self.images_enabled != enabled {
+            self.images_enabled = enabled;
+            self.term.set_images_enabled(enabled);
+            self.generation += 1;
+        }
+        if self.scrollback_images != keep_scrollback {
+            self.scrollback_images = keep_scrollback;
+            self.term.set_scrollback_images(keep_scrollback);
+            self.generation += 1;
+        }
+    }
+
+    /// Whether pictures programs send are shown (the `inline_images` setting).
+    pub fn images_enabled(&self) -> bool {
+        self.images_enabled
+    }
+
+    /// Whether pictures stay when their rows scroll off the screen (the `scrollback_images`
+    /// setting).
+    pub fn scrollback_images(&self) -> bool {
+        self.scrollback_images
+    }
+
     /// Start with grapheme clusters on (DEC private mode 2027) after a reset or a restart. This
     /// only sets the default: the mode a running program has is never flipped. Like
     /// [`Terminal::set_kitty_keyboard`], the title the emulator re-announces is discarded.
@@ -392,6 +447,14 @@ impl Terminal {
     pub fn resize(&mut self, size: GridSize) {
         self.shared.lock().size = size;
         self.term.resize(dims(size));
+        self.generation += 1;
+    }
+
+    /// The physical pixel size of one text cell. Placements convert pixels to cells with it, and
+    /// `CSI 14 t` / `CSI 16 t` answer from it, so programs that size their output by the cell see
+    /// what is drawn. Each axis is clamped to at least 1 by the emulator.
+    pub fn set_cell_pixel_size(&mut self, width: u32, height: u32) {
+        self.term.set_cell_pixel_size(width, height);
         self.generation += 1;
     }
 
@@ -861,6 +924,59 @@ mod tests {
         // Main screen holds 40 * 128 = 5120 pushes, capped at 4096.
         assert!(flags_after_popping(&mut t, 4095));
         assert!(!flags_after_popping(&mut t, 1));
+    }
+
+    /// A sixel on screen, then the setting switched off: the placement is gone at once and its
+    /// image released exactly once; switching it back on does not bring it back.
+    #[test]
+    fn switch_off_clears_images() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        // Cells of 8x16 px: the picture below covers one cell.
+        t.set_cell_pixel_size(8, 16);
+        assert!(t.images_enabled(), "on by default");
+        // A red 4x12 px sixel: four painted columns, then a second band of four.
+        t.feed(b"\x1bPq#0;2;100;0;0#0~~~~-~~~~\x1b\\");
+        let keys: Vec<ImageKey> = t
+            .take_events()
+            .iter()
+            .filter_map(|e| match e {
+                TermEvent::ImageReceived { key, data } => {
+                    match data {
+                        ImageData::Rgba { width, height, .. } => {
+                            assert_eq!((*width, *height), (4, 12))
+                        }
+                        ImageData::Encoded { .. } => panic!("a sixel's pixels arrive decoded"),
+                    }
+                    Some(*key)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "one picture arrives");
+        let key = keys[0];
+        assert_eq!(
+            t.term().visible_placements().len(),
+            1,
+            "and it is on screen"
+        );
+        t.set_images(false, false);
+        assert!(!t.images_enabled());
+        assert!(!t.scrollback_images());
+        assert!(
+            t.term().visible_placements().is_empty(),
+            "switching off clears what is on screen"
+        );
+        assert_eq!(
+            t.take_events(),
+            vec![TermEvent::ImageReleased(key)],
+            "the picture is released exactly once"
+        );
+        t.set_images(true, false);
+        assert!(
+            t.term().visible_placements().is_empty(),
+            "switching back on does not resurrect it"
+        );
+        assert!(t.take_events().is_empty());
     }
 
     #[test]

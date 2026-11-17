@@ -342,6 +342,11 @@ impl App {
     /// see [`SettingsSource`]).
     /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
     /// protocol flags programs have set, turning it on affects their requests from then on.
+    /// `inline_images` shows or drops pictures in every open terminal at once: off clears what is
+    /// on screen there and then (each picture released), and programs get "not supported" from
+    /// then on; on again does not bring the pictures back. `scrollback_images` decides whether a
+    /// picture whose rows have all scrolled off the screen stays or becomes a line saying how big
+    /// it was, and only counts while `inline_images` is on.
     /// `grapheme_clusters` becomes every open terminal's default for mode 2027, used by new
     /// terminals and after a reset or restart; a running program's mode is never flipped.
     /// `color_scheme` recolors the open panes that follow it (those without a scheme of their
@@ -385,6 +390,23 @@ impl App {
             for pane in panes {
                 if let Some(term) = pane.terminal() {
                     term.lock().set_kitty_keyboard(new.kitty_keyboard);
+                }
+            }
+        }
+        // Either switch reaches every open terminal: the pair goes to `set_images` together so a
+        // terminal never sees one half of a change it has to guess the other half of.
+        if new.inline_images != self.settings.inline_images
+            || new.scrollback_images != self.settings.scrollback_images
+        {
+            let panes = self
+                .windows
+                .values()
+                .flat_map(|w| &w.tabs)
+                .flat_map(|t| &t.panes);
+            for pane in panes {
+                if let Some(term) = pane.terminal() {
+                    term.lock()
+                        .set_images(new.inline_images, new.scrollback_images);
                 }
             }
         }
