@@ -13,7 +13,7 @@ mod store;
 
 pub use decode::{DecodeError, Rgba8Image, decode};
 pub use resample::{fit_size, is_integer_multiple, resample};
-pub use store::{ImageStore, Lookup, OwnerHooks, ResampledImage, store};
+pub use store::{ImageStore, Lookup, OwnerHooks, ResampledImage, reclaim, store};
 
 // The emulator's image vocabulary, re-exported so hosts route `TermEvent::ImageReceived` and
 // answer decode results without depending on feathercritty directly.

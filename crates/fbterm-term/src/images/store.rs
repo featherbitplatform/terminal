@@ -100,6 +100,15 @@ struct Entry {
     shown: u64,
     resamples: HashMap<(u32, u32), Slot>,
     resample_bytes: usize,
+    /// Exact identity of this entry: jobs carry the serial of the submit they came from, and an
+    /// answer is only delivered for the entry it belongs to (see [`Job::Refuse`]'s rule).
+    serial: u64,
+    /// An `Encoded` submit owes the emulator exactly one `image_decoded` call. feathercritty holds
+    /// the client's reply and one of its 64 pending-decode slots until it arrives, so every key
+    /// must be answered exactly once even when the caps get in the way: the decode result, or a
+    /// refusal queued in its place (see [`Job::Refuse`]). `release` and `drop_owner` clear it
+    /// silently because nothing waits anymore — the terminal is gone or has forgotten the image.
+    owes_reply: bool,
 }
 
 impl Entry {
@@ -110,6 +119,50 @@ impl Entry {
             State::Evicted => 0,
         };
         base + self.resample_bytes
+    }
+}
+
+/// Buffers and jobs taken out of the store while its mutex was held. A few hundred MiB of pixel
+/// buffers and up to 16 MiB of queued payloads are freed *after* the lock is released, so dropping
+/// them cannot stall a draw-path `get`.
+#[derive(Default)]
+struct Freed {
+    jobs: Vec<Job>,
+    entries: Vec<Entry>,
+    images: Vec<Arc<Rgba8Image>>,
+    copies: Vec<Arc<ResampledImage>>,
+}
+
+impl Freed {
+    fn take_jobs(inner: &mut Inner, keep: impl Fn(&Job) -> bool, freed: &mut Freed) {
+        let mut kept = VecDeque::with_capacity(inner.jobs.len());
+        while let Some(job) = inner.jobs.pop_front() {
+            if keep(&job) {
+                kept.push_back(job);
+            } else {
+                freed.jobs.push(job);
+            }
+        }
+        inner.jobs = kept;
+    }
+
+    /// Everything an entry held, ready to drop outside the lock.
+    fn drain_entry(&mut self, entry: Entry) {
+        for (_, slot) in entry.resamples {
+            if let Slot::Ready(_, out) = slot {
+                self.copies.push(out);
+            }
+        }
+        self.entries.push(entry);
+    }
+
+    /// The pixel buffers of one evicted image, leaving its (now `Evicted`) entry in place.
+    fn drain_resamples(&mut self, resamples: HashMap<(u32, u32), Slot>) {
+        for (_, slot) in resamples {
+            if let Slot::Ready(_, out) = slot {
+                self.copies.push(out);
+            }
+        }
     }
 }
 
@@ -130,10 +183,22 @@ struct OwnerEntry {
 
 /// One unit of worker-thread work. Queued jobs keep the payload or source they need, so running
 /// them touches no lock until the result comes back.
+///
+/// **Exactly-once rule for an `Encoded` key's answer** (feathercritty waits for one
+/// `image_decoded` per encoded transmission): every entry that owes one carries `owes_reply`, and
+/// whichever job claims it first delivers it — a claim is only honored when the job's `serial`
+/// still matches the entry's, so an answer from a replaced entry never lands. When the caps evict
+/// a key whose decode has not run yet, `evict_image` replaces its queued `Decode` with a `Refuse`;
+/// when the decode is already running it queues a `Refuse` as well, and then exactly one of the
+/// two claims: usually the running decode does (it finds the entry `Evicted` and answers
+/// `TooLarge`) and the `Refuse` sees the obligation gone — but if the worker happens to run the
+/// `Refuse` first, that one answers and the decode result is dropped. A key is never answered
+/// twice, and never left unanswered.
 enum Job {
     Decode {
         owner: u64,
         key: ImageKey,
+        serial: u64,
         data: ImageData,
     },
     Resample {
@@ -142,6 +207,14 @@ enum Job {
         target: (u32, u32),
         integer: bool,
         src: Arc<Rgba8Image>,
+    },
+    /// Answer an evicted key `Err(TooLarge)` on the worker, through the same path a decode result
+    /// takes. Queued by `evict_image` in place of (or besides) the decode it removed; see the
+    /// exactly-once rule above.
+    Refuse {
+        owner: u64,
+        key: ImageKey,
+        serial: u64,
     },
 }
 
@@ -204,29 +277,42 @@ impl ImageStore {
         entry.hooks = Some(hooks);
     }
 
-    /// Forget everything one terminal had, including queued work. Called from `Terminal::drop`.
+    /// Forget everything one terminal had, including queued work. Called from `Terminal::drop`,
+    /// so nothing is answered: the terminal — and every client waiting on it — is gone.
     pub fn drop_owner(&self, owner: u64) {
-        let mut inner = self.inner.lock();
-        if let Some(entry) = inner.owners.remove(&owner) {
-            inner.total -= entry.bytes;
+        let mut freed = Freed::default();
+        // The session hooks die with the owner; they are dropped after the lock too (they hold the
+        // session's senders, never the terminal, but nothing belongs inside a short section).
+        let mut hooks = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            if let Some(entry) = inner.owners.remove(&owner) {
+                inner.total -= entry.bytes;
+                hooks.extend(entry.hooks);
+                for (_, image) in entry.images {
+                    freed.drain_entry(image);
+                }
+            }
+            Freed::take_jobs(&mut inner, |job| job_owner(job) != owner, &mut freed);
+            Self::check_idle(&inner, &self.idle);
         }
-        inner.jobs.retain(|job| job_owner(job) != owner);
-        Self::check_idle(&inner, &self.idle);
     }
 
     /// Take ownership of one image payload the terminal handed over.
     ///
     /// `Rgba` pixels (sixel output, raw kitty RGB/RGBA) are stored directly: the terminal decoded
-    /// them and already answered the client, so no decode job and no callback follow. `Encoded`
-    /// payloads queue a decode on the worker; its result goes back to the terminal through the
-    /// owner's hooks, which is what answers a kitty client waiting for `OK` or an error.
+    /// them and already answered the client, so no decode job and no callback follow. A payload
+    /// whose byte count does not match its declared dimensions is dropped — a 0-wide or truncated
+    /// frame has nothing to draw and would only poison the resample path. `Encoded` payloads queue
+    /// a decode on the worker; its result goes back to the terminal through the owner's hooks,
+    /// which is what answers a kitty client waiting for `OK` or an error.
     ///
     /// A submit may push the caps over on purpose: it does not evict anything itself (the session
     /// first gets its chance to reclaim scrollback properly — see [`Self::over_cap`] and
-    /// [`Self::enforce_caps`]). Decode completions, which have no session in the loop, enforce
-    /// directly.
+    /// [`crate::images::reclaim`]). Decode completions run the same reclaim themselves.
     pub fn submit(&self, owner: u64, key: ImageKey, data: ImageData) {
         let stamp = self.next_stamp();
+        let serial = self.next_stamp();
         let mut inner = self.inner.lock();
         // Each branch mutates the owner entry first and only then touches `inner` again: the
         // entry's borrow ends with its last use, so the totals can be adjusted afterwards.
@@ -236,6 +322,10 @@ impl ImageStore {
             pixels,
         } = data
         {
+            if width == 0 || height == 0 || pixels.len() != (width as usize) * (height as usize) * 4
+            {
+                return; // malformed for its declared size: store nothing, answer nothing
+            }
             let img = Arc::new(Rgba8Image {
                 width,
                 height,
@@ -243,7 +333,8 @@ impl ImageStore {
             });
             let bytes = img.bytes();
             let entry = inner.owners.entry(owner).or_insert_with(new_owner);
-            // A key replaced (the emulator never reuses one; defensive anyway).
+            // A key replaced (the emulator never reuses one; defensive anyway): the old entry's
+            // buffers go after the lock, and its owed reply — if any — goes with it.
             let gone = entry
                 .images
                 .insert(
@@ -253,9 +344,15 @@ impl ImageStore {
                         shown: stamp,
                         resamples: HashMap::new(),
                         resample_bytes: 0,
+                        serial,
+                        owes_reply: false,
                     },
                 )
-                .map(|old| old.accounted())
+                .map(|old| {
+                    let accounted = old.accounted();
+                    drop(old);
+                    accounted
+                })
                 .unwrap_or(0);
             entry.bytes = entry.bytes - gone + bytes;
             inner.total = inner.total - gone + bytes;
@@ -275,13 +372,24 @@ impl ImageStore {
                     shown: stamp,
                     resamples: HashMap::new(),
                     resample_bytes: 0,
+                    serial,
+                    owes_reply: true,
                 },
             )
-            .map(|old| old.accounted())
+            .map(|old| {
+                let accounted = old.accounted();
+                drop(old);
+                accounted
+            })
             .unwrap_or(0);
         entry.bytes = entry.bytes - gone + payload;
         inner.total = inner.total - gone + payload;
-        inner.jobs.push_back(Job::Decode { owner, key, data });
+        inner.jobs.push_back(Job::Decode {
+            owner,
+            key,
+            serial,
+            data,
+        });
         drop(inner);
         self.wake.notify_one();
         self.start_global_worker();
@@ -289,19 +397,23 @@ impl ImageStore {
 
     /// Forget one image entirely (its [`TermEvent::ImageReleased`]). Idempotent: the terminal also
     /// releases keys that scrollback eviction or a failed decode already dropped from the store,
-    /// and a second release of the same key must stay harmless.
+    /// and a second release of the same key must stay harmless. Nothing is answered for a released
+    /// key: the terminal has forgotten it, client included.
     pub fn release(&self, owner: u64, key: ImageKey) {
-        let mut inner = self.inner.lock();
-        let Some(entry) = inner.owners.get_mut(&owner) else {
-            return;
-        };
-        if let Some(image) = entry.images.remove(&key) {
-            let gone = image.accounted();
-            entry.bytes -= gone;
-            inner.total -= gone;
+        let mut freed = Freed::default();
+        {
+            let mut inner = self.inner.lock();
+            if let Some(entry) = inner.owners.get_mut(&owner)
+                && let Some(image) = entry.images.remove(&key)
+            {
+                let gone = image.accounted();
+                entry.bytes -= gone;
+                inner.total -= gone;
+                freed.drain_entry(image);
+            }
+            Freed::take_jobs(&mut inner, |job| !job_is(job, owner, key), &mut freed);
+            Self::check_idle(&inner, &self.idle);
         }
-        inner.jobs.retain(|job| !job_is(job, owner, key));
-        Self::check_idle(&inner, &self.idle);
     }
 
     /// Ask for a resample of `key` covering `span` cells of `cell_px` logical pixels at the
@@ -319,6 +431,8 @@ impl ImageStore {
         scale_bits: u32,
     ) -> Lookup {
         let box_px = placement_box(cell_px, span, scale_bits);
+        // Declared before the lock guard so everything it collects is freed after the mutex goes.
+        let mut freed = Freed::default();
         let mut inner = self.inner.lock();
         let Some(owner_entry) = inner.owners.get_mut(&owner) else {
             return Lookup::Unknown;
@@ -342,6 +456,27 @@ impl ImageStore {
         }
         let integer = is_integer_multiple(src.width, src.height, target.0, target.1);
         image.resamples.insert(target, Slot::Queued);
+        // A new size supersedes this picture's other cached sizes: a drawer that moved to another
+        // box (a font zoom, another display) has no use for the copy made for the old one, so it
+        // goes here rather than waiting for the caps to notice. Copies whose resample is still
+        // queued stay — their job installs and enforcement handles them then.
+        let stale: Vec<(u32, u32)> = image
+            .resamples
+            .iter()
+            .filter(|(size, slot)| **size != target && matches!(slot, Slot::Ready(..)))
+            .map(|(size, _)| *size)
+            .collect();
+        let mut superseded = 0usize;
+        for size in stale {
+            if let Some(Slot::Ready(_, out)) = image.resamples.remove(&size) {
+                superseded += out.bytes();
+                freed.copies.push(out);
+            }
+        }
+        if superseded > 0 {
+            image.resample_bytes -= superseded;
+            owner_entry.bytes -= superseded;
+        }
         inner.jobs.push_back(Job::Resample {
             owner,
             key,
@@ -350,6 +485,7 @@ impl ImageStore {
             src,
         });
         drop(inner);
+        drop(freed);
         self.wake.notify_one();
         self.start_global_worker();
         Lookup::Pending
@@ -380,14 +516,17 @@ impl ImageStore {
     /// images, then other owners' resamples, then their whole images. Whole images become
     /// [`Lookup::Evicted`] for later draws; released keys stay gone entirely.
     pub fn enforce_caps(&self, owner: u64) {
-        let mut inner = self.inner.lock();
-        while Self::over(&inner, owner) {
-            let dropped = evict_resample(&mut inner, owner, Scope::Own)
-                || evict_image(&mut inner, owner, Scope::Own)
-                || evict_resample(&mut inner, owner, Scope::Others)
-                || evict_image(&mut inner, owner, Scope::Others);
-            if !dropped {
-                break; // nothing left to drop; cannot happen while a cap is over, but never loop on it
+        let mut freed = Freed::default();
+        {
+            let mut inner = self.inner.lock();
+            while Self::over(&inner, owner) {
+                let dropped = evict_resample(&mut inner, owner, Scope::Own, &mut freed)
+                    || evict_image(&mut inner, owner, Scope::Own, &mut freed)
+                    || evict_resample(&mut inner, owner, Scope::Others, &mut freed)
+                    || evict_image(&mut inner, owner, Scope::Others, &mut freed);
+                if !dropped {
+                    break; // nothing left to drop; cannot happen while a cap is over, but never loop on it
+                }
             }
         }
     }
@@ -521,10 +660,15 @@ impl ImageStore {
 
     fn run_job(&self, job: Job) {
         match job {
-            Job::Decode { owner, key, data } => {
+            Job::Decode {
+                owner,
+                key,
+                serial,
+                data,
+            } => {
                 let hook = self.decode_hook.lock().clone();
                 let result = decode::decode_with(&data, hook.as_ref());
-                self.finish_decode(owner, key, result);
+                self.finish_decode(owner, key, serial, result);
             }
             Job::Resample {
                 owner,
@@ -536,58 +680,135 @@ impl ImageStore {
                 let out = resample(&src, target, integer);
                 self.finish_resample(owner, key, target, out);
             }
+            Job::Refuse { owner, key, serial } => self.finish_refusal(owner, key, serial),
         }
     }
 
-    /// Install a decode result and answer the terminal. Lock order: store first (short), released
+    /// Install a decode result and answer for its key. Lock order: store first (short), released
     /// before the terminal lock; hooks run with no lock held at all.
-    fn finish_decode(&self, owner: u64, key: ImageKey, result: Result<Rgba8Image, DecodeError>) {
-        let answer = match &result {
-            Ok(_) => Ok(()),
-            Err(e) => Err(ImageDecodeError::from(*e)),
-        };
-        let hooks = {
+    fn finish_decode(
+        &self,
+        owner: u64,
+        key: ImageKey,
+        serial: u64,
+        result: Result<Rgba8Image, DecodeError>,
+    ) {
+        // Which answer, if any, this job still owns (see the exactly-once rule on [`Job`]).
+        enum Claim {
+            /// Still this job's pending decode: install the result and answer with it.
+            Decode(usize),
+            /// The caps evicted the entry while the decode ran: answer `TooLarge`, drop the buffer.
+            Refusal,
+        }
+        let delivery = {
             let mut inner = self.inner.lock();
-            // What the queued payload was holding; `None` means the key was released or evicted
-            // mid-decode and this result is no longer wanted.
-            let payload = inner
+            let claim = inner
                 .owners
-                .get_mut(&owner)
-                .and_then(|e| e.images.get_mut(&key))
-                .and_then(|image| match &image.state {
-                    State::Pending(payload) => Some(*payload),
-                    _ => None,
+                .get(&owner)
+                .and_then(|entry| entry.images.get(&key))
+                .filter(|image| image.serial == serial && image.owes_reply)
+                .map(|image| match image.state {
+                    State::Pending(payload) => Claim::Decode(payload),
+                    _ => Claim::Refusal,
                 });
-            let Some(payload) = payload else {
-                return;
+            let Some(claim) = claim else {
+                return; // released, replaced, or a `Refuse` answered it first: nothing to do
             };
-            let decoded = result.as_ref().map_or(0, |img| img.bytes());
+            let answer: Result<(), ImageDecodeError> = match &claim {
+                Claim::Decode(_) => match &result {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(ImageDecodeError::from(*e)),
+                },
+                Claim::Refusal => Err(ImageDecodeError::TooLarge),
+            };
+            let decoded = match &claim {
+                Claim::Decode(_) => result.as_ref().map_or(0, |img| img.bytes()),
+                Claim::Refusal => 0,
+            };
+            // The result is dropped unused on a refusal: the payload's bytes went when it was
+            // evicted, and this buffer has no place left to live in.
+            let mut delta = (0usize, 0usize); // (bytes released, bytes installed)
             let hooks = inner.owners.get_mut(&owner).map(|entry| {
-                if let Some(image) = entry.images.get_mut(&key) {
-                    image.state = match result {
-                        Ok(img) => State::Ready(Arc::new(img)),
-                        // A corrupt or oversized payload: the key stays known as evicted until
-                        // its release arrives, so draws answer `Evicted` rather than waiting.
-                        Err(_) => State::Evicted,
+                if let Some(image) = entry.images.get_mut(&key)
+                    && image.serial == serial
+                    && image.owes_reply
+                {
+                    image.owes_reply = false; // claimed: no `Refuse` job will answer this key
+                    delta = match claim {
+                        Claim::Decode(payload) => {
+                            image.state = match result {
+                                Ok(img) => State::Ready(Arc::new(img)),
+                                // A corrupt or oversized payload: the key stays known as evicted
+                                // until its release arrives, so draws answer `Evicted`.
+                                Err(_) => State::Evicted,
+                            };
+                            (payload, decoded)
+                        }
+                        Claim::Refusal => (0, 0),
                     };
-                    entry.bytes = entry.bytes - payload + decoded;
+                    entry.bytes = entry.bytes - delta.0 + delta.1;
                 }
                 entry
                     .hooks
                     .as_ref()
                     .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()))
             });
-            inner.total = inner.total - payload + decoded;
-            hooks.flatten()
+            inner.total = inner.total - delta.0 + delta.1;
+            hooks.flatten().map(|hooks| (answer, hooks))
         };
-        // The new buffer may have crossed a cap with nobody in a session loop to notice: enforce
-        // here (store-internal drops only — no terminal is locked under this lock).
-        self.enforce_caps(owner);
-        // Lock order, part two: the terminal is locked with the store mutex NOT held. A dropped
-        // terminal means nothing and nobody to answer.
-        let Some((term, on_events, wake)) = hooks else {
+        let Some((answer, hooks)) = delivery else {
             return;
         };
+        self.deliver(owner, key, answer, hooks);
+    }
+
+    /// Answer a key the caps evicted before its decode could run: `Err(TooLarge)`, through the
+    /// same path a decode result takes. The client gets its `ENOMEM` and the emulator frees the
+    /// pending-decode slot and placements it was holding for the image.
+    fn finish_refusal(&self, owner: u64, key: ImageKey, serial: u64) {
+        let hooks = {
+            let mut inner = self.inner.lock();
+            inner
+                .owners
+                .get_mut(&owner)
+                .map(|entry| {
+                    if let Some(image) = entry.images.get_mut(&key)
+                        && image.serial == serial
+                        && image.owes_reply
+                    {
+                        image.owes_reply = false; // claimed: the decode result will not answer
+                        entry
+                            .hooks
+                            .as_ref()
+                            .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()))
+                    } else {
+                        // Its running decode answered first, or the key is gone: nothing waits.
+                        None
+                    }
+                })
+                .flatten()
+                .flatten()
+        };
+        let Some(hooks) = hooks else { return };
+        self.deliver(owner, key, Err(ImageDecodeError::TooLarge), hooks);
+    }
+
+    /// Hand one decode answer to the terminal and its session. No store lock is held here: the
+    /// caps are reclaimed first (scrollback first, exactly as after a submit — see [`reclaim`]),
+    /// then the terminal is locked briefly to answer, then the hooks run with nothing held. A
+    /// dropped terminal means nobody waits, so it gets nothing.
+    fn deliver(
+        &self,
+        owner: u64,
+        key: ImageKey,
+        answer: Result<(), ImageDecodeError>,
+        (term, on_events, wake): (
+            Weak<Mutex<Terminal>>,
+            Arc<dyn Fn(Vec<TermEvent>) + Send + Sync>,
+            Arc<dyn Fn() + Send + Sync>,
+        ),
+    ) {
+        reclaim(self, &term, owner);
         let Some(term) = term.upgrade() else { return };
         let events = {
             let mut guard = term.lock();
@@ -636,10 +857,40 @@ impl ImageStore {
             inner.total += bytes;
             wake.flatten()
         };
+        // Resampled bytes count against the caps too, so they are enforced here: this copy carries
+        // the newest stamp, so what goes first is an older copy (or an older picture), never the
+        // one just asked for. A copy that cannot fit beside its own source is dropped and re-made
+        // on the next draw — bounded work per frame, and the caps hold without any image traffic.
+        self.enforce_caps(owner);
         if let Some(wake) = wake {
             wake();
         }
     }
+}
+
+/// Reclaim one owner's image memory in the order spec 6.3 lays down: its terminal's scrollback
+/// first — each evicted placement becomes a placeholder line and releases its image outright,
+/// which is handed back to the store — and only when that runs dry do the store's own buffers go.
+///
+/// Lock order: call this with neither the store mutex nor a terminal lock held. It locks one
+/// terminal at a time and lets go before touching the store, so it keeps the rule that the store
+/// never locks a terminal under its own mutex. Both the session router (after a submit) and the
+/// image worker (when a decode or a refusal finishes) call it, which is what makes "scrollback
+/// first" hold however the bytes grew. The terminal also emits `ImageReleased` for each eviction;
+/// [`ImageStore::release`] absorbs the duplicate.
+pub fn reclaim(store: &ImageStore, term: &Weak<Mutex<Terminal>>, owner: u64) {
+    while store.over_cap(owner) {
+        let Some(term) = term.upgrade() else {
+            break; // the pane is gone; its whole share goes with it in `drop_owner`
+        };
+        let evicted = term.lock().evict_oldest_scrollback_image();
+        drop(term);
+        let Some(key) = evicted else {
+            break; // scrollback holds no image left to reclaim
+        };
+        store.release(owner, key);
+    }
+    store.enforce_caps(owner);
 }
 
 /// Clears the worker's `running` flag when its thread ends (only by a panic escaping everything),
@@ -658,7 +909,7 @@ impl Drop for ThreadExit {
 
 fn job_owner(job: &Job) -> u64 {
     match job {
-        Job::Decode { owner, .. } | Job::Resample { owner, .. } => *owner,
+        Job::Decode { owner, .. } | Job::Resample { owner, .. } | Job::Refuse { owner, .. } => *owner,
     }
 }
 
@@ -668,6 +919,9 @@ fn job_is(job: &Job, owner: u64, key: ImageKey) -> bool {
             owner: o, key: k, ..
         }
         | Job::Resample {
+            owner: o, key: k, ..
+        }
+        | Job::Refuse {
             owner: o, key: k, ..
         } => *o == owner && *k == key,
     }
@@ -739,7 +993,12 @@ fn covers(owner: u64, trigger: u64, scope: Scope) -> bool {
 }
 
 /// Drop the least recently shown resampled copy in scope. Returns whether anything went.
-fn evict_resample(inner: &mut Inner, trigger: u64, scope: Scope) -> bool {
+fn evict_resample(
+    inner: &mut Inner,
+    trigger: u64,
+    scope: Scope,
+    freed: &mut Freed,
+) -> bool {
     let mut best: Option<(u64, u64, ImageKey, (u32, u32))> = None; // (stamp, owner, key, target)
     for (owner, entry) in &inner.owners {
         if !covers(*owner, trigger, scope) {
@@ -767,14 +1026,16 @@ fn evict_resample(inner: &mut Inner, trigger: u64, scope: Scope) -> bool {
         entry.bytes -= bytes;
         image.resample_bytes -= bytes;
         inner.total -= bytes;
+        freed.copies.push(out); // dropped after the mutex goes
     }
     true
 }
 
 /// Drop the least recently shown whole image in scope: its buffer and every resampled copy of it
-/// (the source is gone). A pending decode's payload counts as a whole image too — its queued job
-/// is purged, and an in-flight one discards itself on completion.
-fn evict_image(inner: &mut Inner, trigger: u64, scope: Scope) -> bool {
+/// (the source is gone). A pending decode counts as a whole image too, and evicting one must not
+/// strand its answer: its queued jobs are purged and a [`Job::Refuse`] takes their place (if the
+/// decode was already running, both exist and the exactly-once rule on [`Job`] picks one).
+fn evict_image(inner: &mut Inner, trigger: u64, scope: Scope, freed: &mut Freed) -> bool {
     let mut best: Option<(u64, u64, ImageKey)> = None; // (shown, owner, key)
     for (owner, entry) in &inner.owners {
         if !covers(*owner, trigger, scope) {
@@ -795,13 +1056,20 @@ fn evict_image(inner: &mut Inner, trigger: u64, scope: Scope) -> bool {
     let entry = inner.owners.get_mut(&owner).unwrap();
     let image = entry.images.get_mut(&key).unwrap();
     let gone = image.accounted();
+    let owed = image.owes_reply;
+    let serial = image.serial;
     entry.bytes -= gone;
     inner.total -= gone;
-    image.state = State::Evicted;
-    image.resamples.clear();
+    if let State::Ready(img) = std::mem::replace(&mut image.state, State::Evicted) {
+        freed.images.push(img);
+    }
+    freed.drain_resamples(std::mem::take(&mut image.resamples));
     image.resample_bytes = 0;
     // Purge queued work for this key so its payload and source copies go now, not at completion.
-    inner.jobs.retain(|job| !job_is(job, owner, key));
+    Freed::take_jobs(inner, |job| !job_is(job, owner, key), freed);
+    if owed {
+        inner.jobs.push_back(Job::Refuse { owner, key, serial });
+    }
     true
 }
 
