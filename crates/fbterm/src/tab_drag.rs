@@ -58,6 +58,8 @@ pub(crate) struct DragState {
     /// Where a carried tile would become a tab, or a carried tab of this strip would move
     /// to, as last drawn.
     pub gap: Option<usize>,
+    /// The pointer at the last move the bar saw: its edge-scroll goes by the distance moved.
+    pub last_pointer: Option<Point>,
 }
 
 /// What a strip of tabs is while an event is handled.
@@ -85,11 +87,15 @@ pub(crate) struct Strip<'a> {
     /// The tab showing the rename field: a press on it is the field's (caret, selection),
     /// never a drag or a double-click.
     pub renaming: Option<TabId>,
+    /// The strip index of the first rectangle passed with an event: the bar passes only the
+    /// tabs it shows (scrolled out ones have no place on screen), the sidebar all its rows.
+    pub first: usize,
 }
 
 /// Where something dropped at `p` lands between the tabs: before the tab whose first half
-/// (along the axis) is under `p`, after the one whose second half is, else the nearest gap.
-/// Over its own tab (`own`): nowhere.
+/// (along the axis) is under `p`, after the one whose second half is, else the nearest gap
+/// between them (past either end: beside the tab at that end). Over its own tab (`own`):
+/// nowhere.
 pub(crate) fn gap_at(
     rects: &[Rectangle],
     own: Option<usize>,
@@ -127,8 +133,8 @@ fn window_gap(indices: &[usize], gap: usize) -> usize {
     }
 }
 
-/// The tab-drag and right-click side of `event` over a strip whose tabs sit at `rects`
-/// inside `bounds`: a press that travels [`DRAG_THRESHOLD`] carries its tab, a carried tab
+/// The tab-drag and right-click side of `event` over a strip whose tabs from
+/// `strip.first` on sit at `rects` inside `bounds`: a press that travels [`DRAG_THRESHOLD`] carries its tab, a carried tab
 /// of this strip dropped in a gap asks to move there ([`DragMsg::ReorderTab`]), a carried
 /// tile dropped in a gap becomes a tab there. Returns `true` when the content beneath must
 /// not see where the pointer is (the release that ends a tab drag is no click on a button; a
@@ -145,7 +151,12 @@ pub(crate) fn drag_event(
     let publish = |shell: &mut Shell<'_, Message>, msg: DragMsg| {
         shell.publish(Message::Drag(strip.window, msg));
     };
-    let under = |p: Point| rects.iter().position(|r| r.contains(p));
+    let under = |p: Point| {
+        rects
+            .iter()
+            .position(|r| r.contains(p))
+            .map(|i| i + strip.first)
+    };
     // A row's index in its window's tab order: what the app is told.
     let at_window = |row: usize| strip.indices.get(row).copied().unwrap_or(row);
     let index_of = |id: TabId| strip.ids.iter().position(|i| *i == id);
@@ -163,7 +174,8 @@ pub(crate) fn drag_event(
     }
     let gap = |p: Option<Point>| {
         let p = p.filter(|_| tile || own.is_some())?;
-        let gap = gap_at(rects, if tile { strip.hole } else { own }, p, strip.axis)?;
+        let own_rect = if tile { strip.hole } else { own }.and_then(|i| i.checked_sub(strip.first));
+        let gap = gap_at(rects, own_rect, p, strip.axis)? + strip.first;
         // Outside the carry's group: a tile goes to the group's nearer end, a tab nowhere.
         let gap = match strip.range {
             Some((lo, hi)) if gap < lo || gap > hi => {
@@ -177,6 +189,25 @@ pub(crate) fn drag_event(
         };
         // Right before or after the carried tab: no move.
         (own != Some(gap) && own.map(|o| o + 1) != Some(gap)).then_some(gap)
+    };
+    // The tab a carried tab of this strip hovers, told to the app when it changes.
+    let track_over = |state: &mut DragState, shell: &mut Shell<'_, Message>| {
+        let Some(mine) = state
+            .press
+            .as_ref()
+            .filter(|p| p.dragging && matches!(strip.carry, Some(Carry::Tab(_))))
+            .map(|p| index_of(p.id))
+        else {
+            return;
+        };
+        let over = cursor
+            .position_over(bounds)
+            .and_then(under)
+            .filter(|i| Some(*i) != mine);
+        if over != state.over {
+            state.over = over;
+            publish(shell, DragMsg::OverTab(over.map(at_window)));
+        }
     };
     match event {
         Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
@@ -238,25 +269,16 @@ pub(crate) fn drag_event(
             }
         }
         Event::Mouse(mouse::Event::CursorMoved { .. }) => {
-            if let (Some(press), Some(p)) = (&mut state.press, cursor.position()) {
-                if !press.dragging && p.distance(press.origin) >= DRAG_THRESHOLD {
-                    press.dragging = true;
-                    if strip.ids.contains(&press.id) {
-                        shell.publish(Message::Drag(strip.window, DragMsg::StartTab(press.id)));
-                    }
-                }
-                if press.dragging && matches!(strip.carry, Some(Carry::Tab(_))) {
-                    let mine = index_of(press.id);
-                    let over = cursor
-                        .position_over(bounds)
-                        .and_then(under)
-                        .filter(|i| Some(*i) != mine);
-                    if over != state.over {
-                        state.over = over;
-                        publish(shell, DragMsg::OverTab(over.map(at_window)));
-                    }
+            if let (Some(press), Some(p)) = (&mut state.press, cursor.position())
+                && !press.dragging
+                && p.distance(press.origin) >= DRAG_THRESHOLD
+            {
+                press.dragging = true;
+                if strip.ids.contains(&press.id) {
+                    shell.publish(Message::Drag(strip.window, DragMsg::StartTab(press.id)));
                 }
             }
+            track_over(state, shell);
             let at = gap(cursor.position_over(bounds));
             if at != state.gap {
                 state.gap = at;
@@ -297,6 +319,15 @@ pub(crate) fn drag_event(
                 );
             }
         }
+        // Every frame is laid out afresh before it is drawn: a strip that scrolled under a
+        // still pointer (edge-scroll, wheel, reveal) moves its tabs, so the gap is measured
+        // again from these rects, as the release will, and the marker shows where the drop
+        // lands. The frame is being drawn already: no redraw to ask for. The hovered tab is
+        // measured again too (a message only when it changed).
+        Event::Window(window::Event::RedrawRequested(_)) => {
+            state.gap = gap(cursor.position_over(bounds));
+            track_over(state, shell);
+        }
         Event::Mouse(mouse::Event::CursorLeft) | Event::Window(window::Event::Unfocused) => {
             if let Some(Press { dragging: true, .. }) = state.press.take() {
                 publish(shell, DragMsg::End);
@@ -315,6 +346,70 @@ pub(crate) fn drag_event(
 mod tests {
     use super::*;
     use iced::{Point, Rectangle, Size};
+
+    #[test]
+    fn a_strip_passing_only_its_shown_tabs_reports_strip_indices() {
+        use iced::advanced::Shell;
+        // Tabs 0 and 3 are scrolled out: only tabs 1 and 2 are passed, at x 100 and 200.
+        let ids = [TabId::next(), TabId::next(), TabId::next(), TabId::next()];
+        let strip = Strip {
+            window: window::Id::unique(),
+            ids: &ids,
+            indices: &[0, 1, 2, 3],
+            range: None,
+            clamp: false,
+            carry: Some(Carry::Tile(crate::layout::PaneId::next())),
+            modal: false,
+            hole: Some(1),
+            axis: Axis::X,
+            scroll: 0.0,
+            renaming: None,
+            first: 1,
+        };
+        let rects =
+            [100.0, 200.0].map(|x| Rectangle::new(Point::new(x, 0.0), Size::new(98.0, 30.0)));
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 30.0));
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let mut gap = |x: f32| {
+            let mut state = DragState::default();
+            let p = Point::new(x, 10.0);
+            let event = Event::Mouse(mouse::Event::CursorMoved { position: p });
+            let cursor = mouse::Cursor::Available(p);
+            drag_event(
+                &strip, &mut state, &event, &rects, bounds, cursor, &mut shell,
+            );
+            state.gap
+        };
+        assert_eq!(
+            gap(50.0),
+            Some(1),
+            "left of the shown tabs: before the first"
+        );
+        assert_eq!(gap(350.0), Some(3), "right of them: after the last");
+        assert_eq!(gap(260.0), Some(3), "second half of the last shown");
+        assert_eq!(
+            gap(120.0),
+            None,
+            "over the active tab (1): the tile goes nowhere"
+        );
+        assert_eq!(gap(220.0), Some(2), "first half of tab 2");
+        // A middle click on the second rectangle closes tab 2.
+        let p = Point::new(250.0, 10.0);
+        let middle = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle));
+        let mut state = DragState::default();
+        let cursor = mouse::Cursor::Available(p);
+        drag_event(
+            &strip, &mut state, &middle, &rects, bounds, cursor, &mut shell,
+        );
+        assert!(
+            matches!(
+                messages.last(),
+                Some(Message::TabBar(_, TabBarMsg::Close(2)))
+            ),
+            "{messages:?}"
+        );
+    }
 
     #[test]
     fn gap_at_works_along_either_axis() {
@@ -384,6 +479,7 @@ mod tests {
             axis: Axis::Y,
             scroll,
             renaming: None,
+            first: 0,
         };
         let bounds = Rectangle::new(
             Point::new(0.0, rows[0].y),
@@ -572,6 +668,7 @@ mod tests {
             axis: Axis::Y,
             scroll: 0.0,
             renaming: None,
+            first: 0,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 136.0));
         let mut state = DragState::default();
@@ -665,6 +762,95 @@ mod tests {
     }
 
     #[test]
+    fn a_strip_scrolled_under_a_still_pointer_moves_the_gap_on_the_next_frame() {
+        use iced::advanced::Shell;
+        let ids = [TabId::next(), TabId::next(), TabId::next()];
+        let strip = Strip {
+            window: window::Id::unique(),
+            ids: &ids,
+            indices: &[0, 1, 2],
+            range: None,
+            clamp: false,
+            carry: Some(Carry::Tile(crate::layout::PaneId::next())),
+            modal: false,
+            hole: None,
+            axis: Axis::X,
+            scroll: 0.0,
+            renaming: None,
+            first: 0,
+        };
+        let tabs = |shift: f32| {
+            [0.0, 100.0, 200.0]
+                .map(|x| Rectangle::new(Point::new(x - shift, 0.0), Size::new(96.0, 30.0)))
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 30.0));
+        let at = mouse::Cursor::Available(Point::new(120.0, 10.0));
+        let mut state = DragState::default();
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let before = tabs(0.0);
+        let event = Event::Mouse(mouse::Event::CursorMoved {
+            position: Point::new(120.0, 10.0),
+        });
+        drag_event(&strip, &mut state, &event, &before, bounds, at, &mut shell);
+        assert_eq!(state.gap, Some(1), "the first half of the second tab");
+        // The strip scrolls 60 px: the pointer is now over the second half of that tab.
+        let after = tabs(60.0);
+        let frame = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        drag_event(&strip, &mut state, &frame, &after, bounds, at, &mut shell);
+        assert_eq!(state.gap, Some(2));
+    }
+
+    #[test]
+    fn a_strip_scrolled_under_a_carried_tab_reports_the_tab_now_under_it() {
+        use iced::advanced::Shell;
+        let ids = [TabId::next(), TabId::next(), TabId::next()];
+        let strip = Strip {
+            window: window::Id::unique(),
+            ids: &ids,
+            indices: &[0, 1, 2],
+            range: None,
+            clamp: false,
+            carry: Some(Carry::Tab(ids[0])),
+            modal: false,
+            hole: None,
+            axis: Axis::X,
+            scroll: 0.0,
+            renaming: None,
+            first: 0,
+        };
+        let tabs = |shift: f32| {
+            [0.0, 100.0, 200.0]
+                .map(|x| Rectangle::new(Point::new(x - shift, 0.0), Size::new(96.0, 30.0)))
+        };
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 30.0));
+        let mut state = DragState::default();
+        let mut messages = Vec::new();
+        let mut shell = Shell::new(&mut messages);
+        let before = tabs(0.0);
+        let mut step = |state: &mut DragState, event: Event, rects: &[Rectangle], p: Point| {
+            let cursor = mouse::Cursor::Available(p);
+            drag_event(&strip, state, &event, rects, bounds, cursor, &mut shell);
+        };
+        let pointer = Point::new(150.0, 10.0);
+        step(&mut state, press(), &before, before[0].center());
+        step(&mut state, moved(pointer), &before, pointer);
+        assert_eq!(state.over, Some(1));
+        // The strip scrolls 100 px: the third tab is under the still pointer.
+        let frame = Event::Window(window::Event::RedrawRequested(std::time::Instant::now()));
+        step(&mut state, frame, &tabs(100.0), pointer);
+        assert_eq!(state.over, Some(2));
+        let overs: Vec<_> = messages
+            .into_iter()
+            .filter_map(|m| match m {
+                Message::Drag(_, DragMsg::OverTab(o)) => Some(o),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(overs, [Some(1), Some(2)]);
+    }
+
+    #[test]
     fn a_tab_that_left_the_strip_during_its_drag_is_not_reordered() {
         let rows = [
             Rectangle::new(Point::new(0.0, 0.0), Size::new(100.0, 30.0)),
@@ -712,6 +898,7 @@ mod tests {
             axis: Axis::Y,
             scroll: 0.0,
             renaming: renaming.map(|r| ids[r]),
+            first: 0,
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 102.0));
         let mut state = DragState::default();
@@ -772,6 +959,7 @@ mod tests {
             // content y 440 is at window y 40.
             scroll: 400.0,
             renaming: None,
+            first: 0,
         };
         let mut state = DragState::default();
         let mut messages = Vec::new();

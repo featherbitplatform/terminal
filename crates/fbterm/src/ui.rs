@@ -29,6 +29,7 @@ pub const ICON_PLUS: &str = "\u{e13d}";
 pub const ICON_USERS: &str = "\u{e1a4}";
 pub const ICON_UP: &str = "\u{e070}"; // chevron-up
 pub const ICON_DOWN: &str = "\u{e06d}"; // chevron-down
+pub const ICON_LEFT: &str = "\u{e06e}"; // chevron-left
 pub const ICON_RIGHT: &str = "\u{e06f}"; // chevron-right
 pub const ICON_COPY: &str = "\u{e09e}";
 pub const ICON_SHIELD_ALERT: &str = "\u{e1fe}";
