@@ -28,6 +28,9 @@ ignore = [
     # keys work. Exposure is limited to signing the auth request with a local RSA user key once
     # per connection, which gives a network observer one timing sample per login.
     { id = "RUSTSEC-2023-0071", reason = "no fixed rsa release; RSA user/host keys needed, see comment" },
+    # chrono is unmaintained (no known vulnerability). russh-sftp depends on it, so it stays in
+    # the tree whatever fbterm uses; revisit when russh-sftp moves to another date crate.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained only; required by russh-sftp, see comment" },
 ]
 
 [bans]
