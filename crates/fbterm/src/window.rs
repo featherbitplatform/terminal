@@ -218,6 +218,7 @@ fn window_view(app: &App, id: window::Id) -> Element<'_, Message> {
                         .find(|t| t.id == source)
                         .map(|from| crate::tiles::Incoming {
                             tab: source,
+                            into: tab.id,
                             mergeable: source != tab.id && from.page.is_none(),
                             layout: from.layout.clone(),
                         })
