@@ -60,6 +60,11 @@ pub enum TabBarMsg {
         offset: f32,
         height: f32,
     },
+    /// The top bar's tab strip scrolls by this many logical pixels (positive: toward later
+    /// tabs): the wheel over it, or a drag near its edge.
+    StripScroll(f32),
+    /// A chevron of the top bar's tab strip: scroll it one tab toward `-1` (earlier tabs) or `1`.
+    StripStep(i8),
     /// The sidebar's rule is being dragged: its new chosen width (window logical pixels,
     /// unclamped).
     SidebarResize(f32),
@@ -105,7 +110,7 @@ impl<T> std::fmt::Debug for Delivered<T> {
     reason = "some variants are sent by the palette, editor and restore"
 )]
 #[derive(Debug, Clone)]
-pub enum Message {
+pub(crate) enum Message {
     Session(SessionId, SessionEvent),
     /// A system font scan for missing suggested fonts finished (see `crate::theme_fonts`).
     FontsScanned(Arc<Vec<crate::theme_fonts::NewFace>>),
@@ -291,6 +296,12 @@ pub struct App {
     pub(crate) sidebar_scroll: HashMap<window::Id, (f32, f32)>,
     /// The active tab each window's sidebar last scrolled into view.
     pub(crate) sidebar_shown: HashMap<window::Id, TabId>,
+    /// How far each window's top tab strip is scrolled (see `tab_strip.rs`).
+    pub(crate) strip_offset: HashMap<window::Id, f32>,
+    /// What each window's strip last scrolled the active tab into view for (see
+    /// `tab_strip::StripSeen`): the reveal repeats only when that changes, so a scroll by hand
+    /// is left alone.
+    pub(crate) strip_seen: HashMap<window::Id, crate::tab_strip::StripSeen>,
     /// Each window's chosen sidebar width (see `tab_sidebar.rs`); absent: the default.
     pub(crate) sidebar_widths: HashMap<window::Id, f32>,
     /// Windows whose sidebar rule is being dragged (no row tooltips meanwhile).
@@ -748,6 +759,8 @@ impl App {
             notices_dismissed: false,
             sidebar_scroll: HashMap::new(),
             sidebar_shown: HashMap::new(),
+            strip_offset: HashMap::new(),
+            strip_seen: HashMap::new(),
             sidebar_widths: HashMap::new(),
             sidebar_resizing: HashSet::new(),
             sidebar_quiet: HashSet::new(),
@@ -1283,6 +1296,14 @@ impl App {
                         self.sidebar_scrolled(wid, offset, height);
                         Task::none()
                     }
+                    TabBarMsg::StripScroll(delta) => {
+                        self.strip_scrolled_by(wid, delta);
+                        Task::none()
+                    }
+                    TabBarMsg::StripStep(dir) => {
+                        self.strip_stepped(wid, dir);
+                        Task::none()
+                    }
                     TabBarMsg::SidebarResize(width) => {
                         self.sidebar_resize(wid, width);
                         Task::none()
@@ -1315,6 +1336,8 @@ impl App {
                 self.blur_views.remove(&id);
                 self.sidebar_scroll.remove(&id);
                 self.sidebar_shown.remove(&id);
+                self.strip_offset.remove(&id);
+                self.strip_seen.remove(&id);
                 self.sidebar_widths.remove(&id);
                 self.sidebar_resizing.remove(&id);
                 self.sidebar_quiet.remove(&id);

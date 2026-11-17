@@ -35,8 +35,8 @@ pub enum DragMsg {
     OverTab(Option<usize>),
     /// A hover over a tab button (its generation) lasted `HOVER_SWITCH`.
     HoverElapsed(u64),
-    /// The carried tab was dropped on the content of the shown tab.
-    DropTab { tab: TabId, at: Drop },
+    /// The carried tab was dropped on the content of tab `into` (the tab shown under it).
+    DropTab { tab: TabId, into: TabId, at: Drop },
     /// The carried tab was dropped on its own tab bar or sidebar: it moves to the gap
     /// `index` (counted in the strip as it was before the move).
     ReorderTab { tab: TabId, index: usize },
@@ -496,17 +496,12 @@ impl App {
                 }
                 _ => Task::none(),
             },
-            DragMsg::DropTab { tab, at } => {
+            DragMsg::DropTab { tab, into, at } => {
+                // Into the tab it was aimed at, not the active one: the strip that started the
+                // drag reports its end first, and that shows the carried tab again when a
+                // hover had switched away from it.
                 self.end_carry();
-                let target = self
-                    .windows
-                    .get(&wid)
-                    .and_then(WindowState::active_tab)
-                    .map(|t| t.id);
-                match target {
-                    Some(target) => self.merge_tab(wid, tab, target, at),
-                    None => Task::none(),
-                }
+                self.merge_tab(wid, tab, into, at)
             }
             DragMsg::ReorderTab { tab, index } => {
                 // Only the drag that is under way: a stale release changes nothing.
@@ -926,6 +921,7 @@ mod tests {
             wid,
             crate::windows::DragMsg::DropTab {
                 tab: tb,
+                into: tb,
                 at: Drop::Edge(Side::Left),
             },
         ));
@@ -963,6 +959,7 @@ mod tests {
             &mut app,
             DragMsg::DropTab {
                 tab: tb,
+                into: ta,
                 at: Drop::Tile(a2, Side::Bottom),
             },
         );
@@ -981,6 +978,39 @@ mod tests {
         assert_eq!(w.tabs[0].layout, Layout::Pane(b));
         drag(&mut app, DragMsg::Tile(None));
         assert_eq!(app.carry, None);
+    }
+
+    #[test]
+    fn the_shown_tab_carried_onto_another_tab_merges_into_it() {
+        use crate::windows::DragMsg;
+        let p = profile("a");
+        let (mut app, wid, [_, a2, b], [ta, tb]) = app_with_tabs(&p);
+        let drag = |app: &mut App, m| {
+            let _ = app.update(Message::Drag(wid, m));
+        };
+        // The shown tab is carried over the other one until that one shows.
+        app.windows.get_mut(&wid).unwrap().active = 1;
+        drag(&mut app, DragMsg::StartTab(tb));
+        drag(&mut app, DragMsg::OverTab(Some(0)));
+        let generation = app.hover_generation;
+        drag(&mut app, DragMsg::HoverElapsed(generation));
+        assert_eq!(app.windows[&wid].active, 0);
+        // Let go on its content: the strip that started the drag reports the end first,
+        // which shows the carried tab again; the drop still lands where it was aimed.
+        drag(&mut app, DragMsg::End);
+        drag(
+            &mut app,
+            DragMsg::DropTab {
+                tab: tb,
+                into: ta,
+                at: Drop::Tile(a2, Side::Bottom),
+            },
+        );
+        let w = &app.windows[&wid];
+        assert_eq!(w.tabs.len(), 1, "merged");
+        assert_eq!(w.tabs[0].id, ta);
+        assert!(w.tabs[0].layout.contains(b));
+        assert_eq!(w.active, 0);
     }
 
     /// A pane area of `w` x `h` logical pixels and a 9 x 18 px cell for every pane: a pane
@@ -1019,6 +1049,7 @@ mod tests {
             wid,
             crate::windows::DragMsg::DropTab {
                 tab: ta,
+                into: tb,
                 at: Drop::Tile(b, Side::Left),
             },
         ));
