@@ -27,10 +27,12 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use feathercritty::event::{ImageData, ImageDecodeError, ImageKey};
+use feathercritty::graphics::kitty::Rect;
+use iced::advanced::image::Handle;
 use parking_lot::{Condvar, Mutex};
 
 use crate::images::decode::{self, DecodeError, DecodeHook, Rgba8Image};
-use crate::images::resample::{fit_size, is_integer_multiple, resample};
+use crate::images::resample::{is_integer_multiple, resample};
 use crate::images::{PER_OWNER_CAP, TOTAL_CAP};
 use crate::{TermEvent, Terminal};
 
@@ -57,18 +59,39 @@ type DeliveryHooks = (
     Arc<dyn Fn() + Send + Sync>,
 );
 
-/// A resampled copy of an image at one placement size. The drawer uploads it once; a GPU handle
-/// can hang off it later without changing what the cache keys on.
+/// A resampled copy of an image at one placement size, ready to draw.
+///
+/// Its pixels live in an iced image [`Handle`] built once on the worker when the resample is
+/// installed (see [`ImageStore::finish_resample`]): iced uploads a handle to the GPU the first
+/// time it is drawn and reuses the texture for every later frame that draws the same handle, so
+/// one resample means one upload however often the pane redraws. The drawer clones this handle per
+/// frame; when a copy is dropped or simply stops being drawn, iced frees the texture itself.
 #[derive(Debug)]
 pub struct ResampledImage {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    /// The source image's own pixel size, so a drawer can map a placement's `src` rectangle onto
+    /// this copy (see [`crate::widget::images::crop_for_src`]).
+    pub source: (u32, u32),
+    /// The copy's pixels, straight (non-premultiplied) RGBA8, as an iced handle.
+    pub handle: Handle,
 }
 
 impl ResampledImage {
     fn bytes(&self) -> usize {
-        self.pixels.len()
+        // The same number the pixel buffer used to report: one RGBA8 frame of `width * height`.
+        (self.width as usize)
+            .saturating_mul(self.height as usize)
+            .saturating_mul(4)
+    }
+
+    /// The copy's pixels, read back out of the handle (tests: what a golden buffer must match).
+    #[cfg(test)]
+    pub(crate) fn pixels(&self) -> Vec<u8> {
+        match &self.handle {
+            Handle::Rgba { pixels, .. } => pixels.to_vec(),
+            other => panic!("a resample holds RGBA pixels, got {other:?}"),
+        }
     }
 }
 
@@ -80,8 +103,10 @@ pub enum Lookup {
     /// The image is known but its decode or a requested resample is still running: draw nothing
     /// and redraw when [`OwnerHooks::wake`] fires.
     Pending,
-    /// The decoded buffer was dropped by the caps; the placement should draw its placeholder.
-    Evicted,
+    /// The decoded buffer was dropped by the caps (or the size cannot be made beside it), so the
+    /// placement draws its placeholder. `width` and `height` are the source image's pixel size:
+    /// what the `[image W×H]` text says (spec 2.6).
+    Evicted { width: u32, height: u32 },
     /// Never seen, or released: nothing to draw and no reason to wait.
     Unknown,
 }
@@ -115,6 +140,10 @@ struct Entry {
     state: State,
     /// Last time this whole image was drawn or kept alive by a draw (LRU).
     shown: u64,
+    /// The source image's pixel size, known from the payload before any decoding (feathercritty
+    /// reports the header's dimensions with every `Encoded` transmission): what an evicted drawing
+    /// names in its `[image W×H]` placeholder.
+    source: (u32, u32),
     resamples: HashMap<(u32, u32), Slot>,
     resample_bytes: usize,
     /// Exact identity of this entry: jobs carry the serial of the submit they came from, and an
@@ -388,6 +417,7 @@ impl ImageStore {
                     Entry {
                         state: State::Ready(img),
                         shown: stamp,
+                        source: (width, height),
                         resamples: HashMap::new(),
                         resample_bytes: 0,
                         serial,
@@ -405,8 +435,13 @@ impl ImageStore {
             inner.total = inner.total - gone + bytes;
             return;
         }
-        let payload = match &data {
-            ImageData::Encoded { bytes, .. } => bytes.len(),
+        let (payload, source) = match &data {
+            ImageData::Encoded {
+                bytes,
+                width,
+                height,
+                ..
+            } => (bytes.len(), (*width, *height)),
             ImageData::Rgba { .. } => unreachable!(),
         };
         let entry = inner.owners.entry(owner).or_insert_with(new_owner);
@@ -417,6 +452,7 @@ impl ImageStore {
                 Entry {
                     state: State::Pending(payload),
                     shown: stamp,
+                    source,
                     resamples: HashMap::new(),
                     resample_bytes: 0,
                     serial,
@@ -464,21 +500,21 @@ impl ImageStore {
         }
     }
 
-    /// Ask for a resample of `key` covering `span` cells of `cell_px` logical pixels at the
-    /// display scale whose bits are `scale_bits`, fitted inside that box with its aspect kept.
+    /// Ask for the resample that draws in a placement covering `box_px` PHYSICAL pixels — the
+    /// placement's cell span at the cell size programs are told (see
+    /// [`crate::widget::images::placement_box_px`]), so what is drawn fills exactly the cells the
+    /// program asked for at any font size or display scale.
+    ///
+    /// `src` is the placement's source rectangle (`None`: the whole image). The fit factor comes
+    /// from that rectangle, so a cropped placement fills its box as an uncropped one would; the
+    /// copy made is always of the WHOLE image at that factor and is keyed by its size alone, so
+    /// placements cropping the same shape of one image share it, and the drawer maps `src` onto it
+    /// with [`ResampledImage::source`] (see [`crate::widget::images::crop_for_src`]).
     ///
     /// A size not cached yet is queued on the worker and answers [`Lookup::Pending`]: nothing is
     /// ever resampled synchronously here, because `get` runs on the draw path. When the resample
     /// finishes, the owner's `wake` fires and a later `get` returns it.
-    pub fn get(
-        &self,
-        owner: u64,
-        key: ImageKey,
-        cell_px: (u32, u32),
-        span: (u32, u32),
-        scale_bits: u32,
-    ) -> Lookup {
-        let box_px = placement_box(cell_px, span, scale_bits);
+    pub fn get(&self, owner: u64, key: ImageKey, box_px: (u32, u32), src: Option<Rect>) -> Lookup {
         let mut inner = self.inner.lock();
         let Some(owner_entry) = inner.owners.get_mut(&owner) else {
             return Lookup::Unknown;
@@ -486,12 +522,21 @@ impl ImageStore {
         let Some(image) = owner_entry.images.get_mut(&key) else {
             return Lookup::Unknown;
         };
-        let src = match &image.state {
-            State::Ready(src) => src.clone(),
+        let source_size = image.source;
+        let whole = match &image.state {
+            State::Ready(img) => img.clone(),
             State::Pending(_) => return Lookup::Pending,
-            State::Evicted => return Lookup::Evicted,
+            State::Evicted => {
+                return Lookup::Evicted {
+                    width: source_size.0,
+                    height: source_size.1,
+                };
+            }
         };
-        let target = fit_capped(src.width, src.height, box_px.0, box_px.1);
+        let target = fit_target(&whole, src, box_px);
+        // The filter rule is asked about the area the placement shows: when that is an exact
+        // integer zoom, so is `whole` to `target` (the same factor scales both).
+        let (area_w, area_h) = src_area(src, whole.width, whole.height);
         image.shown = self.next_stamp();
         match image.resamples.get_mut(&target) {
             Some(Slot::Ready(stamp, out)) => {
@@ -501,10 +546,15 @@ impl ImageStore {
             // already queued with this draw or the last one
             Some(Slot::Queued) => return Lookup::Pending,
             // a copy of this size provably cannot fit beside its source (see `finish_resample`)
-            Some(Slot::Refused) => return Lookup::Evicted,
+            Some(Slot::Refused) => {
+                return Lookup::Evicted {
+                    width: source_size.0,
+                    height: source_size.1,
+                };
+            }
             None => {}
         }
-        let integer = is_integer_multiple(src.width, src.height, target.0, target.1);
+        let integer = is_integer_multiple(area_w, area_h, target.0, target.1);
         image.resamples.insert(target, Slot::Queued);
         // This picture's other cached sizes stay: a drawer that later comes back to one of them
         // should not have to re-make it, and memory is bounded by the LRU plus cap enforcement at
@@ -514,7 +564,9 @@ impl ImageStore {
             key,
             target,
             integer,
-            src,
+            // The WHOLE decoded image: the crop is the drawer's job (see [`fit_target`]), so every
+            // placement that fits at this factor shares this one copy and one GPU upload.
+            src: whole,
         });
         drop(inner);
         self.wake.notify_one();
@@ -733,8 +785,9 @@ impl ImageStore {
                 integer,
                 src,
             } => {
+                let source = (src.width, src.height);
                 let out = resample(&src, target, integer);
-                self.finish_resample(owner, key, target, out);
+                self.finish_resample(owner, key, target, out, source);
             }
             Job::Refuse { owner, key, serial } => self.finish_refusal(owner, key, serial),
             Job::Answer { owner, key, serial } => self.finish_answer(owner, key, serial),
@@ -806,7 +859,12 @@ impl ImageStore {
                     delta = match claim {
                         Claim::Decode(payload) => {
                             image.state = match result {
-                                Ok(img) => State::Ready(Arc::new(img)),
+                                Ok(img) => {
+                                    // What the container actually holds, which for a GIF frame can
+                                    // be smaller than the logical screen its header declared.
+                                    image.source = (img.width, img.height);
+                                    State::Ready(Arc::new(img))
+                                }
                                 // A corrupt or oversized payload: the key stays known as evicted
                                 // until its release arrives, so draws answer `Evicted`.
                                 Err(_) => State::Evicted,
@@ -928,7 +986,19 @@ impl ImageStore {
     }
 
     /// Install a finished resample and wake the pane so it redraws with the new copy.
-    fn finish_resample(&self, owner: u64, key: ImageKey, target: (u32, u32), out: Rgba8Image) {
+    ///
+    /// The pixel buffer becomes an iced image handle here, on the worker, once: that is what makes
+    /// "an image is uploaded to the GPU once" (spec goal 4) true, because every later frame draws
+    /// the same handle id and iced reuses its texture. `source` is the source image's pixel size,
+    /// which the drawer needs to map a placement's `src` rectangle onto this copy.
+    fn finish_resample(
+        &self,
+        owner: u64,
+        key: ImageKey,
+        target: (u32, u32),
+        out: Rgba8Image,
+        source: (u32, u32),
+    ) {
         // Declared before the lock guard so everything enforcement takes goes after the mutex.
         let mut freed = Freed::default();
         let wake = {
@@ -949,7 +1019,10 @@ impl ImageStore {
             let out = Arc::new(ResampledImage {
                 width: out.width,
                 height: out.height,
-                pixels: out.pixels,
+                source,
+                // The one copy of these pixels iced ever sees: `from_rgba` takes the Vec by value,
+                // so nothing is copied here and no codec runs — the store decoded the payload.
+                handle: Handle::from_rgba(out.width, out.height, out.pixels),
             });
             let stamp = self.next_stamp();
             let bytes = out.bytes();
@@ -1093,35 +1166,53 @@ fn job_is(job: &Job, owner: u64, key: ImageKey) -> bool {
     }
 }
 
-/// The pixel box of a placement: `span` cells at `cell_px` logical pixels, rounded to whole
-/// physical pixels at the display scale whose bits are `scale_bits`. Saturating: a hostile span
-/// cannot overflow into a tiny box.
-fn placement_box(cell_px: (u32, u32), span: (u32, u32), scale_bits: u32) -> (u32, u32) {
-    let scale = f32::from_bits(scale_bits);
-    let cell = [cell_px.0, cell_px.1];
-    let span = [span.0, span.1];
-    let mut out = [1u64, 1];
-    for axis in 0..2 {
-        let phys = if scale.is_finite() && scale > 0.0 {
-            (f64::from(cell[axis].max(1)) * f64::from(scale))
-                .round()
-                .max(1.0) as u64
+/// The area of the source image a placement shows: its `src` rectangle clamped to the image, or
+/// the whole image with no `src`. A zero `w` or `h` means "to the end" and the displayed area is
+/// the intersection with the image (feathercritty's [`Rect`] docs), so a rectangle that starts
+/// past the edge still yields at least one pixel rather than zero — a zero area would mean a
+/// divide by zero in [`fit_target`], and a placement cannot display less than a pixel.
+fn src_area(src: Option<Rect>, img_w: u32, img_h: u32) -> (u32, u32) {
+    let Some(rect) = src else {
+        return (img_w.max(1), img_h.max(1));
+    };
+    let axis = |off: u32, len: u32, side: u32| -> u32 {
+        let start = off.min(side.saturating_sub(1));
+        let room = side.saturating_sub(start);
+        if len == 0 {
+            room.max(1)
         } else {
-            u64::from(cell[axis].max(1))
-        };
-        out[axis] = phys
-            .saturating_mul(u64::from(span[axis].max(1)))
-            .min(u64::from(u32::MAX));
-    }
-    (out[0] as u32, out[1] as u32)
+            len.min(room).max(1)
+        }
+    };
+    (axis(rect.x, rect.w, img_w), axis(rect.y, rect.h, img_h))
 }
 
-/// [`fit_size`] with the store's further bound: a fitted copy never exceeds one
+/// The size a placement's resample is made at: the WHOLE image scaled by the factor that fits its
+/// shown area inside `box_px`, rounded to whole pixels and then capped by [`cap_area`]. Cropping
+/// happens in the drawer (see [`crate::widget::images::crop_for_src`]), which keeps one copy per
+/// size instead of one per rectangle.
+fn fit_target(whole: &Rgba8Image, src: Option<Rect>, box_px: (u32, u32)) -> (u32, u32) {
+    let (area_w, area_h) = src_area(src, whole.width, whole.height);
+    let factor = (f64::from(box_px.0.max(1)) / f64::from(area_w))
+        .min(f64::from(box_px.1.max(1)) / f64::from(area_h));
+    // `as u32` on a float saturates, and the cap below shrinks whatever survives; a hostile box
+    // cannot make this wrap.
+    let w = (f64::from(whole.width) * factor)
+        .round()
+        .max(1.0)
+        .min(u64::from(u32::MAX) as f64) as u32;
+    let h = (f64::from(whole.height) * factor)
+        .round()
+        .max(1.0)
+        .min(u64::from(u32::MAX) as f64) as u32;
+    cap_area(w, h)
+}
+
+/// The store's further bound on a fitted size: never more than one
 /// [`MAX_IMAGE_BYTES`](feathercritty::graphics::limits::MAX_IMAGE_BYTES) RGBA8 frame, so even an
 /// absurd placement request cannot ask for a buffer bigger than the per-image cap.
-fn fit_capped(src_w: u32, src_h: u32, box_w: u32, box_h: u32) -> (u32, u32) {
+fn cap_area(mut w: u32, mut h: u32) -> (u32, u32) {
     use feathercritty::graphics::limits::MAX_IMAGE_BYTES;
-    let (mut w, mut h) = fit_size(src_w, src_h, box_w, box_h);
     // Pixels-per-axis bound written as an area comparison: `w * h` of two u32s always fits a u64,
     // multiplying by 4 first would not. Shrinking keeps the aspect (floors) and always progresses.
     while (w as u64) * (h as u64) > MAX_IMAGE_BYTES / 4 {
@@ -1456,7 +1547,7 @@ mod tests {
         store.release(999, ImageKey(2));
         assert_eq!(store.bytes_held(), 0);
         assert!(matches!(
-            store.get(owner, ImageKey(1), (8, 16), (1, 1), 1.0f32.to_bits()),
+            store.get(owner, ImageKey(1), (8, 16), None),
             Lookup::Unknown
         ));
     }
@@ -1487,8 +1578,8 @@ mod tests {
         // Evicted, never vanished.
         for (owner, keys) in plans {
             for key in keys {
-                match store.get(owner, key, (8, 16), (1, 1), 1.0f32.to_bits()) {
-                    Lookup::Pending | Lookup::Ready(_) | Lookup::Evicted => {}
+                match store.get(owner, key, (8, 16), None) {
+                    Lookup::Pending | Lookup::Ready(_) | Lookup::Evicted { .. } => {}
                     Lookup::Unknown => panic!("key {key:?} vanished instead of being evicted"),
                 }
             }
@@ -1500,7 +1591,6 @@ mod tests {
         // 16 KiB pictures, a 32 KiB cap: two survive at a time, and touching one keeps it alive.
         let store = ImageStore::with_caps(32 * KB, 64 * KB);
         let owner = 5;
-        let scale = 1.0f32.to_bits();
         // Key 1 is drawn (touched) on every frame; the others are shown once, when submitted.
         for i in 1..=8u64 {
             store.submit(owner, ImageKey(i), rgba(64, 64, 3));
@@ -1511,8 +1601,8 @@ mod tests {
                 // The invariant each frame restores: the redrawn image plus this frame's newest.
                 let held = |k: u64| {
                     !matches!(
-                        store.get(owner, ImageKey(k), (8, 16), (1, 1), scale),
-                        Lookup::Evicted
+                        store.get(owner, ImageKey(k), (8, 16), None),
+                        Lookup::Evicted { .. }
                     )
                 };
                 // Newest first: a `get` on a ready image marks it shown, and these checks are no
@@ -1529,8 +1619,8 @@ mod tests {
         }
         let held = |k: u64| {
             !matches!(
-                store.get(owner, ImageKey(k), (8, 16), (2, 2), scale),
-                Lookup::Evicted
+                store.get(owner, ImageKey(k), (16, 32), None),
+                Lookup::Evicted { .. }
             )
         };
         // At the end: the redrawn key and the newest one; everything else went oldest-shown first.
@@ -1551,7 +1641,6 @@ mod tests {
     fn resamples_are_dropped_before_whole_images() {
         let store = ImageStore::with_caps(48 * KB, 96 * KB);
         let owner = 6;
-        let scale = 1.0f32.to_bits();
         for i in 1..=2u64 {
             store.submit(owner, ImageKey(i), rgba(64, 64, 7)); // 16 KiB each
         }
@@ -1559,12 +1648,12 @@ mod tests {
 
         // Cache a 32x32 copy of key 1 (4 KiB): the owner sits at 36 KiB, still under its cap.
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (2, 2), scale),
+            store.get(owner, ImageKey(1), (32, 32), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle();
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (2, 2), scale),
+            store.get(owner, ImageKey(1), (32, 32), None),
             Lookup::Ready(_)
         ));
         assert_books(&store);
@@ -1578,8 +1667,8 @@ mod tests {
         for k in [1u64, 2, 3] {
             assert!(
                 !matches!(
-                    store.get(owner, ImageKey(k), (8, 16), (1, 1), scale),
-                    Lookup::Evicted
+                    store.get(owner, ImageKey(k), (8, 16), None),
+                    Lookup::Evicted { .. }
                 ),
                 "key {k} should still be held: the resample was enough"
             );
@@ -1592,14 +1681,14 @@ mod tests {
         assert_books(&store);
         assert_eq!(store.owner_bytes(owner), 48 * KB);
         assert!(matches!(
-            store.get(owner, ImageKey(1), (8, 16), (1, 1), scale),
-            Lookup::Evicted
+            store.get(owner, ImageKey(1), (8, 16), None),
+            Lookup::Evicted { .. }
         ));
         for k in [2u64, 3, 4] {
             assert!(
                 !matches!(
-                    store.get(owner, ImageKey(k), (8, 16), (1, 1), scale),
-                    Lookup::Evicted
+                    store.get(owner, ImageKey(k), (8, 16), None),
+                    Lookup::Evicted { .. }
                 ),
                 "key {k} should still be held"
             );
@@ -1626,7 +1715,7 @@ mod tests {
         store.run_jobs_until_idle();
         assert_eq!(store.bytes_held(), 0);
         assert!(matches!(
-            store.get(owner, ImageKey(1), (8, 16), (1, 1), 1.0f32.to_bits()),
+            store.get(owner, ImageKey(1), (8, 16), None),
             Lookup::Unknown
         ));
 
@@ -1669,8 +1758,8 @@ mod tests {
         );
         // ...the failed image is evicted for draws until its release arrives...
         assert!(matches!(
-            store.get(owner, key, (8, 16), (1, 1), 1.0f32.to_bits()),
-            Lookup::Evicted
+            store.get(owner, key, (8, 16), None),
+            Lookup::Evicted { .. }
         ));
         // ...and the emulator removed it, so the hooks carried its release too (they drain the
         // terminal's queue when answering, which is where a session sees it).
@@ -1721,13 +1810,12 @@ mod tests {
             "no single OK reply after a good decode",
         );
         // The decoded pixels landed: a get fits them into the box and the worker resamples.
-        let scale = 1.0f32.to_bits();
         assert!(matches!(
-            store.get(owner, key3, (8, 16), (1, 1), scale),
+            store.get(owner, key3, (8, 16), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle();
-        match store.get(owner, key3, (8, 16), (1, 1), scale) {
+        match store.get(owner, key3, (8, 16), None) {
             Lookup::Ready(img) => {
                 assert_eq!((img.width, img.height), (8, 8)); // upscaled keeping aspect inside 8x16
                 assert_eq!(img.bytes(), 8 * 8 * 4);
@@ -1757,11 +1845,12 @@ mod tests {
         // Submitted directly (no kitty client waiting on this key): the terminal got its answer
         // anyway, and what the owner holds now is the decoded buffer, not the payload.
         assert_eq!(store.owner_bytes(owner), tiny_rgba().len());
-        let scale = 2.0f32.to_bits();
-        match store.get(owner, ImageKey(50), (8, 16), (1, 1), scale) {
+        // Cells of 8x16 logical pixels at scale 2: a drawer's 1-cell box is 16x32 physical pixels.
+        let box_px = (16, 32);
+        match store.get(owner, ImageKey(50), box_px, None) {
             Lookup::Pending => {
                 assert!(store.wait_idle_for(Duration::from_secs(30)));
-                match store.get(owner, ImageKey(50), (8, 16), (1, 1), scale) {
+                match store.get(owner, ImageKey(50), box_px, None) {
                     // A 16x32 physical box, a 4x4 source: upscale keeping aspect → 16x16.
                     Lookup::Ready(img) => assert_eq!((img.width, img.height), (16, 16)),
                     other => panic!("expected a ready resample after the worker, got {other:?}"),
@@ -1793,49 +1882,180 @@ mod tests {
         );
     }
 
-    /// The identity resample (box exactly the source size) returns the fixture's pixels exactly.
+    /// The identity resample (box exactly the source size) returns the fixture's pixels exactly,
+    /// read back out of the handle the drawer will draw.
     #[test]
     fn decoded_buffers_survive_the_identity_resample() {
         let store = ImageStore::with_caps(64 * KB, 128 * KB);
         store.submit(1, ImageKey(70), png(TINY_PNG));
         store.run_jobs_until_idle();
-        let scale = 1.0f32.to_bits();
         assert!(matches!(
-            store.get(1, ImageKey(70), (4, 4), (1, 1), scale),
+            store.get(1, ImageKey(70), (4, 4), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle();
-        match store.get(1, ImageKey(70), (4, 4), (1, 1), scale) {
-            Lookup::Ready(img) => assert_eq!(img.pixels, tiny_rgba()),
+        match store.get(1, ImageKey(70), (4, 4), None) {
+            Lookup::Ready(img) => {
+                assert_eq!(img.pixels(), tiny_rgba());
+                assert_eq!(
+                    img.bytes(),
+                    tiny_rgba().len(),
+                    "accounting is the pixel buffer"
+                );
+            }
             other => panic!("expected the identity resample, got {other:?}"),
         }
     }
 
+    /// What `get` makes for a placement that shows only part of an image (`src`): the fit factor
+    /// comes from the shown area, so the crop fills its box, but the copy is always the whole
+    /// image at that factor — keyed by its size alone. Crops of one shape therefore share one
+    /// copy however far apart they sit in the source, and a crop of another shape asks for a size
+    /// of its own. `ResampledImage::source` is what lets the drawer tell them apart.
     #[test]
-    fn placement_boxes_round_physical_pixels_without_overflow() {
-        let scale = 2.0f32.to_bits();
-        // 8x16 logical, scale 2, a 3x4 span: whole physical pixels.
-        assert_eq!(placement_box((8, 16), (3, 4), scale), (48, 128));
-        // A fractional scale rounds each cell to the nearest whole pixel (half away from zero).
-        let scale = 1.5f32.to_bits();
-        assert_eq!(placement_box((7, 13), (2, 2), scale), (22, 40));
-        // A missing font metric still never yields a zero-wide box.
-        assert_eq!(placement_box((0, 0), (0, 0), 1.0f32.to_bits()), (1, 1));
-        // A hostile span saturates instead of wrapping.
-        assert_eq!(
-            placement_box((8, 16), (u32::MAX, u32::MAX), scale).0,
-            u32::MAX
+    fn crops_of_one_shape_share_a_copy_and_other_shapes_do_not() {
+        let store = ImageStore::with_caps(64 * KB, 512 * KB);
+        let owner = 22;
+        store.submit(owner, ImageKey(1), rgba(64, 32, 7)); // 8 KiB, whole-image fits below cap
+        let rect = |x, y, w, h| Some(Rect { x, y, w, h });
+        let box_px = (32, 16);
+
+        // Two placements cropping a 16x8 corner of the picture at the same box: factor 2, so both
+        // want the whole image at 128x64. The second ask finds the first's copy and queues nothing.
+        for (i, src) in [rect(0, 0, 16, 8), rect(20, 10, 16, 8)]
+            .into_iter()
+            .enumerate()
+        {
+            let first = store.get(owner, ImageKey(1), box_px, src);
+            if i == 0 {
+                assert!(matches!(first, Lookup::Pending), "the shape is new");
+                store.run_jobs_until_idle();
+            } else {
+                assert!(
+                    matches!(first, Lookup::Ready(_)),
+                    "a crop of the same shape reuses the copy: {first:?}"
+                );
+                assert!(
+                    store.inner.lock().jobs.is_empty(),
+                    "the shared copy queues no work"
+                );
+            }
+            if let Lookup::Ready(img) = first {
+                assert_eq!(
+                    (img.width, img.height),
+                    (128, 64),
+                    "whole image at factor 2"
+                );
+                assert_eq!(img.source, (64, 32), "the drawer maps src against this");
+            }
+        }
+
+        // A 32x8 crop of the same picture at the same box: factor 1, so another size and a job.
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(1), box_px, rect(0, 0, 32, 8)),
+                Lookup::Pending
+            ),
+            "a crop of another shape asks for its own size"
         );
+        store.run_jobs_until_idle();
+        match store.get(owner, ImageKey(1), box_px, rect(0, 0, 32, 8)) {
+            Lookup::Ready(img) => assert_eq!(img.source, (64, 32)),
+            other => panic!("expected the second size, got {other:?}"),
+        }
+        // Both sizes stay cached beside the source: 8 KiB + 32 KiB + 8 KiB.
+        assert_eq!(store.owner_bytes(owner), 8 * KB + 32 * KB + 8 * KB);
+        assert_books(&store);
     }
 
+    /// An uncropped placement fits the whole image inside its box, exactly as before: a 64x32
+    /// picture in a 16x8 box becomes 16x8, and one huge box cannot ask for more than a frame.
     #[test]
     fn decoded_fits_are_capped_at_one_frame() {
+        let big = Rgba8Image {
+            width: 10_000,
+            height: 10_000,
+            pixels: Vec::new(),
+        };
         // A huge box on a large source: the copy never exceeds one 64 MiB RGBA8 frame.
-        let fitted = fit_capped(10_000, 10_000, u32::MAX, u32::MAX);
+        let fitted = fit_target(&big, None, (u32::MAX, u32::MAX));
         assert!((fitted.0 as u64) * u64::from(fitted.1) * 4 <= 64 * 1024 * 1024);
         assert!(fitted.0 >= 1 && fitted.1 >= 1);
         // A normal box is unaffected: exact scales pass through.
-        assert_eq!(fit_capped(8, 8, 16, 16), (16, 16));
+        let small = Rgba8Image {
+            width: 8,
+            height: 8,
+            pixels: Vec::new(),
+        };
+        assert_eq!(fit_target(&small, None, (16, 16)), (16, 16));
+        // The shown area, not the whole picture, decides the factor.
+        let wide = Rgba8Image {
+            width: 64,
+            height: 32,
+            pixels: Vec::new(),
+        };
+        assert_eq!(fit_target(&wide, None, (16, 8)), (16, 8));
+        let strip = Some(Rect {
+            x: 0,
+            y: 0,
+            w: 4,
+            h: 32,
+        });
+        assert_eq!(
+            fit_target(&wide, strip, (16, 8)),
+            (16, 8),
+            "a 4x32 crop in a 16x8 box: factor 0.25 applied to the whole picture"
+        );
+        // A zero side means "to the end", and a rectangle past the edge still yields one pixel.
+        assert_eq!(src_area(strip, 64, 32), (4, 32));
+        assert_eq!(src_area(None, 64, 32), (64, 32));
+        assert_eq!(
+            src_area(
+                Some(Rect {
+                    x: 100,
+                    y: 100,
+                    w: 8,
+                    h: 8,
+                }),
+                64,
+                32,
+            ),
+            (1, 1),
+            "outside the picture: never zero"
+        );
+    }
+
+    /// An evicted picture's placeholder names its source size (spec 2.6): a decoded buffer dropped
+    /// by the caps, a size refused beside a picture that is still held, and a payload evicted
+    /// before its decode ran all answer the same numbers the program sent.
+    #[test]
+    fn evicted_lookups_name_the_source_size() {
+        let per_owner = 16 * KB + 512; // a 16 KiB picture fits alone, never beside a copy
+        let store = ImageStore::with_caps(per_owner, 8 * per_owner);
+        let owner = 23;
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1));
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        match store.get(owner, ImageKey(1), (16, 16), None) {
+            Lookup::Evicted { width, height } => assert_eq!((width, height), (64, 64)),
+            other => panic!("a refused size answers the placeholder, got {other:?}"),
+        }
+
+        // A payload evicted while it waits to decode: the header's dimensions, which the terminal
+        // reported with the bytes.
+        let tiny = ImageStore::with_caps(100, 8 * KB);
+        let owner2 = 24;
+        for i in [ImageKey(1), ImageKey(2)] {
+            tiny.submit(owner2, i, png(TINY_PNG));
+        }
+        tiny.enforce_caps(owner2);
+        match tiny.get(owner2, ImageKey(1), (8, 16), None) {
+            Lookup::Evicted { width, height } => assert_eq!((width, height), (4, 4)),
+            other => panic!("the evicted payload should stay known, got {other:?}"),
+        }
     }
 
     /// The caps must never strand a client: a key evicted while its decode is still queued is
@@ -1899,8 +2119,8 @@ mod tests {
         for (id, key) in &keys[..2] {
             assert!(
                 matches!(
-                    store.get(owner, *key, (8, 16), (1, 1), 1.0f32.to_bits()),
-                    Lookup::Evicted
+                    store.get(owner, *key, (8, 16), None),
+                    Lookup::Evicted { .. }
                 ),
                 "key {id} should stay known as evicted",
             );
@@ -1912,8 +2132,8 @@ mod tests {
         for (id, key) in &keys[2..] {
             assert!(
                 !matches!(
-                    store.get(owner, *key, (8, 16), (1, 1), 1.0f32.to_bits()),
-                    Lookup::Evicted
+                    store.get(owner, *key, (8, 16), None),
+                    Lookup::Evicted { .. }
                 ),
                 "key {id} decoded",
             );
@@ -1934,13 +2154,12 @@ mod tests {
         let total = 40 * KB;
         let store = ImageStore::with_caps(per_owner, total);
         let owner = 8;
-        let scale = 1.0f32.to_bits();
         store.submit(owner, ImageKey(1), rgba(64, 64, 7));
         assert_eq!(store.owner_bytes(owner), 16 * KB);
 
         for cells in [(16u32, 16u32), (12, 12), (8, 8), (20, 20), (4, 4)] {
             if matches!(
-                store.get(owner, ImageKey(1), (cells.0, cells.1), (1, 1), scale),
+                store.get(owner, ImageKey(1), (cells.0, cells.1), None),
                 Lookup::Pending
             ) {
                 store.run_jobs_until_idle();
@@ -1959,12 +2178,12 @@ mod tests {
         // nothing about asking for one size drops another. Re-asking the first one costs no job.
         assert!(
             matches!(
-                store.get(owner, ImageKey(1), (4, 4), (1, 1), scale),
+                store.get(owner, ImageKey(1), (4, 4), None),
                 Lookup::Ready(_)
             ),
             "the last-asked size should be the cached one",
         );
-        let asked_first = store.get(owner, ImageKey(1), (16, 16), (1, 1), scale);
+        let asked_first = store.get(owner, ImageKey(1), (16, 16), None);
         assert!(
             matches!(asked_first, Lookup::Ready(_)),
             "the first-asked size is still cached: `get` drops nothing",
@@ -1982,7 +2201,6 @@ mod tests {
         let store: &'static ImageStore =
             Box::leak(Box::new(ImageStore::with_caps(64 * KB, 256 * KB)));
         let owner = 12;
-        let scale = 1.0f32.to_bits();
         store.submit(owner, ImageKey(1), rgba(64, 64, 7)); // 16 KiB source
         store.start();
 
@@ -1990,7 +2208,7 @@ mod tests {
         for round in 0..12 {
             for cell_px in [(16u32, 16u32), (32, 32)] {
                 if matches!(
-                    store.get(owner, ImageKey(1), cell_px, (1, 1), scale),
+                    store.get(owner, ImageKey(1), cell_px, None),
                     Lookup::Pending
                 ) {
                     pending_asks += 1; // this ask queued a resample
@@ -2001,7 +2219,7 @@ mod tests {
                 );
                 assert!(
                     matches!(
-                        store.get(owner, ImageKey(1), cell_px, (1, 1), scale),
+                        store.get(owner, ImageKey(1), cell_px, None),
                         Lookup::Ready(_)
                     ),
                     "size {cell_px:?} should be cached by round {round}"
@@ -2023,7 +2241,6 @@ mod tests {
         let per_owner = 3 * 16 * KB; // exactly three whole 16 KiB pictures
         let store = ImageStore::with_caps(per_owner, 8 * per_owner);
         let owner = 13;
-        let scale = 1.0f32.to_bits();
         for i in 1..=3u64 {
             store.submit(owner, ImageKey(i), rgba(64, 64, 3)); // key 3 is the newest shown
         }
@@ -2032,7 +2249,7 @@ mod tests {
 
         // A 16x16 copy (1 KiB) of the most recently shown picture pushes the owner over its cap.
         assert!(matches!(
-            store.get(owner, ImageKey(3), (16, 16), (1, 1), scale),
+            store.get(owner, ImageKey(3), (16, 16), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle();
@@ -2042,16 +2259,16 @@ mod tests {
         // copy and its source were protected from this enforcement, so neither could be the victim:
         // exactly 1 KiB went over, and only a whole picture frees that much.
         assert!(matches!(
-            store.get(owner, ImageKey(3), (16, 16), (1, 1), scale),
+            store.get(owner, ImageKey(3), (16, 16), None),
             Lookup::Ready(_)
         ));
         assert!(matches!(
-            store.get(owner, ImageKey(1), (8, 16), (1, 1), scale),
-            Lookup::Evicted
+            store.get(owner, ImageKey(1), (8, 16), None),
+            Lookup::Evicted { .. }
         ));
         // One more ask: still Ready, and nothing queued behind it — no install, no eviction churn.
         assert!(matches!(
-            store.get(owner, ImageKey(3), (16, 16), (1, 1), scale),
+            store.get(owner, ImageKey(3), (16, 16), None),
             Lookup::Ready(_)
         ));
         assert!(store.inner.lock().jobs.is_empty());
@@ -2071,7 +2288,6 @@ mod tests {
         let per_owner = 16 * KB + 512; // room for a 16 KiB picture, not for a copy beside it
         let store = ImageStore::with_caps(per_owner, 8 * per_owner);
         let owner = 14;
-        let scale = 1.0f32.to_bits();
         let term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
         let captured = Captured::default();
         store.register_owner(owner, captured.hooks(&term));
@@ -2082,7 +2298,7 @@ mod tests {
         // A 16x16 copy (1 KiB): source plus copy exceed the cap on geometry alone, so it is
         // refused outright.
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
+            store.get(owner, ImageKey(1), (16, 16), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle(); // the only `Pending` this ask will ever produce
@@ -2091,8 +2307,8 @@ mod tests {
         for _ in 0..4 {
             assert!(
                 matches!(
-                    store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
-                    Lookup::Evicted
+                    store.get(owner, ImageKey(1), (16, 16), None),
+                    Lookup::Evicted { .. }
                 ),
                 "the refused size answers the placeholder without queueing again",
             );
@@ -2114,13 +2330,13 @@ mod tests {
         // afresh (and refused afresh — the geometry has not changed).
         store.submit(owner, ImageKey(1), rgba(64, 64, 2));
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
+            store.get(owner, ImageKey(1), (16, 16), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle();
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
-            Lookup::Evicted
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Evicted { .. }
         ));
         assert_books(&store);
     }
@@ -2133,7 +2349,6 @@ mod tests {
         let per_owner = 16 * KB + 512; // the source alone fits; source plus any copy never does
         let store = ImageStore::with_caps(per_owner, 8 * per_owner);
         let owner = 16;
-        let scale = 1.0f32.to_bits();
         let term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
         let captured = Captured::default();
         store.register_owner(owner, captured.hooks(&term));
@@ -2145,7 +2360,7 @@ mod tests {
 
         // 16 KiB + 1 KiB exceeds the owner's cap on its own: refused at once, nothing evicted.
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
+            store.get(owner, ImageKey(1), (16, 16), None),
             Lookup::Pending
         ));
         store.run_jobs_until_idle();
@@ -2161,8 +2376,8 @@ mod tests {
             );
         }
         assert!(matches!(
-            store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
-            Lookup::Evicted
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Evicted { .. }
         ));
         assert_eq!(captured.wakes(), 0, "a refused install wakes nothing");
         assert_eq!(
@@ -2224,7 +2439,6 @@ mod tests {
         let store: &'static ImageStore =
             Box::leak(Box::new(ImageStore::with_caps(per_owner, 8 * per_owner)));
         let owner = 15;
-        let scale = 1.0f32.to_bits();
         store.submit(owner, ImageKey(1), rgba(64, 64, 1));
         store.submit(owner, ImageKey(2), rgba(64, 64, 2));
         store.start();
@@ -2232,10 +2446,7 @@ mod tests {
         let mut pending_asks = 0;
         for round in 0..12 {
             for key in [ImageKey(1), ImageKey(2)] {
-                if matches!(
-                    store.get(owner, key, (16, 16), (1, 1), scale),
-                    Lookup::Pending
-                ) {
+                if matches!(store.get(owner, key, (16, 16), None), Lookup::Pending) {
                     pending_asks += 1; // this ask queued a resample
                 }
                 assert!(
@@ -2253,15 +2464,15 @@ mod tests {
         // images are still held (only sizes are refused, not pictures), and the books balance.
         assert!(
             matches!(
-                store.get(owner, ImageKey(2), (16, 16), (1, 1), scale),
+                store.get(owner, ImageKey(2), (16, 16), None),
                 Lookup::Ready(_)
             ),
             "the newest copy stays",
         );
         assert!(
             matches!(
-                store.get(owner, ImageKey(1), (16, 16), (1, 1), scale),
-                Lookup::Evicted
+                store.get(owner, ImageKey(1), (16, 16), None),
+                Lookup::Evicted { .. }
             ),
             "the evicted size is refused, not re-made",
         );
@@ -2402,8 +2613,8 @@ mod tests {
         store.enforce_caps(owner);
         assert_books(store);
         assert!(matches!(
-            store.get(owner, first, (8, 16), (1, 1), 1.0f32.to_bits()),
-            Lookup::Evicted
+            store.get(owner, first, (8, 16), None),
+            Lookup::Evicted { .. }
         ));
 
         // Let the decode finish into an entry that is already `Evicted`.
@@ -2503,10 +2714,7 @@ mod tests {
             "only the on-screen picture is held"
         );
         assert!(
-            matches!(
-                store.get(owner, first, (8, 16), (1, 1), 1.0f32.to_bits()),
-                Lookup::Unknown
-            ),
+            matches!(store.get(owner, first, (8, 16), None), Lookup::Unknown),
             "the evicted scrollback image was released outright",
         );
         let after_reclaim = term.lock().take_events();
@@ -2528,8 +2736,8 @@ mod tests {
         assert_eq!(store.owner_bytes(owner), 8);
         assert!(
             !matches!(
-                store.get(owner, second, (8, 16), (1, 1), 1.0f32.to_bits()),
-                Lookup::Evicted | Lookup::Unknown
+                store.get(owner, second, (8, 16), None),
+                Lookup::Evicted { .. } | Lookup::Unknown
             ),
             "the on-screen picture should not have been the one dropped",
         );
@@ -2566,7 +2774,7 @@ mod tests {
         for i in 1..=3u64 {
             assert!(
                 matches!(
-                    store.get(owner, ImageKey(i), (8, 16), (1, 1), 1.0f32.to_bits()),
+                    store.get(owner, ImageKey(i), (8, 16), None),
                     Lookup::Unknown
                 ),
                 "malformed key {i} should not be stored",

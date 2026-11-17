@@ -8,8 +8,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use fbterm_term::{
-    ColorScheme, ExportFormat, GridSize, MATCH_CAP, SearchPattern, SearchQuery, SearchRequest,
-    SharedTerminal, Terminal, build_draw_list, export, search,
+    CellGeometry, ColorScheme, ExportFormat, GridSize, MATCH_CAP, SearchPattern, SearchQuery,
+    SearchRequest, SharedTerminal, Terminal, build_draw_list, export, search,
 };
 use feathercritty::grid::RowReader;
 use parking_lot::Mutex;
@@ -209,7 +209,16 @@ fn main() {
             // One reader across frames, as the widget keeps it.
             let mut reader = RowReader::new();
             best_of(200, || {
-                let list = build_draw_list(&mut reader, &t, &scheme, true, None, None);
+                let list = build_draw_list(
+                    &mut reader,
+                    &t,
+                    &scheme,
+                    true,
+                    None,
+                    None,
+                    fbterm_term::images::store(),
+                    CellGeometry::new(iced::Size::new(8.0, 16.0), 1.0),
+                );
                 list.quads.len() + list.texts.len()
             })
         };

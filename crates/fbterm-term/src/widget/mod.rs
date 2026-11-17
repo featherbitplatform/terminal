@@ -7,6 +7,7 @@ mod colors;
 mod draw;
 mod features;
 mod geometry;
+mod images;
 mod input;
 mod shaped;
 
@@ -30,6 +31,7 @@ pub use colors::cell_colors;
 pub use draw::{DrawList, build as build_draw_list};
 pub use features::FontFeatures;
 pub use geometry::{grid_size_from_bounds, pixel_to_cell, pixel_to_point};
+pub use images::CellGeometry;
 pub use input::paste_input;
 
 /// How a terminal is drawn.
@@ -151,6 +153,12 @@ struct CacheKey {
     scheme: ColorScheme,
     hover: Option<Hyperlink>,
     highlight: Option<Highlight>,
+    /// The cell geometry pictures are laid out with, as bits: a font resize bumps `generation`
+    /// through the grid resize it triggers, but moving the window to another display changes only
+    /// this scale — no relayout, no terminal event — and placements drawn at the old physical cell
+    /// size would sit wrong on their cells until the next bump.
+    cell_bits: (u32, u32),
+    scale_bits: u32,
 }
 
 /// Cell size measured for a font and size.
@@ -381,8 +389,15 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                 scheme: self.style.scheme,
                 hover: state.input.hover().cloned(),
                 highlight: self.highlight.clone(),
+                cell_bits: (m.cell.width.to_bits(), m.cell.height.to_bits()),
+                scale_bits: self.style.scale.to_bits(),
             };
-            if cache.as_ref().is_none_or(|(k, _)| *k != key) {
+            // A frame that left a picture waiting is rebuilt instead of reused: the store has had
+            // its chance to answer since (its `wake` hook is what asked for this redraw).
+            let stale = cache
+                .as_ref()
+                .is_none_or(|(k, l)| *k != key || l.images.pending);
+            if stale {
                 let list = draw::build(
                     &mut state.reader.borrow_mut(),
                     &term,
@@ -390,6 +405,8 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                     key.focused,
                     key.hover.as_ref(),
                     key.highlight.as_ref(),
+                    crate::images::store(),
+                    images::CellGeometry::new(m.cell, self.style.scale),
                 );
                 *cache = Some((key, list));
             }

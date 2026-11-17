@@ -7,9 +7,11 @@
 //! neighbour when the scale factor is an integer and the source is at most [`NEAREST_MAX_SIDE`]
 //! pixels on a side (pixel art stays crisp), Lanczos3 otherwise.
 //!
-//! The resizer runs its plain scalar code path (`CpuExtensions::None`) on purpose: SIMD kernels
-//! round differently across CPU families, and pinning one path keeps the golden fixtures below
-//! comparable byte-for-byte (nearest) and within their tolerance (Lanczos) on every CI platform.
+//! Tests run the resizer on its plain scalar code path (`CpuExtensions::None`): SIMD kernels round
+//! differently across CPU families, and pinning one path keeps the golden fixtures below comparable
+//! byte-for-byte (nearest) and within their tolerance (Lanczos) on every machine. Production builds
+//! skip the pin and use whatever the CPU offers — a user's resample is judged by eye, not against a
+//! fixture.
 
 use fast_image_resize as fr;
 
@@ -73,9 +75,14 @@ pub fn resample(src: &Rgba8Image, target_px: (u32, u32), integer_scale: bool) ->
                 .map_err(|e| e.to_string())?;
         let mut dst = fr::images::Image::new(tw, th, fr::PixelType::U8x4);
         let mut resizer = fr::Resizer::new();
-        // SAFETY: `None` selects the plain scalar path, which needs no CPU feature at all; the
-        // call itself only stores the choice.
-        unsafe { resizer.set_cpu_extensions(fr::CpuExtensions::None) };
+        // SAFETY: `None` selects the plain scalar path, which needs no CPU feature at all; the call
+        // itself only stores the choice. Tests pin it so the golden fixtures below are comparable
+        // byte-for-byte on every CPU family; production takes whatever the machine has, because a
+        // user's resample is judged by eye, not against a fixture.
+        #[cfg(test)]
+        unsafe {
+            resizer.set_cpu_extensions(fr::CpuExtensions::None)
+        };
         resizer
             .resize(&src_img, &mut dst, Some(&options))
             .map_err(|e| e.to_string())?;

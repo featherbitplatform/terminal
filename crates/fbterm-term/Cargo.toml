@@ -11,7 +11,9 @@ workspace = true
 # Reads GSUB and glyph bounds for ligature-only stylistic sets; the version cosmic-text already
 # uses (through swash).
 skrifa = "0.44"
-iced = { workspace = true, features = ["advanced"] }
+# `image-without-codecs` only: the store decodes every payload itself (see `src/images`), so the
+# drawer hands iced already-decoded RGBA pixels and needs none of image's format codecs.
+iced = { workspace = true, features = ["advanced", "image-without-codecs"] }
 feathercritty = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
