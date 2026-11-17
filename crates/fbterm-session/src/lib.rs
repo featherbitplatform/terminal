@@ -270,9 +270,10 @@ impl Router {
         }
     }
 
-    /// Hand one image to the store, and if it pushed this owner over its cap, reclaim — the
+    /// Hand one image to the store, then reclaim if it pushed this owner over its cap — the
     /// terminal's scrollback first (outside the store's lock, as the store never locks a
-    /// terminal), the store's own buffers only when that ran dry.
+    /// terminal), the store's own buffers only when that ran dry. The image worker runs the same
+    /// helper when a decode or refusal finishes, so the order holds however the bytes grew.
     fn submit_image(
         &self,
         key: fbterm_term::images::ImageKey,
@@ -280,22 +281,7 @@ impl Router {
     ) {
         let store = fbterm_term::images::store();
         store.submit(self.owner, key, data);
-        if !store.over_cap(self.owner) {
-            return;
-        }
-        // Each evicted placement becomes a placeholder line and releases its image outright; the
-        // terminal raises `ImageReleased` for it too, which the idempotent release absorbs.
-        while store.over_cap(self.owner) {
-            let Some(terminal) = self.terminal.upgrade() else {
-                break; // the pane is gone: its whole budget goes with it
-            };
-            let Some(evicted) = terminal.lock().evict_oldest_scrollback_image() else {
-                break; // scrollback holds no image left to reclaim
-            };
-            drop(terminal);
-            store.release(self.owner, evicted);
-        }
-        store.enforce_caps(self.owner);
+        fbterm_term::images::reclaim(store, &self.terminal, self.owner);
     }
 
     /// Raise `Dirty` unless one is already pending.
