@@ -419,11 +419,11 @@ mod tests {
 
     fn term() -> SharedTerminal {
         let size = GridSize {
-            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         Arc::new(parking_lot::Mutex::new(crate::Terminal::new(size, 10)))
     }
@@ -434,11 +434,11 @@ mod tests {
     #[test]
     fn a_new_terminal_is_synced_again() {
         let synced = GridSize {
-            scale: 1.0,
             cols: 100,
             rows: 30,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let mut state = State::default();
         let first = term();

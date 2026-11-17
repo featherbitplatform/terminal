@@ -257,11 +257,11 @@ pub(crate) enum SettingsSource {
 
 /// Size used for sessions started before their window has laid out.
 pub(crate) const DEFAULT_GRID: GridSize = GridSize {
-    scale: 1.0,
     cols: 80,
     rows: 24,
     cell_width: 8.0,
     cell_height: 16.0,
+    scale: 1.0,
 };
 
 /// Which window `FBTERM_SCREENSHOT` captures.

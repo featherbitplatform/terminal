@@ -576,11 +576,11 @@ mod tests {
         pane.state = TabState::Connected;
         let term = std::sync::Arc::new(parking_lot::Mutex::new(fbterm_term::Terminal::new(
             fbterm_term::GridSize {
-                scale: 1.0,
                 cols: 20,
                 rows: 5,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         )));
@@ -736,11 +736,11 @@ mod tests {
     fn restart_reset_keeps_old_content_and_continues_below() {
         use feathercritty::index::{Column, Line};
         let size = fbterm_term::GridSize {
-            scale: 1.0,
             cols: 20,
             rows: 6,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let mut term = fbterm_term::Terminal::new(size, 100);
         // A program that wrote two lines, then left the alternate screen, a scroll region and
@@ -770,11 +770,11 @@ mod tests {
             env: Default::default(),
         };
         let size = fbterm_term::GridSize {
-            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let session = fbterm_session::spawn_local(&local, size, 100, tx).expect("spawn");
         let mut w = WindowState::new();
@@ -814,11 +814,11 @@ mod tests {
                 env: Default::default(),
             };
             let size = fbterm_term::GridSize {
-                scale: 1.0,
                 cols: 80,
                 rows: 24,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             };
             fbterm_session::spawn_local(&local, size, 100, tx.clone()).expect("spawn")
         };

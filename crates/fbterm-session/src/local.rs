@@ -60,12 +60,16 @@ fn session_env(
     env
 }
 
+/// A PTY's size: cells, plus the drawable area in PHYSICAL pixels (`pixel_width` /
+/// `pixel_height` are what programs read to lay themselves out in pixels, so they must match what
+/// fbterm draws on the window's display). Both fields are 16-bit: an enormous grid saturates.
 fn pty_size(size: GridSize) -> PtySize {
+    let (w, h) = size.physical_area();
     PtySize {
         rows: size.rows,
         cols: size.cols,
-        pixel_width: (f32::from(size.cols) * size.cell_width) as u16,
-        pixel_height: (f32::from(size.rows) * size.cell_height) as u16,
+        pixel_width: w.min(u16::MAX as u32) as u16,
+        pixel_height: h.min(u16::MAX as u32) as u16,
     }
 }
 
@@ -302,7 +306,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{DEFAULT_LANG, kill_unless_reaped, session_env};
+    use super::{DEFAULT_LANG, kill_unless_reaped, pty_size, session_env};
 
     fn get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
         env.iter()
@@ -362,17 +366,54 @@ mod tests {
             "a reaped pid is never signalled"
         );
     }
+    /// The pixel fields of a PTY's size are what programs read to size themselves by pixels, so
+    /// they carry the window's PHYSICAL pixels: the same grid at 2x is twice as many pixels, and
+    /// what the program draws lines up with what fbterm draws.
+    #[test]
+    fn local_pty_gets_physical_pixels() {
+        let grid = |scale: f32| fbterm_term::GridSize {
+            cols: 100,
+            rows: 30,
+            cell_width: 8.4,
+            cell_height: 16.2,
+            scale,
+        };
+        let at_one = pty_size(grid(1.0));
+        assert_eq!((at_one.cols, at_one.rows), (100, 30), "cells stay cells");
+        assert_eq!((at_one.pixel_width, at_one.pixel_height), (840, 486));
+
+        let at_two = pty_size(grid(2.0));
+        assert_eq!((at_two.pixel_width, at_two.pixel_height), (1680, 972));
+
+        let at_one_five = pty_size(grid(1.5));
+        assert_eq!(
+            (at_one_five.pixel_width, at_one_five.pixel_height),
+            (1260, 729)
+        );
+
+        // Both fields are 16-bit: an enormous grid saturates instead of wrapping.
+        let huge = fbterm_term::GridSize {
+            cols: u16::MAX,
+            rows: u16::MAX,
+            cell_width: 1e20,
+            cell_height: 1e20,
+            scale: 1e9,
+        };
+        let p = pty_size(huge);
+        assert_eq!((p.pixel_width, p.pixel_height), (u16::MAX, u16::MAX));
+    }
+
     /// macOS `openpty` fails now and then (`Unknown error: -6`) when several threads call it
     /// at once; sessions opened together (restored tabs, parallel tests) must all succeed.
     #[cfg(unix)]
     #[test]
     fn concurrent_pty_opens_all_succeed() {
         let size = super::pty_size(fbterm_term::GridSize {
-            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         });
         let failures = AtomicUsize::new(0);
         std::thread::scope(|scope| {

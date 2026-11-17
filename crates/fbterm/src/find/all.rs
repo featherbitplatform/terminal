@@ -329,11 +329,11 @@ mod tests {
     fn terminal() -> SharedTerminal {
         Arc::new(Mutex::new(Terminal::new(
             GridSize {
-                scale: 1.0,
                 cols: 20,
                 rows: 5,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         )))

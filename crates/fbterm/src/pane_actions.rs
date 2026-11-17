@@ -281,11 +281,11 @@ mod tests {
 
     fn grid(area: Size) -> GridSize {
         GridSize {
-            scale: 1.0,
             cols: (area.width / CELL.0) as u16,
             rows: (area.height / CELL.1) as u16,
             cell_width: CELL.0,
             cell_height: CELL.1,
+            scale: 1.0,
         }
     }
 

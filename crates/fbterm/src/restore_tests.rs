@@ -384,11 +384,11 @@ fn grapheme_setting_reaches_new_terminals() {
     let (mut app, _) = App::build(paths, true);
     app.state_saving_enabled = false;
     let grid = fbterm_term::GridSize {
-        scale: 1.0,
         cols: 80,
         rows: 24,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     };
     let on = |app: &App| {
         app.new_terminal(grid)

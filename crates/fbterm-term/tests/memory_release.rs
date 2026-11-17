@@ -185,11 +185,11 @@ fn cycles(cycles: usize) -> ((isize, isize), Vec<Row>) {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let size = GridSize {
-        scale: 1.0,
         cols: 120,
         rows: 40,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     };
     let scrollback = fbterm_config::Settings::default().scrollback_lines;
     let mut buf = String::with_capacity(512);

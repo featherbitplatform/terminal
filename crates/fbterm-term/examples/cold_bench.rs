@@ -120,11 +120,11 @@ fn service_log(seed: u64, rows: usize) -> Vec<u8> {
 fn tab(compression: Option<usize>, bytes: &[u8]) -> SharedTerminal {
     let mut t = Terminal::new(
         GridSize {
-            scale: 1.0,
             cols: COLS,
             rows: ROWS,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         },
         LINES,
     );

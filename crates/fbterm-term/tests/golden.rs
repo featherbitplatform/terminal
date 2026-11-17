@@ -35,11 +35,11 @@ const ALL_TABS_LIMIT: usize = 51;
 
 fn size(cols: u16) -> GridSize {
     GridSize {
-        scale: 1.0,
         cols,
         rows: ROWS,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     }
 }
 

@@ -445,11 +445,11 @@ mod released_tests {
         tokio::sync::mpsc::UnboundedReceiver<(SessionId, SessionEvent)>,
     ) {
         let size = GridSize {
-            scale: 1.0,
             cols: 10,
             rows: 3,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
         let weak = Arc::downgrade(&terminal);
@@ -529,11 +529,11 @@ mod feeder_image_tests {
     #[test]
     fn a_fed_picture_lands_in_the_store_and_its_release_frees_it() {
         let size = GridSize {
-            scale: 1.0,
             cols: 10,
             rows: 3,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
         let owner = terminal.lock().image_owner();
@@ -590,11 +590,11 @@ mod feeder_image_tests {
     #[test]
     fn a_reconnect_moves_the_store_answers_to_the_new_feeder() {
         let size = GridSize {
-            scale: 1.0,
             cols: 10,
             rows: 3,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
         let owner = terminal.lock().image_owner();

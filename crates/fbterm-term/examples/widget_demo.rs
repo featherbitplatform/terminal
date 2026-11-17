@@ -87,11 +87,11 @@ fn pane(sample: String, focused: bool, accent: Option<Rgb>) -> Pane {
     let scheme = ColorScheme::graphite();
     let mut t = Terminal::new(
         GridSize {
-            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         },
         1000,
     );

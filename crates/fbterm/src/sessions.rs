@@ -918,11 +918,11 @@ pub(crate) mod pane_tests {
         app.grids.insert(
             a,
             GridSize {
-                scale: 1.0,
                 cols: 109,
                 rows: 33,
                 cell_width: 9.0,
                 cell_height: 18.0,
+                scale: 1.0,
             },
         );
         // Split by hand, as the split action will.
@@ -940,11 +940,11 @@ pub(crate) mod pane_tests {
         assert_eq!(
             size,
             GridSize {
-                scale: 1.0,
                 cols: 54,
                 rows: 33,
                 cell_width: 9.0,
                 cell_height: 18.0,
+                scale: 1.0,
             }
         );
     }
@@ -1093,6 +1093,87 @@ pub(crate) mod pane_tests {
             );
             assert_eq!(app.grids.get(&b), Some(&g));
             assert!(!app.grids.contains_key(&a));
+        }
+
+        /// A window moving to a display of another scale changes the pixel sizes programs are told.
+        /// It travels the path an ordinary resize already takes: the style carries the new scale, so
+        /// the grid the view reports at its next layout is a new one, and that reaches the pane's
+        /// grid, its terminal and (after the quiet period) its session.
+        #[test]
+        fn scale_change_resends_pixel_sizes() {
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let first = connected("one", shell("sleep 30", tx.clone()));
+            let second = connected("two", shell("sleep 30", tx));
+            let a = first.id;
+            let (mut app, wid) = app_with(first, second);
+            // The assertions below are in whole pixels.
+            app.ui_scale = 1.0;
+
+            // Laid out at the window's scale 1: 100x30 cells of 8x16 logical px.
+            let cell = iced::Size::new(8.0, 16.0);
+            let bounds = iced::Size::new(800.0, 480.0);
+            // What the view reports: its style's scale, in the grid it measured at these bounds.
+            let reported = |app: &App| {
+                let tab = app.windows[&wid].active_tab().unwrap();
+                let pane = tab.pane(a).unwrap();
+                fbterm_term::grid_size_from_bounds(
+                    bounds,
+                    cell,
+                    app.pane_style(wid, tab, pane).scale,
+                )
+            };
+
+            let at_one = reported(&app);
+            assert_eq!(at_one.scale, 1.0);
+            let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(at_one)));
+            let generation = app.pending_resizes[&a].0;
+            let _ = app.update(Message::ResizeSettled(a, generation));
+            assert_eq!(app.grids.get(&a), Some(&at_one));
+            assert_eq!(at_one.physical_area(), (800, 480));
+
+            // The window moves to a 2x display. Nothing resizes it: only its scale is reported.
+            let _ = app.update(Message::WindowScale(wid, 2.0));
+            let tab = app.windows[&wid].active_tab().unwrap();
+            assert_eq!(app.pane_style(wid, tab, tab.pane(a).unwrap()).scale, 2.0);
+
+            // So the grid its view reports at the next layout is a new one: same cells, new pixels.
+            let at_two = reported(&app);
+            assert_eq!((at_two.cols, at_two.rows), (100, 30), "cells stay cells");
+            assert_eq!(at_two.scale, 2.0);
+            assert_eq!(at_two.physical_area(), (1600, 960));
+
+            let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(at_two)));
+            // What the session is handed once the quiet period passes: the scaled grid, whose pixels
+            // `pty_size` and `ssh_pixels` turn into the pixel fields programs read.
+            assert_eq!(app.pending_resizes[&a].1.physical_area(), (1600, 960));
+            let generation = app.pending_resizes[&a].0;
+            let _ = app.update(Message::ResizeSettled(a, generation));
+
+            // The pane's grid and its terminal both carry the new scale.
+            assert_eq!(app.grids.get(&a), Some(&at_two));
+            assert_eq!(size_of(&app, wid, a), at_two);
+            // And so does the size the emulator answers programs with (`CSI 16 t` is one cell).
+            let term = app.windows[&wid].tabs[0]
+                .pane(a)
+                .unwrap()
+                .terminal()
+                .unwrap();
+            let answer = {
+                let mut t = term.lock();
+                t.feed(b"\x1b[16t");
+                String::from_utf8(
+                    t.take_events()
+                        .into_iter()
+                        .filter_map(|e| match e {
+                            fbterm_term::TermEvent::PtyWrite(b) => Some(b),
+                            _ => None,
+                        })
+                        .flatten()
+                        .collect::<Vec<u8>>(),
+                )
+                .unwrap()
+            };
+            assert_eq!(answer, "\x1b[6;32;16t", "cells of 16x32 physical px");
         }
 
         #[test]

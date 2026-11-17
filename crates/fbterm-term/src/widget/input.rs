@@ -680,11 +680,11 @@ mod tests {
 
     fn filled(rows: u16) -> Terminal {
         let size = GridSize {
-            scale: 1.0,
             cols: 40,
             rows,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let mut t = Terminal::new(size, 1000);
         for i in 0..200 {
@@ -1213,11 +1213,11 @@ mod tests {
     fn pointer_past_a_smaller_terminal_stays_inside_its_grid() {
         let term = shared(filled(24));
         let view = GridSize {
-            scale: 1.0,
             cols: 60,
             rows: 30,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         // Column 50 of the view, past the terminal's 40 (lines outside the grid read as empty
         // cells, columns are not checked), on a line inside it.

@@ -460,11 +460,11 @@ mod tests {
     fn term(cols: u16, rows: u16, bytes: &[u8]) -> SharedTerminal {
         let mut t = Terminal::new(
             GridSize {
-                scale: 1.0,
                 cols,
                 rows,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             1000,
         );
@@ -634,11 +634,11 @@ mod tests {
         // Resized between chunks: the export fails and the old file stays as it was.
         let mut grow = || {
             t.lock().resize(GridSize {
-                scale: 1.0,
                 cols: 30,
                 rows: 3,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             })
         };
         let mut sink = Vec::new();
@@ -684,11 +684,11 @@ mod tests {
     fn export_survives_history_clear_midway() {
         let mut t = Terminal::new(
             GridSize {
-                scale: 1.0,
                 cols: 20,
                 rows: 5,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             10_000,
         );

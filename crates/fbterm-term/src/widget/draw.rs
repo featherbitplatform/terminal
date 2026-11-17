@@ -550,11 +550,11 @@ mod tests {
     fn term_with(bytes: &[u8]) -> Terminal {
         let mut t = Terminal::new(
             crate::GridSize {
-                scale: 1.0,
                 cols: 20,
                 rows: 4,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         );
@@ -758,11 +758,11 @@ mod tests {
     fn a_ligature_at_the_last_cells_stays_in_its_run() {
         let mut t = Terminal::new(
             crate::GridSize {
-                scale: 1.0,
                 cols: 4,
                 rows: 3,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         );
