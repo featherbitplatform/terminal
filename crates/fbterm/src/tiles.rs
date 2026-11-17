@@ -266,6 +266,8 @@ fn snap(r: Rectangle) -> Rectangle {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Incoming {
     pub tab: TabId,
+    /// The tab shown here, which it would merge into.
+    pub into: TabId,
     /// It is another tab than the one shown, so it can be dropped here.
     pub mergeable: bool,
     /// Its layout, which lands whole.
@@ -633,6 +635,7 @@ impl Tiles<'_> {
                         self.window,
                         DragMsg::DropTab {
                             tab: incoming.tab,
+                            into: incoming.into,
                             at,
                         },
                     ));
@@ -1827,6 +1830,7 @@ mod tests {
             let carried = |mergeable| {
                 Some(Incoming {
                     tab,
+                    into: TabId::next(),
                     mergeable,
                     layout: Layout::Pane(PaneId(9)),
                 })
@@ -1842,7 +1846,7 @@ mod tests {
                 .iter()
                 .flat_map(|s| &s.messages)
                 .filter_map(|m| match m {
-                    Message::Drag(_, DragMsg::DropTab { tab: t, at }) => Some((*t, *at)),
+                    Message::Drag(_, DragMsg::DropTab { tab: t, at, .. }) => Some((*t, *at)),
                     _ => None,
                 })
                 .collect();
