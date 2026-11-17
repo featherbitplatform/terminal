@@ -838,6 +838,7 @@ mod pool {
     type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
 
     const SIZE: GridSize = GridSize {
+        scale: 1.0,
         cols: 100,
         rows: 30,
         cell_width: 8.0,
@@ -1464,6 +1465,7 @@ mod access {
     use tokio::sync::mpsc::unbounded_channel;
 
     const SIZE: GridSize = GridSize {
+        scale: 1.0,
         cols: 160,
         rows: 30,
         cell_width: 8.0,

@@ -398,7 +398,7 @@ impl App {
     /// The grid a pane's new terminal starts at. A pane that was laid out keeps its grid; a new
     /// one (a new tab, or a split) gets the grid of its rectangle in the window's last known
     /// area, with the cell size of the tab's focused pane (else of any laid-out pane of the
-    /// window). Before the window has laid out: `DEFAULT_GRID`.
+    /// window), at the window's physical scale. Before the window has laid out: `DEFAULT_GRID`.
     pub(crate) fn initial_grid(&self, wid: window::Id, pane: PaneId) -> GridSize {
         if let Some(g) = self.grids.get(&pane) {
             return *g;
@@ -429,6 +429,7 @@ impl App {
             Some((_, r)) => fbterm_term::grid_size_from_bounds(
                 r.size(),
                 iced::Size::new(cell.cell_width, cell.cell_height),
+                self.physical_scale(wid),
             ),
             None => DEFAULT_GRID,
         }
@@ -917,6 +918,7 @@ pub(crate) mod pane_tests {
         app.grids.insert(
             a,
             GridSize {
+                scale: 1.0,
                 cols: 109,
                 rows: 33,
                 cell_width: 9.0,
@@ -938,6 +940,7 @@ pub(crate) mod pane_tests {
         assert_eq!(
             size,
             GridSize {
+                scale: 1.0,
                 cols: 54,
                 rows: 33,
                 cell_width: 9.0,
@@ -1221,13 +1224,13 @@ pub(crate) mod pane_tests {
                 let t = app.windows[&wid].active_tab().unwrap();
                 app.pane_style(wid, t, t.pane(a).unwrap()).font_size
             };
-            let before = fbterm_term::grid_size_from_bounds(bounds, cell(font(&app)));
+            let before = fbterm_term::grid_size_from_bounds(bounds, cell(font(&app)), 1.0);
 
             let _ = app.update(Message::Shortcut(wid, Action::ZoomIn));
             let zoomed = font(&app);
             assert_eq!(zoomed, app.settings.font_size + 1.0);
             // What the view reports after measuring the bigger cell.
-            let after = fbterm_term::grid_size_from_bounds(bounds, cell(zoomed));
+            let after = fbterm_term::grid_size_from_bounds(bounds, cell(zoomed), 1.0);
             assert!(
                 after.cols < before.cols && after.rows < before.rows,
                 "{before:?} -> {after:?}"
@@ -1324,7 +1327,7 @@ pub(crate) mod pane_tests {
                 .layout
                 .rects(iced::Rectangle::with_size(area));
             for (pane, rect) in rects {
-                let g = fbterm_term::grid_size_from_bounds(rect.size(), cell);
+                let g = fbterm_term::grid_size_from_bounds(rect.size(), cell, 1.0);
                 let _ = app.update(Message::Terminal(wid, pane, TerminalOutput::Resized(g)));
                 // Not yet: the session hears it once the quiet period passes.
                 assert_eq!(size_of(&app, wid, pane), DEFAULT_GRID, "{pane:?}");

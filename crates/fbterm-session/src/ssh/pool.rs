@@ -1720,6 +1720,7 @@ mod tests {
     #[test]
     fn refusal_notice_is_dim_text_on_its_own_line() {
         let size = GridSize {
+            scale: 1.0,
             cols: 60,
             rows: 5,
             cell_width: 8.0,

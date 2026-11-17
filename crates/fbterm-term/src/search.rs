@@ -577,6 +577,7 @@ mod tests {
     fn term(cols: u16, rows: u16, history: usize) -> Terminal {
         Terminal::new(
             GridSize {
+                scale: 1.0,
                 cols,
                 rows,
                 cell_width: 8.0,

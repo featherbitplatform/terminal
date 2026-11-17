@@ -185,6 +185,7 @@ fn cycles(cycles: usize) -> ((isize, isize), Vec<Row>) {
     static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let size = GridSize {
+        scale: 1.0,
         cols: 120,
         rows: 40,
         cell_width: 8.0,

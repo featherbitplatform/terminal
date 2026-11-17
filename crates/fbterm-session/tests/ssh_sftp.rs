@@ -38,6 +38,7 @@ const HOME: &str = "/config";
 const STEP: Duration = Duration::from_secs(20);
 
 const SIZE: GridSize = GridSize {
+    scale: 1.0,
     cols: 200,
     rows: 30,
     cell_width: 8.0,

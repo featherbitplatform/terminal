@@ -82,6 +82,7 @@ fn run(path: &Path) -> f64 {
         env: BTreeMap::new(),
     };
     let size = GridSize {
+        scale: 1.0,
         cols: 120,
         rows: 40,
         cell_width: 8.0,

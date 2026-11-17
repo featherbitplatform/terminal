@@ -196,6 +196,7 @@ fn start_widget_io(workload: &str) {
     let scheme = fbterm_term::ColorScheme::graphite();
     let mut t = fbterm_term::Terminal::new(
         fbterm_term::GridSize {
+            scale: 1.0,
             cols: COLS as u16,
             rows: ROWS as u16,
             cell_width: 7.0,
@@ -218,6 +219,7 @@ fn start_widget_io(workload: &str) {
             accent: None,
             focused: true,
             background_opacity: 1.0,
+            scale: 1.0,
         })
         .ok();
     let (tx, rx) = mpsc::unbounded();

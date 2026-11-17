@@ -6,7 +6,10 @@ use iced::Size;
 use crate::GridSize;
 
 /// Grid that fits `bounds` (logical px) with cells of `cell` size; at least 1x1.
-pub fn grid_size_from_bounds(bounds: Size, cell: Size) -> GridSize {
+///
+/// `scale` is the window's physical scale, carried into the grid: programs are told physical
+/// pixels, so a grid must say which window it was measured in (see [`GridSize::physical_cell`]).
+pub fn grid_size_from_bounds(bounds: Size, cell: Size, scale: f32) -> GridSize {
     let fit = |px: f32, cell: f32| {
         if cell > 0.0 {
             (px / cell).floor().clamp(1.0, f32::from(u16::MAX)) as u16
@@ -19,6 +22,7 @@ pub fn grid_size_from_bounds(bounds: Size, cell: Size) -> GridSize {
         rows: fit(bounds.height, cell.height),
         cell_width: cell.width,
         cell_height: cell.height,
+        scale,
     }
 }
 
@@ -54,6 +58,7 @@ mod tests {
 
     fn grid(cols: u16, rows: u16) -> GridSize {
         GridSize {
+            scale: 1.0,
             cols,
             rows,
             cell_width: 8.0,
@@ -63,14 +68,23 @@ mod tests {
 
     #[test]
     fn grid_size_from_bounds_floors_to_whole_cells() {
-        let g = grid_size_from_bounds(Size::new(800.0, 600.0), Size::new(8.0, 16.0));
+        let g = grid_size_from_bounds(Size::new(800.0, 600.0), Size::new(8.0, 16.0), 1.0);
         assert_eq!((g.cols, g.rows), (100, 37));
         assert_eq!((g.cell_width, g.cell_height), (8.0, 16.0));
     }
 
     #[test]
+    fn grid_size_from_bounds_carries_the_windows_scale() {
+        let g = grid_size_from_bounds(Size::new(800.0, 600.0), Size::new(8.4, 16.2), 2.0);
+        assert_eq!(g.scale, 2.0);
+        // The cells stay logical (the widget draws them that way); pixels come from the scale.
+        assert_eq!((g.cell_width, g.cell_height), (8.4, 16.2));
+        assert_eq!(g.physical_cell(), (17, 32));
+    }
+
+    #[test]
     fn grid_size_from_bounds_is_at_least_one_cell() {
-        let g = grid_size_from_bounds(Size::new(3.0, 0.0), Size::new(8.0, 16.0));
+        let g = grid_size_from_bounds(Size::new(3.0, 0.0), Size::new(8.0, 16.0), 1.0);
         assert_eq!((g.cols, g.rows), (1, 1));
     }
 

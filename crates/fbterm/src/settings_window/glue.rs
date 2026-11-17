@@ -28,8 +28,8 @@ pub(crate) fn intern(name: &str) -> &'static str {
     leaked
 }
 
-/// The look of terminals for `settings`, before a pane's color scheme applies (see
-/// [`App::pane_style`]).
+/// The look of terminals for `settings`, before a scheme applies and before a window's physical
+/// scale is known (see [`App::pane_style`], which sets the scale of the window drawn in).
 pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
     TerminalStyle {
         scheme: ColorScheme::graphite(),
@@ -44,13 +44,15 @@ pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
         // The window paints the default background (with the padding around the grid) at
         // `background_opacity`; see `window::view`.
         background_opacity: 0.0,
+        scale: 1.0,
     }
 }
 
 impl App {
     /// The look of one pane: the colors of its scheme ([`App::scheme_for`]), the scheme's font
     /// (its own, or with `use_theme_fonts` its installed suggestion: [`App::scheme_font`]) and
-    /// size where it sets them (else the settings'), at the pane's own zoom; focused (keys
+    /// size where it sets them (else the settings'), at the pane's own zoom, at the window's
+    /// physical scale (so the grid its view reports tells programs physical pixels); focused (keys
     /// go to it, solid cursor) only for the focused pane of the focused window while its find
     /// bar is closed and neither docked panel has the keyboard. No accent border: the tiles
     /// draw the focus outline.
@@ -81,6 +83,8 @@ impl App {
                 && !self.file_panels.has_focus(wid)
                 && !self.tunnels_panels.has_focus(wid),
             accent: None,
+            // The window's own scale: a pane moved to another display tells its program new pixels.
+            scale: self.physical_scale(wid),
             ..self.style.clone()
         }
     }

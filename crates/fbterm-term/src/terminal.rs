@@ -18,12 +18,46 @@ pub use feathercritty::event::{ImageData, ImageKey};
 pub use feathercritty::term::TermMode;
 
 /// Terminal size in cells plus the pixel size of one cell.
+///
+/// `cell_width` and `cell_height` are LOGICAL pixels, exactly as the widget measures and draws
+/// them; `scale` is the window's physical scale (physical pixels per logical one, 1.0 when the
+/// window has not reported one). Programs - PTYs, SSH, the emulator's own reports - see physical
+/// pixels, which [`Self::physical_cell`] and [`Self::physical_area`] give.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridSize {
     pub cols: u16,
     pub rows: u16,
     pub cell_width: f32,
     pub cell_height: f32,
+    /// Physical pixels per logical pixel of the window this grid was measured in.
+    pub scale: f32,
+}
+
+impl GridSize {
+    /// One text cell in physical pixels: each axis is the logical cell rounded to a whole pixel at
+    /// `scale`, and at least 1 (what the emulator places images by and reports for a cell).
+    pub fn physical_cell(&self) -> (u32, u32) {
+        (
+            whole(self.cell_width * self.scale).max(1),
+            whole(self.cell_height * self.scale).max(1),
+        )
+    }
+
+    /// The whole grid in physical pixels: each axis is its cells rounded to a whole pixel at
+    /// `scale`, so a program's idea of the drawable area matches what is drawn. An empty axis is
+    /// 0. Saturates instead of overflowing.
+    pub fn physical_area(&self) -> (u32, u32) {
+        (
+            whole(f32::from(self.cols) * self.cell_width * self.scale),
+            whole(f32::from(self.rows) * self.cell_height * self.scale),
+        )
+    }
+}
+
+/// Logical pixels at a window's scale, as whole physical pixels: rounded, and saturating to
+/// `u32::MAX` rather than overflowing (`NaN` becomes 0).
+fn whole(logical: f32) -> u32 {
+    logical.round().max(0.0) as u32
 }
 
 /// Events the terminal raises towards the host.
@@ -120,12 +154,13 @@ impl EventListener for EventProxy {
             Event::Exit | Event::ChildExit(_) => TermEvent::Exit,
             Event::TextAreaSizeRequest(fmt) => {
                 let s = sh.size;
+                let (w, h) = s.physical_cell();
                 TermEvent::PtyWrite(
                     fmt(WindowSize {
                         num_lines: s.rows,
                         num_cols: s.cols,
-                        cell_width: s.cell_width as u16,
-                        cell_height: s.cell_height as u16,
+                        cell_width: w.min(u16::MAX as u32) as u16,
+                        cell_height: h.min(u16::MAX as u32) as u16,
                     })
                     .into_bytes(),
                 )
@@ -220,7 +255,11 @@ impl Terminal {
             osc52: feathercritty::term::Osc52::OnlyPaste,
             ..Config::default()
         };
-        let term = Term::new(config.clone(), &dims(size), proxy);
+        let mut term = Term::new(config.clone(), &dims(size), proxy);
+        // The emulator places images and answers `CSI 14 t` / `CSI 16 t` from the cell's physical
+        // size, so it gets it before any program can ask (see [`Self::set_cell_pixel_size`]).
+        let (cell_w, cell_h) = size.physical_cell();
+        term.set_cell_pixel_size(cell_w, cell_h);
         Self {
             term,
             config,
@@ -489,9 +528,13 @@ impl Terminal {
         self.generation += 1;
     }
 
+    /// Resize the grid, and with it the cell size programs are told: the new grid carries the
+    /// window's physical scale (see [`Self::set_cell_pixel_size`]).
     pub fn resize(&mut self, size: GridSize) {
         self.shared.lock().size = size;
+        let (cell_w, cell_h) = size.physical_cell();
         self.term.resize(dims(size));
+        self.term.set_cell_pixel_size(cell_w, cell_h);
         self.generation += 1;
     }
 
@@ -559,7 +602,71 @@ mod tests {
             rows,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         }
+    }
+
+    /// A grid of fractional cells (logical px) in a window at `scale`.
+    fn grid_of(cols: u16, rows: u16, cell_width: f32, cell_height: f32, scale: f32) -> GridSize {
+        GridSize {
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            scale,
+        }
+    }
+
+    /// A fractional advance (7.4) and a ceiled line height (15.6): what `measure` gives a font
+    /// whose size is not a whole multiple of 5.
+    #[test]
+    fn physical_cell_is_the_logical_cell_rounded_at_the_scale() {
+        for (scale, w, h) in [(1.0, 7, 16), (2.0, 15, 31), (1.25, 9, 20), (1.5, 11, 23)] {
+            let g = grid_of(80, 24, 7.4, 15.6, scale);
+            assert_eq!(g.physical_cell(), (w, h), "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn physical_cell_is_at_least_one_pixel() {
+        let tiny = grid_of(80, 24, 0.2, 0.4, 1.0);
+        assert_eq!(tiny.physical_cell(), (1, 1));
+        // A window that reported no scale at all still has cells of a whole pixel.
+        let unscaled = grid_of(80, 24, 7.4, 15.6, 0.0);
+        assert_eq!(unscaled.physical_cell(), (1, 1));
+    }
+
+    #[test]
+    fn physical_area_is_the_grid_rounded_at_the_scale() {
+        let g = grid_of(100, 30, 8.4, 16.2, 2.0);
+        // 100 x 8.4 x 2 = 1680, 30 x 16.2 x 2 = 972: the whole grid, not one cell times cells.
+        assert_eq!(g.physical_area(), (1680, 972));
+        let at_one = grid_of(100, 30, 8.4, 16.2, 1.0);
+        assert_eq!(at_one.physical_area(), (840, 486));
+    }
+
+    #[test]
+    fn physical_area_of_an_empty_axis_is_zero() {
+        let g = grid_of(0, 0, 8.0, 16.0, 2.0);
+        assert_eq!(g.physical_area(), (0, 0));
+        assert_eq!(
+            g.physical_cell(),
+            (16, 32),
+            "the cell is still a whole pixel"
+        );
+        let rows_only = grid_of(40, 0, 8.0, 16.0, 1.0);
+        assert_eq!(rows_only.physical_area(), (320, 0));
+    }
+
+    #[test]
+    fn physical_sizes_saturate_instead_of_overflowing() {
+        let huge = grid_of(u16::MAX, u16::MAX, 1e20, 1e20, 1e9);
+        assert_eq!(huge.physical_cell(), (u32::MAX, u32::MAX));
+        assert_eq!(huge.physical_area(), (u32::MAX, u32::MAX));
+        // A product that is not even a finite number.
+        let infinite = grid_of(10, 10, f32::MAX, f32::MAX, f32::MAX);
+        assert_eq!(infinite.physical_cell(), (u32::MAX, u32::MAX));
+        assert_eq!(infinite.physical_area(), (u32::MAX, u32::MAX));
     }
 
     #[test]
@@ -749,6 +856,28 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b[14t");
         assert_eq!(reply(&mut t), "\x1b[4;384;640t");
+    }
+
+    /// The emulator answers `CSI 16 t` (one cell) and `CSI 14 t` (the text area) from the physical
+    /// cell size the host reported with `set_cell_pixel_size`, so a program that sizes its output
+    /// by the cell uses the numbers the drawing actually uses.
+    #[test]
+    fn size_reports_answer_in_physical_pixels() {
+        let mut t = Terminal::new(grid_of(10, 5, 8.4, 16.2, 2.0), 100);
+        t.feed(b"\x1b[16t");
+        assert_eq!(
+            reply(&mut t),
+            "\x1b[6;32;17t",
+            "the cell at the window's scale"
+        );
+        t.feed(b"\x1b[14t");
+        // 10 cells of 17 px, 5 rows of 32.
+        assert_eq!(reply(&mut t), "\x1b[4;160;170t");
+
+        // Resizing carries the new grid's scale too.
+        t.resize(grid_of(20, 8, 8.4, 16.2, 1.0));
+        t.feed(b"\x1b[16t\x1b[14t");
+        assert_eq!(reply(&mut t), "\x1b[6;16;8t\x1b[4;128;160t");
     }
 
     #[test]

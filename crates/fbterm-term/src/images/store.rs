@@ -1313,6 +1313,7 @@ mod tests {
 
     fn size() -> GridSize {
         GridSize {
+            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,
@@ -2437,6 +2438,7 @@ mod tests {
     #[test]
     fn reclaim_takes_scrollback_images_first() {
         let small = GridSize {
+            scale: 1.0,
             cols: 10,
             rows: 3,
             cell_width: 8.0,

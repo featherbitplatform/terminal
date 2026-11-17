@@ -612,11 +612,15 @@ impl SchemesState {
 
     /// How the preview draws the selected draft: its colors, its font and size where it sets
     /// them (its own font, or with `use_theme_fonts` its installed suggestion, as its panes
-    /// would; else `base`'s, the global ones), with its own background.
-    pub fn preview_style(&self, base: &TerminalStyle) -> TerminalStyle {
+    /// would; else `base`'s, the global ones), with its own background, at `scale`: the physical
+    /// scale of the window showing it (`base` is the global look, which has no window).
+    pub fn preview_style(&self, base: &TerminalStyle, scale: f32) -> TerminalStyle {
         let (lo, hi) = fbterm_config::settings::FONT_SIZE_RANGE;
         let Some(d) = self.selected_draft() else {
-            return base.clone();
+            return TerminalStyle {
+                scale,
+                ..base.clone()
+            };
         };
         TerminalStyle {
             scheme: ColorScheme::from(&d.colors),
@@ -631,6 +635,7 @@ impl SchemesState {
             accent: None,
             focused: false,
             background_opacity: 1.0,
+            scale,
         }
     }
 

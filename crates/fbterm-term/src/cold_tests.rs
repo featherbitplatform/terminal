@@ -15,6 +15,7 @@ const SCROLLBACK: usize = 200_000;
 
 pub(crate) fn size(cols: u16, rows: u16) -> GridSize {
     GridSize {
+        scale: 1.0,
         cols,
         rows,
         cell_width: 8.0,

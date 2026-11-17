@@ -20,6 +20,7 @@ const TABS: usize = 20;
 fn full_tab(seed: usize) -> SharedTerminal {
     let mut t = Terminal::new(
         GridSize {
+            scale: 1.0,
             cols: 160,
             rows: 50,
             cell_width: 8.0,
@@ -74,6 +75,7 @@ fn best_of<T>(n: usize, mut f: impl FnMut() -> T) -> (Duration, T) {
 fn wide_tab(colors: bool) -> SharedTerminal {
     let mut t = Terminal::new(
         GridSize {
+            scale: 1.0,
             cols: 200,
             rows: 50,
             cell_width: 8.0,

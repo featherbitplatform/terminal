@@ -166,6 +166,7 @@ mod tests {
     fn apply_to_answers_color_queries_with_scheme() {
         let mut t = Terminal::new(
             GridSize {
+                scale: 1.0,
                 cols: 80,
                 rows: 24,
                 cell_width: 8.0,

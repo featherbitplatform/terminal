@@ -48,6 +48,10 @@ pub struct TerminalStyle {
     /// selection, the cursor and text stay opaque. At `0.0` the default background is not drawn
     /// at all, for a host that paints it behind the widget.
     pub background_opacity: f32,
+    /// Physical pixels per logical pixel of the window this terminal sits in (1.0 when unknown).
+    /// The grid the view reports carries it, so programs are told physical pixels; cells stay
+    /// logical, which is what the drawing uses.
+    pub scale: f32,
 }
 
 impl<'a> From<&'a TerminalStyle> for Cow<'a, TerminalStyle> {
@@ -243,7 +247,7 @@ impl<Message> TerminalView<'_, Message> {
         if bounds.width < 1.0 || bounds.height < 1.0 {
             return;
         }
-        let grid = grid_size_from_bounds(bounds.size(), m.cell);
+        let grid = grid_size_from_bounds(bounds.size(), m.cell, self.style.scale);
         if state.synced == Some(grid) {
             return;
         }
@@ -314,7 +318,7 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
         let bounds = layout.bounds();
         self.sync_size(state, bounds, shell);
         let Some(m) = state.measured else { return };
-        let grid = grid_size_from_bounds(bounds.size(), m.cell);
+        let grid = grid_size_from_bounds(bounds.size(), m.cell, self.style.scale);
         let mut out = Vec::new();
         let ctx = input::Context {
             term: self.term,
@@ -415,6 +419,7 @@ mod tests {
 
     fn term() -> SharedTerminal {
         let size = GridSize {
+            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,
@@ -429,6 +434,7 @@ mod tests {
     #[test]
     fn a_new_terminal_is_synced_again() {
         let synced = GridSize {
+            scale: 1.0,
             cols: 100,
             rows: 30,
             cell_width: 8.0,
@@ -449,6 +455,104 @@ mod tests {
         );
         state.hold(&second);
         assert_eq!(state.synced, None, "new terminal: synced again");
+    }
+
+    fn style_at(scale: f32) -> TerminalStyle {
+        TerminalStyle {
+            scheme: ColorScheme::graphite(),
+            font: Font::with_name("Sample Mono"),
+            font_size: 14.0,
+            features: FontFeatures::default(),
+            accent: None,
+            focused: true,
+            background_opacity: 1.0,
+            scale,
+        }
+    }
+
+    /// What `view` publishes for one `sync_size` pass at `bounds`.
+    fn sync(
+        view: &TerminalView<'_, TerminalOutput>,
+        state: &mut State,
+        bounds: Rectangle,
+    ) -> Vec<TerminalOutput> {
+        let mut out = Vec::new();
+        let mut shell = Shell::new(&mut out);
+        view.sync_size(state, bounds, &mut shell);
+        out
+    }
+
+    /// A window moving to a display of another scale changes nothing the widget draws with: same
+    /// bounds, same logical cells, so the same grid of cells. It changes what programs are told,
+    /// so the grid must carry the new scale and reach the terminal.
+    #[test]
+    fn a_scale_change_makes_the_view_report_a_new_grid() {
+        let term = term();
+        let mut state = State::default();
+        state.hold(&term);
+        state.measured = Some(Measured {
+            font: Font::with_name("Sample Mono"),
+            font_size: 14.0,
+            cell: Size::new(8.0, 16.0),
+            epoch: font_epoch(),
+        });
+        // 100x30 cells of 8x16 logical px: bigger than the terminal's own 80x24, so the first
+        // layout has something to report.
+        let bounds = Rectangle::new(iced::Point::new(0.0, 0.0), Size::new(800.0, 480.0));
+
+        let at_one = style_at(1.0);
+        let view = TerminalView {
+            term: &term,
+            style: Cow::Borrowed(&at_one),
+            highlight: None,
+            on_event: Box::new(|out| out),
+        };
+        let out = sync(&view, &mut state, bounds);
+        let [TerminalOutput::Resized(first)] = out[..] else {
+            panic!("expected one resize, got {out:?}");
+        };
+        assert_eq!((first.cols, first.rows), (100, 30));
+        assert_eq!(first.scale, 1.0);
+        assert!(
+            sync(&view, &mut state, bounds).is_empty(),
+            "the same grid is not reported twice"
+        );
+
+        // The window moved to a 2x display: the layout re-runs with the new scale.
+        let at_two = style_at(2.0);
+        let view = TerminalView {
+            term: &term,
+            style: Cow::Borrowed(&at_two),
+            highlight: None,
+            on_event: Box::new(|out| out),
+        };
+        let out = sync(&view, &mut state, bounds);
+        let [TerminalOutput::Resized(second)] = out[..] else {
+            panic!("expected one resize for the scale change, got {out:?}");
+        };
+        assert_eq!(
+            (second.cols, second.rows),
+            (100, 30),
+            "cells are logical: the grid of cells is unchanged"
+        );
+        assert_eq!(second.scale, 2.0);
+
+        // The terminal took the new grid, and its cell pixels doubled with it.
+        let mut t = term.lock();
+        assert_eq!(t.size(), second);
+        t.feed(b"\x1b[16t");
+        let answer: String = String::from_utf8(
+            t.take_events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    crate::TermEvent::PtyWrite(b) => Some(b),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<u8>>(),
+        )
+        .unwrap();
+        assert_eq!(answer, "\x1b[6;32;16t", "cells of 16x32 physical px");
     }
 
     #[test]

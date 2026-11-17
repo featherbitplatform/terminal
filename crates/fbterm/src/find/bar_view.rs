@@ -176,6 +176,7 @@ mod tests {
     #[test]
     fn the_bar_covers_the_top_right_cells_and_narrows_on_small_windows() {
         let size = GridSize {
+            scale: 1.0,
             cols: 100,
             rows: 40,
             cell_width: 8.0,

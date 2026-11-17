@@ -368,6 +368,7 @@ mod tests {
     #[test]
     fn concurrent_pty_opens_all_succeed() {
         let size = super::pty_size(fbterm_term::GridSize {
+            scale: 1.0,
             cols: 80,
             rows: 24,
             cell_width: 8.0,

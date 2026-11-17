@@ -163,6 +163,7 @@ fn default_panes_use_graphite_unchanged() {
         accent: None,
         focused: s.focused,
         background_opacity: 0.0,
+        scale: app.physical_scale(wid),
     };
     assert_eq!(s, today);
     assert_eq!(app.scheme_for(pane(&app, wid, ids[0])).id, "graphite");
@@ -489,8 +490,8 @@ mod unix {
         // What the view reports after measuring the bigger cell.
         let bounds = iced::Size::new(800.0, 400.0);
         let cell = |font: f32| iced::Size::new(font * 8.0 / 13.0, (font * 1.2).ceil());
-        let before = fbterm_term::grid_size_from_bounds(bounds, cell(13.0));
-        let after = fbterm_term::grid_size_from_bounds(bounds, cell(20.0));
+        let before = fbterm_term::grid_size_from_bounds(bounds, cell(13.0), 1.0);
+        let after = fbterm_term::grid_size_from_bounds(bounds, cell(20.0), 1.0);
         assert_ne!(before, after);
         let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(after)));
         let generation = app.pending_resizes[&a].0;

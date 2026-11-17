@@ -452,6 +452,7 @@ mod tests {
 
     fn size() -> GridSize {
         GridSize {
+            scale: 1.0,
             cols: 120,
             rows: 24,
             cell_width: 8.0,
