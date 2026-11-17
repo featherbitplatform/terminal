@@ -565,9 +565,10 @@ async fn dial(
 }
 
 /// The pixel fields of the two size requests a shell channel gets (`pty-req` at open and
-/// `window-change` after): the grid's area in PHYSICAL pixels, so a program on the remote side
-/// sizes itself by what fbterm actually draws. Cells stay in the request's own width/height
-/// fields; a window moving to another display changes these with its scale.
+/// `window-change` after): the grid's area in PHYSICAL pixels as whole cells, so a program on the
+/// remote side that divides them by its cell counts gets the same cell size fbterm draws with.
+/// Cells stay in the request's own width/height fields; a window moving to another display
+/// changes these with its scale.
 fn ssh_pixels(size: &GridSize) -> (u32, u32) {
     size.physical_area()
 }
@@ -1727,9 +1728,9 @@ mod tests {
         );
     }
 
-    /// The pixel fields of both SSH size requests are the grid's area in physical pixels: what a
-    /// remote program reads to lay itself out in pixels, so it matches what fbterm draws. Cells
-    /// stay cells; only the pixels follow the window's scale.
+    /// The pixel fields of both SSH size requests are the grid's physical cell by its cells: a
+    /// remote program divides them by its cell counts and gets exactly the cell fbterm draws with.
+    /// Cells stay cells; only the pixels follow the window's scale.
     #[test]
     fn ssh_pixels_are_the_grids_physical_area() {
         let grid = |scale: f32| GridSize {
@@ -1739,9 +1740,10 @@ mod tests {
             cell_height: 16.2,
             scale,
         };
-        assert_eq!(ssh_pixels(&grid(1.0)), (840, 486));
-        assert_eq!(ssh_pixels(&grid(2.0)), (1680, 972));
-        assert_eq!(ssh_pixels(&grid(1.25)), (1050, 608));
+        // Cells of 8 x 16, 17 x 32 and 11 x 20 physical px, times 100 columns and 30 rows.
+        assert_eq!(ssh_pixels(&grid(1.0)), (800, 480));
+        assert_eq!(ssh_pixels(&grid(2.0)), (1700, 960));
+        assert_eq!(ssh_pixels(&grid(1.25)), (1100, 600));
 
         // The fields are 32-bit wide: an enormous grid saturates instead of wrapping.
         let huge = GridSize {

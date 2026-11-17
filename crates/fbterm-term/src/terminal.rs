@@ -43,13 +43,15 @@ impl GridSize {
         )
     }
 
-    /// The whole grid in physical pixels: each axis is its cells rounded to a whole pixel at
-    /// `scale`, so a program's idea of the drawable area matches what is drawn. An empty axis is
-    /// 0. Saturates instead of overflowing.
+    /// The text area in physical pixels: the [`Self::physical_cell`] by the cell counts, so a
+    /// program that divides this by `cols` or `rows` - as it must for `TIOCGWINSZ` and `CSI 14 t` -
+    /// gets exactly the cell size images are placed with. An empty axis is 0. Saturates instead of
+    /// overflowing.
     pub fn physical_area(&self) -> (u32, u32) {
+        let (cell_w, cell_h) = self.physical_cell();
         (
-            whole(f32::from(self.cols) * self.cell_width * self.scale),
-            whole(f32::from(self.rows) * self.cell_height * self.scale),
+            u32::from(self.cols).saturating_mul(cell_w),
+            u32::from(self.rows).saturating_mul(cell_h),
         )
     }
 }
@@ -636,13 +638,30 @@ mod tests {
         assert_eq!(unscaled.physical_cell(), (1, 1));
     }
 
+    /// The area a program is told must be the physical cell by the cells, not the whole grid
+    /// rounded once: `TIOCGWINSZ` and `CSI 14 t` report the area, and programs divide it by their
+    /// column and row counts to get the cell size. Rounding the grid as a whole (1680 x 972 here)
+    /// would divide back to a different cell than images are placed with.
     #[test]
-    fn physical_area_is_the_grid_rounded_at_the_scale() {
+    fn physical_area_is_the_physical_cell_by_the_cells() {
         let g = grid_of(100, 30, 8.4, 16.2, 2.0);
-        // 100 x 8.4 x 2 = 1680, 30 x 16.2 x 2 = 972: the whole grid, not one cell times cells.
-        assert_eq!(g.physical_area(), (1680, 972));
+        assert_eq!(g.physical_cell(), (17, 32), "8.4 and 16.2 px at 2x");
+        assert_eq!(g.physical_area(), (1700, 960));
+
         let at_one = grid_of(100, 30, 8.4, 16.2, 1.0);
-        assert_eq!(at_one.physical_area(), (840, 486));
+        assert_eq!(at_one.physical_cell(), (8, 16));
+        assert_eq!(at_one.physical_area(), (800, 480));
+    }
+
+    #[test]
+    fn the_area_divides_back_to_the_physical_cell() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let g = grid_of(100, 30, 8.4, 16.2, scale);
+            let (cell_w, cell_h) = g.physical_cell();
+            let (w, h) = g.physical_area();
+            assert_eq!(w / u32::from(g.cols), cell_w, "scale {scale}, width");
+            assert_eq!(h / u32::from(g.rows), cell_h, "scale {scale}, height");
+        }
     }
 
     #[test]
@@ -871,13 +890,18 @@ mod tests {
             "the cell at the window's scale"
         );
         t.feed(b"\x1b[14t");
-        // 10 cells of 17 px, 5 rows of 32.
-        assert_eq!(reply(&mut t), "\x1b[4;160;170t");
+        // 10 cells of 17 px, 5 rows of 32: the area the emulator answers is the physical cell by
+        // the cells, exactly what `physical_area` reports and PTYs and SSH are told.
+        let (w, h) = t.size().physical_area();
+        assert_eq!((w, h), (170, 160));
+        assert_eq!(reply(&mut t), format!("\x1b[4;{h};{w}t"));
 
         // Resizing carries the new grid's scale too.
         t.resize(grid_of(20, 8, 8.4, 16.2, 1.0));
+        let (w, h) = t.size().physical_area();
+        assert_eq!((w, h), (160, 128));
         t.feed(b"\x1b[16t\x1b[14t");
-        assert_eq!(reply(&mut t), "\x1b[6;16;8t\x1b[4;128;160t");
+        assert_eq!(reply(&mut t), format!("\x1b[6;16;8t\x1b[4;{h};{w}t"));
     }
 
     #[test]

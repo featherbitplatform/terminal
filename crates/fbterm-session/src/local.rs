@@ -60,9 +60,10 @@ fn session_env(
     env
 }
 
-/// A PTY's size: cells, plus the drawable area in PHYSICAL pixels (`pixel_width` /
-/// `pixel_height` are what programs read to lay themselves out in pixels, so they must match what
-/// fbterm draws on the window's display). Both fields are 16-bit: an enormous grid saturates.
+/// A PTY's size: cells, plus the text area in PHYSICAL pixels (`pixel_width` / `pixel_height` are
+/// what programs read to lay themselves out in pixels - they divide them by the cell counts, so
+/// they must be whole physical cells, matching what fbterm draws and places images with). Both
+/// fields are 16-bit: an enormous grid saturates.
 fn pty_size(size: GridSize) -> PtySize {
     let (w, h) = size.physical_area();
     PtySize {
@@ -366,9 +367,10 @@ mod tests {
             "a reaped pid is never signalled"
         );
     }
-    /// The pixel fields of a PTY's size are what programs read to size themselves by pixels, so
-    /// they carry the window's PHYSICAL pixels: the same grid at 2x is twice as many pixels, and
-    /// what the program draws lines up with what fbterm draws.
+    /// The pixel fields of a PTY's size are what programs read to size themselves by pixels - and
+    /// divide by their cell counts to get the cell size - so they carry the window's PHYSICAL
+    /// pixels as whole cells: 100 columns of 8.4 logical px at 2x is 100 cells of 17 physical px,
+    /// which divides back to exactly the cell fbterm places images with.
     #[test]
     fn local_pty_gets_physical_pixels() {
         let grid = |scale: f32| fbterm_term::GridSize {
@@ -380,15 +382,18 @@ mod tests {
         };
         let at_one = pty_size(grid(1.0));
         assert_eq!((at_one.cols, at_one.rows), (100, 30), "cells stay cells");
-        assert_eq!((at_one.pixel_width, at_one.pixel_height), (840, 486));
+        // Cells of 8 x 16 px: 100 * 8, 30 * 16.
+        assert_eq!((at_one.pixel_width, at_one.pixel_height), (800, 480));
 
+        // Cells of 17 x 32 px: 100 * 17, 30 * 32 - not 1680 x 960, which would divide back to 16.
         let at_two = pty_size(grid(2.0));
-        assert_eq!((at_two.pixel_width, at_two.pixel_height), (1680, 972));
+        assert_eq!((at_two.pixel_width, at_two.pixel_height), (1700, 960));
 
+        // Cells of 13 x 24 px: 1300 x 720.
         let at_one_five = pty_size(grid(1.5));
         assert_eq!(
             (at_one_five.pixel_width, at_one_five.pixel_height),
-            (1260, 729)
+            (1300, 720)
         );
 
         // Both fields are 16-bit: an enormous grid saturates instead of wrapping.
