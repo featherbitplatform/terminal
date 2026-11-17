@@ -604,6 +604,7 @@ async fn open_shell_channel(
         bell_pending.clone(),
         detached.clone(),
         ended.clone(),
+        tx.clone(),
     );
 
     tokio::spawn(write_loop(write, rx, closed_rx.clone(), connection.clone()));
@@ -759,9 +760,9 @@ async fn read_loop(
         };
         match msg {
             Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                for reply in feeder.feed(&data) {
-                    let _ = replies.send(Command::Input(reply));
-                }
+                // Terminal replies (kitty answers included) go back through the feeder's own
+                // clone of the input queue, in the order the emulator produced them.
+                feeder.feed(&data);
             }
             other => match state.on(other) {
                 Step::Continue => {}

@@ -176,12 +176,17 @@ fn dims(size: GridSize) -> Dims {
     }
 }
 
+/// Ids handed to [`crate::images`] for decoded-image accounting, one per terminal ever made.
+static NEXT_IMAGE_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// An emulated terminal: grid, parser and pending events.
 pub struct Terminal {
     pub(crate) term: Term<EventProxy>,
     config: Config,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
+    /// This terminal's id in the app-wide image store ([`Terminal::image_owner`]).
+    image_owner: u64,
     /// The `inline_images` setting: whether pictures programs send are shown at all. The emulator
     /// starts with image support on, like the default here.
     images_enabled: bool,
@@ -221,6 +226,7 @@ impl Terminal {
             config,
             parser: Processor::new(),
             shared,
+            image_owner: NEXT_IMAGE_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             images_enabled: true,
             scrollback_images: false,
             generation: 0,
@@ -233,6 +239,45 @@ impl Terminal {
     pub fn feed(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
         self.generation += 1;
+    }
+
+    /// This terminal's id in the app-wide image store ([`crate::images::store`]). The store
+    /// accounts decoded pixels per owner so one tab cannot crowd the others out, and frees a
+    /// tab's whole budget when this terminal drops.
+    pub fn image_owner(&self) -> u64 {
+        self.image_owner
+    }
+
+    /// Report the result of decoding an image the store took from [`crate::images::store`]'s
+    /// queue: `Ok` lets the emulator answer the program's transmission `OK`, the errors answer
+    /// `EBADPNG` and `ENOMEM`. The store calls this from its worker through a registered
+    /// [`crate::images::OwnerHooks`]; callers must `take_events` afterwards to deliver the reply.
+    pub fn image_decoded(
+        &mut self,
+        key: feathercritty::event::ImageKey,
+        result: Result<(), feathercritty::event::ImageDecodeError>,
+    ) {
+        self.term.image_decoded(key, result);
+        self.generation += 1;
+    }
+
+    /// Run the graphics protocols' stall watchdog (see `Term::tick`): drops a stalled chunked
+    /// kitty transmission and delivers image events parked by a resize. Call after feeding bytes
+    /// so replies arrive even while the terminal is otherwise idle.
+    pub fn tick(&mut self, now: std::time::Instant) {
+        self.term.tick(now);
+        self.generation += 1;
+    }
+
+    /// Turn the oldest scrollback image into a placeholder line and release it outright, so a
+    /// session over its share of the image store can reclaim memory until enough went (`None`
+    /// when scrollback holds no image). The emulator sends the matching `ImageReleased`.
+    pub fn evict_oldest_scrollback_image(&mut self) -> Option<feathercritty::event::ImageKey> {
+        let key = self.term.evict_oldest_scrollback_image();
+        if key.is_some() {
+            self.generation += 1;
+        }
+        key
     }
 
     /// Accept the kitty keyboard protocol from programs (off by default). While off, programs'
@@ -489,6 +534,15 @@ impl Terminal {
 
     pub fn term(&self) -> &Term<EventProxy> {
         &self.term
+    }
+}
+
+impl Drop for Terminal {
+    /// Hand this terminal's id back to the image store: queued work for it is dropped and its
+    /// share of the app-wide budget is freed (the store holds no strong reference back, so the
+    /// tab dropping is what ends the terminal → hooks → store chain).
+    fn drop(&mut self) {
+        crate::images::store().drop_owner(self.image_owner);
     }
 }
 

@@ -4,6 +4,7 @@
 mod cold_tests;
 mod export;
 pub mod history_worker;
+pub mod images;
 mod input;
 mod kitty;
 pub mod ligature_sets;

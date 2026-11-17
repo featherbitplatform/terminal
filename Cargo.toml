@@ -36,6 +36,15 @@ async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi", "std", "tracing-log"] }
 png = "0.17"
+# Image store decoders (`fbterm-term/src/images`): JPEG and GIF (first frame), pure Rust, no C.
+zune-jpeg = "0.5"
+# The options and byte-stream types `zune-jpeg` takes; used directly to ask for RGBA output.
+zune-core = "0.5"
+gif = "0.14"
+# Resampling decoded images to cell sizes; runtime-detected SIMD, pure Rust fallback.
+fast_image_resize = "6"
+# Encodes the JPEG test fixture (`fbterm-term` tests); dev-only, never shipped.
+jpeg-encoder = "0.7"
 rfd = "0.17.2"
 # Tab export: gzip output, and the local time in the default file name.
 flate2 = "1"

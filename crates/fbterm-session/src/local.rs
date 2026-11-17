@@ -169,6 +169,7 @@ pub fn spawn_local_into(
         bell_pending.clone(),
         detached.clone(),
         ended.clone(),
+        tx.clone(),
     );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-waiter-{}", id.0))
@@ -185,7 +186,6 @@ pub fn spawn_local_into(
             }
         })?;
 
-    let reader_tx = tx.clone();
     let mut feeder = Feeder::new(
         id,
         terminal.clone(),
@@ -194,6 +194,7 @@ pub fn spawn_local_into(
         bell_pending.clone(),
         detached.clone(),
         ended.clone(),
+        tx.clone(),
     );
     // Reading and parsing run on separate threads. A read can return as little as about 1 KiB
     // (macOS caps each pty read there), so parsing every read as it came meant taking the
@@ -233,9 +234,7 @@ pub fn spawn_local_into(
                         Err(_) => break,
                     }
                 }
-                for reply in feeder.feed(&batch) {
-                    let _ = reader_tx.send(Command::Input(reply));
-                }
+                feeder.feed(&batch);
                 // Closed: whoever still holds the PTY no longer reaches the terminal.
                 if feeder.is_detached() {
                     break;
