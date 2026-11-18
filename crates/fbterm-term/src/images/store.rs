@@ -224,6 +224,19 @@ impl Freed {
     fn woke(&mut self, owner: u64) {
         self.wake.push(owner);
     }
+
+    /// Records that `owner`'s frame is now stale AND bumps its generation — the pair every caller
+    /// wants (see [`Freed::woke`] and [`ImageStore::generation`]). Call under the store lock; the
+    /// bump landing before the wake goes out is what guarantees a rebuild woken by it sees the new
+    /// number. Use bare `woke` where nothing was taken from the pane (a satisfied install: its
+    /// asking frame parked on `pending` and rebuilds anyway).
+    fn changed(&mut self, inner: &mut Inner, owner: u64) {
+        if let Some(entry) = inner.owners.get_mut(&owner) {
+            entry.generation += 1;
+        } // gone with its entry (terminal dropped or released): nothing to invalidate, and
+        // `wake_owners` finds no hook for it either.
+        self.wake.push(owner);
+    }
 }
 
 fn new_owner() -> OwnerEntry {
@@ -231,6 +244,7 @@ fn new_owner() -> OwnerEntry {
         hooks: None,
         images: HashMap::new(),
         bytes: 0,
+        generation: 0,
     }
 }
 
@@ -239,6 +253,14 @@ struct OwnerEntry {
     images: HashMap<ImageKey, Entry>,
     /// Payloads waiting to decode, decoded buffers and resampled copies of this owner.
     bytes: usize,
+    /// Bumped whenever anything this owner was shown goes (an eviction) or a size it could ask for
+    /// becomes `Refused` — exactly where [`Freed::wake`] records it. A wake says "redraw"; this
+    /// counter says why: the pane's cached frame holds handles for pixels that are gone, and it is
+    /// part of the widget's frame-cache key so that redraw rebuilds the frame instead of painting
+    /// the stale one (which would keep those very bytes alive outside the store's books). Reads are
+    /// cheap and lock-free-ish for the drawer ([`ImageStore::generation`]); a never-seen owner reads
+    /// 0, and un-registering an owner drops its counter with its entry.
+    generation: u64,
 }
 
 /// One unit of worker-thread work. Queued jobs keep the payload or source they need, so running
@@ -650,6 +672,16 @@ impl ImageStore {
                 wake();
             }
         }
+    }
+
+    /// The visible-state epoch of one owner's pictures: bumped under the lock each time an eviction
+    /// or a refusal changes what that owner can draw (see [`Freed::changed`]), and never by a lookup,
+    /// a `touch_drawn` or a satisfied install. The widget puts it in its frame-cache key so a woken
+    /// pane rebuilds instead of repainting the stale frame (the reason it exists). An owner with no
+    /// entry — never seen, or dropped — reads 0.
+    pub fn generation(&self, owner: u64) -> u64 {
+        let inner = self.inner.lock();
+        inner.owners.get(&owner).map_or(0, |entry| entry.generation)
     }
 
     /// Stamp `keys` as shown for `owner`, one lock for the whole list.
@@ -1115,7 +1147,9 @@ impl ImageStore {
                 // Refused IS an answer — the drawer draws the placeholder for it — and the frame
                 // that asked is parked on `pending` until it gets one, so this owner must be asked
                 // to redraw. The refused slot answers without queueing afterwards: one wake ends it.
-                freed.woke(owner);
+                // (Here even a bare re-ask would answer differently than the asking frame drew, so
+                // the generation moves with the wake — see [`Freed::changed`].)
+                freed.changed(&mut inner, owner);
             } else {
                 if let Some(entry) = inner.owners.get_mut(&owner)
                     && let Some(image) = entry.images.get_mut(&key)
@@ -1158,7 +1192,13 @@ impl ImageStore {
                         refused_bytes = gone;
                     }
                     inner.total -= refused_bytes;
-                    freed.woke(owner);
+                    if refused_bytes > 0 {
+                        // The size came back out as `Refused`: a visible change, so its generation
+                        // moves with the wake (see [`Freed::changed`]).
+                        freed.changed(&mut inner, owner);
+                    } else {
+                        freed.woke(owner);
+                    }
                 }
             }
         }
@@ -1390,9 +1430,10 @@ fn evict_resample(
         }
         inner.total -= bytes;
     }
-    // Whatever was on screen for this owner just changed: its cached frame holds a handle for
-    // pixels that are gone, and only asking again answers what to draw in their place.
-    freed.woke(owner);
+    // Whatever was on screen for this owner just changed (and under `Reason::Install` a size was
+    // refused as well): its cached frame holds a handle for pixels that are gone, and only asking
+    // again answers what to draw in their place — so the generation bumps too (see [`Freed::changed`]).
+    freed.changed(inner, owner);
     true
 }
 
@@ -1450,8 +1491,8 @@ fn evict_image(
         *queued_job = true;
     }
     // The picture itself went: its placements draw placeholders now, so this owner's cached frame
-    // must be rebuilt (see [`Freed::wake`]).
-    freed.woke(owner);
+    // must be rebuilt and its generation bumped (see [`Freed::changed`]).
+    freed.changed(inner, owner);
     true
 }
 
@@ -2519,8 +2560,14 @@ mod tests {
             store.get(owner, ImageKey(1), (16, 16), None),
             Lookup::Pending
         ));
+        assert_eq!(store.generation(owner), 0, "asking changes nothing");
         store.run_jobs_until_idle(); // refused: the copy cannot fit beside its source
         assert_eq!(captured.wakes(), 1, "the refusal reaches the pane");
+        assert_eq!(
+            store.generation(owner),
+            1,
+            "and it moves the epoch too: only a rebuilt frame draws the placeholder"
+        );
         assert_eq!(
             captured.locked_wakes(),
             0,
@@ -2534,6 +2581,11 @@ mod tests {
         ));
         store.run_jobs_until_idle();
         assert_eq!(captured.wakes(), 1, "one refusal wakes the pane once");
+        assert_eq!(
+            store.generation(owner),
+            1,
+            "the re-ask changes nothing more"
+        );
         assert_books(&store);
     }
 
@@ -2699,6 +2751,80 @@ mod tests {
             }
             other => panic!("expected the finished copy, got {other:?}"),
         }
+        assert_books(&store);
+    }
+
+    /// An eviction moves the evicted owners' generation — the number the widget's frame-cache key
+    /// carries — and nobody else's. Without it the woken pane reuses its cached frame: same key, so
+    /// same `DrawList`, so the picture the store just freed stays drawn from a cloned handle (and
+    /// `touch_drawn` re-stamps it), keeping exactly the bytes the caps meant to reclaim alive for as
+    /// long as the idle pane shows no output. The bump lands under the store lock, before the wake
+    /// goes out, so a rebuild caused by that wake always sees the new number.
+    #[test]
+    fn an_eviction_bumps_the_generation_of_its_owners_and_nobody_elses() {
+        // Three 4 KiB pictures against a 6 KiB total: enforcement takes the trigger's own first,
+        // then the oldest shown among the others — and stops there.
+        let store = ImageStore::with_caps(16 * KB, 6 * KB);
+        let (victim, untouched, trigger) = (30, 31, 32);
+        store.submit(victim, ImageKey(1), rgba(32, 32, 7)); // shown first
+        store.submit(untouched, ImageKey(1), rgba(32, 32, 8));
+        store.submit(trigger, ImageKey(1), rgba(32, 32, 9));
+        for owner in [victim, untouched, trigger] {
+            assert_eq!(store.generation(owner), 0, "submits change nothing");
+        }
+
+        store.enforce_caps(trigger);
+
+        assert_eq!(store.generation(trigger), 1, "its own picture went first");
+        assert_eq!(
+            store.generation(victim),
+            1,
+            "the owner shown the second evicted picture must rebuild too"
+        );
+        assert_eq!(
+            store.generation(untouched),
+            0,
+            "the pane nobody touched keeps its frame — no spurious rebuilds"
+        );
+        // A never-seen owner reads 0; a dropped one starts over with the next registration.
+        assert_eq!(store.generation(999), 0);
+        store.drop_owner(victim);
+        assert_eq!(
+            store.generation(victim),
+            0,
+            "un-registering drops the counter"
+        );
+        assert_books(&store);
+    }
+
+    /// Everything the draw path does — lookups, `touch_drawn`, and even a satisfied resample install
+    /// — leaves the generation alone. Only evictions and refusals move it, so the epoch invalidates
+    /// exactly the frames that hold stale handles and never turns every redraw into a rebuild loop.
+    #[test]
+    fn lookups_touches_and_a_finished_copy_bump_nothing() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let owner = 33;
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1)); // 16 KiB
+
+        // A resample asked for and satisfied: the install wakes its asking pane (that frame was
+        // `pending` and rebuilds on its own key), but nothing was taken from anyone.
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Ready(_)
+        ));
+        // Stamping the on-screen keys for a reused frame, repeats included.
+        store.touch_drawn(owner, &[ImageKey(1)]);
+        store.touch_drawn(owner, &[ImageKey(1)]);
+        assert_eq!(
+            store.generation(owner),
+            0,
+            "the draw path never moves the epoch"
+        );
         assert_books(&store);
     }
 

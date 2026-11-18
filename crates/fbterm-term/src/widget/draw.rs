@@ -576,6 +576,25 @@ fn draw_text_group(
     }
 }
 
+/// Which extra layers one frame's pictures force, and nothing more (see [`render`]'s comment: the
+/// order is fixed by layer creation; a layer that buys nothing just costs iced a prepare pass).
+#[derive(Debug, PartialEq, Eq)]
+struct LayerPlan {
+    /// Text over the under-text pictures: needed exactly when there is one to go under.
+    lift_text: bool,
+    /// The accent in its own layer: needed exactly when an over-text picture could cover it.
+    lift_accent: bool,
+}
+
+/// With no pictures at all both are false and `render` issues exactly what it issued before images
+/// existed: everything in the window's base layer, one text batch for every pane.
+fn layer_plan(under_text: usize, over_text: usize) -> LayerPlan {
+    LayerPlan {
+        lift_text: under_text > 0,
+        lift_accent: over_text > 0,
+    }
+}
+
 pub fn render(
     list: &DrawList,
     renderer: &mut iced::Renderer,
@@ -612,33 +631,43 @@ pub fn render(
     // (`iced_graphics-0.14.0/src/layer.rs`), and a renderer paints layers in index order — each
     // one's quads, then its images, then its text (`iced_wgpu-0.14.0/src/lib.rs`). Everything
     // issued above went into the base layer, so it sits under every picture opened from here on.
+    // The two layers that lift something over the pictures are opened ONLY when this frame has a
+    // picture that makes the lift necessary ([`layer_plan`]): with none, each pane's text stays in
+    // the window's one base-layer batch, as it was before images existed.
 
+    let plan = layer_plan(list.images.under_text.len(), list.images.over_text.len());
     // z < 0 pictures (and the tiles replacing `U+10EEEE` cells), each in its own clipped layer:
     // over the cell backgrounds, under the text that follows.
     images::draw_pictures(renderer, at, &list.images.under_text);
-    // Decorations, cursor, glyphs and placeholder text share ONE layer opened after all of them:
-    // a background image may cover a cell's fill, but it must not cover what is written there.
-    renderer.with_layer(bounds, |r| draw_text_group(r, list, bounds, &m, shapes));
+    // Decorations, cursor, glyphs and placeholder text share ONE layer opened after all of them —
+    // only then: a background image may cover a cell's fill, but it must not cover what is written
+    // there, and with no under-text picture the base layer already keeps that order.
+    if plan.lift_text {
+        renderer.with_layer(bounds, |r| draw_text_group(r, list, bounds, &m, shapes));
+    } else {
+        draw_text_group(renderer, list, bounds, &m, shapes);
+    }
     // Pictures with `z >= 0` sit over the text: their cells' glyphs are already drawn.
     images::draw_pictures(renderer, at, &list.images.over_text);
-    // The pane accent in a layer of its own, opened last: a picture touching the pane edge must not
-    // hide the border that says which pane is focused.
+    // The pane accent in a layer of its own, opened last, when an over-text picture could cover it:
+    // a picture touching the pane edge must not hide the border that says which pane is focused.
+    // With none there is nothing to stay under, and the base layer draws it after everything else.
     if let Some(a) = accent {
-        renderer.with_layer(bounds, |r| {
-            r.fill_quad(
-                Quad {
-                    bounds,
-                    border: Border {
-                        color: color(a),
-                        width: 1.0,
-                        radius: 0.0.into(),
-                    },
-                    snap: true,
-                    ..Quad::default()
-                },
-                iced::Color::TRANSPARENT,
-            );
-        });
+        let border = Quad {
+            bounds,
+            border: Border {
+                color: color(a),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            snap: true,
+            ..Quad::default()
+        };
+        if plan.lift_accent {
+            renderer.with_layer(bounds, |r| r.fill_quad(border, iced::Color::TRANSPARENT));
+        } else {
+            renderer.fill_quad(border, iced::Color::TRANSPARENT);
+        }
     }
 }
 
@@ -1418,5 +1447,45 @@ mod tests {
         assert!(quads.contains(&(0, 0, 2, tint)));
         assert!(quads.contains(&(1, 0, 2, tint)));
         assert_eq!(quads.iter().filter(|q| q.3 == strong).count(), 1);
+    }
+
+    /// The four shapes a frame's picture counts can take, and the layers each one needs: text is
+    /// lifted only when something is under it, the accent only when an over-text picture could sit
+    /// over the border; with no pictures at all `render` must issue exactly what it did before
+    /// images existed (everything in the base layer).
+    #[test]
+    fn layers_are_opened_only_when_pictures_force_them() {
+        assert_eq!(
+            layer_plan(0, 0),
+            LayerPlan {
+                lift_text: false,
+                lift_accent: false,
+            },
+            "a text-only pane pays for no extra layers"
+        );
+        assert_eq!(
+            layer_plan(2, 0),
+            LayerPlan {
+                lift_text: true,
+                lift_accent: false,
+            },
+            "background pictures force the text above them; nothing threatens the accent"
+        );
+        assert_eq!(
+            layer_plan(0, 1),
+            LayerPlan {
+                lift_text: false,
+                lift_accent: true,
+            },
+            "an over-text picture threatens the border; nothing needs lifting under"
+        );
+        assert_eq!(
+            layer_plan(1, 1),
+            LayerPlan {
+                lift_text: true,
+                lift_accent: true,
+            },
+            "both kinds, both lifts"
+        );
     }
 }

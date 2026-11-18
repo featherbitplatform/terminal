@@ -1201,10 +1201,48 @@ mod tests {
             100,
         );
         let mut vt = VirtualTiles::new(&store, &term, geometry(1.0)).expect("images are on");
-        // An id nothing refers to: no tile to draw, and the glyph stays skipped.
+        // An id nothing refers to: no tile to draw, and the glyph stays skipped. (This case passed
+        // before finding 7 was fixed — it resolves to a tile; what the fix is about is the three
+        // below, where `placeholder_tile` itself says no.)
         assert!(
             vt.visit(0, 0, &placeholder(99, &[mark(0), mark(0)])),
             "an unresolved placeholder skips its glyph too"
+        );
+        // A row's first cell with no diacritics: nothing to continue from the left.
+        vt.begin_row();
+        assert!(
+            vt.visit(1, 0, &placeholder(7, &[])),
+            "a 0-mark cell at a row start skips its glyph too"
+        );
+        // A named-colour foreground encodes no image id: unresolvable by definition.
+        vt.begin_row();
+        let named = Cell {
+            c: PLACEHOLDER_CHAR,
+            fg: AnsiColor::Named(feathercritty::vte::ansi::NamedColor::Red),
+            ..Cell::default()
+        };
+        assert!(
+            vt.visit(2, 0, &named),
+            "a named-colour placeholder skips its glyph too"
+        );
+        // A broken colour chain: a 1-mark cell whose colours differ from the cell on its left has
+        // nothing to continue, and it must leave `prev` reset so the 0-mark cell after it does not
+        // inherit either. (The reset itself is asserted on the pure decoder, next.)
+        let left = placeholder(7, &[mark(0), mark(0)]);
+        let prev_tile = placeholder_tile(&left, None).expect("the left cell decodes");
+        assert!(
+            placeholder_tile(&placeholder(8, &[mark(0)]), Some(prev_tile)).is_none(),
+            "different colours break the chain"
+        );
+        vt.begin_row();
+        assert!(vt.visit(3, 0, &left));
+        assert!(
+            vt.visit(3, 1, &placeholder(8, &[mark(0)])),
+            "a broken-chain cell skips its glyph too"
+        );
+        assert!(
+            vt.visit(3, 2, &placeholder(8, &[])),
+            "and so does the 0-mark cell after it: nothing was inherited"
         );
         // A cell that is not a placeholder at all keeps going to text.
         let plain = Cell {

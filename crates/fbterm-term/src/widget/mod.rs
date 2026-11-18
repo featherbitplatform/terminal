@@ -159,6 +159,22 @@ struct CacheKey {
     /// size would sit wrong on their cells until the next bump.
     cell_bits: (u32, u32),
     scale_bits: u32,
+    /// [`crate::images::ImageStore::generation`] for this terminal's image owner: an eviction or a
+    /// refusal bumps it and wakes the pane, and reusing the cached frame then would repaint — and
+    /// `touch_drawn`-re-stamp — exactly the picture the store just freed, its cloned handle keeping
+    /// those bytes alive outside the store's books. The key is read in the same lock section as the
+    /// `get`/`touch_drawn` calls it must agree with.
+    store_generation: u64,
+}
+
+/// Whether a cached frame may be reused for this redraw instead of being rebuilt.
+///
+/// Same key means nothing the drawer could see has changed — not the terminal, not the theme or
+/// geometry, and not the store's epoch for its pictures (`CacheKey::store_generation`, which an
+/// eviction or refusal bumps). A frame that left a picture `pending` is never reused: the answer
+/// may have arrived, and only asking again draws it (or its placeholder).
+fn frame_is_current(cached: &CacheKey, current: &CacheKey, pending: bool) -> bool {
+    cached == current && !pending
 }
 
 /// Cell size measured for a font and size.
@@ -400,12 +416,17 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                     geometry.cell.height.to_bits(),
                 ),
                 scale_bits: geometry.scale.to_bits(),
+                // Read here, in this same lock section as the `get`/`touch_drawn` calls below it:
+                // an eviction or refusal bumps it (under the store's lock, before its wake goes
+                // out), so the redraw that wake asks for rebuilds instead of repainting the frame
+                // that holds the freed picture. Terminal-then-store is the allowed lock order.
+                store_generation: crate::images::store().generation(term.image_owner()),
             };
             // A frame that left a picture waiting is rebuilt instead of reused: the store has had
             // its chance to answer since (its `wake` hook is what asked for this redraw).
             let stale = cache
                 .as_ref()
-                .is_none_or(|(k, l)| *k != key || l.images.pending);
+                .is_none_or(|(k, l)| !frame_is_current(k, &key, l.images.pending));
             if stale {
                 let list = draw::build(
                     &mut state.reader.borrow_mut(),
@@ -458,6 +479,36 @@ mod tests {
             scale: 1.0,
         };
         Arc::new(parking_lot::Mutex::new(crate::Terminal::new(size, 10)))
+    }
+
+    /// The frame-cache decision, as a pure function over two keys. A store eviction or refusal for
+    /// this pane's images bumps `store_generation` and wakes the redraw; reusing the cached frame
+    /// then would repaint — and `touch_drawn`-re-stamp — exactly the picture the store just freed.
+    #[test]
+    fn a_store_epoch_change_invalidates_the_frame_cache() {
+        let key = |store_generation| CacheKey {
+            term: 7,
+            generation: 3,
+            focused: true,
+            scheme: ColorScheme::graphite(),
+            hover: None,
+            highlight: None,
+            cell_bits: (8.0f32.to_bits(), 16.0f32.to_bits()),
+            scale_bits: 1.0f32.to_bits(),
+            store_generation,
+        };
+        assert!(
+            frame_is_current(&key(4), &key(4), false),
+            "nothing moved: the frame is reused"
+        );
+        assert!(
+            !frame_is_current(&key(4), &key(5), false),
+            "the store changed what this pane can show: rebuild, dropping the stale handles"
+        );
+        assert!(
+            !frame_is_current(&key(4), &key(4), true),
+            "a frame that left a picture waiting is never reused"
+        );
     }
 
     /// A view given a new terminal forgets the size it synced to the old one, so the new
