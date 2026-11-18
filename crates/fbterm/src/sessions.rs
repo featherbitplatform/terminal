@@ -590,10 +590,13 @@ impl App {
     }
 
     /// Parse whatever the panes of `wid` that its window cannot show have held for their first real
-    /// grid. A hidden pane's view runs no sooner than it is shown again, so waiting for it only buffers
-    /// what its program writes in the meantime - up to the hold's cap - before parsing it at the same
-    /// provisional cells it would have been parsed at anyway (see `App::start`, which releases them as
-    /// it takes the window's attention). A pane with nothing held is untouched.
+    /// grid, and deliver what that parse produced. A hidden pane's view runs no sooner than it is shown
+    /// again, so waiting for it only buffers what its program writes in the meantime - up to the hold's
+    /// cap - before parsing it at the same provisional cells it would have been parsed at anyway (see
+    /// `App::start`, which releases them as it takes the window's attention). Parsing happens on this
+    /// thread, where no feed follows it, so a reply that parse queued needs the same delivery a resize
+    /// report gets: without it a program blocking on that answer waits for output that never comes. A
+    /// pane with nothing held is untouched.
     fn release_hidden_holds(&self, wid: window::Id) {
         let Some(window) = self.windows.get(&wid) else {
             return;
@@ -604,8 +607,12 @@ impl App {
                 if i == window.active && pane_is_drawn(tab, pane.id) {
                     continue;
                 }
-                if let Some(term) = pane.terminal() {
-                    term.lock().sized();
+                let Some(term) = pane.terminal() else {
+                    continue;
+                };
+                // The lock is released by the end of this statement; delivery takes it again.
+                if term.lock().sized() {
+                    self.deliver_pane_events(pane.id);
                 }
             }
         }
@@ -1213,6 +1220,81 @@ pub(crate) mod pane_tests {
         assert!(
             shown.lock().holding(),
             "the new shown pane waits for its own cells"
+        );
+    }
+
+    /// The sweep parses a hidden pane's held output on this thread, where no feed follows it, so what
+    /// that parse produced has to be asked for: nothing else routes it, because no view runs for a pane
+    /// the window cannot show. A program blocking on the answer would wait for output that never comes.
+    /// The fixture's local program never spawns, so its session is installed by hand as a `recording`
+    /// handle - whose input queue is exactly what gets written to the program.
+    #[test]
+    fn a_pane_the_sweep_releases_delivers_what_it_parsed() {
+        use fbterm_session::SessionHandle;
+        use fbterm_term::{TermEvent, Terminal};
+
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let pa = Pane::for_profile(&p);
+        let a = pa.id;
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(Tab::single(pa));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+
+        let _ = app.start(wid, a);
+        let term = app.windows[&wid].tabs[0]
+            .pane(a)
+            .unwrap()
+            .terminal()
+            .cloned()
+            .unwrap();
+        assert!(term.lock().holding(), "the shown pane waits for its cells");
+
+        // The session arrives, and only afterwards does anything ask a question that needs an answer:
+        // what the install delivers is nothing, so everything read below came from the sweep.
+        let (handle, mut input) = SessionHandle::recording(term.clone());
+        let _ = app.update(Message::Connected(
+            a,
+            crate::app::Delivered::new(handle),
+            crate::app::DEFAULT_GRID,
+        ));
+        assert!(input.inputs().is_empty(), "connecting wrote nothing to it");
+
+        term.lock().feed(b"\x1b[c");
+        assert!(
+            term.lock().holding(),
+            "asked while it still holds: buffered"
+        );
+        assert!(input.inputs().is_empty(), "and answered nobody");
+
+        // A new tab takes the window's attention, so `start` sweeps this pane: its held bytes are
+        // parsed at the grid it has, and the query is answered into the queue.
+        let pb = Pane::for_profile(&p);
+        let b = pb.id;
+        app.windows.get_mut(&wid).unwrap().push(Tab::single(pb));
+        let _ = app.start(wid, b);
+
+        assert!(!term.lock().holding(), "the sweep parsed what it held");
+        // What a terminal answers that query with, at the grid this pane has.
+        let mut probe = Terminal::new(term.lock().size(), 1);
+        probe.feed(b"\x1b[c");
+        let expected: Vec<u8> = probe
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                TermEvent::PtyWrite(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(!expected.is_empty(), "the fixture's query is answered");
+        assert_eq!(
+            input.inputs().concat(),
+            expected,
+            "the sweep delivered what its parsing produced"
         );
     }
 
