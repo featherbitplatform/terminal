@@ -24,7 +24,7 @@ This works in every kind of tab:
 - An SSH session: the picture arrives as part of the output stream, so it follows the same rules there as locally.
 - A local shell on Windows, through the ConPTY console layer fbterm ships with. See [Windows](#windows).
 
-fbterm answers the queries programs use to work this out: the device attributes reply carries the graphics bit (`CSI ? 62;4;22c`), the graphics attributes query reports 1024 sixel color registers and the text area in pixels, and the kitty support query answers OK for what works and with the protocol's own error for what does not. The cell size and text area reports (`CSI 14 t`, `CSI 16 t`) answer in physical pixels at the window's display scale, which is what image programs size their output by: a program that sizes a picture to N cells gets exactly N cells, at any font size and on any display.
+fbterm answers the queries programs use to work this out: the device attributes reply carries the graphics bit (`CSI ? 62;4;22c`), the graphics attributes query reports 1024 sixel color registers and the text area in pixels, and the kitty support query answers OK for what works and with the protocol's own error for what does not. The text area and cell size reports (`CSI 14 t` asks for the text area in pixels, `CSI 16 t` for one cell) answer in physical pixels at the window's display scale, which is what image programs size their output by: a program that sizes a picture to N cells gets exactly N cells, at any font size and on any display.
 
 ## Settings
 
@@ -60,7 +60,7 @@ A program (or a hostile stream) cannot make pictures cost more than this. Every 
 
 | Limit | Value | What happens when it is reached |
 | --- | --- | --- |
-| One picture's size | 10 000 × 10 000 pixels, and 64 MiB decoded | The picture is not shown: a kitty client gets the protocol's error (`ENOMEM` or `EINVAL`), a sixel is drawn as far as it fits and the rest is ignored, an OSC 1337 picture is dropped without a reply. |
+| One picture's size | 10 000 × 10 000 pixels, and 64 MiB decoded | The picture is not shown: a kitty client gets `ENOMEM`, a sixel is drawn as far as it fits and the rest is ignored, an OSC 1337 picture is dropped without a reply. |
 | One transmission | 16 MiB of payload | That transmission is dropped: a kitty client gets `ENOMEM`, an OSC 1337 picture is discarded without a reply. A chunked kitty transmission that stops making progress for 10 seconds is dropped the same way. |
 | One tab | 256 MiB of decoded picture data, resampled copies included | That tab's oldest scrollback pictures become `[image W×H]` lines first; when none are left to reclaim, the least recently shown buffers go, and any of them that was on screen shows its placeholder line. |
 | The whole app | 512 MiB of decoded picture data, resampled copies included | Same order across all tabs: scrollback pictures first, then the least recently shown buffers, whichever tab they belong to. |
@@ -100,9 +100,9 @@ Pictures are display only, and that is a hard rule rather than a default:
 
 ## Windows
 
-Local shells on Windows talk through a console layer (ConPTY) that sits between the program and fbterm, and which layer that is decides whether pictures arrive at all: Microsoft's system one drops the kitty APC and sixel DCS sequences a program writes, so those pictures never reach fbterm. fbterm therefore installs Microsoft's open-source ConPTY (`conpty.dll` and `OpenConsole.exe`, MIT licensed, with its license and third-party notices) beside `fbterm.exe` from the `.msi`; local shells then run under that copy instead. See [Install on Windows](install-windows). SSH tabs are not involved: their output reaches fbterm directly.
+Local shells on Windows talk through a console layer (ConPTY) that sits between the program and fbterm, and which layer that is decides whether pictures arrive at all: Microsoft's system one drops the kitty APC and sixel DCS sequences a program writes, so those pictures never reach fbterm. fbterm therefore installs Microsoft's open-source ConPTY (`conpty.dll` and `OpenConsole.exe`, MIT licensed, with its license and third-party notices) beside `fbterm.exe` from the `.msi`; local shells then run under that copy instead. SSH tabs are not involved: their output reaches fbterm directly.
 
-Which console layer a run is using is written at the start of `fbterm.log` (see [Where files live](files)):
+Which console layer a run is using is written as an early line in `fbterm.log` (see [Where files live](files)):
 
 ```text
 local shells use the bundled ConPTY
