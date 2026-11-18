@@ -10,19 +10,21 @@
 //!
 //! Two rules keep the arithmetic exact:
 //!
-//! - A cell boundary is wherever iced's quad shader puts that column's background: `round((origin +
-//!   column × cell_width) × scale + 0.001)`, in the same f32 order and with the same slack the shader
-//!   uses — never a sum of rounded cell widths. Cell `n`'s right edge and cell `n + 1`'s left edge are
-//!   then the same number by construction, however the rounding falls out, and a shape ends exactly
-//!   where its own cell's background ends.
+//! - A cell boundary is where iced's quad shader puts the left edge of that column's background:
+//!   `round((origin + column × cell_width) × scale + 0.001)`, in the shader's f32 order and with its
+//!   slack — never a sum of rounded cell widths. Cell `n`'s right boundary is by construction cell
+//!   `n + 1`'s left one, so neighbours agree however the rounding falls out. That background quad's
+//!   own right edge scales the width and adds it instead, a different f32 order: it agrees with this
+//!   except at extreme coordinates (a simulation finds a pixel of disagreement only past some 9400
+//!   physical pixels at scale 3).
 //! - Everything inside a cell is a fraction of that cell measured between two of its edges and
 //!   rounded once, and a line's thickness is a whole number of physical pixels. Lines are centred
 //!   on their cell's centre line and reach the cell edges, so joints land on the shared edge.
 //!
 //! Quads are handed back to iced in logical pixels as `physical ÷ scale`. That division cannot always
 //! be exact, so the shader re-derives the pixel by the rule above — which is why [`Geometry::px`]
-//! follows that rule rather than rounding the physical position itself: both land on the same pixel,
-//! and a shape never leaves a hairline of the colour under it at one edge.
+//! follows that rule rather than rounding the physical position itself: a shape starts where its own
+//! cell's background starts and ends where the next cell's background starts.
 //!
 //! Rounded corners (U+256D..=U+2570) and diagonals (U+2571..=U+2573) stay with the font: they are
 //! curves and slants, and a quad cannot stand in for one.
@@ -1078,20 +1080,20 @@ impl Geometry {
         }
     }
 
-    /// The first physical pixel of a logical position, exactly as iced's quad shader computes it:
-    /// `round(pos × scale + 0.001)` (`solid.wgsl`, and `round(pos + size + 0.001)` for the far edge),
-    /// f32 throughout because that is what the shader uses. The background quads `render` draws go
-    /// through that arithmetic, so doing the same here is what makes a cell's shape and its background
-    /// end on the same pixel: at scale 1.25 on an 8.4-wide cell, column 1 is logical `8.4`, whose f32
-    /// form sits just under the true width — multiplied in f64 that is 10.4999995 and lands on 10,
+    /// The first physical pixel of a logical position, exactly as iced's quad shader computes the near
+    /// edge of a box: `round(pos × scale + 0.001)`, f32 throughout (`solid.wgsl`; its far edge is
+    /// `round(pos + size + 0.001)`, which scales the size and adds it instead). The background quads
+    /// `render` draws go through that arithmetic, so matching it is what makes a shape start where its
+    /// cell's background starts: at scale 1.25 on an 8.4-wide cell, column 1 is logical `8.4`, whose
+    /// f32 form sits just under the true width — multiplied in f64 that is 10.4999995 and lands on 10,
     /// while the shader's f32 product is exactly 10.5 and its slack carries it to 11.
     fn px(&self, pos: f32) -> i64 {
         (pos * self.scale + 0.001).round() as i64
     }
 
-    /// Cell boundary `col`, in physical pixels: the shader's snap of the same logical position
-    /// `render`'s background rectangles use for that column, computed in the same f32 order. Never a
-    /// sum of rounded cell widths, so neighbours agree on the edge by construction.
+    /// Cell boundary `col`, in physical pixels: the pixel iced's shader gives the left edge of that
+    /// column's background. Never a sum of rounded cell widths, so neighbours agree on the edge by
+    /// construction; the far boundary is `edge_x(col + 1)`, where the next cell's background starts.
     fn edge_x(&self, col: i64) -> i64 {
         self.px(self.bx + col as f32 * self.cw)
     }
@@ -1636,9 +1638,12 @@ mod tests {
         }
     }
 
-    /// A shape must end where its cell's background ends, or a block shows a hairline of the colour
-    /// under it at one edge. So [`Geometry`]'s boundaries are the shader's own arithmetic on the rect
-    /// `render` draws for that column — same f32 order, same `+ 0.001`, same round.
+    /// A shape must start where its cell's background starts and end where the next one starts, or a
+    /// block shows a hairline of the colour under it at an edge. [`Geometry`]'s boundaries are the
+    /// shader's snap of each column's left position; this compares them against that column's own
+    /// right edge as well, which the shader computes in a different f32 order and which agrees over
+    /// the coordinates here (a simulation finds disagreement only past some 9400 physical pixels at
+    /// scale 3).
     #[test]
     fn cell_edges_land_where_the_shader_puts_the_background() {
         let cases = [
