@@ -14,6 +14,7 @@ on:
       - dev/smoke-linux.sh
       - crates/fbterm/linux/**
       - dev/package-windows.ps1
+      - dev/fetch-conpty.ps1
       - dev/make-windows-icon.sh
       - dev/smoke-windows.ps1
       - crates/fbterm/windows/**

@@ -1,5 +1,7 @@
 # Builds fbterm for Windows (x86-64) and packages it as a per-machine .msi with cargo-wix
-# from crates/fbterm/wix/main.wxs.
+# from crates/fbterm/wix/main.wxs. It first stages Microsoft's ConPTY host from NuGet, into the
+# release folder, by calling dev/fetch-conpty.ps1 (which holds the package pin and checks its
+# SHA-256), so the .msi installs conpty.dll, OpenConsole.exe and their license beside fbterm.exe.
 # Runs on Windows only. Needs cargo-wix (the version pinned in .github/workflows/release.yml)
 # and the WiX Toolset v3 (the WIX environment variable its installer sets, or candle.exe on
 # PATH).
@@ -61,6 +63,9 @@ $dist = Join-Path $root 'target/dist'
 $name = "fbterm-$Version-windows-x86_64"
 $msi = Join-Path $dist "$name.msi"
 $exe = Join-Path $target 'release/fbterm.exe'
+# Where dev/fetch-conpty.ps1 stages conpty.dll, OpenConsole.exe and their license: cargo wix's
+# CargoTargetBinDir is this same release folder, so the files land where the exe is built.
+$conptyDir = Join-Path $target 'release'
 
 Invoke-Native cargo @('build', '--locked', '--release', '-p', 'fbterm')
 
@@ -72,15 +77,26 @@ if ($info.ProductName -cne 'featherbit terminal' -or $info.ProductVersion -cne $
     throw "fbterm.exe has no or the wrong version information: '$($info.ProductName)' '$($info.ProductVersion)'"
 }
 
+# Microsoft's ConPTY host, staged into the release folder so `cargo wix` installs it beside
+# fbterm.exe (main.wxs reads that folder as $(var.ConptyDir)). dev/fetch-conpty.ps1 holds the pin
+# and checks the .nupkg's SHA-256; portable-pty sideloads a conpty.dll sitting next to its own
+# executable, which is what lets a local shell's kitty and sixel images survive at all.
+& (Join-Path $PSScriptRoot 'fetch-conpty.ps1') -OutDir $conptyDir
+
 New-Item -ItemType Directory -Force $dist | Out-Null
 Remove-Item -Force -ErrorAction SilentlyContinue $msi, "$msi.sha256"
 
-# The .msi holds the binary exactly as cargo built it above.
+# The .msi holds the binary exactly as cargo built it above. The one -C argument adds main.wxs's
+# ConptyDir preprocessor variable: cargo-wix forwards each -C value to candle.exe as it is (its
+# --compiler-arg option), and a -D define must reach candle as one argument, which is how
+# cargo-wix builds its own -dCargoTargetBinDir=... too.
 Invoke-Native cargo @('wix', '--package', 'fbterm', '--no-build', '--nocapture',
-    '--install-version', $msiVersion, '--output', $msi)
+    '--install-version', $msiVersion, '--output', $msi,
+    '-C', "-DConptyDir=$conptyDir")
 if (-not (Test-Path $msi)) { throw "cargo wix did not write $msi" }
 
-# Read the built package's Property table back: name, version, per-machine, upgrade code.
+# Read the built package's Property table back: name, version, per-machine, upgrade code. The
+# upgrade code is checked here because it is the one thing a release must never change.
 function Get-MsiProperty {
     param([string]$Path, [string]$Property)
     $installer = New-Object -ComObject WindowsInstaller.Installer
@@ -107,6 +123,43 @@ $want = @{
 foreach ($key in $want.Keys) {
     $got = Get-MsiProperty $msi $key
     if ($got -ne $want[$key]) { throw "the .msi has $key '$got', expected '$($want[$key])'" }
+}
+
+# Read one row of the File table back, by that table's primary key: checking the staged ConPTY files
+# by their WiX-given Ids means no guessing how a compressed .msi and its cabinet spell a long file
+# name. The row's existence is what fails the build when a Component or a ComponentRef went missing;
+# the name it stores is printed for the log, and dev/smoke-windows.ps1 is what checks the installed
+# names, after msiexec.
+function Get-MsiFile {
+    param([string]$Path, [string]$Id)
+    $installer = New-Object -ComObject WindowsInstaller.Installer
+    $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
+    $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
+        @("SELECT ``FileName`` FROM ``File`` WHERE LOWER(``File``) = LOWER('$Id')"))
+    $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
+    $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+    $value = if ($null -eq $record) { $null } else {
+        $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, 1)
+    }
+    $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) | Out-Null
+    [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
+    return $value
+}
+
+# The File Ids main.wxs gives the three staged files (WiX keeps them in the File table's key
+# column). fbterm.exe and LICENSE.txt are not repeated here: the version checks above and the
+# smoke test's install already cover them.
+$files = [ordered]@{
+    conptyDll     = 'conpty.dll'
+    openConsole   = 'OpenConsole.exe'
+    conptyLicense = 'conpty-LICENSE.txt'
+}
+foreach ($id in $files.Keys) {
+    $stored = Get-MsiFile $msi $id
+    if (-not $stored) { throw "the .msi has no File row for '$id' (main.wxs must carry it)" }
+    Write-Output "in the .msi: $($files[$id]) (File row '$stored')"
 }
 
 # Same format as sha256sum: lower-case hash, two spaces, file name, LF; no BOM.

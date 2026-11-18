@@ -59,9 +59,11 @@ libc = "0.2"
 
 # Background blur on Windows 11 (`chrome::system_backdrop`): the acrylic system backdrop set on
 # the window's handle; and the Num Lock state for numpad shortcuts (`keys::num_lock`). The
-# versions the rest of the workspace and iced's windowing use.
+# versions the rest of the workspace and iced's windowing use. `Win32_System_LibraryLoader` is for
+# `main.rs`'s `harden_dll_search`: it restricts LoadLibrary to the app folder and System32, so
+# portable-pty's bare-name sideload of `conpty.dll` cannot pick up a planted copy elsewhere.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Graphics_Dwm", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { workspace = true, features = ["Win32_Graphics_Dwm", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse"] }
 raw-window-handle = "0.6"
 
 # The icon and version information in fbterm.exe (build.rs); without the default `toml`

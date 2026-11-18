@@ -1,6 +1,7 @@
 # Installs the Windows .msi and checks it, as the release workflow's smoke job does: a silent
-# per-machine install, `fbterm --version`, the Start menu shortcut, a silent uninstall that
-# keeps the user's config folder, then a reinstall and a final uninstall.
+# per-machine install, `fbterm --version`, the Start menu shortcut, the bundled ConPTY files beside
+# fbterm.exe, a silent uninstall that keeps the user's config folder and removes them again, then a
+# reinstall and a final uninstall.
 # Run as administrator on a clean machine (a CI runner): it installs into Program Files and
 # writes a sample settings file into the current user's real fbterm config folder, so it
 # refuses to run unless $env:CI is set or that folder holds no settings.toml or secrets.dpapi.
@@ -24,6 +25,10 @@ if ($line -cne "$hash  $name.msi") { throw "checksum file says '$line', the .msi
 
 $installDir = Join-Path $env:ProgramFiles 'featherbit terminal'
 $exe = Join-Path $installDir 'fbterm.exe'
+# The bundled ConPTY host, installed beside fbterm.exe and removed with it (crates/fbterm/wix's
+# main.wxs). Its license text rides along in the install folder, which the checks below cover.
+$conptyDll = Join-Path $installDir 'conpty.dll'
+$openConsole = Join-Path $installDir 'OpenConsole.exe'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\featherbit terminal.lnk'
 # fbterm's config folder (fbterm-config's Paths: directories' ProjectDirs "io.featherbit.fbterm").
 $configDir = Join-Path $env:APPDATA 'featherbit\fbterm\config'
@@ -70,7 +75,8 @@ function Assert-Version {
 }
 
 function Assert-Installed {
-    foreach ($f in @($exe, (Join-Path $installDir 'LICENSE.txt'), $shortcut)) {
+    # The two ConPTY files by name: a .msi that shipped without them installs fine and says nothing.
+    foreach ($f in @($exe, (Join-Path $installDir 'LICENSE.txt'), $conptyDll, $openConsole, $shortcut)) {
         if (-not (Test-Path $f)) { throw "missing after install: $f" }
     }
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
@@ -79,7 +85,9 @@ function Assert-Installed {
 }
 
 function Assert-Removed {
-    foreach ($f in @($installDir, $shortcut)) {
+    # The two ConPTY files are named as well: their own folder is checked first, so this says which
+    # file a partial uninstall left behind rather than only that the folder survived.
+    foreach ($f in @($installDir, $conptyDll, $openConsole, $shortcut)) {
         if (Test-Path $f) { throw "left behind by uninstall: $f" }
     }
 }

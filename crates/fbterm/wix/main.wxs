@@ -13,8 +13,16 @@
     version replaces an older one (MajorUpgrade). Never change it.
 
   Variables set by `cargo wix`: Version (X.Y.Z), CargoTargetBinDir (target\release).
-  sys.SOURCEFILEDIR is this folder, so the paths below do not depend on the working
-  directory.
+  ConptyDir (target\conpty) is added by dev/package-windows.ps1, which sends it to the WiX
+  compiler as a -D define through cargo wix's -C option. sys.SOURCEFILEDIR is this folder, so
+  the paths below do not depend on the working directory.
+
+  The three files under ConptyDir are Microsoft's open-source ConPTY host, fetched and hash
+  checked by dev/fetch-conpty.ps1 (its own variables hold the package version and SHA-256).
+  portable-pty prefers a conpty.dll in its own executable's folder over the system console layer,
+  and that choice is what lets a local shell's kitty APC and sixel DCS images survive: the system
+  one drops them (measured by ci.yml's "ConPTY passthrough (bundled)" step). The license text goes
+  with them because the NuGet package carries none. See LICENSES.md.
 -->
 
 <?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
@@ -91,6 +99,35 @@
                                 Advertise='yes'/>
                         </File>
                     </Component>
+                    <!--
+                      Microsoft's open-source ConPTY host, staged beside the release exe by
+                      dev/package-windows.ps1 (that folder arrives here as $(var.ConptyDir)).
+                      portable-pty sideloads a conpty.dll in its own executable's folder, so local
+                      shells run under it rather than under the system console layer, which drops
+                      the kitty APC and sixel DCS image sequences. Each file is its own Component:
+                      MSI installs and removes a whole Component at a time.
+                    -->
+                    <Component Id='ConptyDll' Guid='*'>
+                        <File Id='conptyDll'
+                            Name='conpty.dll'
+                            DiskId='1'
+                            Source='$(var.ConptyDir)\conpty.dll'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='OpenConsoleHost' Guid='*'>
+                        <File Id='openConsole'
+                            Name='OpenConsole.exe'
+                            DiskId='1'
+                            Source='$(var.ConptyDir)\OpenConsole.exe'
+                            KeyPath='yes'/>
+                    </Component>
+                    <Component Id='ConptyLicense' Guid='*'>
+                        <File Id='conptyLicense'
+                            Name='conpty-LICENSE.txt'
+                            DiskId='1'
+                            Source='$(var.ConptyDir)\conpty-LICENSE.txt'
+                            KeyPath='yes'/>
+                    </Component>
                 </Directory>
             </Directory>
             <Directory Id='ProgramMenuFolder'/>
@@ -99,7 +136,7 @@
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='Installs featherbit terminal, its Start menu shortcut and the license.'
+            Description='Installs featherbit terminal, its Start menu shortcut, the license and the bundled ConPTY host.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
             AllowAdvertise='no'
@@ -107,6 +144,9 @@
             Absent='disallow'>
             <ComponentRef Id='License'/>
             <ComponentRef Id='binary0'/>
+            <ComponentRef Id='ConptyDll'/>
+            <ComponentRef Id='OpenConsoleHost'/>
+            <ComponentRef Id='ConptyLicense'/>
         </Feature>
 
         <Property Id='DISABLEADVTSHORTCUTS' Value='1'/>

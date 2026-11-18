@@ -42,3 +42,9 @@ iced's windowing library, [winit](https://github.com/rust-windowing/winit) 0.30.
 Geist and Geist Mono are bundled under the SIL Open Font License 1.1. The license text is in `crates/fbterm/assets/fonts/LICENSE`.
 
 The icons are glyphs of the Lucide icon font (`lucide.ttf` from `lucide-static` 1.54.0), subset to the icons the app uses by `dev/subset-icons.sh` into `crates/fbterm/assets/fonts/lucide-icons.ttf`. Lucide is under the ISC License; the icons it derives from Feather (among those bundled: `x`, `plus`, `chevron-up`, `chevron-down`, `lock`) are under the MIT License. Both texts are in `crates/fbterm/assets/fonts/LICENSE-lucide`.
+
+## Bundled Windows binaries
+
+The Windows `.msi` installs three files beside `fbterm.exe` that are not Rust crates and so appear nowhere in `Cargo.lock` or the SBOM: `conpty.dll`, `OpenConsole.exe` and `conpty-LICENSE.txt`. They are Microsoft's open-source ConPTY host, from the NuGet package `Microsoft.Windows.Console.ConPTY` version `1.25.260930003` ([github.com/microsoft/terminal](https://github.com/microsoft/terminal)), under the MIT License; its text is what `conpty-LICENSE.txt` holds, because the package itself carries no license file (its manifest declares the MIT expression). `dev/fetch-conpty.ps1` downloads and hash-checks the package and stages those three files, `crates/fbterm/wix/main.wxs` installs them, and `dev/package-windows.ps1` checks that the built `.msi` contains them.
+
+They are bundled because portable-pty prefers a `conpty.dll` in its own executable's folder over the system console layer, and the two differ where images are concerned: measured on CI (`ci.yml`'s "ConPTY passthrough (bundled)" step), the system one strips the kitty APC and sixel DCS escape sequences a local program writes while this pair passes all three image protocols through unchanged. `cargo deny` reads `Cargo.lock`, so it cannot see these binaries; that is why they are recorded here rather than in the table above.
