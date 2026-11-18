@@ -63,10 +63,10 @@ A program (or a hostile stream) cannot make pictures cost more than this. Every 
 | One picture's size | 10 000 × 10 000 pixels, and 64 MiB decoded | The picture is not shown: a kitty client gets `ENOMEM`, a sixel is drawn as far as it fits and the rest is ignored, an OSC 1337 picture is dropped without a reply. |
 | One transmission | 16 MiB of payload | That transmission is dropped: a kitty client gets `ENOMEM`, an OSC 1337 picture is discarded without a reply. A chunked kitty transmission that stops making progress for 10 seconds is dropped the same way. |
 | One tab | 256 MiB of decoded picture data, resampled copies included | That tab's oldest scrollback pictures become `[image W×H]` lines first; when none are left to reclaim, the least recently shown buffers go, and any of them that was on screen shows its placeholder line. |
-| The whole app | 512 MiB of decoded picture data, resampled copies included | Same order across all tabs: scrollback pictures first, then the least recently shown buffers, whichever tab they belong to. |
+| The whole app | 512 MiB of decoded picture data, resampled copies included | The tab that just asked for more memory gives way first: its own scrollback pictures become `[image W×H]` lines, then its own least recently shown buffers go. When that runs dry, other tabs give way too, least recently shown first. |
 | Pictures in one tab | 4 096 placements on screen (and as many placeholder-cell placements), 512 stored pictures kept for re-placing, 100 000 `[image W×H]` records | The oldest are dropped and free their memory. |
 
-Nothing else is affected when a limit is reached: text keeps working, other tabs keep their pictures, and a tab you cannot see does no drawing work at all (no resampling, no upload), although it still parses and decodes within the caps because a program's reply depends on the decode result.
+Nothing else is affected when a limit is reached: text keeps working, and a tab you cannot see does no drawing work at all (no resampling, no upload), although it still parses and decodes within the caps because a program's reply depends on the decode result. A quiet tab can still lose pictures to another tab's cap, and each one it loses shows its placeholder line.
 
 Corrupt picture data is refused rather than shown, and it never takes anything down: a kitty client gets `EBADPNG`, sixel and OSC 1337 stay silent, and the rest of the stream keeps going.
 
