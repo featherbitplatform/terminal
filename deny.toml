@@ -17,6 +17,11 @@ allow = [
     "CDLA-Permissive-2.0",
 ]
 
+# jpeg-encoder (dev-only, encodes the JPEG test fixture): its IJG part is the libjpeg legal notice.
+[[licenses.exceptions]]
+name = "jpeg-encoder"
+allow = ["IJG"]
+
 [advisories]
 version = 2
 # Unmaintained notices only for crates we depend on directly; transitive ones (iced, wgpu,

@@ -91,6 +91,7 @@ fn pane(sample: String, focused: bool, accent: Option<Rgb>) -> Pane {
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         },
         1000,
     );
@@ -108,6 +109,7 @@ fn pane(sample: String, focused: bool, accent: Option<Rgb>) -> Pane {
             accent,
             focused,
             background_opacity: 1.0,
+            scale: 1.0,
         },
         sample,
         fed: false,

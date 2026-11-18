@@ -60,12 +60,17 @@ fn session_env(
     env
 }
 
+/// A PTY's size: cells, plus the text area in PHYSICAL pixels (`pixel_width` / `pixel_height` are
+/// what programs read to lay themselves out in pixels - they divide them by the cell counts, so
+/// they must be whole physical cells, matching what fbterm draws and places images with). Both
+/// fields are 16-bit: an enormous grid saturates.
 fn pty_size(size: GridSize) -> PtySize {
+    let (w, h) = size.physical_area();
     PtySize {
         rows: size.rows,
         cols: size.cols,
-        pixel_width: (f32::from(size.cols) * size.cell_width) as u16,
-        pixel_height: (f32::from(size.rows) * size.cell_height) as u16,
+        pixel_width: w.min(u16::MAX as u32) as u16,
+        pixel_height: h.min(u16::MAX as u32) as u16,
     }
 }
 
@@ -169,6 +174,7 @@ pub fn spawn_local_into(
         bell_pending.clone(),
         detached.clone(),
         ended.clone(),
+        tx.clone(),
     );
     std::thread::Builder::new()
         .name(format!("fbterm-pty-waiter-{}", id.0))
@@ -185,7 +191,6 @@ pub fn spawn_local_into(
             }
         })?;
 
-    let reader_tx = tx.clone();
     let mut feeder = Feeder::new(
         id,
         terminal.clone(),
@@ -194,7 +199,11 @@ pub fn spawn_local_into(
         bell_pending.clone(),
         detached.clone(),
         ended.clone(),
+        tx.clone(),
     );
+    // The handle keeps the router so the app can have output delivered after a resize that happens
+    // on its own thread - a pane's first real grid, which is what releases held bytes.
+    let router = feeder.router();
     // Reading and parsing run on separate threads. A read can return as little as about 1 KiB
     // (macOS caps each pty read there), so parsing every read as it came meant taking the
     // terminal lock once per KiB under heavy output. The reader only drains the pty into a
@@ -233,9 +242,7 @@ pub fn spawn_local_into(
                         Err(_) => break,
                     }
                 }
-                for reply in feeder.feed(&batch) {
-                    let _ = reader_tx.send(Command::Input(reply));
-                }
+                feeder.feed(&batch);
                 // Closed: whoever still holds the PTY no longer reaches the terminal.
                 if feeder.is_detached() {
                     break;
@@ -257,6 +264,7 @@ pub fn spawn_local_into(
             let _ = killer.lock().kill();
         }),
         connection: Mutex::new(None),
+        router: Some(router),
     })
 }
 
@@ -303,7 +311,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-    use super::{DEFAULT_LANG, kill_unless_reaped, session_env};
+    use super::{DEFAULT_LANG, kill_unless_reaped, pty_size, session_env};
 
     fn get<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
         env.iter()
@@ -363,6 +371,47 @@ mod tests {
             "a reaped pid is never signalled"
         );
     }
+    /// The pixel fields of a PTY's size are what programs read to size themselves by pixels - and
+    /// divide by their cell counts to get the cell size - so they carry the window's PHYSICAL
+    /// pixels as whole cells: 100 columns of 8.4 logical px at 2x is 100 cells of 17 physical px,
+    /// which divides back to exactly the cell fbterm places images with.
+    #[test]
+    fn local_pty_gets_physical_pixels() {
+        let grid = |scale: f32| fbterm_term::GridSize {
+            cols: 100,
+            rows: 30,
+            cell_width: 8.4,
+            cell_height: 16.2,
+            scale,
+        };
+        let at_one = pty_size(grid(1.0));
+        assert_eq!((at_one.cols, at_one.rows), (100, 30), "cells stay cells");
+        // Cells of 8 x 16 px: 100 * 8, 30 * 16.
+        assert_eq!((at_one.pixel_width, at_one.pixel_height), (800, 480));
+
+        // Cells of 17 x 32 px: 100 * 17, 30 * 32 - not 1680 x 960, which would divide back to 16.
+        let at_two = pty_size(grid(2.0));
+        assert_eq!((at_two.pixel_width, at_two.pixel_height), (1700, 960));
+
+        // Cells of 13 x 24 px: 1300 x 720.
+        let at_one_five = pty_size(grid(1.5));
+        assert_eq!(
+            (at_one_five.pixel_width, at_one_five.pixel_height),
+            (1300, 720)
+        );
+
+        // Both fields are 16-bit: an enormous grid saturates instead of wrapping.
+        let huge = fbterm_term::GridSize {
+            cols: u16::MAX,
+            rows: u16::MAX,
+            cell_width: 1e20,
+            cell_height: 1e20,
+            scale: 1e9,
+        };
+        let p = pty_size(huge);
+        assert_eq!((p.pixel_width, p.pixel_height), (u16::MAX, u16::MAX));
+    }
+
     /// macOS `openpty` fails now and then (`Unknown error: -6`) when several threads call it
     /// at once; sessions opened together (restored tabs, parallel tests) must all succeed.
     #[cfg(unix)]
@@ -373,6 +422,7 @@ mod tests {
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         });
         let failures = AtomicUsize::new(0);
         std::thread::scope(|scope| {

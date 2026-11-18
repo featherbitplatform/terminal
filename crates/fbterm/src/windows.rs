@@ -1033,6 +1033,7 @@ mod tests {
                     rows: 5,
                     cell_width: 9.0,
                     cell_height: 18.0,
+                    scale: 1.0,
                 },
             );
         }

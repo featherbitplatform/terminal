@@ -77,6 +77,11 @@ pub enum SettingsMsg {
     RetriesText(String),
     RetriesSubmit,
     Kitty(bool),
+    /// `Inline images`: show pictures programs send.
+    InlineImages(bool),
+    /// `Images in scrollback`, the switch under it: keep a picture whose rows scrolled off the
+    /// screen. Only usable while inline images is on.
+    ScrollbackImages(bool),
     /// `Grapheme clusters`.
     Clusters(bool),
     /// `Ligatures`.
@@ -519,6 +524,13 @@ impl SettingsState {
             SettingsMsg::TabBar(v) => self.change(SettingChange::TabBar(v), false),
             SettingsMsg::TabGroups(v) => self.change(SettingChange::TabGroups(v), false),
             SettingsMsg::Kitty(v) => self.change(SettingChange::KittyKeyboard(v), false),
+            SettingsMsg::InlineImages(v) => self.change(SettingChange::InlineImages(v), false),
+            // The view leaves the switch unusable while inline images is off; its messages are
+            // ignored too.
+            SettingsMsg::ScrollbackImages(_) if !self.scrollback_images_enabled() => Effect::NONE,
+            SettingsMsg::ScrollbackImages(v) => {
+                self.change(SettingChange::ScrollbackImages(v), false)
+            }
             SettingsMsg::Clusters(v) => self.change(SettingChange::GraphemeClusters(v), false),
             SettingsMsg::Ligatures(v) => self.change(SettingChange::Ligatures(v), false),
             SettingsMsg::UseThemeFonts(v) => self.change(SettingChange::UseThemeFonts(v), false),
@@ -829,6 +841,12 @@ impl SettingsState {
     /// the scrollback leaves room above the floor.
     pub fn uncompressed_enabled(&self) -> bool {
         self.values.history_compression && self.values.scrollback_lines > UNCOMPRESSED_FLOOR
+    }
+
+    /// Whether the `Images in scrollback` switch can be used: keeping a picture that scrolled off
+    /// the screen only means something while pictures are shown at all.
+    pub fn scrollback_images_enabled(&self) -> bool {
+        self.values.inline_images
     }
 
     /// Why the uncompressed field is disabled, when the scrollback is the reason.

@@ -188,6 +188,99 @@ fn clusters_switch_queues_its_setting() {
 }
 
 #[test]
+fn inline_images_switch_queues_its_setting() {
+    let mut s = state();
+    assert!(s.values.inline_images, "on by default");
+    let e = s.update(SettingsMsg::InlineImages(false));
+    assert_eq!(e.apply, Some(SettingChange::InlineImages(false)));
+    assert_eq!(e.write, Write::Now);
+    assert!(!s.values.inline_images);
+    assert_eq!(s.take_pending(), [SettingChange::InlineImages(false)]);
+}
+
+/// The `Images in scrollback` switch belongs to the `Inline images` one: usable while pictures
+/// are shown, muted and inert without them.
+#[test]
+fn scrollback_images_switch_needs_inline_images() {
+    let mut s = state();
+    assert!(
+        s.scrollback_images_enabled(),
+        "inline images is on by default"
+    );
+    let e = s.update(SettingsMsg::ScrollbackImages(true));
+    assert_eq!(e.apply, Some(SettingChange::ScrollbackImages(true)));
+    assert_eq!(s.take_pending(), [SettingChange::ScrollbackImages(true)]);
+    // Inline images off: the switch is disabled and its message changes nothing.
+    s.update(SettingsMsg::InlineImages(false));
+    s.take_pending();
+    assert!(!s.scrollback_images_enabled());
+    let values = s.values.clone();
+    assert_eq!(s.update(SettingsMsg::ScrollbackImages(false)), Effect::NONE);
+    assert_eq!(s.values, values);
+    assert!(!s.has_pending());
+    // Back on: the value it kept is usable again.
+    s.update(SettingsMsg::InlineImages(true));
+    assert!(s.scrollback_images_enabled());
+    assert!(s.values.scrollback_images, "the setting was never lost");
+}
+
+/// The two rows as the tab draws them: their labels and hints, and what a click on each switch
+/// publishes. A disabled row publishes nothing.
+#[test]
+fn the_image_rows_say_what_they_do_and_a_disabled_one_publishes_nothing() {
+    use crate::app::Message;
+    const INLINE: &str = "Show pictures that programs send";
+    const SCROLLBACK: &str = "Keep pictures when they scroll off the screen";
+    let t = crate::theme::graphite_tokens();
+    // A switch sits at the row's right end: press it 16 px of padding plus half its 18 px width
+    // in from the edge.
+    let inset = 16.0 + 9.0;
+
+    let (messages, texts) = press_right_end(view::inline_images_setting(t, true, true), inset);
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [Message::Settings(SettingsMsg::InlineImages(false))]
+        ),
+        "{messages:?}"
+    );
+    for want in ["Inline images", INLINE] {
+        assert!(texts.iter().any(|x| x == want), "{want}: {texts:?}");
+    }
+
+    let (messages, texts) =
+        press_right_end(view::scrollback_images_setting(t, false, true, true), inset);
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [Message::Settings(SettingsMsg::ScrollbackImages(true))]
+        ),
+        "{messages:?}"
+    );
+    for want in ["Images in scrollback", SCROLLBACK] {
+        assert!(texts.iter().any(|x| x == want), "{want}: {texts:?}");
+    }
+
+    // Inline images off: the row is drawn, its switch publishes nothing.
+    let (messages, texts) = press_right_end(
+        view::scrollback_images_setting(t, false, false, true),
+        inset,
+    );
+    assert!(messages.is_empty(), "{messages:?}");
+    for want in ["Images in scrollback", SCROLLBACK] {
+        assert!(texts.iter().any(|x| x == want), "{want}: {texts:?}");
+    }
+    // The file does not load: neither switch publishes.
+    let (messages, _) = press_right_end(view::inline_images_setting(t, true, false), inset);
+    assert!(messages.is_empty(), "{messages:?}");
+    let (messages, _) = press_right_end(
+        view::scrollback_images_setting(t, false, true, false),
+        inset,
+    );
+    assert!(messages.is_empty(), "{messages:?}");
+}
+
+#[test]
 fn unwritten_changes_go_back_in_line_unless_newer_ones_wait() {
     let mut s = state();
     s.update(SettingsMsg::Kitty(true));

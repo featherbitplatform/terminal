@@ -82,6 +82,11 @@ mod blur_style;
 mod chrome;
 mod config_files;
 mod context_menu;
+// The status line builds and is tested everywhere; only Windows logs it.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod conpty;
+#[cfg(test)]
+mod conpty_tests;
 mod crash;
 mod debug;
 mod dialogs;
@@ -162,7 +167,33 @@ fn version_line<I: IntoIterator<Item = String>>(args: I) -> Option<String> {
         .then(|| format!("fbterm {}", env!("CARGO_PKG_VERSION")))
 }
 
+/// Restricts where every `LoadLibrary` in this process looks for a DLL: the application's own folder
+/// and System32 only. portable-pty sideloads `conpty.dll` by bare name (`win/psuedocon.rs`), and a
+/// bare-name load also searches the current directory and PATH — so without this, a planted
+/// `conpty.dll` in either could be loaded whenever the file is missing beside `fbterm.exe`. Called as
+/// main's first statement, before anything here could load a DLL or start a thread. Its failure is
+/// ignored: on the Windows versions fbterm runs on (10.0.17763 and newer, what portable-pty itself
+/// requires) it cannot fail, and there is nothing to do yet if it ever did.
+#[cfg(windows)]
+fn harden_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // The two flags are spelled out instead of `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (the same pair
+    // plus `USER_DIRS`, what Microsoft recommends) on purpose: fbterm resolves every bare-name load
+    // from its own folder and System32 only, and no in-process component is expected to have
+    // registered a third folder with `AddDllDirectory`.
+    // BOOL: zero is the only failure.
+    unsafe {
+        SetDefaultDllDirectories(
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+    }
+}
+
 fn main() -> iced::Result {
+    #[cfg(windows)]
+    harden_dll_search();
     if let Some(line) = version_line(std::env::args().skip(1)) {
         println!("{line}");
         return Ok(());
@@ -172,6 +203,15 @@ fn main() -> iced::Result {
     // Stderr as always, and `fbterm.log` in the config dir (`crash.rs`).
     crash::init_logging(&app::paths());
     key_log::init_from_env();
+    // Which ConPTY host local shells get: the bundled one installed beside fbterm.exe, or the system
+    // one (`conpty.rs`). Logging is up by now (`crash::init_logging` above), and this is the run's
+    // first line that says anything about what a local shell can do.
+    #[cfg(windows)]
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        tracing::info!("{}", conpty::status_line(dir));
+    }
     let mut daemon = iced::daemon(App::boot, App::update, window::view)
         .title(App::title)
         .theme(|app: &App, _| app.theme.clone())

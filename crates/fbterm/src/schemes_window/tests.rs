@@ -137,7 +137,7 @@ fn edits_preview_without_touching_sessions() {
         SchemesMsg::Hex(Entry::Foreground, "#fefefe".into()),
     );
     // The preview shows the edit...
-    let preview = win(&app).preview_style(&app.style);
+    let preview = win(&app).preview_style(&app.style, 1.0);
     assert_eq!(preview.scheme.background, rgb(0x203040));
     assert_eq!(preview.scheme.foreground, rgb(0xfefefe));
     // ...and nothing else does: not the pane, its terminal, the set or the file.
@@ -689,7 +689,7 @@ fn preview_resize_does_not_loop() {
     let run = |state: &SchemesState| -> Vec<Message> {
         let mut element: Element<'_, Message> = fbterm_term::highlighted_terminal_view(
             &state.preview,
-            state.preview_style(&base),
+            state.preview_style(&base, 1.0),
             None,
             |out| Message::Schemes(SchemesMsg::Preview(out)),
         );

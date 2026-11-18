@@ -17,7 +17,9 @@ use iced::{Border, Font, Rectangle, Size};
 use super::Highlight;
 use super::colors::{cell_colors, resolve};
 use super::features::{FontFeatures, run_features};
+use super::images::{self, ImageLayer};
 use super::shaped::{ShapeCache, ShapeKey};
+use crate::images::ImageStore;
 use crate::palette::ColorScheme;
 use crate::{SearchMatch, Terminal};
 
@@ -63,6 +65,9 @@ pub struct DrawList {
     pub texts: Vec<TextRun>,
     pub lines: Vec<(Span, Rgb, LineKind)>,
     pub cursor: Option<(Span, Rgb, CursorMark)>,
+    /// Pictures in view and the `[image W×H]` text standing in for the ones that are gone (see
+    /// [`ImageLayer`]). Empty when this terminal shows no images.
+    pub images: ImageLayer,
 }
 
 /// Appends `cells` at `(row, col)` to the last span of `out` when it continues it with the same
@@ -135,6 +140,10 @@ fn marks(term: &Terminal, highlight: &Highlight, rows: usize, cols: usize) -> Ve
 /// `reader` reads the rows in view. Keep one with the widget's draw state across frames: rows
 /// on the screen are read in place, and only rows above it (the view scrolled back into the
 /// history) go through the reader's scratch row, at most one screen of them per frame.
+///
+/// `store` and `metrics` are the image store and the cell geometry being drawn with: pictures are
+/// resolved here, under the same lock, because that is where the view is read (see [`images`]).
+#[allow(clippy::too_many_arguments)] // the frame's whole context: view, style, hover, images
 pub fn build(
     reader: &mut RowReader<Cell>,
     term: &Terminal,
@@ -142,6 +151,8 @@ pub fn build(
     focused: bool,
     hover: Option<&Hyperlink>,
     highlight: Option<&Highlight>,
+    store: &ImageStore,
+    metrics: images::CellGeometry,
 ) -> DrawList {
     let t = term.term();
     let grid = t.grid();
@@ -159,8 +170,12 @@ pub fn build(
 
     let mut list = DrawList {
         background: Some(scheme.background),
+        images: images::resolve(store, term, metrics, scheme),
         ..DrawList::default()
     };
+    // Pictures shown through `U+10EEEE` cells are collected as the rows below are walked: a cell
+    // says which tile of which picture it shows, and its glyph is skipped.
+    let mut virtuals = images::VirtualTiles::new(store, term, metrics);
     let mut quads: Vec<(Span, Rgb)> = Vec::new();
     let mut lines: Vec<(Span, (Rgb, LineKind))> = Vec::new();
     let mut strikes: Vec<(Span, (Rgb, LineKind))> = Vec::new();
@@ -169,6 +184,9 @@ pub fn build(
         let row_u16 = y as u16;
         let line = Line(y as i32 - offset as i32);
         let row = reader.row(grid, line);
+        if let Some(v) = &mut virtuals {
+            v.begin_row();
+        }
         let mut run: Option<TextRun> = None;
         // What a run must share besides foreground and font style: a ligature never spans a
         // change of background, decoration, selection, match or the cursor cell.
@@ -252,6 +270,13 @@ pub fn build(
             if flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER) {
                 continue;
             }
+            if let Some(v) = &mut virtuals
+                && v.visit(row_u16, col, cell)
+            {
+                // A kitty placeholder cell: a tile of its picture is drawn instead of this glyph.
+                flush(&mut run, &mut list.texts);
+                continue;
+            }
             let bold = flags.contains(Flags::BOLD);
             let italic = flags.contains(Flags::ITALIC);
             let zerowidth = cell.zerowidth();
@@ -311,6 +336,12 @@ pub fn build(
             }
         }
         flush(&mut run, &mut list.texts);
+        if let Some(v) = &mut virtuals {
+            v.end_row();
+        }
+    }
+    if let Some(v) = virtuals {
+        v.finish(&mut list.images);
     }
     list.quads = quads;
     list.lines = lines
@@ -405,14 +436,66 @@ fn run_font(base: Font, run: &TextRun) -> Font {
     font
 }
 
-/// Issues the renderer primitives for `list` inside `bounds`.
-pub fn render(
-    list: &DrawList,
+/// Shapes `runs` with their OpenType features and hands them to the renderer as shaped buffers,
+/// each in the color `color_of` gives it. The cache keeps a buffer alive until the frame after its
+/// last use, so a run that does not change is shaped once however often the pane redraws.
+fn draw_runs(
     renderer: &mut iced::Renderer,
+    runs: &[TextRun],
     bounds: Rectangle,
-    m: Metrics,
-    accent: Option<Rgb>,
-    background_opacity: f32,
+    m: &Metrics,
+    shapes: &mut ShapeCache,
+    color_of: impl Fn(&TextRun) -> iced::Color,
+) {
+    let (cw, ch) = (m.cell.width, m.cell.height);
+    for run in runs {
+        let mut font = run_font(m.font, run);
+        if run.bold {
+            font.weight = iced::font::Weight::Bold;
+        }
+        if run.italic {
+            font.style = iced::font::Style::Italic;
+        }
+        let detected = if m.features.ligatures && !run.alone {
+            shapes.sets(font)
+        } else {
+            std::sync::Arc::from([])
+        };
+        let features = run_features(&m.features, &detected, run.alone);
+        let r = Rectangle {
+            x: bounds.x + f32::from(run.span.col) * cw,
+            y: bounds.y + f32::from(run.span.row) * ch,
+            width: f32::from(run.span.cells) * cw,
+            height: ch,
+        };
+        let key = ShapeKey::new(
+            &run.text,
+            font,
+            m.font_size,
+            ch,
+            r.width + cw,
+            features,
+            !run.alone,
+        );
+        let buffer = shapes.buffer(key);
+        renderer.fill_raw(Raw {
+            buffer: std::sync::Arc::downgrade(&buffer),
+            position: iced::Point::new(r.x, r.y),
+            color: color_of(run),
+            clip_bounds: bounds,
+        });
+    }
+}
+
+/// Issues the renderer primitives for `list` inside `bounds`.
+/// What must be painted above the z < 0 pictures: decorations, the cursor, the grid text and the
+/// dimmed `[image W×H]` lines. `render` calls this inside one layer opened after every under-text
+/// picture, which is what keeps it above them (see the note there).
+fn draw_text_group(
+    renderer: &mut iced::Renderer,
+    list: &DrawList,
+    bounds: Rectangle,
+    m: &Metrics,
     shapes: &mut ShapeCache,
 ) {
     let (cw, ch) = (m.cell.width, m.cell.height);
@@ -422,19 +505,6 @@ pub fn render(
         width: f32::from(s.cells) * cw,
         height: ch,
     };
-    if let Some(bg) = background_fill(list, background_opacity) {
-        renderer.fill_quad(
-            Quad {
-                bounds,
-                snap: true,
-                ..Quad::default()
-            },
-            bg,
-        );
-    }
-    for (span, c) in &list.quads {
-        fill(renderer, rect(*span), *c);
-    }
     let thin = (ch / 16.0).round().max(1.0);
     for (span, c, kind) in &list.lines {
         let r = rect(*span);
@@ -487,55 +557,120 @@ pub fn render(
             ),
         }
     }
-    // Grid text is shaped here, with the run's OpenType features, and handed to the renderer
-    // as shaped buffers; the cache keeps them alive until the frame after their last use.
+    // Grid text is shaped here, with the run's OpenType features, and handed to the renderer as
+    // shaped buffers; the cache keeps them alive until the frame after their last use. Placeholder
+    // text (`[image W×H]`) goes through the same path, only dimmer (spec 2.6).
     shapes.end_frame();
-    for run in &list.texts {
-        let mut font = run_font(m.font, run);
-        if run.bold {
-            font.weight = iced::font::Weight::Bold;
-        }
-        if run.italic {
-            font.style = iced::font::Style::Italic;
-        }
-        let detected = if m.features.ligatures && !run.alone {
-            shapes.sets(font)
-        } else {
-            std::sync::Arc::from([])
-        };
-        let features = run_features(&m.features, &detected, run.alone);
-        let r = rect(run.span);
-        let key = ShapeKey::new(
-            &run.text,
-            font,
-            m.font_size,
-            ch,
-            r.width + cw,
-            features,
-            !run.alone,
+    draw_runs(renderer, &list.texts, bounds, m, shapes, |run| {
+        color(run.fg)
+    });
+    if !list.images.placeholders.is_empty() {
+        draw_runs(
+            renderer,
+            &list.images.placeholders,
+            bounds,
+            m,
+            shapes,
+            |run| color(run.fg).scale_alpha(images::PLACEHOLDER_ALPHA),
         );
-        let buffer = shapes.buffer(key);
-        renderer.fill_raw(Raw {
-            buffer: std::sync::Arc::downgrade(&buffer),
-            position: iced::Point::new(r.x, r.y),
-            color: color(run.fg),
-            clip_bounds: bounds,
-        });
     }
-    if let Some(a) = accent {
+}
+
+/// Which extra layers one frame's pictures force, and nothing more (see [`render`]'s comment: the
+/// order is fixed by layer creation; a layer that buys nothing just costs iced a prepare pass).
+#[derive(Debug, PartialEq, Eq)]
+struct LayerPlan {
+    /// Text over the under-text pictures: needed exactly when there is one to go under.
+    lift_text: bool,
+    /// The accent in its own top layer: needed whenever this frame opens ANY picture layer — both
+    /// z < 0 and z >= 0 pictures paint after the base layer, so either kind could hide the border.
+    lift_accent: bool,
+}
+
+/// With no pictures at all both are false and `render` issues exactly what it issued before images
+/// existed: everything in the window's base layer, one text batch for every pane.
+fn layer_plan(under_text: usize, over_text: usize) -> LayerPlan {
+    let pictures = under_text > 0 || over_text > 0;
+    LayerPlan {
+        lift_text: under_text > 0,
+        lift_accent: pictures,
+    }
+}
+
+pub fn render(
+    list: &DrawList,
+    renderer: &mut iced::Renderer,
+    bounds: Rectangle,
+    m: Metrics,
+    accent: Option<Rgb>,
+    background_opacity: f32,
+    shapes: &mut ShapeCache,
+) {
+    let (cw, ch) = (m.cell.width, m.cell.height);
+    // Pictures are laid out relative to the grid's top-left corner; this shifts them here.
+    let at = iced::Point::new(bounds.x, bounds.y);
+    let rect = |s: Span| Rectangle {
+        x: bounds.x + f32::from(s.col) * cw,
+        y: bounds.y + f32::from(s.row) * ch,
+        width: f32::from(s.cells) * cw,
+        height: ch,
+    };
+    if let Some(bg) = background_fill(list, background_opacity) {
         renderer.fill_quad(
             Quad {
                 bounds,
-                border: Border {
-                    color: color(a),
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
                 snap: true,
                 ..Quad::default()
             },
-            iced::Color::TRANSPARENT,
+            bg,
         );
+    }
+    for (span, c) in &list.quads {
+        fill(renderer, rect(*span), *c);
+    }
+    // Paint order on screen is the ORDER LAYERS ARE CREATED, not the order primitives are issued:
+    // `push_clip` opens a new layer above the current one and `pop_clip` returns to it
+    // (`iced_graphics-0.14.0/src/layer.rs`), and a renderer paints layers in index order — each
+    // one's quads, then its images, then its text (`iced_wgpu-0.14.0/src/lib.rs`). Everything
+    // issued above went into the base layer, so it sits under every picture opened from here on.
+    // The two layers that lift something over the pictures are opened ONLY when this frame has a
+    // picture that makes the lift necessary ([`layer_plan`]): with none, each pane's text stays in
+    // the window's one base-layer batch, as it was before images existed.
+
+    let plan = layer_plan(list.images.under_text.len(), list.images.over_text.len());
+    // z < 0 pictures (and the tiles replacing `U+10EEEE` cells), each in its own clipped layer:
+    // over the cell backgrounds, under the text that follows.
+    images::draw_pictures(renderer, at, &list.images.under_text);
+    // Decorations, cursor, glyphs and placeholder text share ONE layer opened after all of them —
+    // only then: a background image may cover a cell's fill, but it must not cover what is written
+    // there, and with no under-text picture the base layer already keeps that order.
+    if plan.lift_text {
+        renderer.with_layer(bounds, |r| draw_text_group(r, list, bounds, &m, shapes));
+    } else {
+        draw_text_group(renderer, list, bounds, &m, shapes);
+    }
+    // Pictures with `z >= 0` sit over the text: their cells' glyphs are already drawn.
+    images::draw_pictures(renderer, at, &list.images.over_text);
+    // The pane accent in a layer of its own, opened last, when this frame has any picture at all:
+    // both z < 0 and z >= 0 pictures paint after the base layer, and either could cover the border
+    // that says which pane is focused (their cells start where the border does). With no pictures
+    // there is nothing to stay under, and the base layer draws it after everything else.
+    if let Some(a) = accent {
+        let border = Quad {
+            bounds,
+            border: Border {
+                color: color(a),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            snap: true,
+            ..Quad::default()
+        };
+        if plan.lift_accent {
+            renderer.with_layer(bounds, |r| r.fill_quad(border, iced::Color::TRANSPARENT));
+        } else {
+            renderer.fill_quad(border, iced::Color::TRANSPARENT);
+        }
     }
 }
 
@@ -547,6 +682,17 @@ mod tests {
         ColorScheme::graphite()
     }
 
+    /// The app-wide store the widget asks for pictures from. These tests feed text only, so nothing
+    /// is ever looked up in it; a leaked private store would race with other tests over the global.
+    fn store() -> &'static ImageStore {
+        crate::images::store()
+    }
+
+    /// The cell geometry of `term_with`'s terminals: 8x16 logical px at scale 1.
+    fn metrics() -> images::CellGeometry {
+        images::CellGeometry::new(Size::new(8.0, 16.0), 1.0)
+    }
+
     fn term_with(bytes: &[u8]) -> Terminal {
         let mut t = Terminal::new(
             crate::GridSize {
@@ -554,6 +700,7 @@ mod tests {
                 rows: 4,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         );
@@ -564,7 +711,16 @@ mod tests {
     #[test]
     fn emoji_presentation_draws_with_the_color_emoji_font() {
         let t = term_with("\x1b[?2027h❤\u{FE0F} ❤ 日".as_bytes());
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let font_of = |text: &str| {
             let run = list.texts.iter().find(|r| r.text == text).expect(text);
             run_font(Font::MONOSPACE, run).family
@@ -578,7 +734,16 @@ mod tests {
 
         // Without the mode the cluster has one cell: a color emoji would spill over the next.
         let t = term_with("❤\u{FE0F}x".as_bytes());
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let run = list.texts.iter().find(|r| r.text == "❤\u{FE0F}").unwrap();
         assert_eq!(run.span.cells, 1);
         assert_eq!(
@@ -590,7 +755,16 @@ mod tests {
     #[test]
     fn build_batches_runs_by_style() {
         let t = term_with(b"ab \x1b[31mcd\x1b[0m  \x1b[1mef");
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -612,7 +786,16 @@ mod tests {
     fn only_the_default_background_is_translucent() {
         // Green background on "ab", then default cells.
         let t = term_with(b"\x1b[42mab\x1b[0m cd");
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let bg = background_fill(&list, 0.85).expect("drawn");
         assert!((bg.a - 0.85).abs() < f32::EPSILON);
         assert_eq!(
@@ -638,7 +821,16 @@ mod tests {
     #[test]
     fn build_unfocused_cursor_is_hollow() {
         let t = term_with(b"x");
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert_eq!(list.cursor.map(|c| c.2), Some(CursorMark::Hollow));
         assert!(list.quads.is_empty());
     }
@@ -646,7 +838,16 @@ mod tests {
     #[test]
     fn build_draws_wide_chars_on_their_own() {
         let t = term_with("a日b".as_bytes());
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -658,7 +859,16 @@ mod tests {
     #[test]
     fn non_ascii_narrow_char_breaks_run() {
         let t = term_with("a❯b █▓─x".as_bytes());
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let texts: Vec<_> = list
             .texts
             .iter()
@@ -670,7 +880,16 @@ mod tests {
     #[test]
     fn build_underlines_hovered_link_only() {
         let t = term_with(b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ x");
-        let none = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let none = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert!(none.lines.is_empty());
         let link = t.term().grid().screen()[Line(0)][Column(0)]
             .hyperlink()
@@ -682,6 +901,8 @@ mod tests {
             true,
             Some(&link),
             None,
+            store(),
+            metrics(),
         );
         assert_eq!(hovered.lines.len(), 1);
         assert_eq!(hovered.lines[0].0.cells, 4);
@@ -699,10 +920,28 @@ mod tests {
     #[test]
     fn runs_split_at_the_cursor() {
         let t = term_with(b"a->b\x1b[1;3H");
-        let list = build(&mut RowReader::new(), &t, &scheme(), true, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert_eq!(row0(&list), ["a-", ">", "b"]);
         // An unfocused (hollow) cursor keeps the cell's colors, and still splits.
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert_eq!(row0(&list), ["a-", ">", "b"]);
     }
 
@@ -710,7 +949,16 @@ mod tests {
     fn runs_split_at_selection_edges() {
         let mut t = term_with(b"a->b");
         t.set_selection(Some(crate::Selection::on_line(0, 2, 3)));
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert_eq!(row0(&list), ["a-", ">b"]);
     }
 
@@ -727,24 +975,60 @@ mod tests {
             current_bg: Rgb { r: 2, g: 2, b: 2 },
             current_fg: Rgb { r: 3, g: 3, b: 3 },
         };
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, Some(&h));
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            Some(&h),
+            store(),
+            metrics(),
+        );
         assert_eq!(row0(&list), ["a-", ">", "b"]);
     }
 
     #[test]
     fn runs_split_on_background_and_underline() {
         let t = term_with(b"\x1b[41m-\x1b[0m>");
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert_eq!(row0(&list), ["-", ">"]);
         let t = term_with(b"\x1b[4m-\x1b[0m>");
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert_eq!(row0(&list), ["-", ">"]);
     }
 
     #[test]
     fn alone_runs_are_marked() {
         let t = term_with("日 e\u{301} ->".as_bytes());
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let alone: Vec<(&str, bool)> = list
             .texts
             .iter()
@@ -761,11 +1045,21 @@ mod tests {
                 rows: 3,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         );
         t.feed(b"ab->\r\n");
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         let run = list.texts.iter().find(|r| r.span.row == 0).unwrap();
         assert_eq!(run.text, "ab->");
         assert_eq!((run.span.col, run.span.cells), (0, 4));
@@ -777,7 +1071,16 @@ mod tests {
         let mut sel = crate::Selection::start(Point::new(Line(0), Column(1)));
         sel.update(Point::new(Line(0), Column(3)));
         t.set_selection(Some(sel));
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert!(list.quads.contains(&(
             Span {
                 row: 0,
@@ -808,7 +1111,16 @@ mod tests {
             current_bg: strong,
             current_fg: text,
         };
-        let list = build(&mut RowReader::new(), &t, &scheme(), false, None, Some(&h));
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            Some(&h),
+            store(),
+            metrics(),
+        );
         let quads: Vec<_> = list
             .quads
             .iter()
@@ -823,7 +1135,16 @@ mod tests {
             .find(|r| r.span.row == 0 && r.span.col == 3);
         assert_eq!(current_text.map(|r| r.fg), Some(text));
         // Without a highlight nothing is tinted.
-        let plain = build(&mut RowReader::new(), &t, &scheme(), false, None, None);
+        let plain = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
         assert!(plain.quads.iter().all(|(_, c)| *c != tint && *c != strong));
     }
 
@@ -863,7 +1184,18 @@ mod tests {
             4,
             before,
             |_, _| {},
-            |t| build(&mut RowReader::new(), t, &scheme(), true, None, None),
+            |t| {
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    true,
+                    None,
+                    None,
+                    store(),
+                    metrics(),
+                )
+            },
         )
     }
 
@@ -940,7 +1272,16 @@ mod tests {
                     .hyperlink()
                     .unwrap();
                 assert_eq!(link.uri(), "https://example.com");
-                build(&mut RowReader::new(), t, &scheme(), true, Some(&link), None)
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    true,
+                    Some(&link),
+                    None,
+                    store(),
+                    metrics(),
+                )
             },
         );
         assert_eq!(hovered.lines.len(), 1);
@@ -954,7 +1295,18 @@ mod tests {
             4,
             b"a->b\r\n",
             |t, top| t.set_selection(Some(crate::Selection::on_line(top, 2, 3))),
-            |t| build(&mut RowReader::new(), t, &scheme(), false, None, None),
+            |t| {
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    false,
+                    None,
+                    None,
+                    store(),
+                    metrics(),
+                )
+            },
         );
         assert_eq!(row0(&list), ["a-", ">b"]);
         let list = cold_list(
@@ -973,7 +1325,16 @@ mod tests {
                     current_bg: Rgb { r: 2, g: 2, b: 2 },
                     current_fg: Rgb { r: 3, g: 3, b: 3 },
                 };
-                build(&mut RowReader::new(), t, &scheme(), false, None, Some(&h))
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    false,
+                    None,
+                    Some(&h),
+                    store(),
+                    metrics(),
+                )
             },
         );
         assert_eq!(row0(&list), ["a-", ">", "b"]);
@@ -1000,7 +1361,18 @@ mod tests {
             3,
             b"ab->\r\n",
             |_, _| {},
-            |t| build(&mut RowReader::new(), t, &scheme(), false, None, None),
+            |t| {
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    false,
+                    None,
+                    None,
+                    store(),
+                    metrics(),
+                )
+            },
         );
         let run = list.texts.iter().find(|r| r.span.row == 0).unwrap();
         assert_eq!(run.text, "ab->");
@@ -1018,7 +1390,18 @@ mod tests {
                 sel.update(Point::new(Line(top), Column(3)));
                 t.set_selection(Some(sel));
             },
-            |t| build(&mut RowReader::new(), t, &scheme(), false, None, None),
+            |t| {
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    false,
+                    None,
+                    None,
+                    store(),
+                    metrics(),
+                )
+            },
         );
         assert!(list.quads.contains(&(
             Span {
@@ -1047,7 +1430,16 @@ mod tests {
                     current_bg: strong,
                     current_fg: Rgb { r: 3, g: 3, b: 3 },
                 };
-                build(&mut RowReader::new(), t, &scheme(), false, None, Some(&h))
+                build(
+                    &mut RowReader::new(),
+                    t,
+                    &scheme(),
+                    false,
+                    None,
+                    Some(&h),
+                    store(),
+                    metrics(),
+                )
             },
         );
         let quads: Vec<_> = list
@@ -1058,5 +1450,46 @@ mod tests {
         assert!(quads.contains(&(0, 0, 2, tint)));
         assert!(quads.contains(&(1, 0, 2, tint)));
         assert_eq!(quads.iter().filter(|q| q.3 == strong).count(), 1);
+    }
+
+    /// The four shapes a frame's picture counts can take, and the layers each one needs: text is
+    /// lifted only when something is under it, the accent whenever any picture exists (both kinds
+    /// paint after the base layer); with no pictures at all `render` must issue exactly what it did
+    /// before images existed (everything in the base layer).
+    #[test]
+    fn layers_are_opened_only_when_pictures_force_them() {
+        assert_eq!(
+            layer_plan(0, 0),
+            LayerPlan {
+                lift_text: false,
+                lift_accent: false,
+            },
+            "a text-only pane pays for no extra layers"
+        );
+        assert_eq!(
+            layer_plan(2, 0),
+            LayerPlan {
+                lift_text: true,
+                lift_accent: true,
+            },
+            "background pictures force the text above them — and they paint after the base layer \
+             too, starting where the border does, so the accent must be lifted over them as well"
+        );
+        assert_eq!(
+            layer_plan(0, 1),
+            LayerPlan {
+                lift_text: false,
+                lift_accent: true,
+            },
+            "an over-text picture threatens the border; nothing needs lifting under"
+        );
+        assert_eq!(
+            layer_plan(1, 1),
+            LayerPlan {
+                lift_text: true,
+                lift_accent: true,
+            },
+            "both kinds, both lifts"
+        );
     }
 }

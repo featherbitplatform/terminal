@@ -200,6 +200,7 @@ fn start_widget_io(workload: &str) {
             rows: ROWS as u16,
             cell_width: 7.0,
             cell_height: 15.0,
+            scale: 1.0,
         },
         10_000,
     );
@@ -218,6 +219,7 @@ fn start_widget_io(workload: &str) {
             accent: None,
             focused: true,
             background_opacity: 1.0,
+            scale: 1.0,
         })
         .ok();
     let (tx, rx) = mpsc::unbounded();

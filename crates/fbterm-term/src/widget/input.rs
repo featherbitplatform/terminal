@@ -684,6 +684,7 @@ mod tests {
             rows,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let mut t = Terminal::new(size, 1000);
         for i in 0..200 {
@@ -1216,6 +1217,7 @@ mod tests {
             rows: 30,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         // Column 50 of the view, past the terminal's 40 (lines outside the grid read as empty
         // cells, columns are not checked), on a line inside it.

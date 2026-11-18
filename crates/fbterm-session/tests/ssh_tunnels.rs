@@ -39,6 +39,7 @@ const SIZE: GridSize = GridSize {
     rows: 30,
     cell_width: 8.0,
     cell_height: 16.0,
+    scale: 1.0,
 };
 
 fn enabled() -> bool {

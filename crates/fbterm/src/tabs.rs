@@ -580,6 +580,7 @@ mod tests {
                 rows: 5,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         )));
@@ -739,6 +740,7 @@ mod tests {
             rows: 6,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let mut term = fbterm_term::Terminal::new(size, 100);
         // A program that wrote two lines, then left the alternate screen, a scroll region and
@@ -772,6 +774,7 @@ mod tests {
             rows: 24,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let session = fbterm_session::spawn_local(&local, size, 100, tx).expect("spawn");
         let mut w = WindowState::new();
@@ -815,6 +818,7 @@ mod tests {
                 rows: 24,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             };
             fbterm_session::spawn_local(&local, size, 100, tx.clone()).expect("spawn")
         };

@@ -589,6 +589,13 @@ fn terminal<'a>(
                 SettingsMsg::Kitty,
             ),
         ),
+        inline_images_setting(t, state.values.inline_images, editable),
+        scrollback_images_setting(
+            t,
+            state.values.scrollback_images,
+            state.scrollback_images_enabled(),
+            editable,
+        ),
         setting(
             t,
             "Grapheme clusters",
@@ -606,6 +613,47 @@ fn terminal<'a>(
         ),
         setting(t, "Redraw rate", Some(state.rate_hint()), false, rate),
     ]
+}
+
+/// The `Inline images` switch: pictures programs send are shown (`on`, the default) or dropped.
+/// Off also clears what is already on screen in every open terminal.
+pub(super) fn inline_images_setting<'a>(
+    t: &'static Tokens,
+    on: bool,
+    editable: bool,
+) -> Element<'a, Message> {
+    setting(
+        t,
+        "Inline images",
+        Some("Show pictures that programs send"),
+        false,
+        switch(t, on, editable, false, SettingsMsg::InlineImages),
+    )
+}
+
+/// The `Images in scrollback` switch: a picture whose rows have all scrolled off the screen stays
+/// (`on`) or becomes a line saying how big it was. `enabled`: there is inline images for it to
+/// belong to (see [`SettingsState::scrollback_images_enabled`]); without it the row is muted and
+/// its switch cannot be used.
+pub(super) fn scrollback_images_setting<'a>(
+    t: &'static Tokens,
+    on: bool,
+    enabled: bool,
+    editable: bool,
+) -> Element<'a, Message> {
+    setting(
+        t,
+        "Images in scrollback",
+        Some("Keep pictures when they scroll off the screen"),
+        !enabled,
+        switch(
+            t,
+            on,
+            editable && enabled,
+            false,
+            SettingsMsg::ScrollbackImages,
+        ),
+    )
 }
 
 fn tunnels<'a>(

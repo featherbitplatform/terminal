@@ -230,6 +230,12 @@ pub struct Settings {
     /// Let programs turn on the kitty keyboard protocol (off: requests are ignored and keys keep
     /// their legacy encoding).
     pub kitty_keyboard: bool,
+    /// Show pictures programs send (on). Off, every picture sequence a program writes is consumed
+    /// and discarded, and what is already on screen goes away at once.
+    pub inline_images: bool,
+    /// Keep pictures when they scroll off the screen (`false`: they become a line saying how big
+    /// they were and free their memory). Only counts with `inline_images` on.
+    pub scrollback_images: bool,
     /// Start every new terminal with grapheme clusters on (DEC private mode 2027): joined emoji,
     /// flags and skin tones in one cell. Programs can turn it on and off themselves; a change
     /// applies to new terminals and after a reset or restart, never to a running program.
@@ -282,6 +288,8 @@ impl Default for Settings {
             uncompressed_history_lines: None,
             color_scheme: "graphite".into(),
             kitty_keyboard: false,
+            inline_images: true,
+            scrollback_images: false,
             grapheme_clusters: false,
             background_opacity: 1.0,
             background_blur: false,
@@ -578,6 +586,14 @@ pub const SETTINGS_TEMPLATE: &str = r##"# featherbit terminal settings.
 
 # Let programs turn on the kitty keyboard protocol (true or false).
 #kitty_keyboard = false
+
+# Show pictures that programs send (true or false). Off, every picture a program writes is
+# dropped, and what is already on screen disappears with it.
+#inline_images = true
+
+# Keep a picture when its rows scroll off the screen (true or false): off replaces it with a
+# line saying how big it was. Only counts while inline_images is true.
+#scrollback_images = false
 
 # Keep joined emoji, flags and skin tones in one cell in new tabs (true or false). Programs can
 # turn this on themselves.

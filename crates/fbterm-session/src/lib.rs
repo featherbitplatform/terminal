@@ -10,7 +10,7 @@ pub mod ssh;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use fbterm_term::{GridSize, SharedTerminal, TermEvent};
+use fbterm_term::{GridSize, SharedTerminal, TermEvent, Terminal};
 
 pub use local::{spawn_local, spawn_local_into};
 
@@ -82,6 +82,7 @@ pub enum SessionError {
 
 /// Commands consumed by a session's writer side, in order: input bytes and the terminal's
 /// own replies share one queue so they reach the program in the order they were produced.
+#[derive(Debug)]
 pub(crate) enum Command {
     Input(Vec<u8>),
     Resize(GridSize),
@@ -124,6 +125,9 @@ pub struct SessionHandle {
     pub(crate) ended: Ended,
     /// SSH sessions keep their shared connection alive until closed.
     pub(crate) connection: parking_lot::Mutex<Option<Arc<ssh::pool::Connection>>>,
+    /// This session's event router, for [`SessionHandle::deliver_events`]. `None` on a handle with
+    /// no session behind it ([`SessionHandle::inert`]), where nothing runs to route anything.
+    pub(crate) router: Option<Arc<Router>>,
 }
 
 impl SessionHandle {
@@ -142,16 +146,36 @@ impl SessionHandle {
             auth_warnings: Vec::new(),
             ended: Ended::default(),
             connection: parking_lot::Mutex::new(None),
+            router: None,
         }
     }
 
     /// [`SessionHandle::inert`] that keeps what is sent to it: what the user typed can be
     /// read back from the [`InputLog`].
+    ///
+    /// It routes as well, so a test can follow an event from the emulator to the program's input:
+    /// [`SessionHandle::deliver_events`] on this handle answers out of the same queue keystrokes go
+    /// into. Its half of the session-event channel is dropped - titles and redraw notices reach
+    /// nobody here, only what is written to the program is kept.
     #[doc(hidden)]
     pub fn recording(terminal: SharedTerminal) -> (Self, InputLog) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut handle = Self::inert(terminal);
-        handle.commands = tx;
+        let (events, _unread) = tokio::sync::mpsc::unbounded_channel();
+        let owner = terminal.lock().image_owner();
+        let mut handle = Self::inert(terminal.clone());
+        handle.commands = tx.clone();
+        handle.router = Some(Arc::new(Router {
+            id: handle.id,
+            events,
+            replies: tx,
+            dirty_pending: handle.dirty_pending.clone(),
+            bell_pending: handle.bell_pending.clone(),
+            ended: handle.ended.clone(),
+            terminal: Arc::downgrade(&terminal),
+            owner,
+            last_title: parking_lot::Mutex::new(None),
+            routing: parking_lot::Mutex::new(()),
+        }));
         (handle, InputLog(rx))
     }
 
@@ -175,6 +199,19 @@ impl SessionHandle {
             }
         }
         let _ = self.commands.send(Command::Resize(size));
+    }
+
+    /// Deliver what this session's terminal queued with nobody to route it, as a feed would: its
+    /// replies to the program, its title, its pictures, and one `Dirty`.
+    ///
+    /// A pane started before its window laid out holds its output until the view reports the grid it
+    /// really has (see [`fbterm_term::Terminal::hold_until_sized`]); that resize happens on the app's
+    /// thread, where no feed follows it. Call this after such a resize, and never while holding the
+    /// terminal's lock: delivery hands pictures to the image store, which locks the terminal itself.
+    pub fn deliver_events(&self) {
+        if let Some(router) = &self.router {
+            router.deliver_queued();
+        }
     }
 
     /// Kill the session and stop its threads or tasks. Safe to call repeatedly.
@@ -215,17 +252,165 @@ impl Drop for SessionHandle {
     }
 }
 
+/// What reaches a session from outside its reader thread.
+///
+/// [`Feeder::feed`] and the image store's worker (through the owner hooks) route terminal
+/// events with this, so a kitty reply produced by a finished decode looks exactly like one
+/// produced by a feed: same replies queue in the same order, same title dedupe, same coalesced
+/// `Dirty`/`Bell`. It holds the terminal *weakly*: the store lives for the whole process, and
+/// hooks holding it strongly would keep every closed pane's grid alive.
+struct Router {
+    id: SessionId,
+    events: EventSink,
+    /// Where replies to programs go: the session's own input queue, so they interleave with
+    /// keystrokes in the order they were produced.
+    replies: tokio::sync::mpsc::UnboundedSender<Command>,
+    dirty_pending: Arc<AtomicBool>,
+    bell_pending: Arc<AtomicBool>,
+    ended: Ended,
+    terminal: std::sync::Weak<parking_lot::Mutex<Terminal>>,
+    /// The terminal's id in the image store ([`Terminal::image_owner`]).
+    owner: u64,
+    last_title: parking_lot::Mutex<Option<String>>,
+    /// One terminal's events are taken and routed together, by one thread at a time.
+    ///
+    /// Replies must reach a program in the order the emulator produced them, and a picture must
+    /// reach the store before the event that releases its key. Three threads move events for one
+    /// terminal: the feeder ([`Feeder::feed`]), whoever delivers what a pane's first real grid or a
+    /// hidden pane's release parsed ([`Router::deliver_queued`], which is also what the image
+    /// store's `deliver` hook calls), and - only through that hook - the image worker, whose
+    /// finished decode queues its answer into the terminal rather than carrying it off. Each takes
+    /// this lock, then the terminal lock, empties the queue and routes everything it took; nothing
+    /// else in the app drains that queue, so no reply is overtaken on the way to the program's input.
+    ///
+    /// What that guarantees, precisely: whatever was queued before a thread takes the queue goes out
+    /// in production order from that thread, and anything produced while it routes goes out after,
+    /// from the next taker. It does not order events two threads produce at the same moment - the
+    /// emulator's own lock decides which of those was produced first, and this section keeps that
+    /// order. The order of locks is routing, then terminal (released before routing), then store:
+    /// nothing takes this lock while holding the terminal or the store, the store runs its hooks with
+    /// nothing held, and neither `Dirty` - the redraw notice - nor a caps reclaim's wakes for any
+    /// other pane go out until the guard is dropped: never wake a pane under a lock (finding M3).
+    routing: parking_lot::Mutex<()>,
+}
+
+impl Router {
+    /// Pass the events one feed (or one delivery) produced on to their destinations, and return the
+    /// image owners whose visible state changed on the way.
+    ///
+    /// Those are returned, not woken: a reclaim this routing triggers can take a picture from any
+    /// pane, and a wake delivers events and marks a pane dirty - the feeder thread reading one pane's
+    /// deliveries may be waiting for this section's `routing` lock. Nothing is woken under a lock
+    /// (finding M3): callers run [`ImageStore::wake_owners`](fbterm_term::images::ImageStore::wake_owners)
+    /// after they drop the guard.
+    fn route(&self, term_events: Vec<TermEvent>) -> Vec<u64> {
+        let mut wake = Vec::new();
+        for ev in term_events {
+            match ev {
+                TermEvent::PtyWrite(bytes) => {
+                    let _ = self.replies.send(Command::Input(bytes));
+                }
+                TermEvent::Title(t) => {
+                    let mut last = self.last_title.lock();
+                    if last.as_deref() != Some(t.as_str()) {
+                        *last = Some(t.clone());
+                        drop(last);
+                        self.send(SessionEvent::Title(t));
+                    }
+                }
+                TermEvent::Bell => {
+                    if !self.bell_pending.swap(true, Ordering::AcqRel) {
+                        self.send(SessionEvent::Bell);
+                    }
+                }
+                TermEvent::Exit => {}
+                TermEvent::ImageReceived { key, data } => wake.extend(self.submit_image(key, data)),
+                // Idempotent by design: scrollback eviction and failed decodes release keys the
+                // terminal releases again later, and a second release must stay harmless.
+                TermEvent::ImageReleased(key) => {
+                    fbterm_term::images::store().release(self.owner, key)
+                }
+            }
+        }
+        wake
+    }
+
+    /// Hand one image to the store, then reclaim if it pushed this owner over its cap — the
+    /// terminal's scrollback first (outside the store's lock, as the store never locks a
+    /// terminal), the store's own buffers only when that ran dry. The image worker runs the same
+    /// helper when a decode or refusal finishes, so the order holds however the bytes grew. Returns
+    /// the owners to wake (see [`Self::route`]): this one, plus any pane enforcement took pixels from.
+    fn submit_image(
+        &self,
+        key: fbterm_term::images::ImageKey,
+        data: fbterm_term::images::ImageData,
+    ) -> Vec<u64> {
+        let store = fbterm_term::images::store();
+        store.submit(self.owner, key, data);
+        fbterm_term::images::reclaim(store, &self.terminal, self.owner)
+    }
+
+    /// Deliver what the terminal queued with nobody to route it: output held for a pane's first real
+    /// grid (see [`fbterm_term::Terminal::hold_until_sized`]) is parsed by its view's resize, on the
+    /// app's thread, and so is a hidden pane's release; what either produces - replies, titles,
+    /// pictures - needs the same delivery a feed gives it. The image store's `deliver` hook calls
+    /// this too: that is how a finished decode's answer joins the queue of replies instead of being
+    /// carried past them. Takes the terminal lock only to empty the queue: routing hands pictures to
+    /// the store, which may lock the terminal itself. Raises `Dirty` for the same reason a feed does,
+    /// once this section's lock is dropped.
+    fn deliver_queued(&self) {
+        let Some(terminal) = self.terminal.upgrade() else {
+            return; // nobody owns this terminal any more: nothing waits for its events
+        };
+        // One critical section with the feeder and the image worker (see `Router::routing`).
+        let routing = self.routing.lock();
+        let events = {
+            let mut term = terminal.lock();
+            term.take_events()
+        };
+        drop(terminal);
+        if events.is_empty() {
+            drop(routing);
+            return; // nothing queued: this call is not a reason to redraw
+        }
+        let wake = self.route(events);
+        drop(routing);
+        // Panes whose pictures a reclaim took are asked to redraw once this section's lock is gone
+        // (finding M3), and then this pane's own notice goes out: both with nothing held.
+        fbterm_term::images::store().wake_owners(&wake);
+        self.mark_dirty();
+    }
+
+    /// Raise `Dirty` unless one is already pending.
+    fn mark_dirty(&self) {
+        if !self.dirty_pending.swap(true, Ordering::AcqRel) {
+            self.send(SessionEvent::Dirty);
+        }
+    }
+
+    /// Report an event. The end of the session is recorded first, so a handle installed after
+    /// the event was delivered still learns of it through [`SessionHandle::ended`].
+    fn send(&self, event: SessionEvent) {
+        let end = match &event {
+            SessionEvent::Exited(code) => Some(SessionEnd::Exited(*code)),
+            SessionEvent::Disconnected(reason) => Some(SessionEnd::Disconnected(reason.clone())),
+            _ => None,
+        };
+        if let Some(end) = end {
+            *self.ended.lock() = Some(end);
+        }
+        let _ = self.events.send((self.id, event));
+    }
+}
+
 /// Feeds program output into a session's terminal and raises the coalesced events, the same
 /// way for every kind of session.
 pub(crate) struct Feeder {
-    pub id: SessionId,
     pub terminal: SharedTerminal,
-    pub events: EventSink,
-    pub dirty_pending: Arc<AtomicBool>,
-    pub bell_pending: Arc<AtomicBool>,
     pub detached: Arc<AtomicBool>,
-    pub ended: Ended,
-    last_title: Option<String>,
+    /// Everything feeding and answering goes through here; the image store's worker holds a
+    /// clone of it (as this terminal's owner hooks) until the terminal drops.
+    router: Arc<Router>,
     /// Declared last so it drops after `terminal`: its notice then follows the release of
     /// this feeder's terminal reference.
     _released: ReleasedNotice,
@@ -249,6 +434,11 @@ impl Drop for ReleasedNotice {
 }
 
 impl Feeder {
+    /// Build a feeder for one terminal, and register its owner hooks with the image store: an
+    /// image that finishes decoding later is answered and redrawn through this session. A new
+    /// feeder on the same terminal (a reconnect) replaces them, so the old session stops getting
+    /// its wakeups while the images themselves survive.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: SessionId,
         terminal: SharedTerminal,
@@ -257,62 +447,88 @@ impl Feeder {
         bell_pending: Arc<AtomicBool>,
         detached: Arc<AtomicBool>,
         ended: Ended,
+        replies: tokio::sync::mpsc::UnboundedSender<Command>,
     ) -> Self {
-        Self {
+        let owner = terminal.lock().image_owner();
+        let router = Arc::new(Router {
             id,
-            terminal,
+            events: events.clone(),
+            replies,
+            dirty_pending: dirty_pending.clone(),
+            bell_pending: bell_pending.clone(),
+            ended: ended.clone(),
+            terminal: Arc::downgrade(&terminal),
+            owner,
+            last_title: parking_lot::Mutex::new(None),
+            routing: parking_lot::Mutex::new(()),
+        });
+        fbterm_term::images::store().register_owner(
+            owner,
+            fbterm_term::images::OwnerHooks {
+                term: Arc::downgrade(&terminal),
+                // The worker leaves its answer in the terminal's queue; this delivers it through the
+                // same critical section a feed uses, behind whatever output queued ahead of it.
+                deliver: {
+                    let router = router.clone();
+                    Arc::new(move || router.deliver_queued())
+                },
+                wake: {
+                    let router = router.clone();
+                    Arc::new(move || router.mark_dirty())
+                },
+            },
+        );
+        Self {
             _released: ReleasedNotice {
                 id,
                 events: events.clone(),
                 detached: detached.clone(),
             },
-            events,
-            dirty_pending,
-            bell_pending,
+            terminal,
             detached,
-            ended,
-            last_title: None,
+            router,
         }
     }
 
-    /// Feed output; returns the replies the terminal wants written back to the program.
+    /// This session's router: what delivers terminal events when no feed produced them (see
+    /// [`SessionHandle::deliver_events`]). A handle keeps a copy so the app can ask for that
+    /// delivery without reaching into the session's own thread.
+    pub(crate) fn router(&self) -> Arc<Router> {
+        self.router.clone()
+    }
+
+    /// Feed output, answering programs through the session's replies queue as the emulator asks.
     ///
     /// `Dirty` and `Bell` are raised at most once until [`SessionHandle::take_dirty`] re-arms
     /// them; a title is reported only when it changes. Once the handle is closed the bytes are
-    /// dropped (checked under the terminal lock, so nothing lands after `close` returns).
-    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Vec<u8>> {
+    /// dropped (checked under the terminal lock, so nothing lands after `close` returns). The
+    /// graphics protocols' stall watchdog runs on the same lock: this app schedules no timers,
+    /// so feeding output is what keeps chunked transmissions and parked replies moving.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        // Held across taking the events and routing them: this thread, whoever delivers what a pane's
+        // release parsed, and the image worker (through `Router::deliver_queued`) all move the same
+        // terminal's events out of its queue, and only one of them at a time may do it (see
+        // `Router::routing`). Taken before the terminal lock, which is the order everywhere.
+        let routing = self.router.routing.lock();
         let (term_events, history_jobs) = {
             let mut term = self.terminal.lock();
             if self.is_detached() {
-                return Vec::new();
+                return;
             }
             term.feed(bytes);
+            term.tick(std::time::Instant::now());
             (term.take_events(), term.has_history_jobs())
         };
         if history_jobs {
             // After the lock is released, so the worker can take the jobs at once.
             fbterm_term::history_worker::enqueue(&self.terminal);
         }
-        let mut replies = Vec::new();
-        for ev in term_events {
-            match ev {
-                TermEvent::PtyWrite(bytes) => replies.push(bytes),
-                TermEvent::Title(t) => {
-                    if self.last_title.as_deref() != Some(t.as_str()) {
-                        self.last_title = Some(t.clone());
-                        self.send(SessionEvent::Title(t));
-                    }
-                }
-                TermEvent::Bell => {
-                    if !self.bell_pending.swap(true, Ordering::AcqRel) {
-                        self.send(SessionEvent::Bell);
-                    }
-                }
-                TermEvent::Exit => {}
-            }
-        }
+        let wake = self.router.route(term_events);
+        drop(routing);
+        // Panes whose pictures a reclaim took are asked to redraw once this section's lock is gone
+        // (finding M3), and then this pane's own notice goes out: both with nothing held.
+        fbterm_term::images::store().wake_owners(&wake);
         self.mark_dirty();
-        replies
     }
 
     /// Whether the handle was closed and output must be dropped.
@@ -322,23 +538,13 @@ impl Feeder {
 
     /// Raise `Dirty` unless one is already pending.
     pub fn mark_dirty(&self) {
-        if !self.dirty_pending.swap(true, Ordering::AcqRel) {
-            self.send(SessionEvent::Dirty);
-        }
+        self.router.mark_dirty();
     }
 
     /// Report an event. The end of the session is recorded first, so a handle installed after
     /// the event was delivered still learns of it through [`SessionHandle::ended`].
     pub fn send(&self, event: SessionEvent) {
-        let end = match &event {
-            SessionEvent::Exited(code) => Some(SessionEnd::Exited(*code)),
-            SessionEvent::Disconnected(reason) => Some(SessionEnd::Disconnected(reason.clone())),
-            _ => None,
-        };
-        if let Some(end) = end {
-            *self.ended.lock() = Some(end);
-        }
-        let _ = self.events.send((self.id, event));
+        self.router.send(event);
     }
 }
 
@@ -359,10 +565,12 @@ mod released_tests {
             rows: 3,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
         let weak = Arc::downgrade(&terminal);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies, _replies_rx) = tokio::sync::mpsc::unbounded_channel();
         let f = Feeder::new(
             SessionId::next(),
             terminal,
@@ -371,6 +579,7 @@ mod released_tests {
             Arc::default(),
             Arc::new(AtomicBool::new(detached)),
             Ended::default(),
+            replies,
         );
         (f, weak, rx)
     }
@@ -395,5 +604,481 @@ mod released_tests {
         drop(f);
         assert_eq!(rx.try_recv().unwrap().1, SessionEvent::Exited(Some(0)));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use fbterm_term::{GridSize, Terminal};
+
+    fn grid(cols: u16) -> GridSize {
+        GridSize {
+            cols,
+            rows: 3,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            scale: 1.0,
+        }
+    }
+
+    /// A feeder over its own terminal, with the queue a session's writer would read and the router
+    /// the handle would carry. `holding` starts it waiting for its first real grid, as `App::start`
+    /// does for a pane whose window has not laid out.
+    fn feeder(holding: bool) -> (Feeder, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(grid(10), 10)));
+        if holding {
+            terminal.lock().hold_until_sized();
+        }
+        let (events, _unread) = tokio::sync::mpsc::unbounded_channel();
+        let (replies_tx, replies_rx) = tokio::sync::mpsc::unbounded_channel();
+        let f = Feeder::new(
+            SessionId::next(),
+            terminal,
+            events,
+            Arc::default(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            Ended::default(),
+            replies_tx,
+        );
+        (f, replies_rx)
+    }
+
+    /// What one query answers with, as bytes: `feed` sends them to the program.
+    fn answer_of(query: &[u8]) -> Vec<u8> {
+        let mut t = Terminal::new(grid(10), 10);
+        t.feed(query);
+        t.take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fbterm_term::TermEvent::PtyWrite(b) => Some(b),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    fn written(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(Command::Input(bytes)) = rx.try_recv() {
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    /// A query asked before the pane had cells is not answered by the feed that carried it, nor by
+    /// the resize that parses it: only delivering what that release queued - as `App::start`'s
+    /// caller does when its view reports the grid - writes the answer to the program.
+    #[test]
+    fn a_reply_waits_for_the_delivery_that_follows_its_release() {
+        let (mut feeder, mut replies) = feeder(true);
+        feeder.feed(b"\x1b[c");
+        assert!(
+            written(&mut replies).is_empty(),
+            "held output answered nobody"
+        );
+
+        // The view reports the grid its window really has: the resize parses what waited, and the
+        // answer is queued. On this thread nothing feeds after a resize.
+        feeder.terminal.lock().resize(grid(20));
+        assert!(
+            written(&mut replies).is_empty(),
+            "a resize routes nothing itself"
+        );
+
+        feeder.router().deliver_queued();
+        assert_eq!(written(&mut replies), answer_of(b"\x1b[c"));
+    }
+
+    /// The app delivering a release and the session feeding new output are two threads over one
+    /// event queue. Taking the events and routing them is one section, so whichever gets there
+    /// first takes what the other had not yet produced too - and every reply reaches the program in
+    /// the order the emulator made it, no matter how the two threads interleave.
+    #[test]
+    fn events_reach_the_program_in_the_order_they_were_produced() {
+        let (mut feeder, mut replies) = feeder(true);
+        // Asked while held: its answer is what the release below queues first.
+        feeder.feed(b"\x1b[c");
+        feeder.terminal.lock().resize(grid(20));
+        let da = answer_of(b"\x1b[c");
+
+        let deliver = feeder.router();
+        let later = std::thread::spawn(move || {
+            // Output arriving now: asked after the release, so its answer must not overtake the
+            // first one's.
+            feeder.feed(b"\x1b[16t");
+        });
+        let released = std::thread::spawn(move || deliver.deliver_queued());
+        later.join().expect("the feeder thread");
+        released.join().expect("the delivering thread");
+
+        let got = written(&mut replies);
+        let cell = answer_of(b"\x1b[16t");
+        assert!(got.len() >= da.len() + cell.len(), "both answers were sent");
+        assert!(
+            got.starts_with(&da),
+            "the queued reply went last: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(got, [da.as_slice(), cell.as_slice()].concat());
+    }
+
+    /// The image worker's hand-off is not a second route. Its answer stays in the terminal's queue,
+    /// and whoever delivers empties the whole queue under one lock - so a reply that output produced
+    /// afterwards cannot overtake it. A channel says when the worker reached its hook (no sleeping):
+    /// by then its answer is queued, this feeds a query behind it, and one delivery takes both.
+    ///
+    /// Under the hand-off this replaces - take the events, drop the lock, route them - the decode's
+    /// answer would leave last: it had already left the queue when the second reply was produced.
+    #[test]
+    fn a_decode_answer_and_the_reply_that_follows_it_leave_in_order() {
+        use fbterm_term::images::{ImageStore, OwnerHooks};
+
+        let (feeder, mut replies) = feeder(false);
+        let terminal = feeder.terminal.clone();
+        let owner = terminal.lock().image_owner();
+        // A store of our own, so nothing here depends on the app-wide one or on another test's jobs.
+        let store = ImageStore::with_caps(1024 * 1024, 8 * 1024 * 1024);
+
+        // The gate: the hook reports that it was reached (the answer is queued by then) and waits
+        // here until this test opens it, so nothing the worker does can race with what follows. A
+        // `Receiver` is not `Sync`, and a hook must be, so it lives behind a mutex - the only one
+        // that ever takes it is the thread running this hook.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(parking_lot::Mutex::new(go_rx));
+        let hook_router = feeder.router();
+        store.register_owner(
+            owner,
+            OwnerHooks {
+                term: Arc::downgrade(&terminal),
+                deliver: Arc::new(move || {
+                    entered_tx
+                        .send(())
+                        .expect("nobody was waiting for the hand-off");
+                    gate.lock()
+                        .recv()
+                        .expect("the gate closed before it opened");
+                    hook_router.deliver_queued();
+                }),
+                wake: Arc::new(|| {}),
+            },
+        );
+
+        // A PNG the emulator defers to us, so the client's answer comes from this hand-off: the
+        // frame is fed (the terminal parks its pending transmission and takes no answer yet), and
+        // the payload goes to this store the way routing would hand it over. The bytes are the term
+        // crate's own checked-in 4x4 fixture, read rather than retyped.
+        let tiny = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fbterm-term/tests/fixtures/images/tiny.png"
+        ))
+        .expect("the term crate's tiny PNG fixture");
+        let frame = format!(
+            "\x1b_Gi=1,a=t,f=100;{}\x1b\\",
+            super::feeder_image_tests::b64(&tiny)
+        );
+        terminal.lock().feed(frame.as_bytes());
+        let events = {
+            let mut term = terminal.lock();
+            term.take_events()
+        };
+        let (key, data) = events
+            .into_iter()
+            .find_map(|e| match e {
+                fbterm_term::TermEvent::ImageReceived { key, data } => Some((key, data)),
+                _ => None,
+            })
+            .expect("the terminal should have deferred this PNG to us");
+        store.submit(owner, key, data);
+        // Jobs run on another thread: it parks in the hook while this one works.
+        let driver = std::thread::spawn(move || store.run_jobs_until_idle());
+
+        entered_rx
+            .recv()
+            .expect("the worker never reached its deliver hook");
+        // Output arriving now, put into the terminal as a feed puts it: asked after the decode was
+        // answered, so its reply has to leave after the decode's.
+        terminal.lock().feed(b"\x1b[c");
+        feeder.router().deliver_queued();
+
+        let got = written(&mut replies);
+        let text = String::from_utf8_lossy(&got).into_owned();
+        let ok_at = text
+            .find("i=1;OK")
+            .unwrap_or_else(|| panic!("the decode's answer never reached the program: {text:?}"));
+        let da_at = text
+            .find("\x1b[?")
+            .unwrap_or_else(|| panic!("no device-attributes answer: {text:?}"));
+        assert!(
+            ok_at < da_at,
+            "the decode's answer left after the reply produced after it: {text:?}"
+        );
+
+        // Open the gate and let that thread finish: by the time it returns, the hook has delivered
+        // too, so what is checked below is everything the hand-off ever sent.
+        let _ = go_tx.send(());
+        driver.join().expect("the thread driving the jobs");
+        assert!(
+            written(&mut replies).is_empty(),
+            "the hand-off routed a second copy of an answer"
+        );
+    }
+
+    /// A caps reclaim that runs inside this section must not call any pane's hook until the guard is
+    /// dropped (finding M3). The hook below reports whether the routing lock was free every time it
+    /// ran: had `route` woken from inside the section, a hook that takes a router's lock - which is
+    /// what a future one may well do - would have blocked forever here instead of recording a miss.
+    #[test]
+    fn a_reclaim_wakes_panes_only_after_the_routing_lock_is_dropped() {
+        use fbterm_term::images::{ImageData, ImageKey, OwnerHooks};
+
+        let (mut feeder, _replies) = feeder(false);
+        let terminal = feeder.terminal.clone();
+        let owner = terminal.lock().image_owner();
+        let store = fbterm_term::images::store();
+
+        // Fill this owner to exactly its cap with direct submits, which reclaim nobody: the picture
+        // that arrives through routing is what tips it over. Four 4096x4096 raw frames are the
+        // per-owner cap (`PER_OWNER_CAP`) in the cheapest shape there is - no payload to parse.
+        let side = 4096usize;
+        for id in 1..=4u64 {
+            store.submit(
+                owner,
+                ImageKey(id),
+                ImageData::Rgba {
+                    width: side as u32,
+                    height: side as u32,
+                    pixels: vec![0u8; side * side * 4],
+                },
+            );
+        }
+        let filled = store.owner_bytes(owner);
+        assert_eq!(filled, 4 * side * side * 4, "the owner sits at its cap");
+
+        // The probe: count wakes, and how many found the routing lock free. `deliver` stays the
+        // router's own so anything needing delivery still goes the normal way.
+        let router = feeder.router();
+        let seen = Arc::new(parking_lot::Mutex::new((0usize, 0usize)));
+        let probe_seen = seen.clone();
+        let probe_router = router.clone();
+        store.register_owner(
+            owner,
+            OwnerHooks {
+                term: Arc::downgrade(&terminal),
+                deliver: {
+                    let r = router.clone();
+                    Arc::new(move || r.deliver_queued())
+                },
+                wake: Arc::new(move || {
+                    let free = probe_router.routing.try_lock().is_some();
+                    let mut seen = probe_seen.lock();
+                    seen.0 += 1;
+                    if free {
+                        seen.1 += 1;
+                    }
+                }),
+            },
+        );
+
+        // A 1x1 raw RGBA frame, fed the way output arrives: routed inside the section, it pushes this
+        // owner over its cap, and enforcement takes the oldest pictures to make room for it.
+        let one = super::feeder_image_tests::b64(&[255u8; 4]);
+        feeder.feed(format!("\x1b_Gi=9,a=t,f=32,s=1,v=1;{one}\x1b\\").as_bytes());
+
+        let (total, free) = *seen.lock();
+        assert!(
+            total > 0,
+            "the pane whose pictures were taken should have been asked to redraw"
+        );
+        assert_eq!(
+            free, total,
+            "a wake ran while the routing lock was still held"
+        );
+        let after = store.owner_bytes(owner);
+        assert!(
+            after < filled + 4,
+            "enforcement took nothing: {after} bytes for {filled} plus a new picture"
+        );
+        assert!(
+            after <= fbterm_term::images::PER_OWNER_CAP,
+            "the cap is still over after reclaiming"
+        );
+
+        // This test filled the shared store with 256 MiB; give it back.
+        store.drop_owner(owner);
+        assert_eq!(store.owner_bytes(owner), 0);
+    }
+}
+
+#[cfg(test)]
+mod feeder_image_tests {
+    use super::*;
+    use fbterm_term::images::store;
+
+    /// Minimal standard-alphabet base64 for building kitty frames.
+    pub(super) fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            let t = |i: u32| T[i as usize] as char;
+            out.push(t(n >> 18));
+            out.push(t((n >> 12) & 63));
+            out.push(if chunk.len() > 1 {
+                t((n >> 6) & 63)
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 { t(n & 63) } else { '=' });
+        }
+        out
+    }
+
+    /// A raw-RGBA kitty transmission (no container to decode: the terminal hands pixels over and
+    /// answers the client itself), as one fed frame.
+    fn rgba_frame(id: u32, pixels: &[u8]) -> String {
+        format!("\x1b_Gf=32,s=2,v=1,i={id},a=t;{}\x1b\\", b64(pixels),)
+    }
+
+    /// A picture a program transmits reaches the app-wide store through the feeder, keyed by the
+    /// terminal's owner id; when the emulator releases it — here, by switching pictures off —
+    /// the store forgets it. Replies to programs go back through the session's input queue.
+    #[test]
+    fn a_fed_picture_lands_in_the_store_and_its_release_frees_it() {
+        let size = GridSize {
+            cols: 10,
+            rows: 3,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            scale: 1.0,
+        };
+        let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
+        let owner = terminal.lock().image_owner();
+        let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (replies_tx, mut replies_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut feeder = Feeder::new(
+            SessionId::next(),
+            terminal.clone(),
+            events_tx,
+            Arc::default(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            Ended::default(),
+            replies_tx,
+        );
+
+        // 2x1 RGBA: eight bytes straight into the store, no decode job.
+        feeder.feed(rgba_frame(7, &[255, 0, 0, 255, 0, 255, 0, 255]).as_bytes());
+        assert_eq!(store().owner_bytes(owner), 8);
+        // The emulator answered the transmission itself; the feeder passed that answer on.
+        let Command::Input(reply) = replies_rx
+            .try_recv()
+            .expect("the client's answer should be routed")
+        else {
+            panic!("expected a reply to write, got a close");
+        };
+        // `\x1b_Gi=7;OK\x1b\\`: the emulator answers raw-format transmissions itself.
+        assert!(
+            reply.windows(4).any(|w| w == b"Gi=7") && reply.windows(2).any(|w| w == b"OK"),
+            "expected a kitty answer naming image 7, got {reply:?}",
+        );
+        assert!(matches!(
+            events_rx.try_recv().ok().map(|e| e.1),
+            Some(SessionEvent::Dirty)
+        ));
+
+        // Switching pictures off releases what the terminal holds; routed like any other event.
+        terminal.lock().set_images(false, false);
+        let released = terminal.lock().take_events();
+        feeder.router.route(released);
+        assert_eq!(
+            store().owner_bytes(owner),
+            0,
+            "the release should have freed it"
+        );
+
+        // A second transmission while pictures are off: nothing new is stored.
+        feeder.feed(rgba_frame(8, &[9, 9, 9, 9, 9, 9, 9, 9]).as_bytes());
+        assert_eq!(store().owner_bytes(owner), 0);
+    }
+
+    /// A reconnect builds a new feeder on the same terminal; the store then answers through the
+    /// new session's hooks, and dropping the terminal frees its whole share.
+    #[test]
+    fn a_reconnect_moves_the_store_answers_to_the_new_feeder() {
+        let size = GridSize {
+            cols: 10,
+            rows: 3,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            scale: 1.0,
+        };
+        let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(size, 10)));
+        let owner = terminal.lock().image_owner();
+        let (events_tx, _events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (old_replies, mut old_replies_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let old = Feeder::new(
+            SessionId::next(),
+            terminal.clone(),
+            events_tx.clone(),
+            Arc::default(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            Ended::default(),
+            old_replies,
+        );
+        let (new_replies, mut new_replies_rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
+        let mut fresh = Feeder::new(
+            SessionId::next(),
+            terminal.clone(),
+            events_tx,
+            Arc::default(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            Ended::default(),
+            new_replies,
+        );
+
+        // A PNG the emulator defers to us: the decode result — and with it the client's answer —
+        // must come back through the *newest* feeder's replies queue. The picture is the term
+        // crate's own checked-in fixture, read from disk so this crate tests against real bytes.
+        let tiny = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fbterm-term/tests/fixtures/images/tiny.png"
+        ))
+        .expect("the term crate's tiny PNG fixture");
+        let frame = format!("\x1b_Gi=42,a=t,f=100;{}\x1b\\", b64(&tiny));
+        fresh.feed(frame.as_bytes());
+        assert!(
+            store().owner_bytes(owner) > 0,
+            "the payload should be queued"
+        );
+        // Wait for the app-wide worker to finish it (it may or may not be the one that took the
+        // job; either way the answer reaches whichever session registered last).
+        assert!(store().wait_idle_for(std::time::Duration::from_secs(30)));
+        let answered = matches!(new_replies_rx.try_recv().ok(), Some(Command::Input(_)));
+        let stale = old_replies_rx.try_recv().ok();
+        assert!(answered, "the new feeder should answer the client");
+        assert!(
+            stale.is_none(),
+            "the old feeder got an answer it no longer owns: {stale:?}"
+        );
+        // The 4x4 fixture decoded to 64 bytes of RGBA.
+        assert_eq!(
+            store().owner_bytes(owner),
+            4 * 4 * 4,
+            "the decoded pixels are held"
+        );
+
+        // Closing the terminal hands its whole budget back to the store — but only once nothing
+        // else holds it: the feeders' references go first.
+        drop(old);
+        drop(fresh);
+        drop(terminal);
+        assert_eq!(store().owner_bytes(owner), 0);
     }
 }

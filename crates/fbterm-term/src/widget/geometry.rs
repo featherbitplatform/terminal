@@ -6,7 +6,13 @@ use iced::Size;
 use crate::GridSize;
 
 /// Grid that fits `bounds` (logical px) with cells of `cell` size; at least 1x1.
-pub fn grid_size_from_bounds(bounds: Size, cell: Size) -> GridSize {
+///
+/// `scale` is the window's physical scale, carried into the grid: programs are told physical
+/// pixels, so a grid must say which window it was measured in (see [`GridSize::physical_cell`]).
+/// A scale that is not a positive finite number - a display that reported NaN or 0 - becomes
+/// 1.0: `GridSize` derives `PartialEq`, and a NaN scale would make every grid differ from
+/// itself, so the widget would republish `Resized` on every pass forever.
+pub fn grid_size_from_bounds(bounds: Size, cell: Size, scale: f32) -> GridSize {
     let fit = |px: f32, cell: f32| {
         if cell > 0.0 {
             (px / cell).floor().clamp(1.0, f32::from(u16::MAX)) as u16
@@ -19,6 +25,11 @@ pub fn grid_size_from_bounds(bounds: Size, cell: Size) -> GridSize {
         rows: fit(bounds.height, cell.height),
         cell_width: cell.width,
         cell_height: cell.height,
+        scale: if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        },
     }
 }
 
@@ -58,20 +69,46 @@ mod tests {
             rows,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         }
     }
 
     #[test]
     fn grid_size_from_bounds_floors_to_whole_cells() {
-        let g = grid_size_from_bounds(Size::new(800.0, 600.0), Size::new(8.0, 16.0));
+        let g = grid_size_from_bounds(Size::new(800.0, 600.0), Size::new(8.0, 16.0), 1.0);
         assert_eq!((g.cols, g.rows), (100, 37));
         assert_eq!((g.cell_width, g.cell_height), (8.0, 16.0));
     }
 
     #[test]
+    fn grid_size_from_bounds_carries_the_windows_scale() {
+        let g = grid_size_from_bounds(Size::new(800.0, 600.0), Size::new(8.4, 16.2), 2.0);
+        assert_eq!(g.scale, 2.0);
+        // The cells stay logical (the widget draws them that way); pixels come from the scale.
+        assert_eq!((g.cell_width, g.cell_height), (8.4, 16.2));
+        assert_eq!(g.physical_cell(), (17, 32));
+    }
+
+    #[test]
     fn grid_size_from_bounds_is_at_least_one_cell() {
-        let g = grid_size_from_bounds(Size::new(3.0, 0.0), Size::new(8.0, 16.0));
+        let g = grid_size_from_bounds(Size::new(3.0, 0.0), Size::new(8.0, 16.0), 1.0);
         assert_eq!((g.cols, g.rows), (1, 1));
+    }
+
+    /// A scale that is not a positive finite number becomes 1.0: `GridSize` derives `PartialEq`,
+    /// and a NaN would make every grid differ from itself, republishing `Resized` forever.
+    #[test]
+    fn grid_size_from_bounds_rejects_a_bogus_scale() {
+        let bounds = Size::new(800.0, 600.0);
+        let cell = Size::new(8.0, 16.0);
+        let sane = grid_size_from_bounds(bounds, cell, 1.0);
+        for bogus in [f32::NAN, 0.0, -1.0, f32::INFINITY, f32::NEG_INFINITY] {
+            let g = grid_size_from_bounds(bounds, cell, bogus);
+            assert_eq!(g.scale, 1.0, "scale {bogus}");
+            // The whole grid, not just the scale: it must equal the honest 1.0 grid, so a bogus
+            // scale can never resize anything.
+            assert_eq!(g, sane, "scale {bogus}");
+        }
     }
 
     #[test]

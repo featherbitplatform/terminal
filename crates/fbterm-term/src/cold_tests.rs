@@ -19,6 +19,7 @@ pub(crate) fn size(cols: u16, rows: u16) -> GridSize {
         rows,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     }
 }
 

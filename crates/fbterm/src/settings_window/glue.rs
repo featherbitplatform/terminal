@@ -28,8 +28,8 @@ pub(crate) fn intern(name: &str) -> &'static str {
     leaked
 }
 
-/// The look of terminals for `settings`, before a pane's color scheme applies (see
-/// [`App::pane_style`]).
+/// The look of terminals for `settings`, before a scheme applies and before a window's physical
+/// scale is known (see [`App::pane_style`], which sets the scale of the window drawn in).
 pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
     TerminalStyle {
         scheme: ColorScheme::graphite(),
@@ -44,13 +44,15 @@ pub(crate) fn terminal_style(settings: &Settings) -> TerminalStyle {
         // The window paints the default background (with the padding around the grid) at
         // `background_opacity`; see `window::view`.
         background_opacity: 0.0,
+        scale: 1.0,
     }
 }
 
 impl App {
     /// The look of one pane: the colors of its scheme ([`App::scheme_for`]), the scheme's font
     /// (its own, or with `use_theme_fonts` its installed suggestion: [`App::scheme_font`]) and
-    /// size where it sets them (else the settings'), at the pane's own zoom; focused (keys
+    /// size where it sets them (else the settings'), at the pane's own zoom, at the window's
+    /// physical scale (so the grid its view reports tells programs physical pixels); focused (keys
     /// go to it, solid cursor) only for the focused pane of the focused window while its find
     /// bar is closed and neither docked panel has the keyboard. No accent border: the tiles
     /// draw the focus outline.
@@ -81,6 +83,10 @@ impl App {
                 && !self.file_panels.has_focus(wid)
                 && !self.tunnels_panels.has_focus(wid),
             accent: None,
+            // The window's own scale: a pane moved to another display tells its program new pixels.
+            // Until the window reports one, 0.0 tells the view to report no grid at all, so a new
+            // pane's cells are never measured with an assumed factor (see `Terminal::hold_until_sized`).
+            scale: self.physical_scale_if_known(wid).unwrap_or(0.0),
             ..self.style.clone()
         }
     }
@@ -342,6 +348,11 @@ impl App {
     /// see [`SettingsSource`]).
     /// `kitty_keyboard` applies to every open terminal at once: turning it off drops the
     /// protocol flags programs have set, turning it on affects their requests from then on.
+    /// `inline_images` shows or drops pictures in every open terminal at once: off clears what is
+    /// on screen there and then (each picture released), and programs get "not supported" from
+    /// then on; on again does not bring the pictures back. `scrollback_images` decides whether a
+    /// picture whose rows have all scrolled off the screen stays or becomes a line saying how big
+    /// it was, and only counts while `inline_images` is on.
     /// `grapheme_clusters` becomes every open terminal's default for mode 2027, used by new
     /// terminals and after a reset or restart; a running program's mode is never flipped.
     /// `color_scheme` recolors the open panes that follow it (those without a scheme of their
@@ -385,6 +396,32 @@ impl App {
             for pane in panes {
                 if let Some(term) = pane.terminal() {
                     term.lock().set_kitty_keyboard(new.kitty_keyboard);
+                }
+            }
+        }
+        // Either switch reaches every open terminal: the pair goes to `set_images` together so a
+        // terminal never sees one half of a change it has to guess the other half of.
+        if new.inline_images != self.settings.inline_images
+            || new.scrollback_images != self.settings.scrollback_images
+        {
+            let panes = self
+                .windows
+                .values()
+                .flat_map(|w| &w.tabs)
+                .flat_map(|t| &t.panes);
+            for pane in panes {
+                if let Some(term) = pane.terminal() {
+                    term.lock()
+                        .set_images(new.inline_images, new.scrollback_images);
+                }
+                // Switching off queues one `ImageReleased` per picture in that terminal, and only a
+                // feed or a delivery empties a terminal's event queue: an idle pane, or a hidden tab
+                // with a quiet shell, would go on holding its decoded buffers and copies in the image
+                // store with nothing left to draw (finding I2). Deliver them here, once this pane's
+                // terminal lock is gone - delivery takes the session's routing lock itself. A pane
+                // showing a placeholder has no session yet; `connected` delivers for it later.
+                if let Some(session) = &pane.session {
+                    session.deliver_events();
                 }
             }
         }

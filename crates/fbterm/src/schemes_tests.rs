@@ -114,6 +114,9 @@ pub(crate) fn term(app: &App, wid: window::Id, id: PaneId) -> SharedTerminal {
 
 /// What the terminal answers a program asking for its background (OSC 11).
 fn background_reply(term: &SharedTerminal) -> String {
+    // A program asks this in a pane that has laid out, so whatever it wrote before asking is
+    // parsed by now (see `restore_tests::lay_out`).
+    crate::restore_tests::lay_out(term);
     let mut t = term.lock();
     let _ = t.take_events();
     t.feed(b"\x1b]11;?\x07");
@@ -148,7 +151,7 @@ pub(crate) fn generation(app: &App, wid: window::Id, id: PaneId) -> u64 {
 #[test]
 fn default_panes_use_graphite_unchanged() {
     let a = profile("a");
-    let (app, _, wid, ids) = app_with(std::slice::from_ref(&a), "", &[]);
+    let (mut app, _, wid, ids) = app_with(std::slice::from_ref(&a), "", &[]);
     assert_eq!(
         ColorScheme::from(&builtin("graphite").colors),
         ColorScheme::graphite()
@@ -163,8 +166,15 @@ fn default_panes_use_graphite_unchanged() {
         accent: None,
         focused: s.focused,
         background_opacity: 0.0,
+        // This fixture's window has not reported a display yet. Until it does, the pane is told
+        // nothing about its cells rather than an assumed size - which is what lets a new pane hold
+        // its output until the real cells are known (see `App::physical_scale_if_known`).
+        scale: 0.0,
     };
     assert_eq!(s, today);
+    // Once the window reports one, the pane's cells are measured with it.
+    let _ = app.update(Message::WindowScale(wid, 2.0));
+    assert_eq!(style(&app, wid, ids[0]).scale, app.physical_scale(wid));
     assert_eq!(app.scheme_for(pane(&app, wid, ids[0])).id, "graphite");
     assert!(answers(&term(&app, wid, ids[0]), rgb(0x0b0b0e)));
     assert!(app.notices.is_empty(), "{:?}", app.notices);
@@ -489,8 +499,8 @@ mod unix {
         // What the view reports after measuring the bigger cell.
         let bounds = iced::Size::new(800.0, 400.0);
         let cell = |font: f32| iced::Size::new(font * 8.0 / 13.0, (font * 1.2).ceil());
-        let before = fbterm_term::grid_size_from_bounds(bounds, cell(13.0));
-        let after = fbterm_term::grid_size_from_bounds(bounds, cell(20.0));
+        let before = fbterm_term::grid_size_from_bounds(bounds, cell(13.0), 1.0);
+        let after = fbterm_term::grid_size_from_bounds(bounds, cell(20.0), 1.0);
         assert_ne!(before, after);
         let _ = app.update(Message::Terminal(wid, a, TerminalOutput::Resized(after)));
         let generation = app.pending_resizes[&a].0;

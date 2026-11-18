@@ -564,6 +564,15 @@ async fn dial(
     })
 }
 
+/// The pixel fields of the two size requests a shell channel gets (`pty-req` at open and
+/// `window-change` after): the grid's area in PHYSICAL pixels as whole cells, so a program on the
+/// remote side that divides them by its cell counts gets the same cell size fbterm draws with.
+/// Cells stay in the request's own width/height fields; a window moving to another display
+/// changes these with its scale.
+fn ssh_pixels(size: &GridSize) -> (u32, u32) {
+    size.physical_area()
+}
+
 /// Open a shell channel on `connection` and wire it to a new session.
 async fn open_shell_channel(
     connection: Arc<Connection>,
@@ -571,6 +580,7 @@ async fn open_shell_channel(
     events: EventSink,
 ) -> Result<SessionHandle, SshError> {
     let size = terminal.lock().size();
+    let (px_w, px_h) = ssh_pixels(&size);
     let channel = tokio::time::timeout(HOP_TIMEOUT, connection.target().channel_open_session())
         .await
         .map_err(|_| timed_out("the server did not open a shell channel".into()))??;
@@ -581,8 +591,8 @@ async fn open_shell_channel(
             "xterm-256color",
             u32::from(size.cols),
             u32::from(size.rows),
-            0,
-            0,
+            px_w,
+            px_h,
             &[],
         )
         .await?;
@@ -604,7 +614,12 @@ async fn open_shell_channel(
         bell_pending.clone(),
         detached.clone(),
         ended.clone(),
+        tx.clone(),
     );
+
+    // The handle keeps the router so the app can have output delivered after a resize that happens
+    // on its own thread - a pane's first real grid, which is what releases held bytes.
+    let router = feeder.router();
 
     tokio::spawn(write_loop(write, rx, closed_rx.clone(), connection.clone()));
     tokio::spawn(read_loop(
@@ -628,6 +643,7 @@ async fn open_shell_channel(
             closed_tx.send_replace(true);
         }),
         connection: Mutex::new(Some(connection)),
+        router: Some(router),
     })
 }
 
@@ -658,8 +674,9 @@ async fn write_loop(
                 r = write.data_bytes(bytes) => r,
             },
             Some(Command::Resize(size)) => {
+                let (px_w, px_h) = ssh_pixels(&size);
                 write
-                    .window_change(u32::from(size.cols), u32::from(size.rows), 0, 0)
+                    .window_change(u32::from(size.cols), u32::from(size.rows), px_w, px_h)
                     .await
             }
         };
@@ -759,9 +776,9 @@ async fn read_loop(
         };
         match msg {
             Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                for reply in feeder.feed(&data) {
-                    let _ = replies.send(Command::Input(reply));
-                }
+                // Terminal replies (kitty answers included) go back through the feeder's own
+                // clone of the input queue, in the order the emulator produced them.
+                feeder.feed(&data);
             }
             other => match state.on(other) {
                 Step::Continue => {}
@@ -1716,6 +1733,34 @@ mod tests {
         );
     }
 
+    /// The pixel fields of both SSH size requests are the grid's physical cell by its cells: a
+    /// remote program divides them by its cell counts and gets exactly the cell fbterm draws with.
+    /// Cells stay cells; only the pixels follow the window's scale.
+    #[test]
+    fn ssh_pixels_are_the_grids_physical_area() {
+        let grid = |scale: f32| GridSize {
+            cols: 100,
+            rows: 30,
+            cell_width: 8.4,
+            cell_height: 16.2,
+            scale,
+        };
+        // Cells of 8 x 16, 17 x 32 and 11 x 20 physical px, times 100 columns and 30 rows.
+        assert_eq!(ssh_pixels(&grid(1.0)), (800, 480));
+        assert_eq!(ssh_pixels(&grid(2.0)), (1700, 960));
+        assert_eq!(ssh_pixels(&grid(1.25)), (1100, 600));
+
+        // The fields are 32-bit wide: an enormous grid saturates instead of wrapping.
+        let huge = GridSize {
+            cols: u16::MAX,
+            rows: u16::MAX,
+            cell_width: 1e20,
+            cell_height: 1e20,
+            scale: 1e9,
+        };
+        assert_eq!(ssh_pixels(&huge), (u32::MAX, u32::MAX));
+    }
+
     #[test]
     fn refusal_notice_is_dim_text_on_its_own_line() {
         let size = GridSize {
@@ -1723,6 +1768,7 @@ mod tests {
             rows: 5,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let mut term = Terminal::new(size, 10);
         term.feed(b"prompt");
