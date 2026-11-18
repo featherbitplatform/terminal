@@ -582,16 +582,18 @@ fn draw_text_group(
 struct LayerPlan {
     /// Text over the under-text pictures: needed exactly when there is one to go under.
     lift_text: bool,
-    /// The accent in its own layer: needed exactly when an over-text picture could cover it.
+    /// The accent in its own top layer: needed whenever this frame opens ANY picture layer — both
+    /// z < 0 and z >= 0 pictures paint after the base layer, so either kind could hide the border.
     lift_accent: bool,
 }
 
 /// With no pictures at all both are false and `render` issues exactly what it issued before images
 /// existed: everything in the window's base layer, one text batch for every pane.
 fn layer_plan(under_text: usize, over_text: usize) -> LayerPlan {
+    let pictures = under_text > 0 || over_text > 0;
     LayerPlan {
         lift_text: under_text > 0,
-        lift_accent: over_text > 0,
+        lift_accent: pictures,
     }
 }
 
@@ -649,9 +651,10 @@ pub fn render(
     }
     // Pictures with `z >= 0` sit over the text: their cells' glyphs are already drawn.
     images::draw_pictures(renderer, at, &list.images.over_text);
-    // The pane accent in a layer of its own, opened last, when an over-text picture could cover it:
-    // a picture touching the pane edge must not hide the border that says which pane is focused.
-    // With none there is nothing to stay under, and the base layer draws it after everything else.
+    // The pane accent in a layer of its own, opened last, when this frame has any picture at all:
+    // both z < 0 and z >= 0 pictures paint after the base layer, and either could cover the border
+    // that says which pane is focused (their cells start where the border does). With no pictures
+    // there is nothing to stay under, and the base layer draws it after everything else.
     if let Some(a) = accent {
         let border = Quad {
             bounds,
@@ -1450,9 +1453,9 @@ mod tests {
     }
 
     /// The four shapes a frame's picture counts can take, and the layers each one needs: text is
-    /// lifted only when something is under it, the accent only when an over-text picture could sit
-    /// over the border; with no pictures at all `render` must issue exactly what it did before
-    /// images existed (everything in the base layer).
+    /// lifted only when something is under it, the accent whenever any picture exists (both kinds
+    /// paint after the base layer); with no pictures at all `render` must issue exactly what it did
+    /// before images existed (everything in the base layer).
     #[test]
     fn layers_are_opened_only_when_pictures_force_them() {
         assert_eq!(
@@ -1467,9 +1470,10 @@ mod tests {
             layer_plan(2, 0),
             LayerPlan {
                 lift_text: true,
-                lift_accent: false,
+                lift_accent: true,
             },
-            "background pictures force the text above them; nothing threatens the accent"
+            "background pictures force the text above them — and they paint after the base layer \
+             too, starting where the border does, so the accent must be lifted over them as well"
         );
         assert_eq!(
             layer_plan(0, 1),
