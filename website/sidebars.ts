@@ -10,6 +10,7 @@ const sidebars: SidebarsConfig = {
     'tabs',
     'tiling',
     'color-schemes',
+    'images',
     'tunnels',
     'file-panel',
     'export-import',
