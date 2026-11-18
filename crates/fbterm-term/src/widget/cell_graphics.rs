@@ -1319,13 +1319,13 @@ impl Geometry {
                         cell,
                         light: self.light,
                     };
-                    for span in memo.spans(key, || self.curve_spans(kind, cell)) {
+                    for span in memo.spans(key, || merge_rows(self.curve_spans(kind, cell))) {
                         self.emit(
                             &mut f,
                             x0 + span.x0,
                             y0 + span.y0,
                             x0 + span.x1,
-                            y0 + span.y0 + 1,
+                            y0 + span.y1,
                             span.coverage(),
                         );
                     }
@@ -1568,7 +1568,8 @@ impl Geometry {
     /// bands' edges are whole pixels and a sample never lands on one, which is what makes the straight
     /// parts come out fully covered on exactly the rows and columns a `─` in this row or a `│` in this
     /// column uses — no seam where they meet. Sampling stops at the cell's own edges, so nothing spills
-    /// into a neighbour, and one run per row of equal coverage keeps a frame from paying per pixel.
+    /// into a neighbour, and one run per row of equal coverage — stacked into rectangles by
+    /// [`merge_rows`] before anything is drawn — keeps a frame from paying per pixel.
     ///
     /// A corner is the same quarter circle in coordinates measured from its own bend: the mirror flags
     /// fold the cell's other sides onto the right and bottom ones, so `╮`, `╰` and `╯` need no separate
@@ -1589,9 +1590,11 @@ impl Geometry {
             CurveKind::Arc(Corner::UpRight) => (false, true, w - cx, cy),
             CurveKind::Rising | CurveKind::Falling | CurveKind::Cross => (false, false, 0.0, 0.0),
         };
-        // The arc's radius is the distance from the centre line to the nearer of the two cell edges, so
-        // where cells are taller than wide (usual) it ends exactly on the cell edge.
-        let r = reach_x.min(reach_y);
+        // The arc's radius stops a pixel short of the nearer of the two cell edges, so each arm keeps at
+        // least one whole pixel of straight run at that edge: an arc that meets the cell edge while it is
+        // still bending samples a curve in its last column instead of the band it must join. Never below
+        // a half thickness, which a stroke-thicker-than-the-arm cell would otherwise turn inside out.
+        let r = (reach_x.min(reach_y) - 1.0).max(half);
         // Both diagonals' directions have this length, which is what their cross products divide by.
         let len = (w * w + h * h).sqrt();
         // Whether a point in the cell's own physical pixel coordinates (`(0, 0)` is its top-left pixel)
@@ -1647,6 +1650,7 @@ impl Geometry {
                             x0: start,
                             y0: y,
                             x1: x,
+                            y1: y + 1,
                             count: c,
                         });
                     }
@@ -1659,6 +1663,7 @@ impl Geometry {
                             x0: start,
                             y0: y,
                             x1: x,
+                            y1: y + 1,
                             count: c,
                         });
                         run = Some((x, hits));
@@ -1671,12 +1676,51 @@ impl Geometry {
                     x0: start,
                     y0: y,
                     x1: cell.w,
+                    y1: y + 1,
                     count: c,
                 });
             }
         }
         out
     }
+}
+
+/// Stack unit-high rows into rectangles: a run whose `(x0, x1, count)` matches one the row above ended
+/// on extends that span down instead of starting a new one. What each pixel holds is untouched; only
+/// the number of boxes goes down — the long straight arm of a corner becomes one tall rectangle, and so
+/// does every stretch of a diagonal's stair where two runs line up. Rows arrive in row order, left to
+/// right within a row, exactly as [`Geometry::curve_spans`] emits them.
+fn merge_rows(rows: Vec<CurveSpan>) -> Vec<CurveSpan> {
+    let mut out: Vec<CurveSpan> = Vec::with_capacity(rows.len());
+    // Spans of `out` that ended on the row above the one being read: they are what a run can join, and
+    // each match moves from this list to the next row's, so a run extended many times stays found.
+    let mut prev: Vec<usize> = Vec::new();
+    let mut at = 0;
+    while at < rows.len() {
+        let y = rows[at].y0;
+        let head = at;
+        while at < rows.len() && rows[at].y0 == y {
+            at += 1;
+        }
+        let mut joined: Vec<usize> = Vec::new();
+        for span in &rows[head..at] {
+            match prev.iter().position(|&p| {
+                out[p].x0 == span.x0 && out[p].x1 == span.x1 && out[p].count == span.count
+            }) {
+                Some(i) => {
+                    let p = prev[i];
+                    out[p].y1 = span.y1;
+                    joined.push(p);
+                }
+                None => {
+                    out.push(*span);
+                    joined.push(out.len() - 1);
+                }
+            }
+        }
+        prev = joined;
+    }
+    out
 }
 
 /// Which curve [`CurveMemo`] holds a pattern for.
@@ -1708,14 +1752,16 @@ struct CurveCell {
     hy0: i64,
 }
 
-/// One run of horizontally adjacent pixels inside a cell that came out with the same coverage, as
-/// offsets from that cell's top-left pixel.
+/// One rectangular run of pixels inside a cell that came out with the same coverage, as offsets from
+/// that cell's top-left pixel: [`merge_rows`] stacks rows whose runs match into one span.
 #[derive(Debug, Clone, Copy)]
 struct CurveSpan {
     x0: i64,
     y0: i64,
-    /// The first pixel past the run.
+    /// The first pixel past the run horizontally.
     x1: i64,
+    /// The first pixel past the run vertically. Unit-high until [`merge_rows`] stacks rows.
+    y1: i64,
     /// How many of the sixteen samples in each of its pixels landed in the stroke.
     count: u8,
 }
@@ -2920,47 +2966,63 @@ mod tests {
 
     /// A corner's arms end on the same whole pixels that a `─` in its row and a `│` in its column use, so
     /// a frame built from them joins with no seam: at the edge where the corner meets its neighbour the
-    /// ink is exactly the band, fully covered, with nothing anywhere else in that column or row. Checked
-    /// on [`joint_grid`], where a light line is two pixels and the bands are 15..17 down and 9..11 across.
+    /// last pixel column or row is fully inked on exactly the band rows or columns and empty everywhere
+    /// else in it. Checked at every geometry in [`CASES`], including scale 1 cells 8 px wide where the
+    /// bands sit off-centre; the mirror test covers the symmetric grid.
     #[test]
     fn rounded_corner_joins_its_neighbours_lines() {
-        let g = joint_grid();
-        let (w, h) = (g.edge_x(1) - g.edge_x(0), g.edge_y(1) - g.edge_y(0));
-        let (hy0, hy1) = light_h(&g, 0);
-        let (vx0, vx1) = light_v(&g, 0);
-        assert_eq!((hy0, hy1), (15, 17), "the band a `─` in this row paints");
-        assert_eq!(
-            (vx0, vx1),
-            (9, 11),
-            "and the one a `│` in this column paints"
-        );
-        // Which edge column and row each corner's arms reach, and the two pixels of its cell that must
-        // stay empty: the far corners of the square the arc cuts out of the joint.
-        type CornerCase = (char, i64, i64, [(i64, i64); 2]);
-        let cases: [CornerCase; 4] = [
-            ('╭', w - 1, h - 1, [(0, 0), (w - 1, h - 1)]),
-            ('╮', 0, h - 1, [(w - 1, 0), (0, h - 1)]),
-            ('╰', w - 1, 0, [(0, h - 1), (w - 1, 0)]),
-            ('╯', 0, 0, [(w - 1, h - 1), (0, 0)]),
+        // Character, whether its horizontal arm ends on the right edge, whether its vertical arm ends on
+        // the bottom edge: the other two edges follow by symmetry.
+        type CornerCase = (char, bool, bool);
+        let corners: [CornerCase; 4] = [
+            ('╭', true, true),
+            ('╮', false, true),
+            ('╰', true, false),
+            ('╯', false, false),
         ];
-        for (c, col, row, empty) in cases {
-            let p = paint(&g, c);
-            let (rows, full) = p.column(col);
-            assert_eq!(
-                rows,
-                (hy0..hy1).collect::<Vec<i64>>(),
-                "{c:?} must meet the line next door along its band and nowhere else in the column"
-            );
-            assert!(full, "{c:?} must cover that band whole at the cell edge");
-            let (cols, full) = p.row(row);
-            assert_eq!(
-                cols,
-                (vx0..vx1).collect::<Vec<i64>>(),
-                "{c:?} must meet the line below or above it along its band and nowhere else in the row"
-            );
-            assert!(full, "{c:?} must cover that band whole at the cell edge");
-            for (x, y) in empty {
-                assert_eq!(p.at((x, y)), 0, "{c:?} inks the corner pixel at ({x}, {y})");
+        for &(scale, w) in &CASES {
+            let g = grid((w, w * 1.2), scale);
+            let (w, h) = (g.edge_x(1) - g.edge_x(0), g.edge_y(1) - g.edge_y(0));
+            let (hy0, hy1) = light_h(&g, 0);
+            let (vx0, vx1) = light_v(&g, 0);
+            for &(c, right, down) in &corners {
+                let (col, row) = (if right { w - 1 } else { 0 }, if down { h - 1 } else { 0 });
+                let p = paint(&g, c);
+                let (rows, full) = p.column(col);
+                assert_eq!(
+                    rows,
+                    (hy0..hy1).collect::<Vec<i64>>(),
+                    "{c:?} must meet the line next door along its band and nowhere else in the column \
+                     ({scale}, {w})"
+                );
+                assert!(
+                    full,
+                    "{c:?} must cover that band whole at the cell edge ({scale}, {w})"
+                );
+                let (cols, full) = p.row(row);
+                assert_eq!(
+                    cols,
+                    (vx0..vx1).collect::<Vec<i64>>(),
+                    "{c:?} must meet the line below or above it along its band and nowhere else in \
+                     the row ({scale}, {w})"
+                );
+                assert!(
+                    full,
+                    "{c:?} must cover that band whole at the cell edge ({scale}, {w})"
+                );
+                // The far corner of the cell, and the crossing of the two arm edges: the arc cuts its
+                // square out of that joint, so both pixels stay empty.
+                let empty = [
+                    (if right { 0 } else { w - 1 }, if down { 0 } else { h - 1 }),
+                    (col, row),
+                ];
+                for (x, y) in empty {
+                    assert_eq!(
+                        p.at((x, y)),
+                        0,
+                        "{c:?} inks the corner pixel at ({x}, {y}) ({scale}, {w})"
+                    );
+                }
             }
         }
     }
@@ -2996,9 +3058,10 @@ mod tests {
     }
 
     /// A rounded frame `╭─╮ / │ │ / ╰─╯` has to be one unbroken line: on both sides of every edge two
-    /// cells share, and along the band each pair of neighbours paints, the pixels are covered on both
-    /// sides. Run at a whole-pixel scale, a retina scale, and a fractional scale on a fractional cell —
-    /// 8.4 logical px wide, which rounding spreads over 10 or 11 physical pixels.
+    /// cells share, and along the band each pair of neighbours paints, the pixels are fully inked on
+    /// both sides — a joint that only half covers its band shows up as a notch in the drawn line. Run
+    /// at a whole-pixel scale, a retina scale, and a fractional scale on a fractional cell — 8.4 logical
+    /// px wide, which rounding spreads over 10 or 11 physical pixels.
     #[test]
     fn rounded_box_has_no_seams() {
         for &(scale, w) in &[(1.0f32, 8.4f32), (2.0, 8.4), (1.25, 8.4)] {
@@ -3014,7 +3077,7 @@ mod tests {
                     for y in hy0..hy1 {
                         for x in [edge - 1, edge] {
                             assert!(
-                                p.at((x, y)) > 0,
+                                p.at((x, y)) == FULL,
                                 "the frame's horizontal line breaks at the seam between cells \
                                  ({col}, {row}) and ({}, {row}), row {y} (scale {scale}, cell {w})",
                                 col + 1
@@ -3032,7 +3095,7 @@ mod tests {
                     for x in vx0..vx1 {
                         for y in [edge - 1, edge] {
                             assert!(
-                                p.at((x, y)) > 0,
+                                p.at((x, y)) == FULL,
                                 "the frame's vertical line breaks at the seam between cells \
                                  ({col}, {row}) and ({col}, {}), column {x} (scale {scale}, cell {w})",
                                 row + 1
@@ -3223,6 +3286,68 @@ mod tests {
             g.cover(&drawn(c)[0], 0, 3, 1, &mut memo, |_, _| ());
         }
         assert_eq!(memo.computed(), 6, "one pattern per curve and cell size");
+    }
+
+    /// Stacking equal rows into taller rectangles changes how many boxes a pattern costs, never what a
+    /// pixel holds: expanded back to one row per pixel, the merged spans are the rasterizer's own rows,
+    /// cell for cell, at every geometry in [`CASES`] — same masks, same coverage levels, no dropped
+    /// low-coverage pixels. And it collapses real work: a curve's long straight arms stack into one
+    /// rectangle each, and a diagonal's staircases repeat every row they hold the same run.
+    #[test]
+    fn merging_rows_keeps_the_coverage_masks_identical() {
+        let kind_of = |c: char| match drawn(c)[0] {
+            Shape::Arc(corner) => CurveKind::Arc(corner),
+            Shape::Diagonal { rising, falling } => match (rising, falling) {
+                (true, false) => CurveKind::Rising,
+                (false, true) => CurveKind::Falling,
+                _ => CurveKind::Cross,
+            },
+            _ => unreachable!(),
+        };
+        // What each pixel of the cell holds, with every span painting its whole area.
+        let mask = |cell: CurveCell, spans: &[CurveSpan]| -> Vec<u8> {
+            let mut m = vec![0u8; (cell.w * cell.h) as usize];
+            for s in spans {
+                for y in s.y0..s.y1 {
+                    for x in s.x0..s.x1 {
+                        m[(y * cell.w + x) as usize] = s.count;
+                    }
+                }
+            }
+            m
+        };
+        let (mut total_rows, mut total_merged) = (0usize, 0usize);
+        for &(scale, w) in &CASES {
+            let g = grid((w, w * 1.2), scale);
+            let [(hy0, _), _] = g.bands(g.axis_y(0), Weight::Light);
+            for c in ['╭', '╮', '╯', '╰', '╱', '╲', '╳'] {
+                for col in 0..3u32 {
+                    let (x0, y0) = (g.edge_x(i64::from(col)), g.edge_y(0));
+                    let [(vx0, _), _] = g.bands(g.axis_x(i64::from(col)), Weight::Light);
+                    let cell = CurveCell {
+                        w: g.edge_x(i64::from(col) + 1) - x0,
+                        h: g.edge_y(1) - y0,
+                        vx0: vx0 - x0,
+                        hy0: hy0 - y0,
+                    };
+                    let rows = g.curve_spans(kind_of(c), cell);
+                    let merged = merge_rows(rows.clone());
+                    assert_eq!(
+                        mask(cell, &merged),
+                        mask(cell, &rows),
+                        "{c:?} changed pixels when its rows were stacked ({scale}, {w}, col {col})"
+                    );
+                    total_rows += rows.len();
+                    total_merged += merged.len();
+                }
+            }
+        }
+        // How much goes down is geometry-dependent (a hairline's coverage rarely repeats a row), but
+        // it must always go down, or the merge does nothing at all.
+        assert!(
+            total_merged < total_rows,
+            "stacking equal rows saved nothing: {total_merged} spans from {total_rows} rows"
+        );
     }
 
     /// The worst case for these shapes: a whole view of `╭─╮╰╯╱╲╳`, which is a curve in six cells
