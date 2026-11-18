@@ -179,6 +179,10 @@ fn harden_dll_search() {
     use windows_sys::Win32::System::LibraryLoader::{
         LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
     };
+    // The two flags are spelled out instead of `LOAD_LIBRARY_SEARCH_DEFAULT_DIRS` (the same pair
+    // plus `USER_DIRS`, what Microsoft recommends) on purpose: fbterm resolves every bare-name load
+    // from its own folder and System32 only, and no in-process component is expected to have
+    // registered a third folder with `AddDllDirectory`.
     // BOOL: zero is the only failure.
     unsafe {
         SetDefaultDllDirectories(
@@ -203,10 +207,10 @@ fn main() -> iced::Result {
     // one (`conpty.rs`). Logging is up by now (`crash::init_logging` above), and this is the run's
     // first line that says anything about what a local shell can do.
     #[cfg(windows)]
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            tracing::info!("{}", conpty::status_line(dir));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        tracing::info!("{}", conpty::status_line(dir));
     }
     let mut daemon = iced::daemon(App::boot, App::update, window::view)
         .title(App::title)

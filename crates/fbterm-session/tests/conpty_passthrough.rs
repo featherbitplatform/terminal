@@ -6,10 +6,13 @@
 //! variable when `conpty.dll` and `OpenConsole.exe` sit next to the test executable: portable-pty
 //! prefers that sideloaded pair over the system console layer (`win/psuedocon.rs`), and this test
 //! measures whichever one it gets, so it refuses to run at all without them.
-//! `.github/workflows/ci.yml`'s "ConPTY passthrough (bundled)" step builds the test, stages the
-//! pinned package beside it with `dev/fetch-conpty.ps1` and runs it with `--nocapture`, which is how
-//! its byte-level evidence reaches the CI log: a passing run's own output stays behind libtest's
-//! capture.
+//! `.github/workflows/ci.yml`'s "ConPTY passthrough (bundled)" step builds the test, copies the
+//! executable into a fresh folder together with the files `dev/fetch-conpty.ps1` stages, and runs the
+//! copy with `--nocapture`, which is how its byte-level evidence reaches the CI log: a passing run's
+//! own output stays behind libtest's capture. The gated run first applies the same DLL-search
+//! hardening fbterm's `main` applies, and after opening the pseudo-console it reports which
+//! `conpty.dll` the process really loaded, so the step measures the bundled host under production's
+//! lookup rather than trusting that a staged file was used.
 //!
 //! The child is this same test executable, re-spawned through portable-pty with
 //! `FBTERM_CONPTY_HELPER=1` and asked to run only [`helper_writes_image_sequences`], which writes
@@ -105,6 +108,55 @@ const CASES: [Probe; 3] = [
     },
 ];
 
+/// Restricts this process's DLL search to the application folder and System32, exactly as fbterm's
+/// `main` does (`crates/fbterm/src/main.rs`, `harden_dll_search`). Called first in a gated run, so
+/// what this measures is the lookup the shipped program performs — the staged `conpty.dll` found as
+/// the executable's own, not one the default search order might have found in PATH. The failure
+/// return is ignored for production's reason: it cannot fail on the Windows versions fbterm runs on.
+#[cfg(windows)]
+fn harden_dll_search() {
+    use windows_sys::Win32::System::LibraryLoader::{
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, SetDefaultDllDirectories,
+    };
+    // BOOL: zero is the only failure.
+    unsafe {
+        SetDefaultDllDirectories(
+            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
+    }
+}
+
+/// The full path of the `conpty.dll` this process has loaded, or `None` when nothing with that name
+/// is loaded. `GetModuleHandleW` matches an already-loaded module by base name and loads nothing;
+/// `GetModuleFileNameW` then says where the loader actually found it — a copy in some other searched
+/// folder would report that path here rather than pass unnoticed.
+#[cfg(windows)]
+fn loaded_conpty_dll() -> Option<std::path::PathBuf> {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+
+    let wide: Vec<u16> = std::ffi::OsStr::new(CONPTY_DLL)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let module = unsafe { GetModuleHandleW(wide.as_ptr()) };
+    if module.is_null() {
+        return None;
+    }
+    // A UTF-16 buffer of MAX_PATH code units plus the terminator, what the API documents as enough.
+    let mut buf: Vec<u16> = vec![0; 261];
+    let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) };
+    // 0 means failure; exactly the buffer length means a path too long to report.
+    if len == 0 || len as usize == buf.len() {
+        return None;
+    }
+    let end = buf[..len as usize]
+        .iter()
+        .position(|c| *c == 0)
+        .unwrap_or(len as usize);
+    Some(std::ffi::OsString::from_wide(&buf[..end]).into())
+}
+
 fn enabled() -> bool {
     std::env::var(RUN_ENV).as_deref() == Ok("1")
 }
@@ -184,6 +236,10 @@ fn image_sequences_pass_through_conpty() {
         return;
     }
 
+    // Before anything can load a DLL, as production does: the check below is about which conpty.dll
+    // this locked-down search finds. (The whole file is `cfg(windows)`, so no cfg attribute here.)
+    harden_dll_search();
+
     let exe = std::env::current_exe().expect("this test's own executable");
     let dir = exe
         .parent()
@@ -216,6 +272,29 @@ fn image_sequences_pass_through_conpty() {
             pixel_height: 0,
         })
         .expect("open a pseudo-console");
+
+    // Opening a pseudo-console needs the conpty functions, and portable-pty loads them on first use
+    // (`win/psuedocon.rs`), so by here this process has loaded some `conpty.dll`. Say which: a null
+    // handle means it never loaded the staged file at all (portable-pty's silent fallback to
+    // kernel32 — nothing of the bundled host was measured), and a path from another searched folder
+    // would mean a copy outside the executable's own was used. Windows compares paths
+    // case-insensitively, so this does too; the loaded path goes into the log either way.
+    let loaded = loaded_conpty_dll().unwrap_or_else(|| {
+        panic!(
+            "no conpty.dll is loaded after opening a pseudo-console, so portable-pty fell back \
+                to the system console layer and nothing of the bundled one was measured"
+        )
+    });
+    let loaded_dir = loaded
+        .parent()
+        .expect("a loaded module has a path with a directory");
+    assert_eq!(
+        loaded_dir.to_string_lossy().to_lowercase(),
+        dir.to_string_lossy().to_lowercase(),
+        "{CONPTY_DLL} was loaded from {loaded_dir:?}, not from the test executable's own folder \
+         ({dir:?})"
+    );
+    println!("loaded {CONPTY_DLL} from {loaded:?}");
 
     let mut cmd = CommandBuilder::new(&exe);
     cmd.args(["--exact", HELPER_TEST, "--nocapture", "--test-threads=1"]);

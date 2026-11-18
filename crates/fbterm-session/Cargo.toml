@@ -36,3 +36,9 @@ test-support = []
 fbterm-session = { path = ".", features = ["test-support"] }
 tempfile = "3"
 feathercritty = { workspace = true }
+
+# `tests/conpty_passthrough.rs` proves which conpty.dll the process actually loaded and hardens its
+# own DLL search exactly as fbterm's `main` does; both are Windows-only, so this is a dev-only
+# dependency of this crate (the versions the workspace already uses).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }
