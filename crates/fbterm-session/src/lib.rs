@@ -289,14 +289,22 @@ struct Router {
     /// emulator's own lock decides which of those was produced first, and this section keeps that
     /// order. The order of locks is routing, then terminal (released before routing), then store:
     /// nothing takes this lock while holding the terminal or the store, the store runs its hooks with
-    /// nothing held, and `Dirty` - the redraw notice - is raised after the guard is dropped, never
-    /// under a lock.
+    /// nothing held, and neither `Dirty` - the redraw notice - nor a caps reclaim's wakes for any
+    /// other pane go out until the guard is dropped: never wake a pane under a lock (finding M3).
     routing: parking_lot::Mutex<()>,
 }
 
 impl Router {
-    /// Pass the events one feed (or one delivery) produced on to their destinations.
-    fn route(&self, term_events: Vec<TermEvent>) {
+    /// Pass the events one feed (or one delivery) produced on to their destinations, and return the
+    /// image owners whose visible state changed on the way.
+    ///
+    /// Those are returned, not woken: a reclaim this routing triggers can take a picture from any
+    /// pane, and a wake delivers events and marks a pane dirty - the feeder thread reading one pane's
+    /// deliveries may be waiting for this section's `routing` lock. Nothing is woken under a lock
+    /// (finding M3): callers run [`ImageStore::wake_owners`](fbterm_term::images::ImageStore::wake_owners)
+    /// after they drop the guard.
+    fn route(&self, term_events: Vec<TermEvent>) -> Vec<u64> {
+        let mut wake = Vec::new();
         for ev in term_events {
             match ev {
                 TermEvent::PtyWrite(bytes) => {
@@ -316,7 +324,7 @@ impl Router {
                     }
                 }
                 TermEvent::Exit => {}
-                TermEvent::ImageReceived { key, data } => self.submit_image(key, data),
+                TermEvent::ImageReceived { key, data } => wake.extend(self.submit_image(key, data)),
                 // Idempotent by design: scrollback eviction and failed decodes release keys the
                 // terminal releases again later, and a second release must stay harmless.
                 TermEvent::ImageReleased(key) => {
@@ -324,20 +332,22 @@ impl Router {
                 }
             }
         }
+        wake
     }
 
     /// Hand one image to the store, then reclaim if it pushed this owner over its cap — the
     /// terminal's scrollback first (outside the store's lock, as the store never locks a
     /// terminal), the store's own buffers only when that ran dry. The image worker runs the same
-    /// helper when a decode or refusal finishes, so the order holds however the bytes grew.
+    /// helper when a decode or refusal finishes, so the order holds however the bytes grew. Returns
+    /// the owners to wake (see [`Self::route`]): this one, plus any pane enforcement took pixels from.
     fn submit_image(
         &self,
         key: fbterm_term::images::ImageKey,
         data: fbterm_term::images::ImageData,
-    ) {
+    ) -> Vec<u64> {
         let store = fbterm_term::images::store();
         store.submit(self.owner, key, data);
-        fbterm_term::images::reclaim(store, &self.terminal, self.owner);
+        fbterm_term::images::reclaim(store, &self.terminal, self.owner)
     }
 
     /// Deliver what the terminal queued with nobody to route it: output held for a pane's first real
@@ -363,9 +373,11 @@ impl Router {
             drop(routing);
             return; // nothing queued: this call is not a reason to redraw
         }
-        self.route(events);
+        let wake = self.route(events);
         drop(routing);
-        // The notice that the pane must redraw goes out with no lock held.
+        // Panes whose pictures a reclaim took are asked to redraw once this section's lock is gone
+        // (finding M3), and then this pane's own notice goes out: both with nothing held.
+        fbterm_term::images::store().wake_owners(&wake);
         self.mark_dirty();
     }
 
@@ -511,9 +523,11 @@ impl Feeder {
             // After the lock is released, so the worker can take the jobs at once.
             fbterm_term::history_worker::enqueue(&self.terminal);
         }
-        self.router.route(term_events);
+        let wake = self.router.route(term_events);
         drop(routing);
-        // The notice that the pane must redraw goes out with no lock held.
+        // Panes whose pictures a reclaim took are asked to redraw once this section's lock is gone
+        // (finding M3), and then this pane's own notice goes out: both with nothing held.
+        fbterm_term::images::store().wake_owners(&wake);
         self.mark_dirty();
     }
 
@@ -810,6 +824,91 @@ mod routing_tests {
             written(&mut replies).is_empty(),
             "the hand-off routed a second copy of an answer"
         );
+    }
+
+    /// A caps reclaim that runs inside this section must not call any pane's hook until the guard is
+    /// dropped (finding M3). The hook below reports whether the routing lock was free every time it
+    /// ran: had `route` woken from inside the section, a hook that takes a router's lock - which is
+    /// what a future one may well do - would have blocked forever here instead of recording a miss.
+    #[test]
+    fn a_reclaim_wakes_panes_only_after_the_routing_lock_is_dropped() {
+        use fbterm_term::images::{ImageData, ImageKey, OwnerHooks};
+
+        let (mut feeder, _replies) = feeder(false);
+        let terminal = feeder.terminal.clone();
+        let owner = terminal.lock().image_owner();
+        let store = fbterm_term::images::store();
+
+        // Fill this owner to exactly its cap with direct submits, which reclaim nobody: the picture
+        // that arrives through routing is what tips it over. Four 4096x4096 raw frames are the
+        // per-owner cap (`PER_OWNER_CAP`) in the cheapest shape there is - no payload to parse.
+        let side = 4096usize;
+        for id in 1..=4u64 {
+            store.submit(
+                owner,
+                ImageKey(id),
+                ImageData::Rgba {
+                    width: side as u32,
+                    height: side as u32,
+                    pixels: vec![0u8; side * side * 4],
+                },
+            );
+        }
+        let filled = store.owner_bytes(owner);
+        assert_eq!(filled, 4 * side * side * 4, "the owner sits at its cap");
+
+        // The probe: count wakes, and how many found the routing lock free. `deliver` stays the
+        // router's own so anything needing delivery still goes the normal way.
+        let router = feeder.router();
+        let seen = Arc::new(parking_lot::Mutex::new((0usize, 0usize)));
+        let probe_seen = seen.clone();
+        let probe_router = router.clone();
+        store.register_owner(
+            owner,
+            OwnerHooks {
+                term: Arc::downgrade(&terminal),
+                deliver: {
+                    let r = router.clone();
+                    Arc::new(move || r.deliver_queued())
+                },
+                wake: Arc::new(move || {
+                    let free = probe_router.routing.try_lock().is_some();
+                    let mut seen = probe_seen.lock();
+                    seen.0 += 1;
+                    if free {
+                        seen.1 += 1;
+                    }
+                }),
+            },
+        );
+
+        // A 1x1 raw RGBA frame, fed the way output arrives: routed inside the section, it pushes this
+        // owner over its cap, and enforcement takes the oldest pictures to make room for it.
+        let one = super::feeder_image_tests::b64(&[255u8; 4]);
+        feeder.feed(format!("\x1b_Gi=9,a=t,f=32,s=1,v=1;{one}\x1b\\").as_bytes());
+
+        let (total, free) = *seen.lock();
+        assert!(
+            total > 0,
+            "the pane whose pictures were taken should have been asked to redraw"
+        );
+        assert_eq!(
+            free, total,
+            "a wake ran while the routing lock was still held"
+        );
+        let after = store.owner_bytes(owner);
+        assert!(
+            after < filled + 4,
+            "enforcement took nothing: {after} bytes for {filled} plus a new picture"
+        );
+        assert!(
+            after <= fbterm_term::images::PER_OWNER_CAP,
+            "the cap is still over after reclaiming"
+        );
+
+        // This test filled the shared store with 256 MiB; give it back.
+        store.drop_owner(owner);
+        assert_eq!(store.owner_bytes(owner), 0);
     }
 }
 
