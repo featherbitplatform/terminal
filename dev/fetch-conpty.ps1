@@ -25,7 +25,7 @@ if ($PSVersionTable.PSVersion.Major -lt 7) { throw 'dev/fetch-conpty.ps1 needs P
 $Version = '1.25.260930003'
 $Sha256 = '02b07b349af66d801159bdf9e440d4a1ce78bb951f37fc8609731665afdae7ee'
 $Uri = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/$Version/" +
-    "microsoft.windows.console.conpty.$Version.nupkg"
+    "microsoft.windows.console.conpty.${Version}.nupkg"
 
 # The x64 pair, by path inside the package (a .nupkg is a zip), and the names they are written
 # under. The package also carries win-x86 and win-arm64 copies; fbterm ships x64 only, which
@@ -65,8 +65,8 @@ SOFTWARE.
 $out = (New-Item -ItemType Directory -Force -Path $OutDir).FullName
 # Expand-Archive insists on a .zip extension, hence the suffix on the download; it unpacks to a
 # staging folder so that only the files named above ever reach -OutDir.
-$tmp = Join-Path ([System.IO.Path]::GetTempPath()) "fbterm-conpty-$Version.zip"
-$stage = Join-Path ([System.IO.Path]::GetTempPath()) "fbterm-conpty-$Version-stage"
+$tmp = Join-Path ([System.IO.Path]::GetTempPath()) "fbterm-conpty-${Version}.zip"
+$stage = Join-Path ([System.IO.Path]::GetTempPath()) "fbterm-conpty-${Version}-stage"
 
 try {
     Write-Host "downloading Microsoft.Windows.Console.ConPTY $Version"
@@ -74,7 +74,7 @@ try {
 
     $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $tmp).Hash.ToLowerInvariant()
     if ($actual -ne $Sha256) {
-        throw "conpty $Version downloaded with sha256 $actual, expected $Sha256. If the package really did change, update both variables at the top of this script together."
+        throw "conpty $Version downloaded with sha256 $actual, expected ${Sha256}. If the package really did change, update both variables at the top of this script together."
     }
 
     if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force -LiteralPath $stage }
@@ -85,10 +85,10 @@ try {
         $from = $stage
         foreach ($part in ($inside -split '/')) { $from = Join-Path $from $part }
         if (-not (Test-Path -LiteralPath $from -PathType Leaf)) {
-            throw "conpty-$Version.zip does not contain $inside: the package layout changed, or this is not the pinned version"
+            throw "conpty-${Version}.zip does not contain ${inside}: the package layout changed, or this is not the pinned version"
         }
         $item = Get-Item -LiteralPath $from
-        if ($item.Length -lt 1) { throw "$inside inside conpty-$Version.zip is empty" }
+        if ($item.Length -lt 1) { throw "$inside inside conpty-${Version}.zip is empty" }
         $to = Join-Path $out $Inside[$inside]
         Copy-Item -LiteralPath $from -Destination $to -Force
         Write-Host ("{0}: {1} bytes from {2}" -f $Inside[$inside], $item.Length, $inside)
@@ -98,8 +98,7 @@ try {
     Set-Content -LiteralPath $licensePath -Value $License -Encoding utf8NoBOM
     Write-Host "conpty-LICENSE.txt: the package's MIT license, from microsoft/terminal's LICENSE"
     Write-Host "conpty $Version staged in $out"
-}
-finally {
+} finally {
     Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
 }
