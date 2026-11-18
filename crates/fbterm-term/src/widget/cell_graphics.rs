@@ -26,8 +26,15 @@
 //! follows that rule rather than rounding the physical position itself: a shape starts where its own
 //! cell's background starts and ends where the next cell's background starts.
 //!
-//! Rounded corners (U+256D..=U+2570) and diagonals (U+2571..=U+2573) stay with the font: they are
-//! curves and slants, and a quad cannot stand in for one.
+//! The seven curves of that block — the rounded corners U+256D..=U+2570 and the diagonals
+//! U+2571..=U+2573 — are not quads either: a quad cannot bend. [`Geometry::cover`] rasterizes them
+//! instead, sampling the stroke's coverage in each cell's physical pixels and handing back one box
+//! per run of horizontally adjacent pixels that came out equally covered, with its coverage as the
+//! alpha. So they get anti-aliasing (MSAA is off here) while keeping the rule everything else in
+//! this module follows: their arms end on the same whole-pixel bands a `─` or a `│` in the same row
+//! or column uses, which is what lets a rounded box join its straight lines with no seam, and lets
+//! a staircase of diagonals meet at every cell corner. Everything else — fills, lines, dashes,
+//! doubles — is still exact quads, reported as full coverage.
 
 use iced::{Rectangle, Size};
 
@@ -93,6 +100,21 @@ impl Dash {
     }
 }
 
+/// Which corner of its cell a rounded [`Shape::Arc`] rounds: the quarter circle's arms run out to
+/// the cell edge on that side along the light bands, so they meet the lines next door. The names are
+/// the characters' own, read as the directions their arms go: `╭` is `DOWN AND RIGHT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Corner {
+    /// `╭`: down and right, the top-left corner of a frame.
+    DownRight,
+    /// `╮`: down and left, the top-right corner.
+    DownLeft,
+    /// `╯`: up and left, the bottom-right corner.
+    UpLeft,
+    /// `╰`: up and right, the bottom-left corner.
+    UpRight,
+}
+
 /// One quad-covered piece of a covered character, in cell-relative terms.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Shape {
@@ -116,6 +138,12 @@ pub enum Shape {
         right: Option<Weight>,
         dash: Dash,
     },
+    /// A rounded corner: a quarter arc of the light stroke joining the two light bands it ends on.
+    /// [`Geometry::cover`] rasterizes this one, so its quads come with a coverage between 0 and 1.
+    Arc(Corner),
+    /// A diagonal of the cell along one or both directions: `rising` is `╱`, `falling` is `╲`, and
+    /// both together is `╳`. Rasterized like [`Shape::Arc`].
+    Diagonal { rising: bool, falling: bool },
 }
 
 impl Shape {
@@ -138,15 +166,19 @@ impl Shape {
                     && left.is_some()
                     && left == right
             }
+            // A curve is per cell whatever its shape: its coverage pattern depends on the cell's own
+            // edges, and two cells of a run have different ones.
+            Shape::Arc(_) | Shape::Diagonal { .. } => false,
         }
     }
 
-    /// The fill's opacity of the cell's foreground; 1.0 for lines, which are always opaque.
+    /// The fill's opacity of the cell's foreground; 1.0 for lines, which are always opaque. Curves
+    /// are opaque too: [`Geometry::cover`] scales each quad's alpha by its own coverage instead.
     pub fn alpha(&self) -> f32 {
         match self {
             Shape::Empty => 0.0,
             Shape::Fill { alpha, .. } => *alpha,
-            Shape::Lines { .. } => 1.0,
+            Shape::Lines { .. } | Shape::Arc(_) | Shape::Diagonal { .. } => 1.0,
         }
     }
 }
@@ -229,6 +261,14 @@ const fn dashed(
         right,
         dash,
     }
+}
+
+const fn arc(corner: Corner) -> Shape {
+    Shape::Arc(corner)
+}
+
+const fn diagonal(rising: bool, falling: bool) -> Shape {
+    Shape::Diagonal { rising, falling }
 }
 
 const FIRST: u32 = 0x2500;
@@ -887,19 +927,19 @@ const fn entry(cp: u32) -> Entry {
             Some(Weight::Double),
         )), /* ╬  arms:DDDD */
 
-        0x256D => Entry::NONE, /* light arc down and right stays with the font */
+        0x256D => Entry::one(arc(Corner::DownRight)), /* ╭  quarter arc, arms right and down */
 
-        0x256E => Entry::NONE, /* light arc down and left stays with the font */
+        0x256E => Entry::one(arc(Corner::DownLeft)), /* ╮  its mirror in the cell's centre column */
 
-        0x256F => Entry::NONE, /* light arc up and left stays with the font */
+        0x256F => Entry::one(arc(Corner::UpLeft)), /* ╯  its mirror in the cell's centre row */
 
-        0x2570 => Entry::NONE, /* light arc up and right stays with the font */
+        0x2570 => Entry::one(arc(Corner::UpRight)), /* ╰  both mirrors */
 
-        0x2571 => Entry::NONE, /* light diagonal upper right to lower left stays with the font */
+        0x2571 => Entry::one(diagonal(true, false)), /* ╱  corner to corner, bottom left to top right */
 
-        0x2572 => Entry::NONE, /* light diagonal upper left to lower right stays with the font */
+        0x2572 => Entry::one(diagonal(false, true)), /* ╲  corner to corner, top left to bottom right */
 
-        0x2573 => Entry::NONE, /* light diagonal cross stays with the font */
+        0x2573 => Entry::one(diagonal(true, true)), /* ╳  both, each sample counted once */
 
         0x2574 => Entry::one(lines(None, None, Some(Weight::Light), None)), /* ╴  arms:--L- */
 
@@ -993,8 +1033,7 @@ const fn entry(cp: u32) -> Entry {
     }
 }
 
-/// The shapes that draw `c`, or `None` for everything else (including the rounded corners and
-/// diagonals above, which keep going through the font).
+/// The shapes that draw `c`, or `None` for everything outside the block this module covers.
 ///
 /// `#[inline]` because the draw list asks for every cell in the grid, and almost all of them are
 /// plain text: inlined, that question is a bounds check on a register.
@@ -1204,15 +1243,21 @@ impl Geometry {
     }
 
     /// Calls `f` with every quad covering `shape` over the cells `(col, row)` to
-    /// `(col + cells - 1, row)`, in logical pixels. A shape that spans its cell's full width is one
-    /// quad across the whole run; anything else repeats per cell, where it must.
+    /// `(col + cells - 1, row)`, in logical pixels, and how much of the cell's foreground each one
+    /// carries. That is exactly 1.0 for every shape made of whole quads; the curves are the exception,
+    /// and their coverage comes from [`Geometry::curve_spans`], which samples the stroke inside the
+    /// cell because a quad cannot bend and MSAA is off. A shape that spans its cell's full width is one
+    /// quad across the whole run; anything else repeats per cell, where it must. `memo` carries the
+    /// curve patterns already rasterized in this frame, so each distinct one is computed once: see
+    /// [`CurveMemo`].
     pub fn cover(
         &self,
         shape: &Shape,
         col: u32,
         row: u32,
         cells: u32,
-        mut f: impl FnMut(Rectangle),
+        memo: &mut CurveMemo,
+        mut f: impl FnMut(Rectangle, f32),
     ) {
         let (col, row, cells) = (i64::from(col), i64::from(row), i64::from(cells));
         match *shape {
@@ -1229,6 +1274,7 @@ impl Geometry {
                         top,
                         self.edge_x(col + cells),
                         bottom,
+                        1.0,
                     );
                 } else {
                     for c in col..col + cells {
@@ -1238,17 +1284,59 @@ impl Geometry {
                             top,
                             self.part_x(c, u32::from(x1)),
                             bottom,
+                            1.0,
                         );
                     }
                 }
             }
             Shape::Lines { .. } => self.cover_lines(&mut f, shape, col, row, cells),
+            // A curve is never one quad across a run: its pattern depends on where the cell's own edges
+            // land, and two cells of a run do not share that.
+            Shape::Arc(_) | Shape::Diagonal { .. } => {
+                let kind = match *shape {
+                    Shape::Arc(corner) => CurveKind::Arc(corner),
+                    Shape::Diagonal { rising, falling } => match (rising, falling) {
+                        (true, false) => CurveKind::Rising,
+                        (false, true) => CurveKind::Falling,
+                        _ => CurveKind::Cross,
+                    },
+                    _ => unreachable!(),
+                };
+                // The horizontal band is the one a `─` in this row uses; the vertical one follows each
+                // cell's own column.
+                let [(hy0, _), _] = self.bands(self.axis_y(row), Weight::Light);
+                for c in col..col + cells {
+                    let (x0, y0) = (self.edge_x(c), self.edge_y(row));
+                    let [(vx0, _), _] = self.bands(self.axis_x(c), Weight::Light);
+                    let cell = CurveCell {
+                        w: self.edge_x(c + 1) - x0,
+                        h: self.edge_y(row + 1) - y0,
+                        vx0: vx0 - x0,
+                        hy0: hy0 - y0,
+                    };
+                    let key = CurveKey {
+                        kind,
+                        cell,
+                        light: self.light,
+                    };
+                    for span in memo.spans(key, || self.curve_spans(kind, cell)) {
+                        self.emit(
+                            &mut f,
+                            x0 + span.x0,
+                            y0 + span.y0,
+                            x0 + span.x1,
+                            y0 + span.y0 + 1,
+                            span.coverage(),
+                        );
+                    }
+                }
+            }
         }
     }
 
     fn cover_lines(
         &self,
-        f: &mut impl FnMut(Rectangle),
+        f: &mut impl FnMut(Rectangle, f32),
         shape: &Shape,
         col: i64,
         row: i64,
@@ -1281,14 +1369,14 @@ impl Geometry {
                     let (a, b) = (self.edge_x(c), self.edge_x(c + 1));
                     for (s, e) in self.dash_spans(b - a, dash) {
                         for (t0, t1) in self.bands(self.axis_y(row), w) {
-                            self.emit(f, a + s, t0, a + e, t1);
+                            self.emit(f, a + s, t0, a + e, t1, 1.0);
                         }
                     }
                 } else {
                     let (a, b) = (self.edge_y(row), self.edge_y(row + 1));
                     for (s, e) in self.dash_spans(b - a, dash) {
                         for (t0, t1) in self.bands(self.axis_x(c), w) {
-                            self.emit(f, t0, a + s, t1, a + e);
+                            self.emit(f, t0, a + s, t1, a + e, 1.0);
                         }
                     }
                 }
@@ -1313,7 +1401,7 @@ impl Geometry {
         if matches!((left, right), (Some(w), Some(d)) if w == d) {
             let w = left.unwrap_or(Weight::Light);
             for (t0, t1) in self.bands(self.axis_y(row), w) {
-                self.emit(f, self.edge_x(col), t0, self.edge_x(col + cells), t1);
+                self.emit(f, self.edge_x(col), t0, self.edge_x(col + cells), t1, 1.0);
             }
         }
 
@@ -1337,7 +1425,7 @@ impl Geometry {
             if matches!((up, down), (Some(w), Some(d)) if w == d) {
                 let w = up.unwrap_or(Weight::Light);
                 for (x0, x1) in self.bands(self.axis_x(c), w) {
-                    self.emit(f, x0, top, x1, bottom);
+                    self.emit(f, x0, top, x1, bottom, 1.0);
                 }
             } else {
                 // Unequal or single arms: each runs from its cell edge into the crossing region, so
@@ -1345,7 +1433,7 @@ impl Geometry {
                 for (w, y0, y1) in [(up, top, cross_y1), (down, cross_y0, bottom)] {
                     let Some(w) = w else { continue };
                     for (x0, x1) in self.bands(self.axis_x(c), w) {
-                        self.emit(f, x0, y0, x1, y1);
+                        self.emit(f, x0, y0, x1, y1, 1.0);
                     }
                 }
             }
@@ -1353,7 +1441,7 @@ impl Geometry {
                 for (w, x0, x1) in [(left, left_edge, cross_x1), (right, cross_x0, right_edge)] {
                     let Some(w) = w else { continue };
                     for (t0, t1) in self.bands(self.axis_y(row), w) {
-                        self.emit(f, x0, t0, x1, t1);
+                        self.emit(f, x0, t0, x1, t1, 1.0);
                     }
                 }
             }
@@ -1372,7 +1460,7 @@ impl Geometry {
     /// one nested corner, and what breaks the crossbar's inner rail in `╦` instead.
     fn cover_joint(
         &self,
-        f: &mut impl FnMut(Rectangle),
+        f: &mut impl FnMut(Rectangle, f32),
         shape: &Shape,
         col: i64,
         row: i64,
@@ -1395,7 +1483,7 @@ impl Geometry {
             // Nothing crosses this line: it is one stroke across the whole run, edges included, which
             // is what lets a row of `═` stand as a single quad that meets the cells either side.
             for (y0, y1) in [h.lo, h.hi] {
-                self.emit(f, self.edge_x(col), y0, self.edge_x(col + cells), y1);
+                self.emit(f, self.edge_x(col), y0, self.edge_x(col + cells), y1, 1.0);
             }
             return;
         }
@@ -1407,7 +1495,7 @@ impl Geometry {
             // it: only two doubles have rails that stop short of each other.
             if v.through && !(v.double && h.double) {
                 for (_, rail) in rails(&v) {
-                    self.emit(f, rail.0, y0, rail.1, y1);
+                    self.emit(f, rail.0, y0, rail.1, y1, 1.0);
                 }
             } else {
                 for (side, arm) in [(Side::Low, up), (Side::High, down)] {
@@ -1417,15 +1505,15 @@ impl Geometry {
                     for (rail_side, rail) in rails(&v) {
                         let stop = reach(&v, &h, side, rail_side, snap(self.axis_y(row)));
                         match side {
-                            Side::Low => self.emit(f, rail.0, y0, rail.1, stop),
-                            Side::High => self.emit(f, rail.0, stop, rail.1, y1),
+                            Side::Low => self.emit(f, rail.0, y0, rail.1, stop, 1.0),
+                            Side::High => self.emit(f, rail.0, stop, rail.1, y1, 1.0),
                         }
                     }
                 }
             }
             if h.through && !(v.double && h.double) {
                 for (_, rail) in rails(&h) {
-                    self.emit(f, x0, rail.0, x1, rail.1);
+                    self.emit(f, x0, rail.0, x1, rail.1, 1.0);
                 }
             } else {
                 for (side, arm) in [(Side::Low, left), (Side::High, right)] {
@@ -1435,8 +1523,8 @@ impl Geometry {
                     for (rail_side, rail) in rails(&h) {
                         let stop = reach(&h, &v, side, rail_side, snap(self.axis_x(c)));
                         match side {
-                            Side::Low => self.emit(f, x0, rail.0, stop, rail.1),
-                            Side::High => self.emit(f, stop, rail.0, x1, rail.1),
+                            Side::Low => self.emit(f, x0, rail.0, stop, rail.1, 1.0),
+                            Side::High => self.emit(f, stop, rail.0, x1, rail.1, 1.0),
                         }
                     }
                 }
@@ -1444,20 +1532,261 @@ impl Geometry {
         }
     }
 
-    /// A box in physical pixels as the logical quad iced draws: dividing by the scale leaves every
-    /// corner on a whole physical pixel, so iced's snapping has nothing left to change.
-    fn emit(&self, f: &mut impl FnMut(Rectangle), x0: i64, y0: i64, x1: i64, y1: i64) {
+    /// A box in physical pixels as the logical quad iced draws, filled at `coverage` of the cell's
+    /// foreground: dividing by the scale leaves every corner on a whole physical pixel, so iced's
+    /// snapping has nothing left to change. Everything but the curves passes 1.0.
+    fn emit(
+        &self,
+        f: &mut impl FnMut(Rectangle, f32),
+        x0: i64,
+        y0: i64,
+        x1: i64,
+        y1: i64,
+        coverage: f32,
+    ) {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
         let scale = f64::from(self.scale);
-        f(Rectangle {
-            x: (x0 as f64 / scale) as f32,
-            y: (y0 as f64 / scale) as f32,
-            width: ((x1 - x0) as f64 / scale) as f32,
-            height: ((y1 - y0) as f64 / scale) as f32,
-        });
+        f(
+            Rectangle {
+                x: (x0 as f64 / scale) as f32,
+                y: (y0 as f64 / scale) as f32,
+                width: ((x1 - x0) as f64 / scale) as f32,
+                height: ((y1 - y0) as f64 / scale) as f32,
+            },
+            coverage,
+        );
     }
+
+    /// The coverage pattern of one cell of a curve: every run of horizontally adjacent pixels that came
+    /// out with the same coverage, as offsets from that cell's top-left pixel.
+    ///
+    /// Each physical pixel is sampled at sixteen points, four across and four down, and its coverage is
+    /// how many land inside the stroke, so a curve's edge steps through whole sixteenths of the
+    /// foreground instead of jaggies: MSAA is off here, so this is where anti-aliasing comes from. The
+    /// bands' edges are whole pixels and a sample never lands on one, which is what makes the straight
+    /// parts come out fully covered on exactly the rows and columns a `─` in this row or a `│` in this
+    /// column uses — no seam where they meet. Sampling stops at the cell's own edges, so nothing spills
+    /// into a neighbour, and one run per row of equal coverage keeps a frame from paying per pixel.
+    ///
+    /// A corner is the same quarter circle in coordinates measured from its own bend: the mirror flags
+    /// fold the cell's other sides onto the right and bottom ones, so `╮`, `╰` and `╯` need no separate
+    /// arithmetic. The arc counts only while the point sits in the arc's quadrant as seen from the
+    /// circle's centre; outside it the two straight arms out to the cell edges decide. A diagonal is the
+    /// infinite line through two opposite corners, clipped by sampling only pixels inside the cell, which
+    /// is what makes its corner pixels come out whole and lets a staircase of them meet at a corner.
+    fn curve_spans(&self, kind: CurveKind, cell: CurveCell) -> Vec<CurveSpan> {
+        let half = (self.light as f64) * 0.5;
+        // The stroke's centre lines are the centres of the two light bands a `─` and a `│` here use, so
+        // its arms end on those bands at the cell edges.
+        let (cx, cy) = ((cell.vx0 as f64) + half, (cell.hy0 as f64) + half);
+        let (w, h) = ((cell.w as f64), (cell.h as f64));
+        let (mx, my, reach_x, reach_y) = match kind {
+            CurveKind::Arc(Corner::DownRight) => (false, false, w - cx, h - cy),
+            CurveKind::Arc(Corner::DownLeft) => (true, false, cx, h - cy),
+            CurveKind::Arc(Corner::UpLeft) => (true, true, cx, cy),
+            CurveKind::Arc(Corner::UpRight) => (false, true, w - cx, cy),
+            CurveKind::Rising | CurveKind::Falling | CurveKind::Cross => (false, false, 0.0, 0.0),
+        };
+        // The arc's radius is the distance from the centre line to the nearer of the two cell edges, so
+        // where cells are taller than wide (usual) it ends exactly on the cell edge.
+        let r = reach_x.min(reach_y);
+        // Both diagonals' directions have this length, which is what their cross products divide by.
+        let len = (w * w + h * h).sqrt();
+        // Whether a point in the cell's own physical pixel coordinates (`(0, 0)` is its top-left pixel)
+        // is inside the stroke.
+        let inside = |px: f64, py: f64| match kind {
+            CurveKind::Rising | CurveKind::Falling | CurveKind::Cross => {
+                let rise = (h * px + w * py - w * h).abs() / len;
+                let fall = (h * px - w * py).abs() / len;
+                match kind {
+                    CurveKind::Rising => rise < half,
+                    CurveKind::Falling => fall < half,
+                    // `╳`: either line covers a sample, and a sample where both do is still one sample.
+                    _ => rise.min(fall) < half,
+                }
+            }
+            CurveKind::Arc(_) => {
+                let (u, v) = (
+                    if mx { cx - px } else { px - cx },
+                    if my { cy - py } else { py - cy },
+                );
+                let ring = if u <= r && v <= r {
+                    (((u - r) * (u - r) + (v - r) * (v - r)).sqrt() - r).abs()
+                } else {
+                    f64::INFINITY
+                };
+                // The arms along the bands, each from where the arc leaves the centre line to the cell
+                // edge: a zero-length one when the arc already reaches that edge.
+                let dx = (r - u).max(u - reach_x).max(0.0);
+                let dy = (r - v).max(v - reach_y).max(0.0);
+                ring.min((dx * dx + v * v).sqrt())
+                    .min((u * u + dy * dy).sqrt())
+                    < half
+            }
+        };
+        let mut out = Vec::new();
+        for y in 0..cell.h {
+            // One open run at a time: pixels next to each other with the same coverage are one box.
+            let mut run: Option<(i64, u8)> = None;
+            for x in 0..cell.w {
+                let mut hits = 0u8;
+                for j in 0..4 {
+                    for i in 0..4 {
+                        let px = (x as f64) + (f64::from(i) + 0.5) * 0.25;
+                        let py = (y as f64) + (f64::from(j) + 0.5) * 0.25;
+                        if inside(px, py) {
+                            hits += 1;
+                        }
+                    }
+                }
+                if hits == 0 {
+                    if let Some((start, c)) = run.take() {
+                        out.push(CurveSpan {
+                            x0: start,
+                            y0: y,
+                            x1: x,
+                            count: c,
+                        });
+                    }
+                    continue;
+                }
+                match run {
+                    Some((_, c)) if c == hits => {}
+                    Some((start, c)) => {
+                        out.push(CurveSpan {
+                            x0: start,
+                            y0: y,
+                            x1: x,
+                            count: c,
+                        });
+                        run = Some((x, hits));
+                    }
+                    None => run = Some((x, hits)),
+                }
+            }
+            if let Some((start, c)) = run {
+                out.push(CurveSpan {
+                    x0: start,
+                    y0: y,
+                    x1: cell.w,
+                    count: c,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// Which curve [`CurveMemo`] holds a pattern for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurveKind {
+    /// A quarter arc at this corner.
+    Arc(Corner),
+    /// `╱` on its own.
+    Rising,
+    /// `╲` on its own.
+    Falling,
+    /// `╳`: both lines, each sample counted once.
+    Cross,
+}
+
+/// One cell in physical pixels as a curve's pattern sees it: its size, and where the two light bands
+/// start inside it. Everything [`Geometry::curve_spans`] reads, and so everything that can change its
+/// answer; all of it is relative to the cell's own top-left pixel, which is why one pattern serves any
+/// number of cells that share it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CurveCell {
+    /// `X1 - X0`: the cell's width.
+    w: i64,
+    /// `Y1 - Y0`.
+    h: i64,
+    /// `vx0 - X0`: where a `│` in this column puts its light band.
+    vx0: i64,
+    /// `hy0 - Y0`: where a `─` in this row puts its light band.
+    hy0: i64,
+}
+
+/// One run of horizontally adjacent pixels inside a cell that came out with the same coverage, as
+/// offsets from that cell's top-left pixel.
+#[derive(Debug, Clone, Copy)]
+struct CurveSpan {
+    x0: i64,
+    y0: i64,
+    /// The first pixel past the run.
+    x1: i64,
+    /// How many of the sixteen samples in each of its pixels landed in the stroke.
+    count: u8,
+}
+
+impl CurveSpan {
+    /// The alpha this run carries: its coverage, a whole number of sixteenths. Exact in f32.
+    fn coverage(&self) -> f32 {
+        f32::from(self.count) / 16.0
+    }
+}
+
+/// Everything a curve's span pattern depends on: which curve it is, the cell it was rasterized in, and
+/// the light thickness its stroke was measured with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CurveKey {
+    kind: CurveKind,
+    cell: CurveCell,
+    light: i64,
+}
+
+/// The curve patterns one draw of a frame has already rasterized, so each distinct one is computed once
+/// however many cells use it (see [`Geometry::cover`]).
+///
+/// A pattern depends only on the character, the cell's physical size, where the two light bands sit in
+/// it and the line thickness — never on where the cell sits in the grid — so every later cell that
+/// shares a key reuses the same spans, offset by its own top-left pixel. The memo belongs to one call
+/// that draws shapes: no static, thread-local or global state, nothing allocated per cell once a key is
+/// cached, and it goes away with the call. An unused one allocates nothing.
+#[derive(Debug, Default)]
+pub struct CurveMemo {
+    entries: Vec<(CurveKey, Vec<CurveSpan>)>,
+    /// Distinct patterns rasterized (tests: the spans themselves are not visible outside this module).
+    #[cfg(test)]
+    computed: usize,
+}
+
+impl CurveMemo {
+    /// An empty memo.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many distinct patterns this memo has rasterized: one per key, not one per cell (tests).
+    #[cfg(test)]
+    pub fn computed(&self) -> usize {
+        self.computed
+    }
+
+    /// The spans for `key`, rasterizing them with `compute` the first time this frame meets that key. A
+    /// hit allocates nothing.
+    fn spans(&mut self, key: CurveKey, compute: impl FnOnce() -> Vec<CurveSpan>) -> &[CurveSpan] {
+        match self.entries.iter().position(|(k, _)| *k == key) {
+            Some(at) => &self.entries[at].1,
+            None => {
+                self.record_computation();
+                self.entries.push((key, compute()));
+                &self.entries.last().expect("just pushed").1
+            }
+        }
+    }
+
+    /// Note that one more pattern was rasterized, for [`CurveMemo::computed`] (tests). Release builds
+    /// do not count and this compiles away.
+    #[cfg(test)]
+    fn record_computation(&mut self) {
+        self.computed += 1;
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn record_computation(&mut self) {}
 }
 
 /// A line's rails to walk in order: both for a double line, and one band for anything else — the slot
@@ -1541,13 +1870,26 @@ mod tests {
         shapes(c).unwrap_or_else(|| panic!("{c:?} should be drawn as a shape"))
     }
 
-    /// The quads `c` covers over `cells` cells from `(col, row)`, in logical pixels.
-    fn quads(g: &Geometry, c: char, col: u32, row: u32, cells: u32) -> Vec<Rectangle> {
+    /// The quads `c` covers over `cells` cells from `(col, row)`, in logical pixels, with how much of
+    /// the foreground each carries. A fresh memo per call: these tests ask once per character, and the
+    /// sharing across a frame is what [`curve_patterns_are_computed_once_per_key`] checks.
+    fn covered(g: &Geometry, c: char, col: u32, row: u32, cells: u32) -> Vec<(Rectangle, f32)> {
         let mut out = Vec::new();
+        let mut memo = CurveMemo::new();
         for shape in drawn(c) {
-            g.cover(shape, col, row, cells, |r| out.push(r));
+            g.cover(shape, col, row, cells, &mut memo, |r, cov| {
+                out.push((r, cov))
+            });
         }
         out
+    }
+
+    /// The quads `c` covers over `cells` cells from `(col, row)`, in logical pixels.
+    fn quads(g: &Geometry, c: char, col: u32, row: u32, cells: u32) -> Vec<Rectangle> {
+        covered(g, c, col, row, cells)
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect()
     }
 
     fn one(g: &Geometry, c: char, col: u32, row: u32) -> Rectangle {
@@ -1997,12 +2339,12 @@ mod tests {
         let drawn_count = (FIRST..=LAST)
             .filter(|cp| shapes(char::from_u32(*cp).unwrap()).is_some())
             .count();
-        assert_eq!(drawn_count, COUNT - 7);
-        // ...and the only things left out are the rounded corners and the diagonals.
+        assert_eq!(drawn_count, COUNT);
+        // ...nothing in it is left to the font: even the rounded corners and diagonals are rasterized.
         let left_out: Vec<u32> = (FIRST..=LAST)
             .filter(|cp| shapes(char::from_u32(*cp).unwrap()).is_none())
             .collect();
-        assert_eq!(left_out, (0x256D..=0x2573).collect::<Vec<u32>>());
+        assert!(left_out.is_empty(), "{left_out:?} still come from the font");
         // Everything else keeps going through the font.
         for c in ['a', ' ', '\u{24ff}', '\u{25a0}', '\u{2800}'] {
             assert_eq!(shapes(c), None, "{c:?} is not ours to draw");
@@ -2033,23 +2375,29 @@ mod tests {
     }
 
     /// One cell's worth of pixels, as the shader paints them: quads rasterized into a grid the size of
-    /// the cell, so a test can say exactly where the ink is.
+    /// the cell, so a test can say exactly where the ink is and how thick it is. A pixel holds the
+    /// coverage iced is asked for, in sixteenths — [`FULL`] for a whole one, less for an anti-aliased
+    /// edge — and overlapping quads keep the greater of their coverages.
     struct Pixels {
         w: usize,
         h: usize,
-        ink: Vec<bool>,
+        ink: Vec<u8>,
     }
+
+    /// A whole pixel's coverage, in sixteenths: what every quad of every shape made of whole quads
+    /// carries, and what an anti-aliased run carries when all sixteen of its samples land in the stroke.
+    const FULL: u8 = 16;
 
     impl Pixels {
         fn new(w: i64, h: i64) -> Self {
             Self {
                 w: w as usize,
                 h: h as usize,
-                ink: vec![false; (w * h) as usize],
+                ink: vec![0; (w * h) as usize],
             }
         }
 
-        /// The expected picture: the union of these boxes.
+        /// The expected picture: the union of these boxes, each of them fully covered.
         fn boxes(w: i64, h: i64, rects: &[(i64, i64, i64, i64)]) -> Self {
             let mut out = Self::new(w, h);
             for &(x0, y0, x1, y1) in rects {
@@ -2058,22 +2406,72 @@ mod tests {
             out
         }
 
+        /// Fully inks a box.
         fn fill(&mut self, (x0, y0, x1, y1): (i64, i64, i64, i64)) {
+            self.paint((x0, y0, x1, y1), FULL);
+        }
+
+        /// Covers a box at `cov` sixteenths.
+        fn paint(&mut self, (x0, y0, x1, y1): (i64, i64, i64, i64), cov: u8) {
             for y in y0.max(0)..y1.min(self.h as i64) {
                 for x in x0.max(0)..x1.min(self.w as i64) {
-                    self.ink[(y * self.w as i64 + x) as usize] = true;
+                    let at = (y * self.w as i64 + x) as usize;
+                    self.ink[at] = self.ink[at].max(cov);
                 }
             }
         }
 
-        /// Whether every pixel of the box is inked.
+        /// The coverage of one pixel.
+        fn at(&self, (x, y): (i64, i64)) -> u8 {
+            self.ink[y as usize * self.w + x as usize]
+        }
+
+        /// The rows of column `col` with any ink in them, and whether every one is fully covered.
+        fn column(&self, col: i64) -> (Vec<i64>, bool) {
+            let rows: Vec<i64> = (0..self.h as i64)
+                .filter(|&y| self.at((col, y)) > 0)
+                .collect();
+            let full = rows.iter().all(|&y| self.at((col, y)) == FULL);
+            (rows, full)
+        }
+
+        /// The columns of row `row` with any ink in them, and whether every one is fully covered.
+        fn row(&self, row: i64) -> (Vec<i64>, bool) {
+            let cols: Vec<i64> = (0..self.w as i64)
+                .filter(|&x| self.at((x, row)) > 0)
+                .collect();
+            let full = cols.iter().all(|&x| self.at((x, row)) == FULL);
+            (cols, full)
+        }
+
+        /// Whether every pixel of the box is fully covered.
         fn covers(&self, (x0, y0, x1, y1): (i64, i64, i64, i64)) -> bool {
-            (y0..y1).all(|y| (x0..x1).all(|x| self.ink[(y * self.w as i64 + x) as usize]))
+            (y0..y1).all(|y| (x0..x1).all(|x| self.at((x, y)) == FULL))
         }
 
         /// Whether the box is free of ink.
         fn clear(&self, (x0, y0, x1, y1): (i64, i64, i64, i64)) -> bool {
-            (y0..y1).all(|y| (x0..x1).all(|x| !self.ink[(y * self.w as i64 + x) as usize]))
+            (y0..y1).all(|y| (x0..x1).all(|x| self.at((x, y)) == 0))
+        }
+
+        /// Whether this canvas is `other`'s coverage mirrored left to right.
+        fn mirrors_x(&self, other: &Self) -> bool {
+            self.w == other.w
+                && self.h == other.h
+                && (0..self.h as i64).all(|y| {
+                    (0..self.w as i64)
+                        .all(|x| self.at((x, y)) == other.at((self.w as i64 - 1 - x, y)))
+                })
+        }
+
+        /// Whether this canvas is `other`'s coverage mirrored top to bottom.
+        fn mirrors_y(&self, other: &Self) -> bool {
+            self.w == other.w
+                && self.h == other.h
+                && (0..self.h as i64).all(|y| {
+                    (0..self.w as i64)
+                        .all(|x| self.at((x, y)) == other.at((x, self.h as i64 - 1 - y)))
+                })
         }
     }
 
@@ -2084,15 +2482,52 @@ mod tests {
         grid((10.0, 16.0), 2.0)
     }
 
-    /// A character's cell as [`Pixels`].
+    /// A character's cell as [`Pixels`], recording each quad's coverage.
     fn paint(g: &Geometry, c: char) -> Pixels {
         let (ox, oy) = (g.edge_x(0), g.edge_y(0));
         let mut out = Pixels::new(g.edge_x(1) - ox, g.edge_y(1) - oy);
-        for r in quads(g, c, 0, 0, 1) {
+        for (r, cov) in covered(g, c, 0, 0, 1) {
             let q = box_of(g, r);
-            out.fill((q.0 - ox, q.1 - oy, q.2 - ox, q.3 - oy));
+            out.paint((q.0 - ox, q.1 - oy, q.2 - ox, q.3 - oy), sixteenths(cov));
         }
         out
+    }
+
+    /// A quad's coverage back in whole sixteenths: [`Geometry::curve_spans`] counts whole samples, so
+    /// this is exact.
+    fn sixteenths(cov: f32) -> u8 {
+        (cov * 16.0).round() as u8
+    }
+
+    /// A grid of characters painted into one [`Pixels`] canvas, each standing in its own cell: what
+    /// neighbouring shapes really draw across the edge they share. `cells[row][col]`.
+    fn paint_grid(g: &Geometry, cells: &[&[char]]) -> Pixels {
+        let (rows, cols) = (cells.len() as i64, cells[0].len() as i64);
+        let (ox, oy) = (g.edge_x(0), g.edge_y(0));
+        let mut out = Pixels::new(g.edge_x(cols) - ox, g.edge_y(rows) - oy);
+        for (r, row) in cells.iter().enumerate() {
+            for (c, &ch) in row.iter().enumerate() {
+                if ch == ' ' {
+                    continue;
+                }
+                for (q, cov) in covered(g, ch, c as u32, r as u32, 1) {
+                    let b = box_of(g, q);
+                    out.paint((b.0 - ox, b.1 - oy, b.2 - ox, b.3 - oy), sixteenths(cov));
+                }
+            }
+        }
+        out
+    }
+
+    /// The exact pixel rows a light `─` in this row covers: the band a curve's horizontal arm has to end
+    /// on to meet it.
+    fn light_h(g: &Geometry, row: i64) -> (i64, i64) {
+        g.bands(g.axis_y(row), Weight::Light)[0]
+    }
+
+    /// The columns a light `│` in this column covers.
+    fn light_v(g: &Geometry, col: i64) -> (i64, i64) {
+        g.bands(g.axis_x(col), Weight::Light)[0]
     }
 
     /// A double line's rails and the channel between them along one axis, as (near rail, gap, far rail).
@@ -2481,5 +2916,364 @@ mod tests {
                 assert!(p.covers(b), "{c:?} has a hollow joint at {b:?}");
             }
         }
+    }
+
+    /// A corner's arms end on the same whole pixels that a `─` in its row and a `│` in its column use, so
+    /// a frame built from them joins with no seam: at the edge where the corner meets its neighbour the
+    /// ink is exactly the band, fully covered, with nothing anywhere else in that column or row. Checked
+    /// on [`joint_grid`], where a light line is two pixels and the bands are 15..17 down and 9..11 across.
+    #[test]
+    fn rounded_corner_joins_its_neighbours_lines() {
+        let g = joint_grid();
+        let (w, h) = (g.edge_x(1) - g.edge_x(0), g.edge_y(1) - g.edge_y(0));
+        let (hy0, hy1) = light_h(&g, 0);
+        let (vx0, vx1) = light_v(&g, 0);
+        assert_eq!((hy0, hy1), (15, 17), "the band a `─` in this row paints");
+        assert_eq!(
+            (vx0, vx1),
+            (9, 11),
+            "and the one a `│` in this column paints"
+        );
+        // Which edge column and row each corner's arms reach, and the two pixels of its cell that must
+        // stay empty: the far corners of the square the arc cuts out of the joint.
+        type CornerCase = (char, i64, i64, [(i64, i64); 2]);
+        let cases: [CornerCase; 4] = [
+            ('╭', w - 1, h - 1, [(0, 0), (w - 1, h - 1)]),
+            ('╮', 0, h - 1, [(w - 1, 0), (0, h - 1)]),
+            ('╰', w - 1, 0, [(0, h - 1), (w - 1, 0)]),
+            ('╯', 0, 0, [(w - 1, h - 1), (0, 0)]),
+        ];
+        for (c, col, row, empty) in cases {
+            let p = paint(&g, c);
+            let (rows, full) = p.column(col);
+            assert_eq!(
+                rows,
+                (hy0..hy1).collect::<Vec<i64>>(),
+                "{c:?} must meet the line next door along its band and nowhere else in the column"
+            );
+            assert!(full, "{c:?} must cover that band whole at the cell edge");
+            let (cols, full) = p.row(row);
+            assert_eq!(
+                cols,
+                (vx0..vx1).collect::<Vec<i64>>(),
+                "{c:?} must meet the line below or above it along its band and nowhere else in the row"
+            );
+            assert!(full, "{c:?} must cover that band whole at the cell edge");
+            for (x, y) in empty {
+                assert_eq!(p.at((x, y)), 0, "{c:?} inks the corner pixel at ({x}, {y})");
+            }
+        }
+    }
+
+    /// `╮`, `╰` and `╯` are `╭` mirrored, not separate shapes. The mirror is exact only where the two
+    /// light bands sit symmetrically in the cell: [`joint_grid`] leaves 9 pixels either side of the
+    /// vertical band across a 20-pixel cell and 15 either side of the horizontal one down a 32-pixel
+    /// cell. Where rounding puts a band off-centre by a pixel (an odd physical cell width), the arc's
+    /// radius differs between the two corners by that pixel, so their masks cannot agree exactly there;
+    /// [`rounded_corner_joins_its_neighbours_lines`] checks those cells by the property that matters
+    /// instead, which holds wherever the bands happen to fall.
+    #[test]
+    fn rounded_corners_are_mirror_images() {
+        let g = joint_grid();
+        let (w, h) = (g.edge_x(1) - g.edge_x(0), g.edge_y(1) - g.edge_y(0));
+        let (vx0, vx1) = light_v(&g, 0);
+        let (hy0, hy1) = light_h(&g, 0);
+        assert_eq!(vx0, w - vx1, "the premise: the vertical band is centred");
+        assert_eq!(hy0, h - hy1, "the premise: the horizontal band is centred");
+        let tl = paint(&g, '╭');
+        assert!(
+            tl.ink.iter().any(|&v| v > 0),
+            "a corner that draws nothing mirrors trivially"
+        );
+        let tr = paint(&g, '╮');
+        assert!(tr.mirrors_x(&tl), "╮ is ╭ mirrored across the cell");
+        let bl = paint(&g, '╰');
+        assert!(bl.mirrors_y(&tl), "╰ is ╭ mirrored down the cell");
+        assert!(
+            paint(&g, '╯').mirrors_x(&bl),
+            "╯ is ╰ mirrored across the cell"
+        );
+    }
+
+    /// A rounded frame `╭─╮ / │ │ / ╰─╯` has to be one unbroken line: on both sides of every edge two
+    /// cells share, and along the band each pair of neighbours paints, the pixels are covered on both
+    /// sides. Run at a whole-pixel scale, a retina scale, and a fractional scale on a fractional cell —
+    /// 8.4 logical px wide, which rounding spreads over 10 or 11 physical pixels.
+    #[test]
+    fn rounded_box_has_no_seams() {
+        for &(scale, w) in &[(1.0f32, 8.4f32), (2.0, 8.4), (1.25, 8.4)] {
+            let g = grid((w, w * 1.2), scale);
+            let frame: [&[char]; 3] = [&['╭', '─', '╮'], &['│', ' ', '│'], &['╰', '─', '╯']];
+            let p = paint_grid(&g, &frame);
+            // The top and bottom rows: across the seam between two cells of the horizontal line.
+            for row in [0i64, 2] {
+                let (hy0, hy1) = light_h(&g, row);
+                assert!(hy1 > hy0, "a row has a band");
+                for col in 0..2 {
+                    let edge = g.edge_x(col + 1) - g.edge_x(0);
+                    for y in hy0..hy1 {
+                        for x in [edge - 1, edge] {
+                            assert!(
+                                p.at((x, y)) > 0,
+                                "the frame's horizontal line breaks at the seam between cells \
+                                 ({col}, {row}) and ({}, {row}), row {y} (scale {scale}, cell {w})",
+                                col + 1
+                            );
+                        }
+                    }
+                }
+            }
+            // The left and right columns: down the seam between two cells of the vertical line.
+            for col in [0i64, 2] {
+                let (vx0, vx1) = light_v(&g, col);
+                assert!(vx1 > vx0, "a column has a band");
+                for row in 0..2 {
+                    let edge = g.edge_y(row + 1) - g.edge_y(0);
+                    for x in vx0..vx1 {
+                        for y in [edge - 1, edge] {
+                            assert!(
+                                p.at((x, y)) > 0,
+                                "the frame's vertical line breaks at the seam between cells \
+                                 ({col}, {row}) and ({col}, {}), column {x} (scale {scale}, cell {w})",
+                                row + 1
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A diagonal runs corner to corner of its cell, so it meets the diagonal in the cell that touches
+    /// it at that corner: each covers the pixels of the shared corner that lie inside its own cell, and
+    /// neither one's ink spills across the edge.
+    #[test]
+    fn diagonals_meet_at_the_cell_corners() {
+        let g = joint_grid();
+        let (w, h) = (g.edge_x(1) - g.edge_x(0), g.edge_y(1) - g.edge_y(0));
+        for (c, corners, empty) in [
+            ('╱', [(0, h - 1), (w - 1, 0)], [(0, 0), (w - 1, h - 1)]),
+            ('╲', [(0, 0), (w - 1, h - 1)], [(0, h - 1), (w - 1, 0)]),
+        ] {
+            let p = paint(&g, c);
+            for (x, y) in corners {
+                assert_eq!(
+                    p.at((x, y)),
+                    FULL,
+                    "{c:?} leaves its corner ({x}, {y}) partial"
+                );
+            }
+            for (x, y) in empty {
+                assert_eq!(p.at((x, y)), 0, "{c:?} inks the opposite corner ({x}, {y})");
+            }
+        }
+        // A staircase: `╱` at (0,1) and at (1,0), which touch at the grid point (edge_x(1), edge_y(1)).
+        // The pixel of that corner inside the upper cell is its bottom-left one, and the pixel inside
+        // the lower cell is its top-right one: both covered means the line goes on across the corner.
+        let step: [&[char]; 2] = [&[' ', '╱'], &['╱', ' ']];
+        let p = paint_grid(&g, &step);
+        let (gx, gy) = (g.edge_x(1) - g.edge_x(0), g.edge_y(1) - g.edge_y(0));
+        assert_eq!(
+            p.at((gx, gy - 1)),
+            FULL,
+            "the upper cell's ╱ must reach the shared corner"
+        );
+        assert_eq!(
+            p.at((gx - 1, gy)),
+            FULL,
+            "the lower cell's ╱ must reach the shared corner"
+        );
+    }
+
+    /// `╳` is the two diagonals painted as one stroke: a pixel's ink is how many of its sixteen samples
+    /// fall inside either line, a sample inside both counts once, and nowhere is more than the whole
+    /// foreground asked for. The lines' own equations are sampled here to check that much directly.
+    #[test]
+    fn diagonal_cross_never_overcounts() {
+        for &(scale, w) in &CASES {
+            let g = grid((w, w * 1.2), scale);
+            let both = paint(&g, '╳');
+            let (w, h) = ((both.w as f64), (both.h as f64));
+            let half = (g.light as f64) * 0.5;
+            let len = (w * w + h * h).sqrt();
+            for y in 0..both.h as i64 {
+                for x in 0..both.w as i64 {
+                    let mut want = 0u8;
+                    for j in 0..4 {
+                        for i in 0..4 {
+                            let px = (x as f64) + (f64::from(i) + 0.5) * 0.25;
+                            let py = (y as f64) + (f64::from(j) + 0.5) * 0.25;
+                            // The two lines corner to corner: `╱` from the bottom left, `╲` from the top.
+                            let rise = (h * px + w * py - w * h).abs() / len < half;
+                            let fall = (h * px - w * py).abs() / len < half;
+                            if rise || fall {
+                                want += 1;
+                            }
+                        }
+                    }
+                    assert_eq!(
+                        both.at((x, y)),
+                        want,
+                        "╳ at ({x}, {y}) is not either line counted once per sample ({scale}, {w})"
+                    );
+                }
+            }
+            for (_, cov) in covered(&g, '╳', 0, 0, 1) {
+                assert!(
+                    cov > 0.0 && cov <= 1.0,
+                    "coverage {cov} outside (0, 1] ({scale}, {w})"
+                );
+            }
+        }
+    }
+
+    /// Nothing about a curve leaks out of its cell: every quad lies inside the cell it was asked to
+    /// cover, none of them overlap another (they are runs, not strokes laid over each other), and every
+    /// coverage is a fraction of the foreground rather than zero or more than one.
+    #[test]
+    fn curve_quads_stay_in_their_cell() {
+        for &(scale, w) in &CASES {
+            let g = grid((w, w * 1.2), scale);
+            for c in ['╭', '╮', '╰', '╯', '╱', '╲', '╳'] {
+                for col in 0..4u32 {
+                    let cell = (
+                        g.edge_x(i64::from(col)),
+                        g.edge_y(2),
+                        g.edge_x(i64::from(col) + 1),
+                        g.edge_y(3),
+                    );
+                    let qs: Vec<_> = covered(&g, c, col, 2, 1)
+                        .iter()
+                        .map(|(r, cov)| (box_of(&g, *r), *cov))
+                        .collect();
+                    assert!(!qs.is_empty(), "{c:?} draws nothing ({scale}, {w})");
+                    for (i, (q, cov)) in qs.iter().enumerate() {
+                        assert!(
+                            q.0 >= cell.0 && q.1 >= cell.1 && q.2 <= cell.2 && q.3 <= cell.3,
+                            "{c:?} quad {q:?} leaves its cell {:?} ({scale}, {w})",
+                            cell
+                        );
+                        assert!(
+                            *cov > 0.0 && *cov <= 1.0,
+                            "{c:?} coverage {cov} outside (0, 1] ({scale}, {w})"
+                        );
+                        for (j, (other, _)) in qs.iter().enumerate() {
+                            if j > i {
+                                assert!(
+                                    !overlaps(q, other),
+                                    "{c:?} quads {i} and {j} overlap ({scale}, {w})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The curves are the only shapes that carry a fraction of the foreground. Sweeping [`TABLE`], every
+    /// quad of every character that was already drawn as quads still comes with coverage 1.0, over a run
+    /// of merged cells and at every scale in [`CASES`].
+    #[test]
+    fn existing_shapes_cover_fully() {
+        for &(scale, w) in &CASES {
+            let g = grid((w, w * 1.2), scale);
+            for cp in FIRST..=LAST {
+                let c = char::from_u32(cp).unwrap();
+                let Some(shapes) = shapes(c) else { continue };
+                if shapes
+                    .iter()
+                    .any(|s| matches!(s, Shape::Arc(_) | Shape::Diagonal { .. }))
+                {
+                    continue;
+                }
+                for (i, cov) in covered(&g, c, 3, 1, 2).iter().enumerate() {
+                    assert!(
+                        cov.1 == 1.0,
+                        "{c:?} quad {i} of a merged run carries {cov:?} ({scale}, {w})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A curve's pattern depends on the character and the cell it was rasterized in, and on nothing else:
+    /// fifty cells that share both take one rasterization. The count comes from the memo, which belongs
+    /// to the one call that draws the shapes (see [`CurveMemo`]).
+    #[test]
+    fn curve_patterns_are_computed_once_per_key() {
+        // 10x16 logical at scale 2: every cell of this grid is the same 20x32 physical pixels with the
+        // bands in the same place, so all fifty cells share one key.
+        let g = joint_grid();
+        let mut memo = CurveMemo::new();
+        for col in 0..50u32 {
+            g.cover(&drawn('╭')[0], col, 3, 1, &mut memo, |_, _| ());
+        }
+        assert_eq!(memo.computed(), 1, "fifty like-sized cells rasterize once");
+        // The key is not just the character: another cell size needs its own pattern...
+        let tall = grid((10.0, 20.0), 2.0);
+        tall.cover(&drawn('╭')[0], 0, 0, 1, &mut memo, |_, _| ());
+        assert_eq!(
+            memo.computed(),
+            2,
+            "a different cell size is a different pattern"
+        );
+        // ...and so is another curve in the like-sized cells.
+        for c in ['╮', '╱', '╲', '╳'] {
+            g.cover(&drawn(c)[0], 0, 3, 1, &mut memo, |_, _| ());
+        }
+        assert_eq!(memo.computed(), 6, "one pattern per curve and cell size");
+    }
+
+    /// The worst case for these shapes: a whole view of `╭─╮╰╯╱╲╳`, which is a curve in six cells
+    /// out of seven, against the same view with every curve replaced by `─` — which merges into one
+    /// quad per row. Times the shape loop that `draw_text_group` runs (the cover calls and the quads
+    /// they hand back) for a 160x50 view at scale 2 on a typical 8.4 x 17 cell. Run it with:
+    /// `cargo test --release -p fbterm-term curve_view_costs -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn curve_view_costs() {
+        use std::time::Instant;
+
+        let (cols, rows) = (160u32, 50u32);
+        let g = grid((8.4, 17.0), 2.0);
+        // The cells as `build` hands them over: runs of one character in one colour. No two neighbours
+        // in the pattern are alike, so every cell is its own run; `─` on its own merges into whole rows.
+        let pattern: [char; 8] = ['╭', '─', '╮', '╰', '╯', '╱', '╲', '╳'];
+        let curves: Vec<(char, u32, u32)> = (0..rows)
+            .flat_map(|row| {
+                (0..cols).map(move |col| (pattern[(col as usize + row as usize * 3) % 8], col, row))
+            })
+            .collect();
+        let dashes: Vec<(char, u32, u32)> = (0..rows).map(|row| ('─', 0, row)).collect();
+
+        /// One frame of the shape loop: cover every cell, count the quads, keep the fastest pass after
+        /// the first (the first pays for cold caches and page faults).
+        fn shape_loop(g: &Geometry, runs: &[(char, u32, u32)]) -> (usize, usize, f64) {
+            let (mut quads, mut patterns, mut best_ms) = (0usize, 0usize, f64::MAX);
+            for pass in 0..10usize {
+                let start = Instant::now();
+                let mut count = 0usize;
+                let mut memo = CurveMemo::new();
+                for &(c, col, row) in runs {
+                    for shape in drawn(c) {
+                        g.cover(shape, col, row, 1, &mut memo, |_, _| count += 1);
+                    }
+                }
+                if pass > 0 {
+                    best_ms = best_ms.min(start.elapsed().as_secs_f64() * 1000.0);
+                }
+                quads = count;
+                patterns = memo.computed();
+            }
+            (quads, patterns, best_ms)
+        }
+
+        let (q_curves, pats, ms_curves) = shape_loop(&g, &curves);
+        println!(
+            "curves: {q_curves} quads per frame from {pats} rasterizations, {ms_curves:.3} ms/frame"
+        );
+        let (q_dashes, _, ms_dashes) = shape_loop(&g, &dashes);
+        println!("dashes: {q_dashes} quads per frame, {ms_dashes:.3} ms/frame");
     }
 }
