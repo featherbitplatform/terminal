@@ -127,9 +127,12 @@ fn harden_dll_search() {
 }
 
 /// The full path of the `conpty.dll` this process has loaded, or `None` when nothing with that name
-/// is loaded. `GetModuleHandleW` matches an already-loaded module by base name and loads nothing;
-/// `GetModuleFileNameW` then says where the loader actually found it — a copy in some other searched
-/// folder would report that path here rather than pass unnoticed.
+/// is loaded or its path cannot be read. `GetModuleHandleW` matches an already-loaded module by base
+/// name and loads nothing; `GetModuleFileNameW` then says where the loader actually found it — a copy
+/// in some other searched folder would report that path here rather than pass unnoticed. With long
+/// paths enabled a real path can exceed MAX_PATH, so a buffer that comes back full is doubled and
+/// retried up to the longest path Windows allows; only a failure or a path beyond even that reads as
+/// nothing loaded.
 #[cfg(windows)]
 fn loaded_conpty_dll() -> Option<std::path::PathBuf> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -143,11 +146,23 @@ fn loaded_conpty_dll() -> Option<std::path::PathBuf> {
     if module.is_null() {
         return None;
     }
-    // A UTF-16 buffer of MAX_PATH code units plus the terminator, what the API documents as enough.
+    // Start at MAX_PATH code units plus the terminator, what the API documents as enough. A result
+    // of exactly the buffer length means truncation: double it and ask again, up to 32768 units,
+    // the longest path Windows allows, so a long path enabled on the volume still reports its DLL
+    // rather than reading as "nothing loaded". 0 means failure.
     let mut buf: Vec<u16> = vec![0; 261];
-    let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) };
-    // 0 means failure; exactly the buffer length means a path too long to report.
-    if len == 0 || len as usize == buf.len() {
+    let len = loop {
+        let len = unsafe { GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32) };
+        if len == 0 || len as usize != buf.len() {
+            break len;
+        }
+        if buf.len() >= 32768 {
+            return None;
+        }
+        buf = vec![0; (buf.len() * 2).min(32768)];
+    };
+    // 0 means failure.
+    if len == 0 {
         return None;
     }
     let end = buf[..len as usize]

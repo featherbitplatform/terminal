@@ -39,9 +39,10 @@ jobs:
       # crates/fbterm-session/tests/conpty_passthrough.rs refuses to run without one rather than
       # silently measuring the system console layer; it also hardens its DLL search exactly as
       # fbterm's main does and reports which conpty.dll was really loaded. The test exe is copied
-      # into a fresh folder below target (never the cached target tree, where staged DLLs would
-      # leak into later cargo test runs) together with the files dev/fetch-conpty.ps1 stages, and
-      # that copy runs - so only the app-dir search can find the staged pair. The step then insists
+      # into a folder under the runner's temporary directory (outside target, so never part of what
+      # rust-cache caches: staged DLLs here cannot leak into later cargo test runs) together with
+      # the files dev/fetch-conpty.ps1 stages, and that copy runs - so only the app-dir search can
+      # find the staged pair. The step then insists
       # on a real result line, on the line naming the conpty.dll that was really loaded, and on each
       # of the lines the test prints about its sequences, so a renamed test or a skipped gate cannot
       # pass vacuously. `--nocapture` because a passing run's own evidence stays behind libtest's
@@ -60,11 +61,12 @@ jobs:
             }
           }
           if (-not $exe) { throw 'cargo test --no-run did not report the conpty_passthrough executable' }
-          # A fresh folder, emptied first: a staged conpty.dll left in the cached target tree would
-          # put every later portable-pty test under the bundled host on cache hits only. The staged
-          # files go beside the copied exe and nothing else does, so the run proves the app-dir
-          # search alone (the exe hardens its own DLL search, as fbterm's main does).
-          $stage = Join-Path 'target' 'conpty-test'
+          # A folder under RUNNER_TEMP, emptied first: it sits outside target, so rust-cache never
+          # caches it and a staged conpty.dll here cannot put later portable-pty tests under the
+          # bundled host on cache hits. The staged files go beside the copied exe and nothing else
+          # does, so the run proves the app-dir search alone (the exe hardens its own DLL search,
+          # as fbterm's main does).
+          $stage = Join-Path $env:RUNNER_TEMP 'conpty-test'
           if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force -LiteralPath $stage }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
           $copy = Join-Path $stage (Split-Path -Leaf $exe)
