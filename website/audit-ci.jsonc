@@ -5,5 +5,12 @@
   // .github/workflows/security.yml and dev/sast.sh). Every allowlist entry
   // needs a comment and a removal condition; no silent suppression.
   "high": true,
-  "allowlist": []
+  "allowlist": [
+    // picomatch ReDoS on crafted glob patterns, every release up to 4.0.7 (the
+    // newest; no patched version exists). It only runs at build time inside
+    // Docusaurus and webpack tooling, on glob patterns from our own config,
+    // never on outside input, and it is not part of fbterm. Remove when a
+    // picomatch release above 4.0.7 is published and the lockfile picks it up.
+    "GHSA-fc5q-39xc-vjpf"
+  ]
 }
