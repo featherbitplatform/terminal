@@ -190,14 +190,18 @@ fn requested_box_px(
     let (cw, ch) = m.physical_cell();
     let (span_w, span_h) = placement_box_px(m, cols, rows);
     let scale = |side: u32, from: u32, now: u32, span: u32| -> u32 {
-        // The u64 product guards a hostile cell size; rounding happens in f64.
+        // Integer: side * now / from, rounded to the nearest (`+ from / 2`), in u64 so a hostile
+        // cell size saturates rather than wraps; the zero-`from` guard above keeps it a copy.
         let scaled = if from == 0 {
             u64::from(side)
         } else {
-            let exact = f64::from(side) * f64::from(now) / f64::from(from);
-            (exact.round() as u64).min(u32::MAX as u64)
-        };
-        u32::try_from(scaled).unwrap_or(u32::MAX).clamp(1, span)
+            u64::from(side)
+                .saturating_mul(u64::from(now))
+                .saturating_add(u64::from(from) / 2)
+                / u64::from(from)
+        }
+        .min(u32::MAX as u64);
+        (scaled as u32).min(span).max(1)
     };
     Some((
         scale(bw, box_cell_px.0, cw, span_w),
@@ -509,12 +513,12 @@ pub fn resolve(
         // A placement the protocol sized in pixels or percent asks for exactly the box it named
         // (feathercritty's `box_px`), scaled to the current cell size and kept inside its span:
         // that wins over every span-based rule below. It is drawn from the span's top-left and
-        // clipped to the span as everything else is. A placement the protocol asks to fill takes
-        // the span whole instead, because filling a box smaller than it would stretch the picture
-        // into a room the protocol did not ask for. Otherwise: a picture whose span is its own
-        // pixels at this cell size asks for exactly those pixels and draws unscaled; a span the
-        // program sized, or one no longer matching after a cell-size change, asks for the span and
-        // resamples into it as before (finding I1).
+        // clipped to the span as everything else is. Without a box of its own, a fill takes the
+        // span whole (filling a smaller room would stretch the picture into a place the protocol
+        // did not ask for), and otherwise a picture whose span is its own pixels at this cell size
+        // asks for exactly those pixels and draws unscaled, while a span the program sized, or one
+        // no longer matching after a cell-size change, asks for the span and resamples into it as
+        // before (finding I1).
         let box_px = requested_box_px(m, p.box_px, p.box_cell_px, p.cols, p.rows)
             .or_else(|| {
                 if p.stretch {
@@ -1158,7 +1162,7 @@ mod tests {
     /// An OSC 1337 picture sized in pixels draws exactly that many pixels wide, not the cells its
     /// width rounds up to: `width=100px` in 16 px cells takes a 7-cell span (100 px rounded up) and
     /// used to be drawn 112 wide (the span); now it is drawn 100, and the height it left `auto`
-    /// comes from the picture's own ratio (160×96 → 100×58).
+    /// comes from the picture's own ratio (160×96 → 100×60).
     #[test]
     fn inline_pixel_width_draws_exactly_that_wide() {
         let store = ImageStore::with_caps(8 * MB, 32 * MB);
@@ -1195,10 +1199,10 @@ mod tests {
         );
     }
 
-    /// A percent size draws its exact share of the terminal's pixels on that axis: `width=50%` of a
-    /// 20-column terminal in 16 px cells is 20 × 16 / 2 = 160 px wide (the old answer was the span,
-    /// the share's ceil at 8 cells, 128 px). The height it left `auto` comes from the picture's own
-    /// ratio.
+    /// A percent size draws its exact share of the terminal's pixels on that axis: `width=31%` of a
+    /// 20-column terminal in 16 px cells is 320 × 31 / 100 = 99 px wide (the span is 7 cells, 112
+    /// px; a share that does not land on a cell boundary, so the box and the span disagree). The
+    /// height it left `auto` comes from the picture's own ratio.
     #[test]
     fn inline_percent_draws_the_exact_share() {
         let store = ImageStore::with_caps(8 * MB, 32 * MB);
@@ -1213,7 +1217,7 @@ mod tests {
             100,
         );
         term.set_cell_pixel_size(16, 16);
-        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("50%", "auto", true)).as_bytes());
+        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("31%", "auto", true)).as_bytes());
         for event in term.take_events() {
             if let crate::TermEvent::ImageReceived { key, data } = event {
                 store.submit(term.image_owner(), key, data);
@@ -1225,15 +1229,14 @@ mod tests {
         assert_eq!(draws.len(), 1, "the picture draws once");
         assert_eq!(
             span_of(&term),
-            (10, 6),
-            "the span is the ceil of its pixels: 160 in 16-px cells is 10, 96 in 16 is 6"
+            (7, 5),
+            "the span is the ceil of its pixels: 99 in 16-px cells is 7, 60 in 16 is 5"
         );
         assert_eq!(
             draws[0].bounds,
-            rect(0.0, -16.0, 160.0, 96.0),
-            "half of the 320 px terminal, at the picture's own ratio: the span (10 cells, 160 px) \
-             is its exact fit, so nothing is cropped and the picture's last row overflows the last \
-             cell and is cut there by the clip"
+            rect(0.0, 0.0, 98.0, 59.0),
+            "the 99 px box the request named, fitted at the picture's ratio: 98 wide, not the 112 \
+             the span covers"
         );
     }
 
@@ -1305,7 +1308,7 @@ mod tests {
             "100 wide at the size it was placed in"
         );
 
-        // The cell doubles: the same placement now occupies 14 × 8 cells (224 × 128 px), and the
+        // The cell doubles: the placement's span stays 7 × 5 (224 × 160 px at 32 px cells), and the
         // box it asked for doubles with it.
         term.set_cell_pixel_size(32, 32);
         let m = CellGeometry::new(Size::new(32.0, 32.0), 1.0);
@@ -1384,10 +1387,10 @@ mod tests {
             Some((50, 25)),
             "scaled down with the cell size, then kept inside the span"
         );
-        // A zero `box_cell_px` axis keeps that side as it was, instead of dividing by zero.
-        let zeroed = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        // The same geometry as `m`, with a zero in `box_cell_px`: the zeroed axis keeps its side as
+        // it was, instead of dividing by zero.
         assert_eq!(
-            requested_box_px(zeroed, Some((100, 50)), (0, 16), 10, 4),
+            requested_box_px(m, Some((100, 50)), (0, 16), 10, 4),
             Some((100, 50)),
             "no divide by zero: each side stands as it was, clamped to the span"
         );
