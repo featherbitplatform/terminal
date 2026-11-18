@@ -50,7 +50,7 @@ Both are ordinary keys in [`settings.toml`](files#settingstoml). The file fbterm
 When a picture cannot be drawn any more, its first row shows a dim line naming its pixel size, for example `[image 640×480]`. It appears in two situations:
 
 - **Scrolled away,** with `scrollback_images = false` (the default): the picture's rows have all left the screen, so the line replaces it and its memory is freed. With `scrollback_images = true` the picture itself stays in history instead and no line is drawn.
-- **Out of memory:** a [memory cap](#limits) took the picture's pixels while its placement is still on screen, so the line shows in its place until the program sends that picture again.
+- **Out of memory:** a [memory cap](#limits) took the picture's pixels while its placement is still on screen. The line shows in its place until the program sends that picture again. A size that lost its place to another picture's install comes back on its own when memory frees (a picture is released or a tab closes): the placement asks for its copy again and the line goes, with no new output needed.
 
 The line is drawn over the row in the pane's text color at 55% opacity and is never written into the grid or into history. It is not selectable, copying does not include it, and find does not match it: it is a hint about what was there, not content. Pictures shown through kitty Unicode placeholders get no line of their own, because the cells they cover are already text.
 
