@@ -1,7 +1,8 @@
 # Builds fbterm for Windows (x86-64) and packages it as a per-machine .msi with cargo-wix
 # from crates/fbterm/wix/main.wxs. It first stages Microsoft's ConPTY host from NuGet, into the
 # release folder, by calling dev/fetch-conpty.ps1 (which holds the package pin and checks its
-# SHA-256), so the .msi installs conpty.dll, OpenConsole.exe and their license beside fbterm.exe.
+# SHA-256), so the .msi installs conpty.dll, OpenConsole.exe, conpty-LICENSE.txt and
+# conpty-NOTICE.md beside fbterm.exe.
 # Runs on Windows only. Needs cargo-wix (the version pinned in .github/workflows/release.yml)
 # and the WiX Toolset v3 (the WIX environment variable its installer sets, or candle.exe on
 # PATH).
@@ -63,8 +64,8 @@ $dist = Join-Path $root 'target/dist'
 $name = "fbterm-$Version-windows-x86_64"
 $msi = Join-Path $dist "$name.msi"
 $exe = Join-Path $target 'release/fbterm.exe'
-# Where dev/fetch-conpty.ps1 stages conpty.dll, OpenConsole.exe and their license: cargo wix's
-# CargoTargetBinDir is this same release folder, so the files land where the exe is built.
+# Where dev/fetch-conpty.ps1 stages conpty.dll, OpenConsole.exe and their license and notices:
+# cargo wix's CargoTargetBinDir is this same release folder, so the files land where the exe is built.
 $conptyDir = Join-Path $target 'release'
 
 Invoke-Native cargo @('build', '--locked', '--release', '-p', 'fbterm')
@@ -87,12 +88,13 @@ New-Item -ItemType Directory -Force $dist | Out-Null
 Remove-Item -Force -ErrorAction SilentlyContinue $msi, "$msi.sha256"
 
 # The .msi holds the binary exactly as cargo built it above. The one -C argument adds main.wxs's
-# ConptyDir preprocessor variable: cargo-wix forwards each -C value to candle.exe as it is (its
-# --compiler-arg option), and a -D define must reach candle as one argument, which is how
-# cargo-wix builds its own -dCargoTargetBinDir=... too.
+# ConptyDir preprocessor define: cargo-wix forwards each -C value to candle.exe as it is (its
+# --compiler-arg option), and the define must reach candle as one argument. The switch is candle's
+# lowercase -d, exactly as cargo-wix builds its own defines in src/create.rs (-dCargoTargetBinDir=
+# ...); an uppercase -D is not a candle switch and leaves $(var.ConptyDir) undefined.
 Invoke-Native cargo @('wix', '--package', 'fbterm', '--no-build', '--nocapture',
     '--install-version', $msiVersion, '--output', $msi,
-    '-C', "-DConptyDir=$conptyDir")
+    '-C', "-dConptyDir=$conptyDir")
 if (-not (Test-Path $msi)) { throw "cargo wix did not write $msi" }
 
 # Read the built package's Property table back: name, version, per-machine, upgrade code. The
@@ -125,41 +127,68 @@ foreach ($key in $want.Keys) {
     if ($got -ne $want[$key]) { throw "the .msi has $key '$got', expected '$($want[$key])'" }
 }
 
-# Read one row of the File table back, by that table's primary key: checking the staged ConPTY files
-# by their WiX-given Ids means no guessing how a compressed .msi and its cabinet spell a long file
-# name. The row's existence is what fails the build when a Component or a ComponentRef went missing;
-# the name it stores is printed for the log, and dev/smoke-windows.ps1 is what checks the installed
-# names, after msiexec.
-function Get-MsiFile {
-    param([string]$Path, [string]$Id)
+# Read a whole table of the built package back, one PowerShell object per row: Windows Installer's
+# SQL subset has no functions and no joins, so filtering and joining happen here in PowerShell and
+# every query is a plain SELECT. -Columns names the query's columns in order, because Record hands
+# out values only by 1-based position.
+function Get-MsiRows {
+    param([string]$Path, [string]$Query, [string[]]$Columns)
     $installer = New-Object -ComObject WindowsInstaller.Installer
     $db = $installer.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $installer, @($Path, 0))
-    $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db,
-        @("SELECT ``FileName`` FROM ``File`` WHERE LOWER(``File``) = LOWER('$Id')"))
+    $view = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, $Query)
     $view.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $view, $null) | Out-Null
-    $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
-    $value = if ($null -eq $record) { $null } else {
-        $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, 1)
+    $rows = @()
+    while ($true) {
+        $record = $view.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $view, $null)
+        if ($null -eq $record) { break }
+        $row = [pscustomobject]@{}
+        for ($i = 1; $i -le $Columns.Count; $i++) {
+            $row | Add-Member -NotePropertyName $Columns[$i] -NotePropertyValue (
+                $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, $i))
+        }
+        $rows += $row
     }
     $view.GetType().InvokeMember('Close', 'InvokeMethod', $null, $view, $null) | Out-Null
     [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($view) | Out-Null
     [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) | Out-Null
     [System.Runtime.InteropServices.Marshal]::FinalReleaseComObject($installer) | Out-Null
-    return $value
+    return $rows
 }
 
-# The File Ids main.wxs gives the three staged files (WiX keeps them in the File table's key
-# column). fbterm.exe and LICENSE.txt are not repeated here: the version checks above and the
-# smoke test's install already cover them.
-$files = [ordered]@{
-    conptyDll     = 'conpty.dll'
-    openConsole   = 'OpenConsole.exe'
-    conptyLicense = 'conpty-LICENSE.txt'
+# The staged ConPTY files, by the names they must install as (compared case-insensitively: Windows
+# names are). fbterm.exe itself is read too, as the reference for "in the application folder".
+# Windows Installer's SQL has no functions and no joins, so the two tables are read whole and joined
+# here; FileName holds short and long name split by a pipe when both are stored, and the long part
+# (or the whole value without a pipe) is what msiexec installs.
+$expected = @('conpty.dll', 'OpenConsole.exe', 'conpty-LICENSE.txt', 'conpty-NOTICE.md')
+$fileRows = Get-MsiRows -Path $msi -Query 'SELECT File, Component_, FileName FROM File' `
+    -Columns @('File', 'Component_', 'FileName') |
+    Where-Object { $_.File -in ($expected + 'fbterm.exe') }
+$dirs = @{}
+$componentRows = Get-MsiRows -Path $msi -Query 'SELECT Component, Directory_ FROM Component' `
+    -Columns @('Component', 'Directory_')
+foreach ($row in $componentRows) {
+    $dirs[$row.Component] = $row.Directory_
 }
-foreach ($id in $files.Keys) {
-    $stored = Get-MsiFile $msi $id
-    if (-not $stored) { throw "the .msi has no File row for '$id' (main.wxs must carry it)" }
-    Write-Output "in the .msi: $($files[$id]) (File row '$stored')"
+$found = @()
+foreach ($row in $fileRows) {
+    $long = $row.FileName
+    if ($long.Contains('|')) { $long = $long.Split('|')[-1] }
+    $found += [pscustomobject]@{ Name = $long; Directory = $dirs[$row.Component_] }
+}
+foreach ($fileName in $expected) {
+    $same = @($found | Where-Object { $_.Name -ieq $fileName })
+    if ($same.Count -ne 1) {
+        throw "the .msi installs $fileName $($same.Count) time(s), expected exactly once (check main.wxs's components and the feature's ComponentRefs)"
+    }
+}
+$exeRows = @($found | Where-Object { $_.Name -ieq 'fbterm.exe' })
+if ($exeRows.Count -ne 1) { throw "the .msi has $($exeRows.Count) fbterm.exe rows, expected exactly 1" }
+foreach ($item in $found) {
+    if ($item.Directory -ne $exeRows[0].Directory) {
+        throw "$($item.Name) installs into '$($item.Directory)', not the same folder as fbterm.exe ('$($exeRows[0].Directory)')"
+    }
+    Write-Output "in the .msi: $($item.Name) in $($item.Directory)"
 }
 
 # Same format as sha256sum: lower-case hash, two spaces, file name, LF; no BOM.

@@ -26,9 +26,11 @@ if ($line -cne "$hash  $name.msi") { throw "checksum file says '$line', the .msi
 $installDir = Join-Path $env:ProgramFiles 'featherbit terminal'
 $exe = Join-Path $installDir 'fbterm.exe'
 # The bundled ConPTY host, installed beside fbterm.exe and removed with it (crates/fbterm/wix's
-# main.wxs). Its license text rides along in the install folder, which the checks below cover.
+# main.wxs), with the license and third-party notices that travel with those binaries.
 $conptyDll = Join-Path $installDir 'conpty.dll'
 $openConsole = Join-Path $installDir 'OpenConsole.exe'
+$conptyLicense = Join-Path $installDir 'conpty-LICENSE.txt'
+$conptyNotice = Join-Path $installDir 'conpty-NOTICE.md'
 $shortcut = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\featherbit terminal.lnk'
 # fbterm's config folder (fbterm-config's Paths: directories' ProjectDirs "io.featherbit.fbterm").
 $configDir = Join-Path $env:APPDATA 'featherbit\fbterm\config'
@@ -75,8 +77,10 @@ function Assert-Version {
 }
 
 function Assert-Installed {
-    # The two ConPTY files by name: a .msi that shipped without them installs fine and says nothing.
-    foreach ($f in @($exe, (Join-Path $installDir 'LICENSE.txt'), $conptyDll, $openConsole, $shortcut)) {
+    # Every ConPTY file by name: a .msi that shipped without one of them installs fine and says
+    # nothing. fbterm's own license is checked the same way.
+    foreach ($f in @($exe, (Join-Path $installDir 'LICENSE.txt'), $conptyDll, $openConsole,
+                     $conptyLicense, $conptyNotice, $shortcut)) {
         if (-not (Test-Path $f)) { throw "missing after install: $f" }
     }
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($shortcut)
@@ -85,9 +89,9 @@ function Assert-Installed {
 }
 
 function Assert-Removed {
-    # The two ConPTY files are named as well: their own folder is checked first, so this says which
-    # file a partial uninstall left behind rather than only that the folder survived.
-    foreach ($f in @($installDir, $conptyDll, $openConsole, $shortcut)) {
+    # The ConPTY files come first: a leftover file keeps its folder too, and naming the file is
+    # what says which part of the uninstall failed. The folder check last catches anything else.
+    foreach ($f in @($conptyDll, $openConsole, $conptyLicense, $conptyNotice, $installDir, $shortcut)) {
         if (Test-Path $f) { throw "left behind by uninstall: $f" }
     }
 }

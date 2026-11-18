@@ -37,9 +37,15 @@ jobs:
       # The ConPTY passthrough check runs only against the bundled, pinned ConPTY: portable-pty
       # sideloads a conpty.dll sitting next to its own executable (`win/psuedocon.rs`), and
       # crates/fbterm-session/tests/conpty_passthrough.rs refuses to run without one rather than
-      # silently measuring the system console layer. Building the test first is what makes its
-      # executable directory known, so the staged files can go beside it. `--nocapture` because a
-      # passing run's own output — which sequence arrived how — stays behind libtest's capture.
+      # silently measuring the system console layer; it also hardens its DLL search exactly as
+      # fbterm's main does and reports which conpty.dll was really loaded. The test exe is copied
+      # into a fresh folder below target (never the cached target tree, where staged DLLs would
+      # leak into later cargo test runs) together with the files dev/fetch-conpty.ps1 stages, and
+      # that copy runs - so only the app-dir search can find the staged pair. The step then insists
+      # on a real result line, on the line naming the conpty.dll that was really loaded, and on each
+      # of the lines the test prints about its sequences, so a renamed test or a skipped gate cannot
+      # pass vacuously. `--nocapture` because a passing run's own evidence stays behind libtest's
+      # capture.
       - name: ConPTY passthrough (bundled)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -54,14 +60,34 @@ jobs:
             }
           }
           if (-not $exe) { throw 'cargo test --no-run did not report the conpty_passthrough executable' }
-          ./dev/fetch-conpty.ps1 -OutDir (Split-Path -Parent $exe)
-          # Run it as cargo would: its own directory first, in case a dependency DLL sits beside it.
-          # portable-pty finds conpty.dll the same way either way (LoadLibraryW searches the
-          # executable's directory before PATH).
-          $env:PATH = "$(Split-Path -Parent $exe);$env:PATH"
+          # A fresh folder, emptied first: a staged conpty.dll left in the cached target tree would
+          # put every later portable-pty test under the bundled host on cache hits only. The staged
+          # files go beside the copied exe and nothing else does, so the run proves the app-dir
+          # search alone (the exe hardens its own DLL search, as fbterm's main does).
+          $stage = Join-Path 'target' 'conpty-test'
+          if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force -LiteralPath $stage }
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $copy = Join-Path $stage (Split-Path -Leaf $exe)
+          Copy-Item -LiteralPath $exe -Destination $copy
+          ./dev/fetch-conpty.ps1 -OutDir $stage
+          # A Rust test binary needs no sibling DLLs; if this build ever did, the copied exe would
+          # fail to start and this line says so before the test itself starts.
+          & $copy --list 2>&1 | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "the copied test exe exited with $LASTEXITCODE running --list" }
           $env:FBTERM_TEST_CONPTY = '1'
-          & $exe --exact image_sequences_pass_through_conpty --nocapture --test-threads=1
+          # Tee keeps the run's own lines in the job log and also collects them, so the checks below
+          # can prove a real result rather than just a zero exit code.
+          & $copy --exact image_sequences_pass_through_conpty --nocapture --test-threads=1 2>&1 |
+            Tee-Object -Variable out
           if ($LASTEXITCODE -ne 0) { throw "conpty_passthrough exited with $LASTEXITCODE" }
+          if (-not ($out -match '^test result: ok\. 1 passed')) {
+            throw 'the step passed without the test reporting one real pass (a renamed or gated-off test exits 0)'
+          }
+          foreach ($name in @('bundled ConPTY:', 'loaded conpty.dll from', 'kitty APC: unchanged', 'sixel DCS: unchanged', 'OSC 1337: unchanged')) {
+            if (-not ($out | Where-Object { $_ -like "*$name*" })) {
+              throw "the test output has no line about '$name'; the check did not report what it measured"
+            }
+          }
 
   # cargo-deny runs in security.yml (job cargo-deny), which also re-scans weekly.
 
