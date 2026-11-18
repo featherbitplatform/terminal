@@ -661,6 +661,61 @@ fn compression_off_applies_to_open_terminals() {
     }
 }
 
+/// Switching pictures off frees every pane's store share, not only when that pane next prints
+/// something (finding I2). The emulator queues one `ImageReleased` per picture; what releases them to
+/// the store is delivering the terminal's queue, which this apply now does for each pane. Nothing
+/// else feeds these panes: their tabs are quiet, and their bytes are gone anyway.
+#[test]
+fn switching_pictures_off_frees_an_idle_panes_store() {
+    use crate::tabs::install_session;
+    use fbterm_session::SessionHandle;
+    use fbterm_term::images::store;
+
+    let (mut app, _terms) = app_with_two_tabs(0);
+    assert!(app.settings.inline_images, "pictures are on by default");
+
+    // Give each pane a session that routes, over the terminal it already shows: a picture arrives,
+    // delivery puts it in the store, and nothing else feeds this pane afterwards.
+    let mut installed: Vec<(fbterm_term::SharedTerminal, u64)> = Vec::new();
+    for window in app.windows.values_mut() {
+        for tab in &mut window.tabs {
+            for pane in &mut tab.panes {
+                let term = pane
+                    .placeholder
+                    .clone()
+                    .expect("a pane whose shell has not connected shows a placeholder");
+                let owner = term.lock().image_owner();
+                // A 1x1 raw RGBA transmission: the terminal queues it for whoever routes.
+                term.lock()
+                    .feed(b"\x1b_Gi=1,a=t,f=32,s=1,v=1;AAAAAA==\x1b\\");
+                let (handle, _log) = SessionHandle::recording(term.clone());
+                handle.deliver_events(); // the way output normally reaches the store
+                assert!(
+                    store().owner_bytes(owner) > 0,
+                    "the picture should be held before the switch"
+                );
+                let _notice = install_session(pane, handle);
+                installed.push((term, owner));
+            }
+        }
+    }
+    assert_eq!(installed.len(), 2, "two panes");
+
+    apply(&mut app, |s| s.inline_images = false);
+
+    for (term, owner) in &installed {
+        assert_eq!(
+            store().owner_bytes(*owner),
+            0,
+            "an idle pane kept its pictures after the switch went off"
+        );
+        assert!(
+            term.lock().term().visible_placements().is_empty(),
+            "and it should not be drawing them either"
+        );
+    }
+}
+
 #[test]
 fn switching_on_requests_release_once_idle() {
     let (mut app, _terms) = app_with_two_tabs(50);

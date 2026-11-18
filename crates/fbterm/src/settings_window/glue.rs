@@ -414,6 +414,15 @@ impl App {
                     term.lock()
                         .set_images(new.inline_images, new.scrollback_images);
                 }
+                // Switching off queues one `ImageReleased` per picture in that terminal, and only a
+                // feed or a delivery empties a terminal's event queue: an idle pane, or a hidden tab
+                // with a quiet shell, would go on holding its decoded buffers and copies in the image
+                // store with nothing left to draw (finding I2). Deliver them here, once this pane's
+                // terminal lock is gone - delivery takes the session's routing lock itself. A pane
+                // showing a placeholder has no session yet; `connected` delivers for it later.
+                if let Some(session) = &pane.session {
+                    session.deliver_events();
+                }
             }
         }
         if new.grapheme_clusters != self.settings.grapheme_clusters {
