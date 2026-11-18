@@ -382,6 +382,12 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
         let mut cache = state.cache.borrow_mut();
         {
             let term = self.term.lock();
+            // Pictures are laid out with the grid the terminal itself reports: its cell size and its
+            // sanitized scale, which is what programs are told and what `grid_size_from_bounds`
+            // settled (a bogus `style.scale` must not put images at different pixels than text).
+            let grid = term.size();
+            let geometry =
+                images::CellGeometry::new(Size::new(grid.cell_width, grid.cell_height), grid.scale);
             let key = CacheKey {
                 term: term_id(self.term),
                 generation: term.generation(),
@@ -389,8 +395,11 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                 scheme: self.style.scheme,
                 hover: state.input.hover().cloned(),
                 highlight: self.highlight.clone(),
-                cell_bits: (m.cell.width.to_bits(), m.cell.height.to_bits()),
-                scale_bits: self.style.scale.to_bits(),
+                cell_bits: (
+                    geometry.cell.width.to_bits(),
+                    geometry.cell.height.to_bits(),
+                ),
+                scale_bits: geometry.scale.to_bits(),
             };
             // A frame that left a picture waiting is rebuilt instead of reused: the store has had
             // its chance to answer since (its `wake` hook is what asked for this redraw).
@@ -406,9 +415,15 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                     key.hover.as_ref(),
                     key.highlight.as_ref(),
                     crate::images::store(),
-                    images::CellGeometry::new(m.cell, self.style.scale),
+                    geometry,
                 );
                 *cache = Some((key, list));
+            } else if let Some((_, list)) = cache.as_ref() {
+                // Reused frame: the pictures it holds were not asked for this time, so tell the
+                // store they are on screen — otherwise a static pane's images age out of the LRU
+                // while plainly visible (see [`crate::images::ImageStore::touch_drawn`]).
+                let keys: Vec<_> = list.images.drawn_keys().collect();
+                crate::images::store().touch_drawn(term.image_owner(), &keys);
             }
         }
         if let Some((_, list)) = cache.as_ref() {

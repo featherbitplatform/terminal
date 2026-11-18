@@ -488,40 +488,23 @@ fn draw_runs(
 }
 
 /// Issues the renderer primitives for `list` inside `bounds`.
-pub fn render(
-    list: &DrawList,
+/// What must be painted above the z < 0 pictures: decorations, the cursor, the grid text and the
+/// dimmed `[image W×H]` lines. `render` calls this inside one layer opened after every under-text
+/// picture, which is what keeps it above them (see the note there).
+fn draw_text_group(
     renderer: &mut iced::Renderer,
+    list: &DrawList,
     bounds: Rectangle,
-    m: Metrics,
-    accent: Option<Rgb>,
-    background_opacity: f32,
+    m: &Metrics,
     shapes: &mut ShapeCache,
 ) {
     let (cw, ch) = (m.cell.width, m.cell.height);
-    // Pictures are laid out relative to the grid's top-left corner; this shifts them here.
-    let at = iced::Point::new(bounds.x, bounds.y);
     let rect = |s: Span| Rectangle {
         x: bounds.x + f32::from(s.col) * cw,
         y: bounds.y + f32::from(s.row) * ch,
         width: f32::from(s.cells) * cw,
         height: ch,
     };
-    if let Some(bg) = background_fill(list, background_opacity) {
-        renderer.fill_quad(
-            Quad {
-                bounds,
-                snap: true,
-                ..Quad::default()
-            },
-            bg,
-        );
-    }
-    for (span, c) in &list.quads {
-        fill(renderer, rect(*span), *c);
-    }
-    // Pictures with `z < 0` (and the tiles replacing `U+10EEEE` cells): over cell backgrounds,
-    // under decorations and text.
-    images::draw_pictures(renderer, at, &list.images.under_text);
     let thin = (ch / 16.0).round().max(1.0);
     for (span, c, kind) in &list.lines {
         let r = rect(*span);
@@ -578,7 +561,7 @@ pub fn render(
     // shaped buffers; the cache keeps them alive until the frame after their last use. Placeholder
     // text (`[image W×H]`) goes through the same path, only dimmer (spec 2.6).
     shapes.end_frame();
-    draw_runs(renderer, &list.texts, bounds, &m, shapes, |run| {
+    draw_runs(renderer, &list.texts, bounds, m, shapes, |run| {
         color(run.fg)
     });
     if !list.images.placeholders.is_empty() {
@@ -586,27 +569,76 @@ pub fn render(
             renderer,
             &list.images.placeholders,
             bounds,
-            &m,
+            m,
             shapes,
             |run| color(run.fg).scale_alpha(images::PLACEHOLDER_ALPHA),
         );
     }
-    // Pictures with `z >= 0` sit over the text; their cells' glyphs are already drawn.
-    images::draw_pictures(renderer, at, &list.images.over_text);
-    if let Some(a) = accent {
+}
+
+pub fn render(
+    list: &DrawList,
+    renderer: &mut iced::Renderer,
+    bounds: Rectangle,
+    m: Metrics,
+    accent: Option<Rgb>,
+    background_opacity: f32,
+    shapes: &mut ShapeCache,
+) {
+    let (cw, ch) = (m.cell.width, m.cell.height);
+    // Pictures are laid out relative to the grid's top-left corner; this shifts them here.
+    let at = iced::Point::new(bounds.x, bounds.y);
+    let rect = |s: Span| Rectangle {
+        x: bounds.x + f32::from(s.col) * cw,
+        y: bounds.y + f32::from(s.row) * ch,
+        width: f32::from(s.cells) * cw,
+        height: ch,
+    };
+    if let Some(bg) = background_fill(list, background_opacity) {
         renderer.fill_quad(
             Quad {
                 bounds,
-                border: Border {
-                    color: color(a),
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
                 snap: true,
                 ..Quad::default()
             },
-            iced::Color::TRANSPARENT,
+            bg,
         );
+    }
+    for (span, c) in &list.quads {
+        fill(renderer, rect(*span), *c);
+    }
+    // Paint order on screen is the ORDER LAYERS ARE CREATED, not the order primitives are issued:
+    // `push_clip` opens a new layer above the current one and `pop_clip` returns to it
+    // (`iced_graphics-0.14.0/src/layer.rs`), and a renderer paints layers in index order — each
+    // one's quads, then its images, then its text (`iced_wgpu-0.14.0/src/lib.rs`). Everything
+    // issued above went into the base layer, so it sits under every picture opened from here on.
+
+    // z < 0 pictures (and the tiles replacing `U+10EEEE` cells), each in its own clipped layer:
+    // over the cell backgrounds, under the text that follows.
+    images::draw_pictures(renderer, at, &list.images.under_text);
+    // Decorations, cursor, glyphs and placeholder text share ONE layer opened after all of them:
+    // a background image may cover a cell's fill, but it must not cover what is written there.
+    renderer.with_layer(bounds, |r| draw_text_group(r, list, bounds, &m, shapes));
+    // Pictures with `z >= 0` sit over the text: their cells' glyphs are already drawn.
+    images::draw_pictures(renderer, at, &list.images.over_text);
+    // The pane accent in a layer of its own, opened last: a picture touching the pane edge must not
+    // hide the border that says which pane is focused.
+    if let Some(a) = accent {
+        renderer.with_layer(bounds, |r| {
+            r.fill_quad(
+                Quad {
+                    bounds,
+                    border: Border {
+                        color: color(a),
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    snap: true,
+                    ..Quad::default()
+                },
+                iced::Color::TRANSPARENT,
+            );
+        });
     }
 }
 

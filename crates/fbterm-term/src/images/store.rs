@@ -173,15 +173,22 @@ impl Entry {
     }
 }
 
-/// Buffers and jobs taken out of the store while its mutex was held. A few hundred MiB of pixel
-/// buffers and up to 16 MiB of queued payloads are freed *after* the lock is released, so dropping
-/// them cannot stall a draw-path `get`.
+/// What a store operation took out while its mutex was held: buffers, jobs, and the owners whose
+/// visible state changed.
+///
+/// A few hundred MiB of pixel buffers and up to 16 MiB of queued payloads are freed *after* the
+/// lock is released (see [`ImageStore::finish_resample`]), so dropping them cannot stall a draw-path
+/// `get`. `wake` names owners whose state changed in a way their pane must see — a size refused, a
+/// copy or picture they were shown evicted: the cached draw list holds a handle for pixels that are
+/// gone now, and asking again answers the placeholder spec 6.3 asks for. Those hooks run with no
+/// lock held (see [`ImageStore::wake_owners`]).
 #[derive(Default)]
 struct Freed {
     jobs: Vec<Job>,
     entries: Vec<Entry>,
     images: Vec<Arc<Rgba8Image>>,
     copies: Vec<Arc<ResampledImage>>,
+    wake: Vec<u64>,
 }
 
 impl Freed {
@@ -210,6 +217,12 @@ impl Freed {
                 self.copies.push(out);
             }
         }
+    }
+
+    /// Notes that `owner`'s visible state changed, so its pane has to be asked to redraw. Duplicates
+    /// are harmless: [`ImageStore::wake_owners`] wakes each owner once.
+    fn woke(&mut self, owner: u64) {
+        self.wake.push(owner);
     }
 }
 
@@ -534,9 +547,9 @@ impl ImageStore {
             }
         };
         let target = fit_target(&whole, src, box_px);
-        // The filter rule is asked about the area the placement shows: when that is an exact
-        // integer zoom, so is `whole` to `target` (the same factor scales both).
-        let (area_w, area_h) = src_area(src, whole.width, whole.height);
+        // The filter rule is asked about the pair the resample actually scales: `whole` to `target`
+        // (the crop's own area would call an exact 2x zoom of a sheet with a different-aspect tile
+        // non-integer, and pixel art would go through Lanczos for no reason).
         image.shown = self.next_stamp();
         match image.resamples.get_mut(&target) {
             Some(Slot::Ready(stamp, out)) => {
@@ -554,7 +567,7 @@ impl ImageStore {
             }
             None => {}
         }
-        let integer = is_integer_multiple(area_w, area_h, target.0, target.1);
+        let integer = is_integer_multiple(whole.width, whole.height, target.0, target.1);
         image.resamples.insert(target, Slot::Queued);
         // This picture's other cached sizes stay: a drawer that later comes back to one of them
         // should not have to re-make it, and memory is bounded by the LRU plus cap enforcement at
@@ -609,6 +622,54 @@ impl ImageStore {
             // A refusal for an evicted owed key sits on the queue: do not let it wait for some
             // other submit to happen to wake the worker.
             self.wake.notify_one();
+        }
+        self.wake_owners(&freed.wake);
+    }
+
+    /// Ask each owner in `owners` (duplicates collapsed) to redraw, through the hook its session
+    /// registered. Called after the store mutex is released: a hook delivers events and marks a
+    /// pane dirty, and nothing of that belongs under the lock — the rule the worker already keeps.
+    fn wake_owners(&self, owners: &[u64]) {
+        let mut seen: Vec<u64> = Vec::with_capacity(owners.len());
+        for owner in owners {
+            if !seen.contains(owner) {
+                seen.push(*owner);
+            }
+        }
+        for owner in seen {
+            // One short lock per owner to read its hook out; the call itself happens with nothing
+            // held. An owner that vanished meanwhile (its terminal dropped) needs no redraw.
+            let wake = {
+                let inner = self.inner.lock();
+                inner
+                    .owners
+                    .get(&owner)
+                    .and_then(|e| e.hooks.as_ref().map(|h| h.wake.clone()))
+            };
+            if let Some(wake) = wake {
+                wake();
+            }
+        }
+    }
+
+    /// Stamp `keys` as shown for `owner`, one lock for the whole list.
+    ///
+    /// The draw path normally stamps through [`Self::get`]; a frame that was reused without asking
+    /// (nothing about the pane changed) still shows the same pictures, and without this those
+    /// pictures would age out of the LRU while plainly on screen. Keys the owner no longer has are
+    /// skipped; nothing is queued and nothing is woken — this only moves stamps.
+    pub fn touch_drawn(&self, owner: u64, keys: &[ImageKey]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock();
+        let Some(entry) = inner.owners.get_mut(&owner) else {
+            return;
+        };
+        for key in keys {
+            if let Some(image) = entry.images.get_mut(key) {
+                image.shown = self.next_stamp();
+            }
         }
     }
 
@@ -985,12 +1046,15 @@ impl ImageStore {
         wake();
     }
 
-    /// Install a finished resample and wake the pane so it redraws with the new copy.
+    /// Install a finished resample — or refuse it — and wake the pane either way.
     ///
     /// The pixel buffer becomes an iced image handle here, on the worker, once: that is what makes
     /// "an image is uploaded to the GPU once" (spec goal 4) true, because every later frame draws
     /// the same handle id and iced reuses its texture. `source` is the source image's pixel size,
-    /// which the drawer needs to map a placement's `src` rectangle onto this copy.
+    /// which the drawer needs to map a placement's `src` rectangle onto this copy. A refusal wakes
+    /// too: the frame that asked is sitting on `pending`, and only asking again answers the
+    /// placeholder spec 2.6 and 6.3 draw in the empty box (the refused slot then answers without
+    /// queueing, so this cannot become a loop).
     fn finish_resample(
         &self,
         owner: u64,
@@ -1001,7 +1065,7 @@ impl ImageStore {
     ) {
         // Declared before the lock guard so everything enforcement takes goes after the mutex.
         let mut freed = Freed::default();
-        let wake = {
+        {
             let mut inner = self.inner.lock();
             // Only install onto the exact queue slot this job filled: if the source was evicted
             // or released meanwhile, its Arc in this job is what kept it alive, and now goes.
@@ -1048,56 +1112,57 @@ impl ImageStore {
                     image.resamples.insert(target, Slot::Refused);
                 }
                 freed.copies.push(out); // the made buffer goes after the mutex, untouched
-                return; // and nothing is woken: no draw could use what was refused
-            }
-            if let Some(entry) = inner.owners.get_mut(&owner)
-                && let Some(image) = entry.images.get_mut(&key)
-            {
-                image.resamples.insert(target, Slot::Ready(stamp, out));
-                image.resample_bytes += bytes;
-                entry.bytes += bytes;
-            }
-            inner.total += bytes;
-            // Resampled bytes count against the caps too, so they are enforced here — with this
-            // copy and its source image protected: what goes first is an older copy or an older
-            // picture, never the one just asked for. Every other copy this drops is marked
-            // refused (see [`Reason::Install`]): a displaced on-screen size becomes its
-            // placeholder instead of resampling once per frame beside the new copy. If only the
-            // protected picture is left and a cap is still over — unreachable with the up-front
-            // check, which would have refused it before evicting anything for it — the copy comes
-            // back out and the size is refused all the same. A refusal this queues needs no wake
-            // of its own: this job's worker loop picks up whatever is next when it returns.
-            let (satisfied, _queued) = Self::enforce_inner(
-                &mut inner,
-                owner,
-                Reason::Install(Protect { owner, key, target }),
-                &mut freed,
-            );
-            if satisfied {
-                inner
-                    .owners
-                    .get(&owner)
-                    .and_then(|e| e.hooks.as_ref().map(|h| h.wake.clone()))
+                // Refused IS an answer — the drawer draws the placeholder for it — and the frame
+                // that asked is parked on `pending` until it gets one, so this owner must be asked
+                // to redraw. The refused slot answers without queueing afterwards: one wake ends it.
+                freed.woke(owner);
             } else {
-                let mut refused_bytes = 0usize;
                 if let Some(entry) = inner.owners.get_mut(&owner)
                     && let Some(image) = entry.images.get_mut(&key)
-                    && let Some(Slot::Ready(_, copy)) = image.resamples.remove(&target)
                 {
-                    let gone = copy.bytes();
-                    entry.bytes -= gone;
-                    image.resample_bytes -= gone;
-                    freed.copies.push(copy);
-                    image.resamples.insert(target, Slot::Refused);
-                    refused_bytes = gone;
+                    image.resamples.insert(target, Slot::Ready(stamp, out));
+                    image.resample_bytes += bytes;
+                    entry.bytes += bytes;
                 }
-                inner.total -= refused_bytes;
-                None
+                inner.total += bytes;
+                // Resampled bytes count against the caps too, so they are enforced here — with this
+                // copy and its source image protected: what goes first is an older copy or an older
+                // picture, never the one just asked for. Every other copy this drops is marked
+                // refused (see [`Reason::Install`]) and wakes its owner (see [`Freed::wake`]): a
+                // displaced on-screen size becomes its placeholder instead of resampling once per
+                // frame beside the new copy, and a pane whose picture went must see that. If only
+                // the protected picture is left and a cap is still over — unreachable with the
+                // up-front check, which would have refused it before evicting anything for it — the
+                // copy comes back out and the size is refused all the same, another answer the
+                // asking pane has to hear. A refusal enforcement queues for an evicted owed key
+                // needs no wake of its own: this job's worker loop takes whatever is next.
+                let (satisfied, _queued) = Self::enforce_inner(
+                    &mut inner,
+                    owner,
+                    Reason::Install(Protect { owner, key, target }),
+                    &mut freed,
+                );
+                if satisfied {
+                    freed.woke(owner); // the new copy is there: draw it
+                } else {
+                    let mut refused_bytes = 0usize;
+                    if let Some(entry) = inner.owners.get_mut(&owner)
+                        && let Some(image) = entry.images.get_mut(&key)
+                        && let Some(Slot::Ready(_, copy)) = image.resamples.remove(&target)
+                    {
+                        let gone = copy.bytes();
+                        entry.bytes -= gone;
+                        image.resample_bytes -= gone;
+                        freed.copies.push(copy);
+                        image.resamples.insert(target, Slot::Refused);
+                        refused_bytes = gone;
+                    }
+                    inner.total -= refused_bytes;
+                    freed.woke(owner);
+                }
             }
-        };
-        if let Some(wake) = wake {
-            wake();
         }
+        self.wake_owners(&freed.wake);
     }
 }
 
@@ -1325,6 +1390,9 @@ fn evict_resample(
         }
         inner.total -= bytes;
     }
+    // Whatever was on screen for this owner just changed: its cached frame holds a handle for
+    // pixels that are gone, and only asking again answers what to draw in their place.
+    freed.woke(owner);
     true
 }
 
@@ -1381,6 +1449,9 @@ fn evict_image(
         inner.jobs.push_back(Job::Refuse { owner, key, serial });
         *queued_job = true;
     }
+    // The picture itself went: its placements draw placeholders now, so this owner's cached frame
+    // must be rebuilt (see [`Freed::wake`]).
+    freed.woke(owner);
     true
 }
 
@@ -1452,23 +1523,61 @@ mod tests {
     }
 
     /// Events and wakes captured through the owner hooks.
+    ///
+    /// With a probe store attached (see [`Captured::hooks_probing`]), each `wake` also checks that
+    /// the store mutex is NOT held when it runs: a hook delivers events and marks a pane dirty, and
+    /// none of that belongs inside the store's short critical section.
     #[derive(Clone, Default)]
     struct Captured(
         Arc<StdMutex<Vec<TermEvent>>>,
         Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<StdMutex<Option<Arc<ImageStore>>>>,
     );
 
     impl Captured {
         fn hooks(&self, term: &Arc<Mutex<Terminal>>) -> OwnerHooks {
+            self.hooks_with(term, None)
+        }
+
+        /// Hooks that additionally record whether the store mutex was free at each `wake`.
+        fn hooks_probing(
+            &self,
+            term: &Arc<Mutex<Terminal>>,
+            store: &Arc<ImageStore>,
+        ) -> OwnerHooks {
+            *self.3.lock().unwrap() = Some(store.clone());
+            self.hooks_with(term, None)
+        }
+
+        fn hooks_with(
+            &self,
+            term: &Arc<Mutex<Terminal>>,
+            probe: Option<Arc<ImageStore>>,
+        ) -> OwnerHooks {
             let sink = self.0.clone();
             let wakes = self.1.clone();
+            let held = self.2.clone();
+            let probe = probe.or_else(|| self.3.lock().unwrap().clone());
             OwnerHooks {
                 term: Arc::downgrade(term),
                 on_events: Arc::new(move |events| sink.lock().unwrap().extend(events)),
                 wake: Arc::new(move || {
                     wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(store) = probe.clone() else { return };
+                    // `try_lock` returns a guard only when it actually takes the mutex; binding it
+                    // in a statement drops it again immediately, so this cannot deadlock.
+                    let free = store.inner.try_lock().is_some();
+                    if !free {
+                        held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }),
             }
+        }
+
+        /// How many wakes ran while the probed store's mutex was still held (0 is the rule).
+        fn locked_wakes(&self) -> usize {
+            self.2.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         fn events(&self) -> Vec<TermEvent> {
@@ -2278,11 +2387,11 @@ mod tests {
 
     /// A copy that cannot fit beside its own source is refused — up front when geometry alone
     /// proves it (see [`ImageStore::finish_resample`]), or by dropping back out when enforcement
-    /// gets only as far as "nothing but the protected picture" — with no `wake` (a redraw would
-    /// only queue it again), and the refusal remembered for that `(key, target)`: every later draw
-    /// answers `Evicted` without queueing, until the source image is replaced or released. That
-    /// memory is the chosen loop guard: re-asking a size that provably cannot fit would burn the
-    /// same work forever.
+    /// gets only as far as "nothing but the protected picture" — with one `wake` for the asking
+    /// pane (refused is an answer: it draws the placeholder), and the refusal remembered for that
+    /// `(key, target)`: every later draw answers `Evicted` without queueing, until the source image
+    /// is replaced or released. That memory is the chosen loop guard: re-asking a size that provably
+    /// cannot fit would burn the same work forever.
     #[test]
     fn a_copy_that_cannot_fit_is_refused_once_and_stays_refused() {
         let per_owner = 16 * KB + 512; // room for a 16 KiB picture, not for a copy beside it
@@ -2320,8 +2429,8 @@ mod tests {
         );
         assert_eq!(
             captured.wakes(),
-            0,
-            "an unsatisfiable install must not wake a redraw"
+            1,
+            "the refusal is an answer the pane has to redraw for: it draws the placeholder"
         );
         assert_eq!(store.owner_bytes(owner), 16 * KB);
         assert!(store.owner_bytes(owner) <= per_owner);
@@ -2379,12 +2488,218 @@ mod tests {
             store.get(owner, ImageKey(1), (16, 16), None),
             Lookup::Evicted { .. }
         ));
-        assert_eq!(captured.wakes(), 0, "a refused install wakes nothing");
+        assert_eq!(
+            captured.wakes(),
+            1,
+            "a refusal wakes the asking pane once, so its empty box becomes the placeholder"
+        );
         assert_eq!(
             store.owner_bytes(owner),
             16 * KB + 256,
             "byte counts untouched"
         );
+    }
+
+    /// A refused size is an answer, not a silence. The pane that asked parked its frame on
+    /// `pending`, and only asking again draws the `[image W×H]` line spec 2.6 and 6.3 put in an
+    /// empty box — so the refusal wakes its owner, with the store mutex released (a hook delivers
+    /// events and marks a pane dirty; none of that belongs in the store's short critical section).
+    /// The refused slot then answers without queueing, so this cannot become a loop.
+    #[test]
+    fn a_refusal_wakes_its_owner_with_the_store_unlocked() {
+        let per_owner = 16 * KB + 512; // the source alone fits; source plus any copy never does
+        let store = Arc::new(ImageStore::with_caps(per_owner, 8 * per_owner));
+        let owner = 21;
+        let term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let captured = Captured::default();
+        store.register_owner(owner, captured.hooks_probing(&term, &store));
+
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1)); // 16 KiB
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle(); // refused: the copy cannot fit beside its source
+        assert_eq!(captured.wakes(), 1, "the refusal reaches the pane");
+        assert_eq!(
+            captured.locked_wakes(),
+            0,
+            "the hook ran with no store lock held"
+        );
+
+        // The redraw asks again and is answered at once, without queueing or waking a second time.
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None),
+            Lookup::Evicted { .. }
+        ));
+        store.run_jobs_until_idle();
+        assert_eq!(captured.wakes(), 1, "one refusal wakes the pane once");
+        assert_books(&store);
+    }
+
+    /// A picture taken from an owner by cap pressure — even pressure another pane caused — wakes
+    /// that owner. Its cached draw list holds a handle for pixels the store just freed: only asking
+    /// again replaces the picture with its placeholder and lets iced drop the texture, which is how
+    /// the caps stay the real bound on memory rather than a number the visible panes exceed.
+    #[test]
+    fn an_eviction_wakes_the_owner_it_took_from() {
+        // Room for one 4 KiB picture in all: enforcement takes the triggering owner's own first and
+        // then the other's, and both must hear about it.
+        let store = Arc::new(ImageStore::with_caps(8 * KB, 2 * KB));
+        let (trigger, other) = (22, 23);
+        let t_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let o_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let mine = Captured::default();
+        let theirs = Captured::default();
+        store.register_owner(trigger, mine.hooks_probing(&t_term, &store));
+        store.register_owner(other, theirs.hooks_probing(&o_term, &store));
+
+        store.submit(other, ImageKey(1), rgba(32, 32, 7)); // shown first
+        store.submit(trigger, ImageKey(1), rgba(32, 32, 9));
+        assert_eq!(store.owner_bytes(other), 4 * KB);
+        store.enforce_caps(trigger); // what a submit or a finished decode does afterwards
+
+        assert_eq!(
+            store.owner_bytes(trigger),
+            0,
+            "the trigger's own picture went first"
+        );
+        assert_eq!(
+            store.owner_bytes(other),
+            0,
+            "then the older one to free the cap"
+        );
+        assert_eq!(
+            theirs.wakes(),
+            1,
+            "the pane whose picture was taken is asked to redraw"
+        );
+        assert_eq!(
+            mine.wakes(),
+            1,
+            "and so is the one enforcement freed room from"
+        );
+        assert_eq!(
+            theirs.locked_wakes() + mine.locked_wakes(),
+            0,
+            "no wake ran under the store mutex"
+        );
+        assert_books(&store);
+    }
+
+    /// A frame reused without asking the store reports what it still shows (`ImageStore::touch_drawn`),
+    /// or the LRU's idea of "least recently shown" drifts from what is on screen: a pane sitting on
+    /// one picture while another fills the caps would lose that picture mid-view.
+    #[test]
+    fn touch_drawn_keeps_a_visible_picture_through_lru() {
+        let per_owner = 8 * KB + 512; // room for two 4 KiB pictures, not three
+        let store = ImageStore::with_caps(per_owner, 16 * KB);
+        let owner = 24;
+        store.submit(owner, ImageKey(1), rgba(32, 32, 1)); // shown first
+        store.submit(owner, ImageKey(2), rgba(32, 32, 2));
+        // The pane still draws key 1 — its frame was reused, so it never asked for it.
+        store.touch_drawn(owner, &[ImageKey(1)]);
+        store.submit(owner, ImageKey(3), rgba(32, 32, 3)); // the third does not fit
+        store.enforce_caps(owner);
+        {
+            let inner = store.inner.lock();
+            assert!(
+                matches!(
+                    inner.owners[&owner].images[&ImageKey(1)].state,
+                    State::Ready(_)
+                ),
+                "the visible picture survived: reporting it shown made it the newest"
+            );
+            assert!(
+                matches!(
+                    inner.owners[&owner].images[&ImageKey(2)].state,
+                    State::Evicted
+                ),
+                "the picture nobody drew went instead"
+            );
+        }
+        // An unknown key is skipped, not an error; an empty list takes no lock at all.
+        store.touch_drawn(owner, &[ImageKey(9)]);
+        store.touch_drawn(999, &[ImageKey(1)]);
+        assert_books(&store);
+    }
+
+    /// The filter rule is asked about the pair the resample actually scales — `whole` to `target` —
+    /// so a 2x zoom of a pixel-art sheet stays nearest neighbour even when the placement crops it to
+    /// another aspect. The queued job shows the decision; the finished copy proves it, with the
+    /// sheet's hard edge still hard (Lanczos3 rings beside an edge like this).
+    #[test]
+    fn an_integer_zoom_of_a_crop_uses_nearest() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let owner = 25;
+        // A 64x32 sheet: opaque black on the left half, white on the right.
+        let mut pixels = vec![0u8; 64 * 32 * 4];
+        for px in pixels.as_chunks_mut::<4>().0 {
+            px[3] = 255; // fully opaque everywhere: what differs is the colour, not the alpha
+        }
+        for y in 0..32usize {
+            for x in 32..64usize {
+                let i = (y * 64 + x) * 4;
+                pixels[i] = 255;
+                pixels[i + 1] = 255;
+                pixels[i + 2] = 255;
+            }
+        }
+        store.submit(
+            owner,
+            ImageKey(1),
+            ImageData::Rgba {
+                width: 64,
+                height: 32,
+                pixels,
+            },
+        );
+
+        // A 16x16 tile of the black half, in a 32x32 box: factor 2, so the copy is the whole sheet
+        // at 128x64 — an exact 2x zoom of ITSELF, whatever the crop's own aspect was.
+        let src = Some(Rect {
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+        });
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (32, 32), src),
+            Lookup::Pending
+        ));
+        let integer = {
+            let inner = store.inner.lock();
+            match inner.jobs.front() {
+                Some(Job::Resample {
+                    target, integer, ..
+                }) => {
+                    assert_eq!(
+                        *target,
+                        (128, 64),
+                        "the whole sheet at the crop's fit factor"
+                    );
+                    *integer
+                }
+                Some(_) => panic!("the queued job is not a resample"),
+                None => panic!("nothing was queued for the new shape"),
+            }
+        };
+        assert!(integer, "64x32 to 128x64 is an integer multiple");
+        store.run_jobs_until_idle();
+
+        match store.get(owner, ImageKey(1), (32, 32), src) {
+            Lookup::Ready(img) => {
+                assert_eq!((img.width, img.height), (128, 64));
+                let px = img.pixels();
+                // The sheet's edge lands between copy columns 63 and 64: nearest repeats each source
+                // pixel, so both stay exactly what they were.
+                let at = |x: usize| [px[x * 4], px[x * 4 + 1], px[x * 4 + 2], px[x * 4 + 3]];
+                assert_eq!(at(63), [0, 0, 0, 255], "the last black column");
+                assert_eq!(at(64), [255, 255, 255, 255], "the first white one");
+            }
+            other => panic!("expected the finished copy, got {other:?}"),
+        }
+        assert_books(&store);
     }
 
     /// A decode that finishes with no hooks registered still enforces the caps: the installed

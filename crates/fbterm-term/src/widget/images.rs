@@ -57,7 +57,20 @@ pub struct CellGeometry {
 }
 
 impl CellGeometry {
+    /// Geometry for one cell size and display scale.
+    ///
+    /// A scale that is not a positive finite number becomes 1.0 — the same fallback
+    /// [`crate::GridSize`] uses when a display reports something bogus (see
+    /// [`crate::grid_size_from_bounds`]). Without it a NaN would turn every box into `cols × rows`
+    /// pixels and every bound into millions of logical ones, so images would stop lining up with the
+    /// cells programs were told about. The widget builds this from the terminal's own grid, which is
+    /// already sanitized; the guard here keeps every other caller honest too.
     pub fn new(cell: Size, scale: f32) -> Self {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
         Self { cell, scale }
     }
 
@@ -172,6 +185,28 @@ pub fn crop_for_src(src: Option<Rect>, source: (u32, u32), copy: (u32, u32)) -> 
     let (x, w) = axis(r.x, r.w, source.0, copy.0);
     let (y, h) = axis(r.y, r.h, source.1, copy.1);
     Rect { x, y, w, h }
+}
+
+/// What a placement's picture is cut to: its box, the pane, and — when it shows a `src` rectangle —
+/// as much of the box as that crop covers.
+///
+/// The copy holds the WHOLE image, shifted so the crop's first pixel sits at the box's top-left
+/// corner. Whenever the box is bigger than the crop on either axis — its aspect differs from the
+/// crop's, its span was rounded up to whole cells, [`crate::images::resample`] capped the copy —
+/// pixels past the rectangle the program asked for would otherwise show inside the box: a sprite
+/// sheet cropped to one tile would spill the neighbouring tiles into it. With no `src` the crop is
+/// the whole copy and this third term cannot cut anything.
+pub fn placement_clip(
+    box_: Rectangle,
+    crop: Rect,
+    m: CellGeometry,
+    pane: Rectangle,
+) -> Option<Rectangle> {
+    let shown = Rectangle::new(
+        Point::new(box_.x, box_.y),
+        Size::new(m.logical_of(crop.w), m.logical_of(crop.h)),
+    );
+    clip_rect(clip_rect(box_, pane)?, shown)
 }
 
 /// The rectangle a `copy`-pixel picture occupies inside `area`: its pixels at 1:1 physical scale
@@ -316,10 +351,13 @@ pub fn placeholder_tile(cell: &Cell, prev: Option<Placeholder>) -> Option<Placeh
 pub struct ImageDraw {
     /// Where the picture goes: its own size at 1:1 physical scale, never stretched to `clip`.
     pub bounds: Rectangle,
-    /// What to cut it to (its placement box or a run of cells, ∩ the pane).
+    /// What to cut it to (its placement box ∩ the crop's extent ∩ the pane, or a run of cells).
     pub clip: Rectangle,
     /// The store's resampled copy: cloning this handle costs nothing and reuses one GPU texture.
     pub handle: Handle,
+    /// What image this is, so a frame that is reused without asking the store can still report what
+    /// it shows (see [`super::super::images::ImageStore::touch_drawn`]).
+    pub key: ImageKey,
 }
 
 /// Everything a frame draws that is not text, resolved from the terminal under its lock.
@@ -337,6 +375,17 @@ pub struct ImageLayer {
     /// The widget rebuilds its draw list (asking again) instead of caching a frame that draws less
     /// than it can, and the store's `wake` hook is what makes that redraw happen.
     pub pending: bool,
+}
+
+impl ImageLayer {
+    /// The images this layer's pictures show: what a reused frame reports to the store so its LRU
+    /// follows what is on screen (see [`ImageStore::touch_drawn`](crate::images::ImageStore::touch_drawn)).
+    pub fn drawn_keys(&self) -> impl Iterator<Item = ImageKey> + '_ {
+        self.under_text
+            .iter()
+            .chain(self.over_text.iter())
+            .map(|d| d.key)
+    }
 }
 
 /// The `[image W×H]` text of an evicted placement or a scrolled-off row, as a text run at its grid
@@ -379,24 +428,30 @@ pub fn resolve(
 
     // In the order feathercritty returns them: it is already paint order.
     for p in t.visible_placements() {
-        // Clipped away entirely: nothing to draw, and no reason to ask a copy for it.
+        // Clipped away entirely: nothing to draw, and no reason to ask a copy for it. (The real clip
+        // is cut further by the crop below, once there is a copy to know the crop from.)
         let box_ = placement_rect(m, p.row_in_view, p.col, p.cols, p.rows, p.x_off, p.y_off);
-        let Some(clip) = clip_rect(box_, pane) else {
+        if clip_rect(box_, pane).is_none() {
             continue;
-        };
+        }
         match store.get(owner, p.key, placement_box_px(m, p.cols, p.rows), p.src) {
             Lookup::Ready(res) => {
                 let crop = crop_for_src(p.src, res.source, (res.width, res.height));
                 // The copy is the whole image; shifting it by the crop's offset puts the part this
-                // placement shows in its box, and the clip cuts away the rest.
+                // placement shows in its box. The clip cuts away the rest — including everything
+                // outside the crop, which would otherwise spill into a box larger than it ([`placement_clip`]).
                 let bounds = Rectangle::new(
                     Point::new(box_.x - m.logical_of(crop.x), box_.y - m.logical_of(crop.y)),
                     Size::new(m.logical_of(res.width), m.logical_of(res.height)),
                 );
+                let Some(clip) = placement_clip(box_, crop, m, pane) else {
+                    continue;
+                };
                 let draw = ImageDraw {
                     bounds,
                     clip,
                     handle: res.handle.clone(),
+                    key: p.key,
                 };
                 if p.z < 0 {
                     out.under_text.push(draw);
@@ -439,16 +494,13 @@ pub fn resolve(
     out
 }
 
-/// One virtual placement seen in this frame: what it refers to, and the grid cell its picture is
-/// pinned to.
+/// One virtual placement seen in this frame: what it refers to, resolved once however many of its
+/// cells are on screen. Where its picture sits is NOT kept here — every cell computes it from
+/// itself (see [`VirtualTiles::tile`]), so the same image shown at two places draws twice.
 struct Virtual {
     key: ImageKey,
     cols: u32,
     rows: u32,
-    /// The placement's top-left grid cell, taken from the first placeholder cell of it seen this
-    /// frame (that cell minus its row and column within the placement). Pinning it means every cell
-    /// of one picture agrees on where the picture is, even when only some of them are in view.
-    anchor: Option<(i64, i64)>,
 }
 
 /// A run of consecutive cells sharing one picture, merged so a row of an image costs one draw.
@@ -458,6 +510,7 @@ struct Run {
     cells: u32,
     picture: Rectangle,
     handle: Handle,
+    key: ImageKey,
 }
 
 /// Collects the pictures shown through `U+10EEEE` cells while the grid's rows are walked, and turns
@@ -516,7 +569,10 @@ impl<'a> VirtualTiles<'a> {
         self.flush_run();
     }
 
-    /// Whether `cell` at grid-local `(row, col)` is a placeholder tile whose glyph to skip.
+    /// Whether `cell` at grid-local `(row, col)` is a placeholder whose glyph to skip.
+    ///
+    /// Every `U+10EEEE` cell answers `true` while images are on: the character is private use, so
+    /// shaping it would draw a missing-glyph box whether or not the tile behind it can be resolved.
     pub fn visit(&mut self, row: u16, col: u16, cell: &Cell) -> bool {
         if cell.c != PLACEHOLDER_CHAR {
             self.prev = None;
@@ -525,8 +581,9 @@ impl<'a> VirtualTiles<'a> {
         let Some(tile) = placeholder_tile(cell, self.prev) else {
             // A placeholder this terminal cannot resolve (unknown id, or colours that break the
             // inheritance chain): it draws no tile, and nothing to its right may inherit from it.
+            // Its glyph is still skipped — a private-use character is not worth a tofu box.
             self.prev = None;
-            return false;
+            return true;
         };
         self.prev = Some(tile);
         self.tile(tile, row, col);
@@ -551,15 +608,7 @@ impl<'a> VirtualTiles<'a> {
                 self.flush_run();
                 return; // no such virtual placement: this cell has nothing to show
             };
-            self.virtuals.insert(
-                id,
-                Virtual {
-                    key,
-                    cols,
-                    rows,
-                    anchor: None,
-                },
-            );
+            self.virtuals.insert(id, Virtual { key, cols, rows });
         }
         let (key, cols, rows) = {
             let v = &self.virtuals[&id];
@@ -584,20 +633,14 @@ impl<'a> VirtualTiles<'a> {
             self.flush_run();
             return;
         };
-        // Pin the picture to the grid with the first cell of it seen this frame.
-        let anchor = match self.virtuals[&id].anchor {
-            Some(a) => a,
-            None => {
-                let a = (
-                    i64::from(col) - i64::from(tile.col),
-                    i64::from(row) - i64::from(tile.row),
-                );
-                if let Some(v) = self.virtuals.get_mut(&id) {
-                    v.anchor = Some(a);
-                }
-                a
-            }
-        };
+        // The protocol defines this cell as "tile (row, col) of the image at THIS cell", so the
+        // picture is pinned to this cell: cells of one copy agree on where it sits because they do
+        // the same arithmetic, and cells of a second copy of the same `(id, pid)` — the same picture
+        // printed twice on one screen — land where their own cells do.
+        let anchor = (
+            i64::from(col) - i64::from(tile.col),
+            i64::from(row) - i64::from(tile.row),
+        );
         let Some((picture, part)) = virtual_tile(
             self.m,
             anchor,
@@ -617,7 +660,8 @@ impl<'a> VirtualTiles<'a> {
         }
         match &mut self.run {
             Some(r)
-                if r.picture == picture
+                if r.key == key
+                    && r.picture == picture
                     && r.row == row
                     && u64::from(r.col) + u64::from(r.cells) == u64::from(col) =>
             {
@@ -631,6 +675,7 @@ impl<'a> VirtualTiles<'a> {
                     cells: 1,
                     picture,
                     handle: copy.handle.clone(),
+                    key,
                 });
             }
         }
@@ -652,6 +697,7 @@ impl<'a> VirtualTiles<'a> {
             bounds: run.picture,
             clip,
             handle: run.handle,
+            key: run.key,
         });
     }
 }
@@ -680,7 +726,10 @@ pub fn draw_pictures(renderer: &mut iced::Renderer, at: Point, draws: &[ImageDra
 #[cfg(test)]
 mod tests {
     use super::*;
+    use feathercritty::event::ImageData;
     use feathercritty::graphics::kitty_diacritics::ROW_COLUMN_DIACRITICS;
+    use feathercritty::grid::RowReader;
+    use feathercritty::index::{Column, Line};
     use feathercritty::vte::ansi::Rgb as AnsiRgb;
 
     /// Cells of 8×16 logical px at `scale`.
@@ -735,11 +784,57 @@ mod tests {
             let (bw, bh) = placement_box_px(m, 4, 2);
             assert_eq!((bw, bh), (cw as u32 * 4, ch as u32 * 2));
 
-            // A copy of that many physical pixels covers the cells again, within the rounding to
-            // whole physical pixels that both the store and the placement's span use.
+            // A copy of that many physical pixels, drawn at copy px / scale, is exactly the box the
+            // span occupies — no slack for an implementation that dropped a column or a row: the only
+            // difference from `cols × cell` logical px is the rounding of each cell to whole physical
+            // pixels, half a cell per axis.
             let drawn = Size::new(m.logical_of(bw), m.logical_of(bh));
-            assert!((drawn.width - r.width).abs() <= cell.0);
-            assert!((drawn.height - r.height).abs() <= cell.1);
+            let eps = 1e-4f32;
+            let exact = |copy: u32| (f64::from(copy) / f64::from(scale)) as f32;
+            assert!(
+                (drawn.width - exact(bw)).abs() <= eps,
+                "the copy is drawn at its own size over the scale, got {}",
+                drawn.width
+            );
+            assert!(
+                (drawn.height - exact(bh)).abs() <= eps,
+                "the copy is drawn at its own size over the scale, got {}",
+                drawn.height
+            );
+            // Which leaves only the rounding of each cell to whole physical pixels: half a cell per
+            // axis, times the span. Anything coarser (a dropped column) fails here.
+            assert!(
+                (drawn.width - r.width).abs() <= f64::from(4.0 * (0.5 / scale)) as f32 + eps,
+                "4 columns of rounded physical cells, back to logical px"
+            );
+            assert!(
+                (drawn.height - r.height).abs() <= f64::from(2.0 * (0.5 / scale)) as f32 + eps,
+                "2 rows of rounded physical cells, back to logical px"
+            );
+        }
+    }
+
+    /// A display that reports a scale of NaN (or zero, or infinity) must not move pictures off the
+    /// grid: [`crate::GridSize`] already falls back to 1.0 for what it tells programs, and the
+    /// widget builds this geometry from those numbers — the guard here is for every caller. Without
+    /// it `NaN × cell` would poison every box, and a scale of 0 would ask the store for boxes of
+    /// `cols × rows` pixels while drawing them at millions of logical ones.
+    #[test]
+    fn a_bogus_scale_falls_back_to_one() {
+        let one = geometry(1.0);
+        for bogus in [f32::NAN, 0.0, -1.0, f32::INFINITY] {
+            let m = CellGeometry::new(Size::new(8.0, 16.0), bogus);
+            assert_eq!(m.scale, 1.0, "{bogus} is not a usable scale");
+            assert_eq!(
+                placement_box_px(m, 4, 2),
+                placement_box_px(one, 4, 2),
+                "the copy asked of the store follows the fallback"
+            );
+            assert_eq!(
+                placement_rect(m, 0, 0, 4, 2, 3, 5),
+                placement_rect(one, 0, 0, 4, 2, 3, 5),
+                "so does where it is drawn"
+            );
         }
     }
 
@@ -929,6 +1024,205 @@ mod tests {
         assert_eq!(picture, rect(0.0, 4.0, 16.0, 8.0));
         assert_eq!(clip, rect(8.0, 4.0, 8.0, 8.0));
     }
+
+    /// A `src` rectangle cuts the picture to its own extent, not to the box around it: the copy holds
+    /// the whole image, so a box bigger than the crop — a different aspect, a span rounded up to whole
+    /// cells, a copy the caps shrank — would otherwise show pixels the program never asked for.
+    #[test]
+    fn a_crop_shows_only_its_own_pixels() {
+        let m = geometry(1.0);
+        let pane = m.pane(10, 5);
+        // A 16x16 tile of a 64x32 sprite sheet, in a box two cells tall (16x32 physical px): the fit
+        // factor is 1, so the copy is the whole sheet and the crop stays 16x16. The lower half of the
+        // box must show nothing — not the next row of sprites.
+        let crop = crop_for_src(
+            Some(Rect {
+                x: 0,
+                y: 0,
+                w: 16,
+                h: 16,
+            }),
+            (64, 32),
+            (64, 32),
+        );
+        let tall = placement_rect(m, 0, 0, 2, 2, 0, 0);
+        assert_eq!((tall.width, tall.height), (16.0, 32.0));
+        assert_eq!(
+            placement_clip(tall, crop, m, pane),
+            Some(rect(0.0, 0.0, 16.0, 16.0)),
+            "a box taller than the crop clips to the crop"
+        );
+
+        // The same tile in a box four cells wide (32x16): the right half shows nothing either.
+        let wide = placement_rect(m, 0, 0, 4, 1, 0, 0);
+        assert_eq!(
+            placement_clip(wide, crop, m, pane),
+            Some(rect(0.0, 0.0, 16.0, 16.0)),
+            "a box wider than the crop clips to the crop"
+        );
+
+        // A crop partway into the sheet keeps its own size, and a scrolled-off placement is still cut
+        // to both the pane and the crop.
+        let middle = crop_for_src(
+            Some(Rect {
+                x: 16,
+                y: 16,
+                w: 16,
+                h: 8,
+            }),
+            (64, 32),
+            (64, 32),
+        );
+        assert_eq!((middle.w, middle.h), (16, 8));
+        // The same tile scrolled a row off the top, its `y_off` pulling it down by 12 px: only the
+        // last 4 px of the crop are in view — cut to the pane AND to the crop at once.
+        let scrolled = placement_rect(m, -1, 0, 2, 2, 0, 12);
+        assert_eq!(
+            placement_clip(scrolled, middle, m, pane),
+            Some(rect(0.0, 0.0, 16.0, 4.0)),
+            "pane and crop together"
+        );
+
+        // With no `src` the crop is the whole copy, so this can cut nothing: the box stands as is.
+        let whole = crop_for_src(None, (64, 32), (64, 32));
+        assert_eq!(whole.w, 64);
+        assert_eq!(
+            placement_clip(tall, whole, m, pane),
+            clip_rect(tall, pane),
+            "an uncropped placement is unchanged"
+        );
+    }
+
+    /// The protocol defines each placeholder cell as "tile (row, col) of the image AT THIS CELL", so
+    /// a picture printed twice on one screen — the same `(id, pid)` in two places, which is how a TUI
+    /// redraws it and how scrollback keeps an earlier copy — draws at both. Each cell computes its
+    /// picture from its own position, and cells of different copies never merge into one run.
+    #[test]
+    fn one_image_printed_twice_draws_at_both_places() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        // A 2x2 RGBA picture transmitted as id 7 (16 bytes of opaque white), then displayed as a
+        // virtual placement (`U=1`) covering 2 cells by 2. Its placeholder cells are what a program
+        // prints; the emulator only records the id and span.
+        term.feed(b"\x1b_Ga=t,f=32,s=2,v=2,i=7;/////////////////////w==\x1b\\");
+        let mut key = None;
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key: k, data } = event {
+                assert!(matches!(
+                    data,
+                    ImageData::Rgba {
+                        width: 2,
+                        height: 2,
+                        ..
+                    }
+                ));
+                store.submit(term.image_owner(), k, data);
+                key = Some(k);
+            }
+        }
+        let key = key.expect("the transmission reaches the store");
+        term.feed(b"\x1b_Ga=p,i=7,U=1,c=2,r=2\x1b\\");
+        term.take_events(); // the OK reply: not what this is about
+
+        // The same two tiles printed on row 0 and again on row 2, colours naming image id 7.
+        let print = |term: &mut Terminal, row: u16| {
+            term.feed(format!("\x1b[{};1H\x1b[0m\x1b[38;2;0;0;7m", row + 1).as_bytes());
+            for col in 0..2u32 {
+                term.feed(
+                    format!("{}{}{}", PLACEHOLDER_CHAR, mark(0), mark(col as usize)).as_bytes(),
+                );
+            }
+        };
+        print(&mut term, 0);
+        print(&mut term, 2);
+
+        // The span's copy is queued by the first pass and ready for the second.
+        let draw = |term: &Terminal| {
+            let mut layer = ImageLayer::default();
+            let mut vt = VirtualTiles::new(&store, term, geometry(1.0)).expect("images are on");
+            let grid = term.term().grid();
+            let rows = usize::from(term.size().rows);
+            let cols = usize::from(term.size().cols);
+            let mut reader = RowReader::new();
+            for y in 0..rows {
+                vt.begin_row();
+                let line = Line(y as i32 - grid.display_offset() as i32);
+                let cells = reader.row(grid, line);
+                for x in 0..cols {
+                    vt.visit(y as u16, x as u16, &cells[Column(x)]);
+                }
+                vt.end_row();
+            }
+            vt.finish(&mut layer);
+            layer
+        };
+        let first = draw(&term);
+        assert!(first.pending, "the 2x2 copy is not made yet");
+        store.run_jobs_until_idle();
+        let layer = draw(&term);
+
+        // A 2x2 picture in a 16x32 px span fits to 16x16 and centres: rows 8..24 of the first copy's
+        // cells, rows 40..56 of the second's. Two draws, one per copy — not one and a blank.
+        assert_eq!(layer.under_text.len(), 2, "both copies draw");
+        assert_eq!(layer.under_text[0].bounds, rect(0.0, 8.0, 16.0, 16.0));
+        assert_eq!(layer.under_text[0].clip, rect(0.0, 8.0, 16.0, 8.0));
+        assert_eq!(layer.under_text[1].bounds, rect(0.0, 40.0, 16.0, 16.0));
+        assert_eq!(
+            layer.under_text[1].clip,
+            rect(0.0, 40.0, 16.0, 8.0),
+            "the second copy's clip covers its own cells"
+        );
+        assert_eq!(layer.under_text[0].key, key);
+        assert_eq!(layer.under_text[1].key, key);
+    }
+
+    /// A `U+10EEEE` cell whose tile cannot be resolved still does not go to text shaping: it is a
+    /// private-use character, so shaping it draws a missing-glyph box where the picture should be.
+    #[test]
+    fn an_unresolvable_placeholder_cell_is_not_shaped() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        let mut vt = VirtualTiles::new(&store, &term, geometry(1.0)).expect("images are on");
+        // An id nothing refers to: no tile to draw, and the glyph stays skipped.
+        assert!(
+            vt.visit(0, 0, &placeholder(99, &[mark(0), mark(0)])),
+            "an unresolved placeholder skips its glyph too"
+        );
+        // A cell that is not a placeholder at all keeps going to text.
+        let plain = Cell {
+            c: 'x',
+            ..Cell::default()
+        };
+        assert!(!vt.visit(0, 1, &plain));
+        let mut layer = ImageLayer::default();
+        vt.finish(&mut layer);
+        assert!(
+            layer.under_text.is_empty(),
+            "an id nothing refers to draws no tile"
+        );
+        assert!(!layer.pending, "and it waits for nothing");
+    }
+
+    /// KiB, for store caps in these tests.
+    const KB: usize = 1024;
 
     #[test]
     fn placeholder_cells_decode_their_tile() {
