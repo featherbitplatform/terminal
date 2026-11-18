@@ -152,11 +152,30 @@ impl SessionHandle {
 
     /// [`SessionHandle::inert`] that keeps what is sent to it: what the user typed can be
     /// read back from the [`InputLog`].
+    ///
+    /// It routes as well, so a test can follow an event from the emulator to the program's input:
+    /// [`SessionHandle::deliver_events`] on this handle answers out of the same queue keystrokes go
+    /// into. Its half of the session-event channel is dropped - titles and redraw notices reach
+    /// nobody here, only what is written to the program is kept.
     #[doc(hidden)]
     pub fn recording(terminal: SharedTerminal) -> (Self, InputLog) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut handle = Self::inert(terminal);
-        handle.commands = tx;
+        let (events, _unread) = tokio::sync::mpsc::unbounded_channel();
+        let owner = terminal.lock().image_owner();
+        let mut handle = Self::inert(terminal.clone());
+        handle.commands = tx.clone();
+        handle.router = Some(Arc::new(Router {
+            id: handle.id,
+            events,
+            replies: tx,
+            dirty_pending: handle.dirty_pending.clone(),
+            bell_pending: handle.bell_pending.clone(),
+            ended: handle.ended.clone(),
+            terminal: Arc::downgrade(&terminal),
+            owner,
+            last_title: parking_lot::Mutex::new(None),
+            routing: parking_lot::Mutex::new(()),
+        }));
         (handle, InputLog(rx))
     }
 
@@ -253,9 +272,33 @@ struct Router {
     /// The terminal's id in the image store ([`Terminal::image_owner`]).
     owner: u64,
     last_title: parking_lot::Mutex<Option<String>>,
+    /// One terminal's events are taken and routed together, by one thread at a time.
+    ///
+    /// Replies must reach a program in the order the emulator produced them, and a picture must
+    /// reach the store before the event that releases its key. Three threads can hold events for
+    /// the same terminal: the session's feeder ([`Feeder::feed`]), the app delivering what a pane's
+    /// first real grid released ([`Router::deliver_queued`]) and the image worker, through this
+    /// terminal's owner hooks. Emptying the queue is only atomic with delivering from it if both
+    /// happen under this lock - otherwise one thread can take the older events, drop the lock, and
+    /// be overtaken on the way to the replies queue by another that took newer ones.
+    ///
+    /// Taken before the terminal lock and held across taking and routing, so the order is always
+    /// routing, then terminal, then store: routing takes the store lock (a picture goes there),
+    /// nothing takes this lock while holding the terminal or the store - the store runs its hooks
+    /// with nothing held - and `wake` (the redraw notice) is a channel send made without any lock.
+    routing: parking_lot::Mutex<()>,
 }
 
 impl Router {
+    /// Route events the image worker produced for this terminal, in its turn: the store calls an
+    /// owner's hooks with nothing held, so this is where a finished decode's answer joins the queue
+    /// of replies and picture events, behind whatever was already waiting to be routed (see
+    /// [`Router::routing`]).
+    fn route_in_order(&self, term_events: Vec<TermEvent>) {
+        let _routing = self.routing.lock();
+        self.route(term_events);
+    }
+
     /// Pass the events one feed (or one decode result) produced on to their destinations.
     fn route(&self, term_events: Vec<TermEvent>) {
         for ev in term_events {
@@ -310,6 +353,9 @@ impl Router {
         let Some(terminal) = self.terminal.upgrade() else {
             return; // nobody owns this terminal any more: nothing waits for its events
         };
+        // One critical section with the feeder and the image worker, so what this released reaches
+        // the program ahead of whatever output arrives next (see `Router::routing`).
+        let _routing = self.routing.lock();
         let events = {
             let mut term = terminal.lock();
             term.take_events()
@@ -401,6 +447,7 @@ impl Feeder {
             terminal: Arc::downgrade(&terminal),
             owner,
             last_title: parking_lot::Mutex::new(None),
+            routing: parking_lot::Mutex::new(()),
         });
         fbterm_term::images::store().register_owner(
             owner,
@@ -408,7 +455,7 @@ impl Feeder {
                 term: Arc::downgrade(&terminal),
                 on_events: {
                     let router = router.clone();
-                    Arc::new(move |events| router.route(events))
+                    Arc::new(move |events| router.route_in_order(events))
                 },
                 wake: {
                     let router = router.clone();
@@ -443,6 +490,11 @@ impl Feeder {
     /// graphics protocols' stall watchdog runs on the same lock: this app schedules no timers,
     /// so feeding output is what keeps chunked transmissions and parked replies moving.
     pub fn feed(&mut self, bytes: &[u8]) {
+        // Held across taking the events and routing them: this thread, the app delivering what a
+        // pane's first real grid released, and the image worker all route the same terminal's events,
+        // and only one of them at a time may move them from the queue to the program (see
+        // `Router::routing`). Taken before the terminal lock, which is the order everywhere.
+        let _routing = self.router.routing.lock();
         let (term_events, history_jobs) = {
             let mut term = self.terminal.lock();
             if self.is_detached() {
@@ -533,6 +585,124 @@ mod released_tests {
         drop(f);
         assert_eq!(rx.try_recv().unwrap().1, SessionEvent::Exited(Some(0)));
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    use fbterm_term::{GridSize, Terminal};
+
+    fn grid(cols: u16) -> GridSize {
+        GridSize {
+            cols,
+            rows: 3,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            scale: 1.0,
+        }
+    }
+
+    /// A feeder over its own terminal, with the queue a session's writer would read and the router
+    /// the handle would carry. `holding` starts it waiting for its first real grid, as `App::start`
+    /// does for a pane whose window has not laid out.
+    fn feeder(holding: bool) -> (Feeder, tokio::sync::mpsc::UnboundedReceiver<Command>) {
+        let terminal = Arc::new(parking_lot::Mutex::new(Terminal::new(grid(10), 10)));
+        if holding {
+            terminal.lock().hold_until_sized();
+        }
+        let (events, _unread) = tokio::sync::mpsc::unbounded_channel();
+        let (replies_tx, replies_rx) = tokio::sync::mpsc::unbounded_channel();
+        let f = Feeder::new(
+            SessionId::next(),
+            terminal,
+            events,
+            Arc::default(),
+            Arc::default(),
+            Arc::new(AtomicBool::new(false)),
+            Ended::default(),
+            replies_tx,
+        );
+        (f, replies_rx)
+    }
+
+    /// What one query answers with, as bytes: `feed` sends them to the program.
+    fn answer_of(query: &[u8]) -> Vec<u8> {
+        let mut t = Terminal::new(grid(10), 10);
+        t.feed(query);
+        t.take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fbterm_term::TermEvent::PtyWrite(b) => Some(b),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    fn written(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> Vec<u8> {
+        let mut out = Vec::new();
+        while let Ok(Command::Input(bytes)) = rx.try_recv() {
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    /// A query asked before the pane had cells is not answered by the feed that carried it, nor by
+    /// the resize that parses it: only delivering what that release queued - as `App::start`'s
+    /// caller does when its view reports the grid - writes the answer to the program.
+    #[test]
+    fn a_reply_waits_for_the_delivery_that_follows_its_release() {
+        let (mut feeder, mut replies) = feeder(true);
+        feeder.feed(b"\x1b[c");
+        assert!(
+            written(&mut replies).is_empty(),
+            "held output answered nobody"
+        );
+
+        // The view reports the grid its window really has: the resize parses what waited, and the
+        // answer is queued. On this thread nothing feeds after a resize.
+        feeder.terminal.lock().resize(grid(20));
+        assert!(
+            written(&mut replies).is_empty(),
+            "a resize routes nothing itself"
+        );
+
+        feeder.router().deliver_queued();
+        assert_eq!(written(&mut replies), answer_of(b"\x1b[c"));
+    }
+
+    /// The app delivering a release and the session feeding new output are two threads over one
+    /// event queue. Taking the events and routing them is one section, so whichever gets there
+    /// first takes what the other had not yet produced too - and every reply reaches the program in
+    /// the order the emulator made it, no matter how the two threads interleave.
+    #[test]
+    fn events_reach_the_program_in_the_order_they_were_produced() {
+        let (mut feeder, mut replies) = feeder(true);
+        // Asked while held: its answer is what the release below queues first.
+        feeder.feed(b"\x1b[c");
+        feeder.terminal.lock().resize(grid(20));
+        let da = answer_of(b"\x1b[c");
+
+        let deliver = feeder.router();
+        let later = std::thread::spawn(move || {
+            // Output arriving now: asked after the release, so its answer must not overtake the
+            // first one's.
+            feeder.feed(b"\x1b[16t");
+        });
+        let released = std::thread::spawn(move || deliver.deliver_queued());
+        later.join().expect("the feeder thread");
+        released.join().expect("the delivering thread");
+
+        let got = written(&mut replies);
+        let cell = answer_of(b"\x1b[16t");
+        assert!(got.len() >= da.len() + cell.len(), "both answers were sent");
+        assert!(
+            got.starts_with(&da),
+            "the queued reply went last: {:?}",
+            String::from_utf8_lossy(&got)
+        );
+        assert_eq!(got, [da.as_slice(), cell.as_slice()].concat());
     }
 }
 
