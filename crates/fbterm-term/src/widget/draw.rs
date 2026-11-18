@@ -15,6 +15,7 @@ use iced::advanced::renderer::{Quad, Renderer as _};
 use iced::{Border, Font, Rectangle, Size};
 
 use super::Highlight;
+use super::cell_graphics;
 use super::colors::{cell_colors, resolve};
 use super::features::{FontFeatures, run_features};
 use super::images::{self, ImageLayer};
@@ -65,6 +66,10 @@ pub struct DrawList {
     pub texts: Vec<TextRun>,
     pub lines: Vec<(Span, Rgb, LineKind)>,
     pub cursor: Option<(Span, Rgb, CursorMark)>,
+    /// Runs of block and box-drawing characters, drawn as cell-filling shapes instead of glyphs so
+    /// their edges meet (see [`cell_graphics`]). Each is one character in one colour; the run exists
+    /// only to draw a row of them as fewer, longer quads.
+    pub cell_graphics: Vec<(Span, char, Rgb)>,
     /// Pictures in view and the `[image W×H]` text standing in for the ones that are gone (see
     /// [`ImageLayer`]). Empty when this terminal shows no images.
     pub images: ImageLayer,
@@ -86,8 +91,9 @@ fn push_span<K: PartialEq>(out: &mut Vec<(Span, K)>, row: u16, col: u16, cells: 
 
 /// Narrow characters drawn at their own cell rather than inside a run: anything outside ASCII may
 /// come from a fallback font with a different advance, which would shift the rest of the run.
-/// Box drawing and block elements (U+2500..=U+259F) stay in runs; the monospace fonts cover them
-/// and they make up whole rows of TUI frames and bars.
+/// Block and box-drawing characters never reach this: shapes draw them (see [`cell_graphics`]), and
+/// only the rounded corners and diagonals of that block, which stay glyphs, are kept in runs — the
+/// monospace fonts cover them and they make up whole rows of TUI frames.
 fn standalone(c: char) -> bool {
     !c.is_ascii() && !('\u{2500}'..='\u{259f}').contains(&c)
 }
@@ -177,6 +183,7 @@ pub fn build(
     // says which tile of which picture it shows, and its glyph is skipped.
     let mut virtuals = images::VirtualTiles::new(store, term, metrics);
     let mut quads: Vec<(Span, Rgb)> = Vec::new();
+    let mut graphics: Vec<(Span, char, Rgb)> = Vec::new();
     let mut lines: Vec<(Span, (Rgb, LineKind))> = Vec::new();
     let mut strikes: Vec<(Span, (Rgb, LineKind))> = Vec::new();
     let marks = highlight.map(|h| (h, marks(term, h, rows, cols)));
@@ -280,6 +287,39 @@ pub fn build(
             let bold = flags.contains(Flags::BOLD);
             let italic = flags.contains(Flags::ITALIC);
             let zerowidth = cell.zerowidth();
+            // Block and box-drawing characters are shapes that fill their cells rather than glyphs
+            // (see [`cell_graphics`]): they leave the text runs entirely, and a run of one character
+            // in one colour becomes a single entry, drawn as one long quad per shape piece. A wide
+            // cell or one carrying a combining mark keeps the font path: its glyph spans two cells or
+            // belongs to a cluster.
+            if !flags.contains(Flags::WIDE_CHAR)
+                && zerowidth.is_none()
+                && cell_graphics::shapes(cell.c).is_some()
+            {
+                flush(&mut run, &mut list.texts);
+                match graphics.last_mut() {
+                    // The same character in the same colour next door is the same shape: one entry
+                    // for the run, so a row of them costs one quad per shape piece, not one per cell.
+                    Some((span, c, last_fg))
+                        if span.row == row_u16
+                            && span.col + span.cells == col
+                            && *c == cell.c
+                            && *last_fg == fg =>
+                    {
+                        span.cells += 1;
+                    }
+                    _ => graphics.push((
+                        Span {
+                            row: row_u16,
+                            col,
+                            cells: 1,
+                        },
+                        cell.c,
+                        fg,
+                    )),
+                }
+                continue;
+            }
             if flags.contains(Flags::WIDE_CHAR) || zerowidth.is_some() || standalone(cell.c) {
                 flush(&mut run, &mut list.texts);
                 let mut text = String::from(cell.c);
@@ -344,6 +384,7 @@ pub fn build(
         v.finish(&mut list.images);
     }
     list.quads = quads;
+    list.cell_graphics = graphics;
     list.lines = lines
         .into_iter()
         .chain(strikes)
@@ -391,16 +432,26 @@ pub struct Metrics {
     pub font: Font,
     pub font_size: f32,
     pub features: FontFeatures,
+    /// Physical pixels per logical pixel of the window being drawn (1.0 when unknown). Cell graphics
+    /// need it to put their edges on whole physical pixels; text does not, because iced snaps that
+    /// itself (see [`cell_graphics`]).
+    pub scale: f32,
 }
 
 fn fill(renderer: &mut iced::Renderer, bounds: Rectangle, c: Rgb) {
+    fill_color(renderer, bounds, color(c));
+}
+
+/// A quad in already-computed bounds, filled with `c`. Cell graphics come from physical pixels
+/// divided by the scale, so their corners land where iced's own snapping would put them anyway.
+fn fill_color(renderer: &mut iced::Renderer, bounds: Rectangle, c: iced::Color) {
     renderer.fill_quad(
         Quad {
             bounds,
             snap: true,
             ..Quad::default()
         },
-        color(c),
+        c,
     );
 }
 
@@ -506,6 +557,28 @@ fn draw_text_group(
         height: ch,
     };
     let thin = (ch / 16.0).round().max(1.0);
+    // Block and box-drawing characters: cell-filling shapes whose edges are the grid's own, worked out
+    // in physical pixels so neighbours agree on them (see [`cell_graphics`]). They go where their glyphs
+    // used to — under the text — but before everything else this group paints, so an underline, a
+    // strike or the cursor over a full block is drawn on top of it rather than buried by it.
+    if !list.cell_graphics.is_empty() {
+        let g = cell_graphics::Geometry::new(bounds, m.cell, m.scale);
+        for &(span, c, fg) in &list.cell_graphics {
+            let Some(shapes) = cell_graphics::shapes(c) else {
+                continue;
+            };
+            for shape in shapes {
+                let paint = color(fg).scale_alpha(shape.alpha());
+                g.cover(
+                    shape,
+                    u32::from(span.col),
+                    u32::from(span.row),
+                    u32::from(span.cells),
+                    |r| fill_color(renderer, r, paint),
+                );
+            }
+        }
+    }
     for (span, c, kind) in &list.lines {
         let r = rect(*span);
         let mut line = |y: f32| {
@@ -874,7 +947,255 @@ mod tests {
             .iter()
             .map(|r| (r.span.col, r.span.cells, r.text.as_str()))
             .collect();
-        assert_eq!(texts, vec![(0, 1, "a"), (1, 1, "❯"), (2, 6, "b █▓─x")]);
+        // The block and line characters are not text any more: shapes draw them (see `cell_graphics`),
+        // each character a run of its own because they differ.
+        let graphics: Vec<_> = list
+            .cell_graphics
+            .iter()
+            .map(|(s, c, _)| (s.col, s.cells, *c))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![(0, 1, "a"), (1, 1, "❯"), (2, 1, "b"), (7, 1, "x")]
+        );
+        assert_eq!(graphics, vec![(4, 1, '█'), (5, 1, '▓'), (6, 1, '─')]);
+    }
+
+    /// Helper for the shape tests: the cell-graphics batch as (row, col, cells, character).
+    fn shape_runs(list: &DrawList) -> Vec<(u16, u16, u16, char)> {
+        list.cell_graphics
+            .iter()
+            .map(|(s, c, _)| (s.row, s.col, s.cells, *c))
+            .collect()
+    }
+
+    /// A run of one shape character is one entry; the text around it keeps its own runs.
+    #[test]
+    fn block_runs_leave_the_text_for_shape_runs() {
+        let t = term_with("ab██cd".as_bytes());
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
+        let texts: Vec<_> = list
+            .texts
+            .iter()
+            .map(|r| (r.span.col, r.span.cells, r.text.as_str()))
+            .collect();
+        assert_eq!(texts, vec![(0, 2, "ab"), (4, 2, "cd")]);
+        assert_eq!(shape_runs(&list), vec![(0, 2, 2, '█')]);
+    }
+
+    #[test]
+    fn a_row_of_one_line_character_merges_into_one_run() {
+        let t = term_with("┌────┐".as_bytes());
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
+        assert!(list.texts.is_empty(), "the whole row is shapes");
+        // The four dashes share one entry; the corners differ, so they stand on their own.
+        assert_eq!(
+            shape_runs(&list),
+            vec![(0, 0, 1, '┌'), (0, 1, 4, '─'), (0, 5, 1, '┐')]
+        );
+    }
+
+    #[test]
+    fn shapes_get_the_same_colour_as_text() {
+        let build_row = |bytes: &[u8]| {
+            let t = term_with(bytes);
+            build(
+                &mut RowReader::new(),
+                &t,
+                &scheme(),
+                true,
+                None,
+                None,
+                store(),
+                metrics(),
+            )
+        };
+        // DIM: the block blends exactly like the dim letter next to it.
+        let list = build_row("\x1b[2ma█\x1b[0m".as_bytes());
+        assert_eq!(list.texts.len(), 1);
+        let (span, c, fg) = list.cell_graphics[0];
+        assert_eq!((span.col, span.cells, c), (1, 1, '█'));
+        assert_eq!(fg, list.texts[0].fg, "DIM resolves the same way for both");
+        // INVERSE: the block takes the cell's background as its colour, like a glyph would.
+        let list = build_row("\x1b[7ma█\x1b[0m".as_bytes());
+        assert_eq!(list.cell_graphics[0].2, scheme().background);
+        // A search match tints the background only, and only the current match replaces the
+        // foreground, so a shape has to end up with whatever colour a letter in that cell gets. The
+        // query `[█b]` matches `██` and `bb` at the same two columns, and its second match is made the
+        // current one: column 0 is an ordinary match in both rows, column 1 the current one.
+        let (tint, strong, text) = (
+            Rgb { r: 1, g: 1, b: 1 },
+            Rgb { r: 2, g: 2, b: 2 },
+            Rgb { r: 3, g: 3, b: 3 },
+        );
+        let highlight_on = |bytes: &[u8]| -> (Terminal, Highlight) {
+            let t = term_with(bytes);
+            let pattern = crate::SearchPattern::new(&crate::SearchQuery::new("[█b]", true))
+                .unwrap()
+                .unwrap();
+            let all = t.visible_matches(&pattern);
+            let last = all[all.len() - 1];
+            assert_eq!((last.start.line, last.start.col, last.end.col), (0, 1, 1));
+            (
+                t,
+                Highlight {
+                    current: Some(last),
+                    pattern,
+                    match_bg: tint,
+                    current_bg: strong,
+                    current_fg: text,
+                },
+            )
+        };
+        let build_with = |bytes: &[u8]| {
+            let (t, h) = highlight_on(bytes);
+            (
+                build(
+                    &mut RowReader::new(),
+                    &t,
+                    &scheme(),
+                    true,
+                    None,
+                    Some(&h),
+                    store(),
+                    metrics(),
+                ),
+                h,
+            )
+        };
+        let (shapes, h) = build_with("██".as_bytes());
+        // The run splits where the match state does, so each block keeps its own colour.
+        assert_eq!(shape_runs(&shapes), vec![(0, 0, 1, '█'), (0, 1, 1, '█')]);
+        let (glyphs, _) = build_with("bb".as_bytes());
+        // Cell by cell, the shape's colour is what the letter in the same position was given: an
+        // ordinary match leaves the foreground alone, and only the current one replaces it.
+        let got: Vec<_> = shapes
+            .cell_graphics
+            .iter()
+            .map(|&(s, _, fg)| (s.col, fg))
+            .collect();
+        let want: Vec<_> = glyphs
+            .texts
+            .iter()
+            .flat_map(|r| (0..r.span.cells).map(move |i| (r.span.col + i, r.fg)))
+            .collect();
+        assert_eq!(want.len(), 2, "one run per match state, as for the shapes");
+        assert_eq!(
+            got, want,
+            "a shape gets the colour a letter in its cell gets"
+        );
+        assert_eq!(
+            got[0].1,
+            scheme().foreground,
+            "an ordinary match tints only the bg"
+        );
+        assert_eq!(
+            got[1].1, h.current_fg,
+            "the current match brings its own fg"
+        );
+        // The match colours still arrive as background quads under the shapes, exactly as they do for
+        // letters: nothing about a shape moves a tint into the shape's own colour.
+        let bg_of = |list: &DrawList| -> Vec<_> {
+            list.quads
+                .iter()
+                .map(|(s, c)| (s.row, s.col, s.cells, *c))
+                .filter(|(_, _, _, c)| *c == tint || *c == strong)
+                .collect()
+        };
+        assert_eq!(bg_of(&shapes), bg_of(&glyphs));
+        // Without a highlight the two blocks are one colour again, so they stay a single run.
+        let plain = build_row("██".as_bytes());
+        assert_eq!(shape_runs(&plain), vec![(0, 0, 2, '█')]);
+    }
+
+    /// A selected block takes the selection the same way text does. Selection changes only the
+    /// background here (see `colors::cell_colors`), so the shape keeps the cell's foreground and
+    /// the selected cells get a selection-coloured quad under it.
+    #[test]
+    fn a_selected_block_sits_on_the_selection_and_keeps_its_colour() {
+        let mut t = term_with("a██b".as_bytes());
+        let mut sel = crate::Selection::start(Point::new(Line(0), Column(1)));
+        sel.update(Point::new(Line(0), Column(2)));
+        t.set_selection(Some(sel));
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            false,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
+        assert_eq!(shape_runs(&list), vec![(0, 1, 2, '█')]);
+        assert_eq!(
+            list.cell_graphics[0].2,
+            scheme().foreground,
+            "the shape is drawn in the colour its glyph would have used"
+        );
+        assert!(
+            list.quads.contains(&(
+                Span {
+                    row: 0,
+                    col: 1,
+                    cells: 2
+                },
+                scheme().selection
+            )),
+            "the selected cells get the selection background under the shape"
+        );
+    }
+
+    #[test]
+    fn block_under_a_block_cursor_uses_the_cursor_text_colour() {
+        // Cursor back onto the first block of "ab██cd".
+        let t = term_with("ab██cd\x1b[4D".as_bytes());
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
+        assert!(
+            list.quads
+                .iter()
+                .any(|(s, c)| s.col == 2 && *c == scheme().cursor),
+            "the cursor cell gets the cursor background"
+        );
+        // The covered block takes the cursor's text colour; its neighbour keeps its own, so they are
+        // two runs and not one.
+        assert_eq!(
+            list.cell_graphics
+                .iter()
+                .map(|(s, c, fg)| (s.col, s.cells, *c, *fg))
+                .collect::<Vec<_>>(),
+            vec![
+                (2, 1, '█', scheme().background),
+                (3, 1, '█', scheme().foreground)
+            ]
+        );
     }
 
     #[test]
@@ -1238,9 +1559,16 @@ mod tests {
                 (0, 3, 1, "b"),
                 (1, 0, 1, "a"),
                 (1, 1, 1, "❯"),
-                (1, 2, 6, "b █▓─x")
+                (1, 2, 1, "b")
             ]
         );
+        // The same through the cold path: shapes come out as their own batch, one run per character.
+        let graphics: Vec<_> = list
+            .cell_graphics
+            .iter()
+            .map(|(s, c, _)| (s.row, s.col, s.cells, *c))
+            .collect();
+        assert_eq!(graphics, [(1, 4, 1, '█'), (1, 5, 1, '▓'), (1, 6, 1, '─')]);
     }
 
     #[test]

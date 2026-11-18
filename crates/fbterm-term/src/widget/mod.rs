@@ -3,6 +3,7 @@
 //! The widget is drawn with iced's own primitives (quads and text runs, see `draw`). Input handling
 //! lives in `input`. The terminal is locked only while building the draw list or handling an event.
 
+mod cell_graphics;
 mod colors;
 mod draw;
 mod features;
@@ -491,6 +492,9 @@ impl<Message> Widget<Message, iced::Theme, iced::Renderer> for TerminalView<'_, 
                     font: m.font,
                     font_size: m.font_size,
                     features: self.style.features.clone(),
+                    // The widget's own scale; `cell_graphics::Geometry::new` falls back like
+                    // `images::CellGeometry::new` does if a display reported something bogus.
+                    scale: self.style.scale,
                 },
                 self.style.accent,
                 self.style.background_opacity,
