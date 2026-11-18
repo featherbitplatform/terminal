@@ -29,8 +29,10 @@ $Uri = "https://api.nuget.org/v3-flatcontainer/microsoft.windows.console.conpty/
 
 # The x64 pair, by path inside the package (a .nupkg is a zip), and the names they are written
 # under. The package also carries win-x86 and win-arm64 copies; fbterm ships x64 only, which
-# dev/package-windows.ps1 insists on.
-$Inside = [ordered]@{
+# dev/package-windows.ps1 insists on. PowerShell variable names are case-insensitive, so nothing here
+# may differ from something else by case alone: `$entry` is the loop's name and `$Files` the map's,
+# where an earlier version named them `$inside` and `$Inside`, which PowerShell read as one variable.
+$Files = [ordered]@{
     'runtimes/win-x64/native/conpty.dll' = 'conpty.dll'
     'build/native/runtimes/x64/OpenConsole.exe' = 'OpenConsole.exe'
 }
@@ -80,18 +82,18 @@ try {
     if (Test-Path -LiteralPath $stage) { Remove-Item -Recurse -Force -LiteralPath $stage }
     Expand-Archive -LiteralPath $tmp -DestinationPath $stage
 
-    foreach ($inside in $Inside.Keys) {
+    foreach ($entry in $Files.Keys) {
         # Join-Path per segment, so the package's forward slashes become this platform's separator.
         $from = $stage
-        foreach ($part in ($inside -split '/')) { $from = Join-Path $from $part }
+        foreach ($part in ($entry -split '/')) { $from = Join-Path $from $part }
         if (-not (Test-Path -LiteralPath $from -PathType Leaf)) {
-            throw "conpty-${Version}.zip does not contain ${inside}: the package layout changed, or this is not the pinned version"
+            throw "conpty-${Version}.zip does not contain ${entry}: the package layout changed, or this is not the pinned version"
         }
         $item = Get-Item -LiteralPath $from
-        if ($item.Length -lt 1) { throw "$inside inside conpty-${Version}.zip is empty" }
-        $to = Join-Path $out $Inside[$inside]
+        if ($item.Length -lt 1) { throw "$entry inside conpty-${Version}.zip is empty" }
+        $to = Join-Path $out $Files[$entry]
         Copy-Item -LiteralPath $from -Destination $to -Force
-        Write-Host ("{0}: {1} bytes from {2}" -f $Inside[$inside], $item.Length, $inside)
+        Write-Host ("{0}: {1} bytes from {2}" -f $Files[$entry], $item.Length, $entry)
     }
 
     $licensePath = Join-Path $out 'conpty-LICENSE.txt'
