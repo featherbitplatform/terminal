@@ -143,7 +143,8 @@ function Get-MsiRows {
         if ($null -eq $record) { break }
         $row = [pscustomobject]@{}
         for ($i = 1; $i -le $Columns.Count; $i++) {
-            $row | Add-Member -NotePropertyName $Columns[$i] -NotePropertyValue (
+            # $i is the Record's 1-based column number; $Columns itself is a 0-based array.
+            $row | Add-Member -NotePropertyName $Columns[$i - 1] -NotePropertyValue (
                 $record.GetType().InvokeMember('StringData', 'GetProperty', $null, $record, $i))
         }
         $rows += $row
@@ -158,12 +159,13 @@ function Get-MsiRows {
 # The staged ConPTY files, by the names they must install as (compared case-insensitively: Windows
 # names are). fbterm.exe itself is read too, as the reference for "in the application folder".
 # Windows Installer's SQL has no functions and no joins, so the two tables are read whole and joined
-# here; FileName holds short and long name split by a pipe when both are stored, and the long part
-# (or the whole value without a pipe) is what msiexec installs.
+# here. Filtering goes on the installed name, never the File table's key column: that holds WiX's
+# File Ids (conptyDll, exe0, ...), not names. FileName holds short and long name split by a pipe
+# when both are stored, and the long part (or the whole value without a pipe) is what msiexec installs.
 $expected = @('conpty.dll', 'OpenConsole.exe', 'conpty-LICENSE.txt', 'conpty-NOTICE.md')
+$wanted = $expected + 'fbterm.exe'
 $fileRows = Get-MsiRows -Path $msi -Query 'SELECT File, Component_, FileName FROM File' `
-    -Columns @('File', 'Component_', 'FileName') |
-    Where-Object { $_.File -in ($expected + 'fbterm.exe') }
+    -Columns @('File', 'Component_', 'FileName')
 $dirs = @{}
 $componentRows = Get-MsiRows -Path $msi -Query 'SELECT Component, Directory_ FROM Component' `
     -Columns @('Component', 'Directory_')
@@ -174,7 +176,10 @@ $found = @()
 foreach ($row in $fileRows) {
     $long = $row.FileName
     if ($long.Contains('|')) { $long = $long.Split('|')[-1] }
-    $found += [pscustomobject]@{ Name = $long; Directory = $dirs[$row.Component_] }
+    # -in compares case-insensitively, like the checks below and like Windows.
+    if ($long -in $wanted) {
+        $found += [pscustomobject]@{ Name = $long; Directory = $dirs[$row.Component_] }
+    }
 }
 foreach ($fileName in $expected) {
     $same = @($found | Where-Object { $_.Name -ieq $fileName })

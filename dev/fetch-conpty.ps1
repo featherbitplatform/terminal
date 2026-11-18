@@ -2,7 +2,7 @@
 # with the license and third-party notices of the microsoft/terminal release those binaries were
 # built from, beside them. Runs wherever PowerShell 7 runs; the staged binaries are Windows x64
 # files.
-# Usage: pwsh dev/fetch-conpty.ps1 -OutDir <dir>     e.g. pwsh dev/fetch-conpty.ps1 -OutDir target/conpty-test
+# Usage: pwsh dev/fetch-conpty.ps1 -OutDir <dir>     e.g. pwsh dev/fetch-conpty.ps1 -OutDir target/release
 # Output: <dir>/conpty.dll, <dir>/OpenConsole.exe, <dir>/conpty-LICENSE.txt and
 #         <dir>/conpty-NOTICE.md, and nothing else.
 #
