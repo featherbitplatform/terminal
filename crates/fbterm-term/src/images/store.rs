@@ -133,19 +133,37 @@ pub enum Lookup {
     Unknown,
 }
 
+/// Why a resampled copy was refused: the two situations need different fates.
+///
+/// [`Refusal::Geometry`] is permanent: this size provably cannot coexist with its own source
+/// under the tightest cap, so nothing that frees other memory can change it — it stays refused
+/// until the source is replaced or released. [`Refusal::Pressure`] is not: a fresh install
+/// displaced this copy only to make room (see [`Reason::Install`]), so it comes back as soon as
+/// memory frees — the next release or dropped owner clears it and the drawer's next ask makes it
+/// again. The refusal exists either way to stop two copies that cannot coexist evicting each
+/// other every frame (the loop the round-3 review calls N4): a size refused under pressure stays
+/// refused until the next release, so the two copies race once more and settle again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    Geometry,
+    Pressure,
+}
+
 /// One cached resample of one image: queued, ready with its last-used stamp, or refused.
 enum Slot {
     Queued,
     Ready(u64, Arc<ResampledImage>),
-    /// This size has no copy and will not get one until its source changes: either the copy was
-    /// dropped the moment it was installed (it could not fit beside its own source under the
-    /// caps — see [`ImageStore::finish_resample`]), or another image's install-time enforcement
-    /// evicted it to make room, its whole image still being held (see [`Reason::Install`]). Draws
-    /// answer [`Lookup::Evicted`] for a refused size until the source image is replaced or
-    /// released — spec 6.3's placeholder rule; re-asking a size enforcement already proved it
-    /// cannot keep would only burn the same work every frame. Copies dropped by ordinary
-    /// submit- or decode-time enforcement stay re-makeable (plain LRU).
-    Refused,
+    /// This size has no copy: either it cannot fit beside its own source under the caps at all
+    /// ([`Refusal::Geometry`], see [`ImageStore::finish_resample`]), or another image's
+    /// install-time enforcement evicted it to make room, its whole image still being held (see
+    /// [`Reason::Install`]). Draws answer [`Lookup::Evicted`] for a refused size either way —
+    /// spec 6.3's placeholder rule — until the source image is replaced or released. The two
+    /// kinds differ only in what a release brings back: a size refused under pressure is cleared
+    /// by a release or a dropped owner that actually removed something (`ImageStore::release`
+    /// and `ImageStore::drop_owner`) and is asked afresh, while a geometry refusal stays until
+    /// the source changes. Copies dropped by ordinary submit- or decode-time enforcement stay
+    /// re-makeable (plain LRU): they never become `Refused`.
+    Refused(Refusal),
 }
 
 /// The state of one image key.
@@ -210,9 +228,10 @@ impl Entry {
 /// A few hundred MiB of pixel buffers and up to 16 MiB of queued payloads are freed *after* the
 /// lock is released (see [`ImageStore::finish_resample`]), so dropping them cannot stall a draw-path
 /// `get`. `wake` names owners whose state changed in a way their pane must see — a size refused, a
-/// copy or picture they were shown evicted: the cached draw list holds a handle for pixels that are
-/// gone now, and asking again answers the placeholder spec 6.3 asks for. Those hooks run with no
-/// lock held (see [`ImageStore::wake_owners`]).
+/// copy or picture they were shown evicted, a size refused under pressure that a release just
+/// brought back: the cached draw list holds a handle for pixels that are gone now, and asking
+/// again answers the placeholder spec 6.3 asks for. Those hooks run with no lock held (see
+/// [`ImageStore::wake_owners`]).
 #[derive(Default)]
 struct Freed {
     jobs: Vec<Job>,
@@ -267,6 +286,55 @@ impl Freed {
         } // gone with its entry (terminal dropped or released): nothing to invalidate, and
         // `wake_owners` finds no hook for it either.
         self.wake.push(owner);
+    }
+
+    /// Bring back every size a release just made room for: drop each
+    /// [`Slot::Refused(Refusal::Pressure)`] across ALL owners still in the store (refusals cross
+    /// panes) so the drawer's next ask queues a resample as for any uncached size, and record each
+    /// owner that lost one through [`Self::changed`] so its pane redraws. Call under the store lock,
+    /// in the same section as the removal, and only when that removal actually took something —
+    /// a second release of the same key, or a release of an unknown key, must clear nothing and
+    /// wake nothing. A geometry refusal is untouched: it provably cannot fit beside its own
+    /// source, and freeing other memory cannot change that. Refusal slots account no bytes, so no
+    /// ledger moves.
+    fn clear_pressure_refusals(&mut self, inner: &mut Inner) {
+        // A cleared size is asked afresh, so it is queued again: the slot goes back to `Queued`
+        // AND the resample job goes on the worker's queue, the same pair a fresh `get` makes.
+        // (Setting the slot alone would leave it `Queued` with no job running — a `Pending` the
+        // drawer waits on forever.) Collect them first: bumping a generation re-borrows
+        // `inner.owners`, so the mutations must be done before the `changed` calls.
+        let mut queued = Vec::new();
+        let mut cleared = Vec::new();
+        for (owner, entry) in &mut inner.owners {
+            for (key, image) in &mut entry.images {
+                for (slot_key, slot) in &mut image.resamples {
+                    if matches!(slot, Slot::Refused(Refusal::Pressure)) {
+                        *slot = Slot::Queued;
+                        let (w, h, stretch) = *slot_key;
+                        let integer = is_integer_multiple(image.source.0, image.source.1, w, h);
+                        let src = match &image.state {
+                            State::Ready(img) => img.clone(),
+                            // A released or evicted source: the slot goes, so the job is moot —
+                            // `finish_resample` finds the entry gone and does nothing.
+                            _ => continue,
+                        };
+                        queued.push(Job::Resample {
+                            owner: *owner,
+                            key: *key,
+                            target: (w, h),
+                            stretch,
+                            integer,
+                            src,
+                        });
+                        cleared.push(*owner);
+                    }
+                }
+            }
+        }
+        inner.jobs.extend(queued);
+        for owner in cleared {
+            self.changed(inner, owner);
+        }
     }
 }
 
@@ -432,6 +500,12 @@ impl ImageStore {
 
     /// Forget everything one terminal had, including queued work. Called from `Terminal::drop`,
     /// so nothing is answered: the terminal — and every client waiting on it — is gone.
+    ///
+    /// Removing an owner that existed frees its bytes, so the sizes other panes had to refuse
+    /// under that pressure come back with it: every `Refused(Pressure)` slot is cleared in the
+    /// same lock section as the removal, and the owners that lost one are woken after the lock
+    /// goes (see [`Freed::clear_pressure_refusals`]). A second drop of the same owner removes
+    /// nothing and clears nothing. The owner being dropped is never woken: its hooks are gone.
     pub fn drop_owner(&self, owner: u64) {
         let mut freed = Freed::default();
         // The session hooks die with the owner; they are dropped after the lock too (they hold the
@@ -439,15 +513,25 @@ impl ImageStore {
         let mut hooks = Vec::new();
         {
             let mut inner = self.inner.lock();
-            if let Some(entry) = inner.owners.remove(&owner) {
-                inner.total -= entry.bytes;
-                hooks.extend(entry.hooks);
-                for (_, image) in entry.images {
-                    freed.drain_entry(image);
+            let gone = match inner.owners.remove(&owner) {
+                Some(entry) => {
+                    inner.total -= entry.bytes;
+                    hooks.extend(entry.hooks);
+                    for (_, image) in entry.images {
+                        freed.drain_entry(image);
+                    }
+                    true
                 }
+                None => false,
+            };
+            if gone {
+                freed.clear_pressure_refusals(&mut inner);
             }
             Freed::take_jobs(&mut inner, |job| job_owner(job) != owner, &mut freed);
             Self::check_idle(&inner, &self.idle);
+        }
+        if !freed.wake.is_empty() {
+            self.wake_owners(&freed.wake);
         }
     }
 
@@ -561,10 +645,17 @@ impl ImageStore {
     /// also releases keys that scrollback eviction or a failed decode already dropped from the store,
     /// and a second release of the same key must stay harmless. Nothing is answered for a released
     /// key: the terminal has forgotten it, client included.
+    ///
+    /// A release that actually removed an image frees memory, so sizes other panes had to refuse
+    /// under that pressure come back with it: every `Refused(Pressure)` slot across the store is
+    /// cleared in the same lock section as the removal, and each owner that lost one is woken
+    /// after the lock goes (see [`Freed::clear_pressure_refusals`]). A second release of the same
+    /// key, or a release of an unknown key, removes nothing, clears nothing and wakes nothing.
     pub fn release(&self, owner: u64, key: ImageKey) {
         let mut freed = Freed::default();
         {
             let mut inner = self.inner.lock();
+            let mut removed = false;
             if let Some(entry) = inner.owners.get_mut(&owner)
                 && let Some(image) = entry.images.remove(&key)
             {
@@ -572,9 +663,16 @@ impl ImageStore {
                 entry.bytes -= gone;
                 inner.total -= gone;
                 freed.drain_entry(image);
+                removed = true;
+            }
+            if removed {
+                freed.clear_pressure_refusals(&mut inner);
             }
             Freed::take_jobs(&mut inner, |job| !job_is(job, owner, key), &mut freed);
             Self::check_idle(&inner, &self.idle);
+        }
+        if !freed.wake.is_empty() {
+            self.wake_owners(&freed.wake);
         }
     }
 
@@ -643,8 +741,10 @@ impl ImageStore {
             }
             // already queued with this draw or the last one
             Some(Slot::Queued) => return Lookup::Pending,
-            // a copy of this size provably cannot fit beside its source (see `finish_resample`)
-            Some(Slot::Refused) => {
+            // either kind of refusal answers the same way for both: the placeholder (see
+            // `finish_resample` and [`Reason::Install`]); a pressure refusal comes back when a
+            // release frees memory, a geometry refusal does not
+            Some(Slot::Refused(_)) => {
                 return Lookup::Evicted {
                     width: source_size.0,
                     height: source_size.1,
@@ -1238,9 +1338,10 @@ impl ImageStore {
             let stamp = self.next_stamp();
             let bytes = out.charge();
             // A copy that cannot fit beside its own source under the tightest cap is refused up
-            // front: no enforcement pass could free more than "everything except this pair", and
-            // evicting other images for a copy that comes back out anyway is pure collateral. An
-            // alias of the source accounts nothing, so it always fits (finding P4).
+            // front, as a GEOMETRY refusal: no enforcement pass could free more than "everything
+            // except this pair", so nothing that frees other memory can change this, and evicting
+            // other images for a copy that comes back out anyway is pure collateral. An alias of
+            // the source accounts nothing, so it always fits (finding P4).
             let cannot_fit = !out.shares_source()
                 && inner
                     .owners
@@ -1258,7 +1359,9 @@ impl ImageStore {
                     .get_mut(&owner)
                     .and_then(|e| e.images.get_mut(&key))
                 {
-                    image.resamples.insert(slot_key, Slot::Refused);
+                    image
+                        .resamples
+                        .insert(slot_key, Slot::Refused(Refusal::Geometry));
                 }
                 freed.copies.push(out); // the made buffer goes after the mutex, untouched
                 // Refused IS an answer — the drawer draws the placeholder for it — and the frame
@@ -1289,14 +1392,15 @@ impl ImageStore {
                 // Resampled bytes count against the caps too, so they are enforced here — with this
                 // copy and its source image protected: what goes first is an older copy or an older
                 // picture, never the one just asked for. Every other copy this drops is marked
-                // refused (see [`Reason::Install`]) and wakes its owner (see [`Freed::wake`]): a
-                // displaced on-screen size becomes its placeholder instead of resampling once per
-                // frame beside the new copy, and a pane whose picture went must see that. If only
-                // the protected picture is left and a cap is still over — unreachable with the
-                // up-front check, which would have refused it before evicting anything for it — the
-                // copy comes back out and the size is refused all the same, another answer the
-                // asking pane has to hear. A refusal enforcement queues for an evicted owed key
-                // needs no wake of its own: this job's worker loop takes whatever is next.
+                // refused under pressure (see [`Reason::Install`]) and wakes its owner
+                // (see [`Freed::wake`]): a displaced on-screen size becomes its placeholder instead
+                // of resampling once per frame beside the new copy, and a pane whose picture went
+                // must see that. If only the protected picture is left and a cap is still over —
+                // unreachable with the up-front check, which would have refused it before evicting
+                // anything for it — the copy comes back out and the size is refused all the same,
+                // as a GEOMETRY refusal: with only its own source left, nothing can make room.
+                // A refusal enforcement queues for an evicted owed key needs no wake of its own:
+                // this job's worker loop takes whatever is next.
                 let (satisfied, _queued) = Self::enforce_inner(
                     &mut inner,
                     owner,
@@ -1319,7 +1423,11 @@ impl ImageStore {
                         entry.bytes -= gone;
                         image.resample_bytes -= gone;
                         freed.copies.push(copy);
-                        image.resamples.insert(slot_key, Slot::Refused);
+                        // Only its own source is left and the cap is still over: geometry,
+                        // so this size stays refused until the source changes.
+                        image
+                            .resamples
+                            .insert(slot_key, Slot::Refused(Refusal::Geometry));
                         refused_bytes = gone;
                     }
                     inner.total -= refused_bytes;
@@ -1509,10 +1617,12 @@ struct Protect {
 /// [`Reason::Routine`] is reclaim after a submit or a decode completion: plain LRU, and evicted
 /// copies stay re-makeable — the drawer may ask for them again and get them.
 /// [`Reason::Install`] names the copy being put in place: that copy and its source are skipped,
-/// and every *other* copy this pass drops is marked [`Slot::Refused`]. A copy of a still-held
-/// image displaced by an install must become its placeholder rather than resample once per frame
-/// — otherwise two placements whose copies cannot coexist evict each other forever (the loop the
-/// round-3 review calls N4).
+/// and every *other* copy this pass drops is marked [`Slot::Refused(Refusal::Pressure)`]. A copy
+/// of a still-held image displaced by an install must become its placeholder rather than resample
+/// once per frame — otherwise two placements whose copies cannot coexist evict each other forever
+/// (the loop the round-3 review calls N4). The refusal is a pressure refusal: it keeps the loop
+/// dead only until memory frees, so a release or dropped owner that actually removed something
+/// clears it and the size is made again (see [`Freed::clear_pressure_refusals`]).
 #[derive(Clone, Copy)]
 enum Reason {
     Routine,
@@ -1531,8 +1641,11 @@ fn covers(owner: u64, trigger: u64, scope: Scope) -> bool {
 /// names (with [`Reason::Routine`] — and for whole-image candidates, always — this is exactly the
 /// plain LRU step), and it skips a copy that is its picture's own pixels: an alias accounts nothing
 /// (finding P4), so dropping it would free nothing and leave the cap where it was. An install-time
-/// eviction marks the losing size [`Slot::Refused`]: a copy displaced to make room for a fresh
-/// install must not be re-made every frame. Returns whether anything went.
+/// eviction marks the losing size [`Slot::Refused(Refusal::Pressure)`]: a copy displaced to make
+/// room for a fresh install must not be re-made every frame — but the pressure that refused it
+/// ends when memory frees, so the size comes back with the next release or dropped owner that
+/// actually removed something (`ImageStore::release` and `ImageStore::drop_owner`). A plain
+/// LRU eviction leaves the slot empty and re-makeable. Returns whether anything went.
 fn evict_resample(
     inner: &mut Inner,
     trigger: u64,
@@ -1578,8 +1691,12 @@ fn evict_resample(
         freed.copies.push(out); // dropped after the mutex goes
         if matches!(reason, Reason::Install(..)) {
             // The source is still held (only copies are evicted here), so this size draws its
-            // placeholder until the source changes — refusing it stops the ask-evict-ask loop.
-            image.resamples.insert(slot_key, Slot::Refused);
+            // placeholder — refusing it under pressure stops the ask-evict-ask loop. The refusal
+            // is a [`Refusal::Pressure`] one: when memory frees, the next release or dropped
+            // owner clears it and the size is asked afresh.
+            image
+                .resamples
+                .insert(slot_key, Slot::Refused(Refusal::Pressure));
         }
         inner.total -= bytes;
     }
@@ -1591,12 +1708,12 @@ fn evict_resample(
 }
 
 /// Drop the least recently shown whole image in scope: its buffer and every resampled copy of it
-/// (the source is gone — any refused sizes go with it, so they are asked afresh if the key is
-/// re-submitted). A pending decode counts as a whole image too, and evicting one must not strand
-/// its answer: its queued jobs are purged and a [`Job::Refuse`] takes their place (if the decode
-/// was already running, both exist and the exactly-once rule on [`Job`] picks one) — `queued_job`
-/// reports that push so the caller can wake the worker. The image `Reason::Install` names is
-/// skipped in the scan.
+/// (the source is gone — any refused sizes, of either kind, go with it, so they are asked afresh
+/// if the key is re-submitted: the whole entry, refusals included, is drained). A pending decode
+/// counts as a whole image too, and evicting one must not strand its answer: its queued jobs are
+/// purged and a [`Job::Refuse`] takes their place (if the decode was already running, both exist
+/// and the exactly-once rule on [`Job`] picks one) — `queued_job` reports that push so the caller
+/// can wake the worker. The image `Reason::Install` names is skipped in the scan.
 fn evict_image(
     inner: &mut Inner,
     trigger: u64,
@@ -3264,6 +3381,362 @@ mod tests {
         }
         assert_eq!(store.owner_bytes(owner), per_owner); // two whole + one copy
         assert_books(store);
+    }
+
+    /// Two copies that cannot coexist settle with the first's size refused under pressure. A
+    /// release of an unrelated picture that actually existed frees memory, so that refused size
+    /// comes back: the next `get` queues a resample as for any uncached size, and the worker makes
+    /// the copy. (On `develop` the refusal was permanent — the next `get` answered `Evicted` and
+    /// never queued.)
+    #[test]
+    fn pressure_refusal_recovers_after_a_release() {
+        // Two whole 16 KiB pictures plus exactly one 1 KiB copy fit; both copies together do not.
+        let per_owner = 2 * 16 * KB + 1024;
+        let store = ImageStore::with_caps(per_owner, 8 * per_owner);
+        let owner = 40;
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1));
+        store.submit(owner, ImageKey(2), rgba(64, 64, 2));
+        store.submit(owner, ImageKey(3), rgba(2, 2, 5)); // 16 bytes: an unrelated picture to release
+
+        // The second copy's install pushes the caps over: key 1's copy is the victim.
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        assert!(matches!(
+            store.get(owner, ImageKey(2), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(2), (16, 16), None, false),
+                Lookup::Ready(_)
+            ),
+            "the second copy is installed"
+        );
+        let refused = store.get(owner, ImageKey(1), (16, 16), None, false);
+        assert!(
+            matches!(refused, Lookup::Evicted { .. }),
+            "the first copy is refused under pressure, got {refused:?}"
+        );
+        assert_books(&store);
+
+        // The release frees the 16 bytes, so the refused size is asked afresh...
+        store.release(owner, ImageKey(3));
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(1), (16, 16), None, false),
+                Lookup::Pending
+            ),
+            "the cleared refusal queues a resample again"
+        );
+        store.run_jobs_until_idle();
+        match store.get(owner, ImageKey(1), (16, 16), None, false) {
+            Lookup::Ready(img) => {
+                assert_eq!((img.width, img.height), (16, 16));
+            }
+            other => panic!("the recovered size should answer its copy, got {other:?}"),
+        }
+        assert_books(&store);
+    }
+
+    /// The same recovery through a dropped owner: the pane whose picture is gone frees its bytes,
+    /// and the other owner's pressure refusal comes back with a generation bump and a wake — the
+    /// dropped owner's own hooks are already gone, so it is never asked to redraw.
+    #[test]
+    fn pressure_refusal_recovers_after_another_owner_drops() {
+        // Room for two whole 16 KiB pictures and exactly one 1 KiB copy per owner; the other
+        // owner holds a 4 KiB picture that goes on drop to make room for the recovered copy.
+        let per_owner = 2 * 16 * KB + 1024;
+        let total = 3 * 16 * KB + 1024;
+        let store = Arc::new(ImageStore::with_caps(per_owner, total));
+        let (keeper, victim) = (41, 42);
+        let k_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let v_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let mine = Captured::default();
+        let theirs = Captured::default();
+        store.register_owner(keeper, mine.hooks_probing(&k_term, &store));
+        store.register_owner(victim, theirs.hooks_probing(&v_term, &store));
+
+        store.submit(keeper, ImageKey(1), rgba(64, 64, 1));
+        store.submit(keeper, ImageKey(2), rgba(64, 64, 2));
+        store.submit(victim, ImageKey(9), rgba(32, 32, 9)); // 4 KiB, the memory that frees
+        assert_eq!(
+            store.owner_bytes(keeper),
+            2 * 16 * KB,
+            "both pictures held before the pressure"
+        );
+        assert_books(&store);
+
+        // The second copy's install pushes the app total over: key 1's copy is the victim.
+        assert!(matches!(
+            store.get(keeper, ImageKey(1), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        assert!(matches!(
+            store.get(keeper, ImageKey(2), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(2), (16, 16), None, false),
+                Lookup::Ready(_)
+            ),
+            "the second copy is installed"
+        );
+        let refused = store.get(keeper, ImageKey(1), (16, 16), None, false);
+        assert!(
+            matches!(refused, Lookup::Evicted { .. }),
+            "the first copy is refused under pressure, got {refused:?}"
+        );
+        assert_books(&store);
+        let epoch = store.generation(keeper);
+        let wakes = mine.wakes();
+
+        // The victim's pane closes: its bytes free, and the keeper's refused size comes back.
+        store.drop_owner(victim);
+        assert_books(&store);
+        assert_eq!(
+            mine.wakes(),
+            wakes + 1,
+            "the keeper is asked to redraw once its refusal is cleared"
+        );
+        assert_eq!(
+            store.generation(keeper),
+            epoch + 1,
+            "its generation moved with the wake: the cached frame is stale"
+        );
+        assert_eq!(
+            theirs.wakes(),
+            0,
+            "the dropped owner's hooks are gone: it is not woken"
+        );
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Pending
+            ),
+            "the cleared refusal queues a resample again"
+        );
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Ready(_)
+            ),
+            "the recovered copy is made from the freed room"
+        );
+        assert_books(&store);
+        assert_eq!(mine.locked_hooks(), 0, "no hook ran under the store mutex");
+    }
+
+    /// A copy that cannot fit beside its own source is a GEOMETRY refusal: an unrelated release
+    /// frees other memory, but it cannot make this pair fit, so the size stays refused.
+    #[test]
+    fn geometry_refusal_stays_after_a_release() {
+        let per_owner = 16 * KB + 512; // a 16 KiB picture fits alone, never beside a copy
+        let store = ImageStore::with_caps(per_owner, 8 * per_owner);
+        let owner = 43;
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1));
+        store.submit(owner, ImageKey(2), rgba(2, 2, 5)); // an unrelated 16-byte neighbour
+
+        assert!(matches!(
+            store.get(owner, ImageKey(1), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(1), (16, 16), None, false),
+                Lookup::Evicted { .. }
+            ),
+            "the copy is refused on geometry alone"
+        );
+        assert_books(&store);
+
+        // Releasing the neighbour frees 16 bytes, but the pair still cannot fit: no re-ask.
+        store.release(owner, ImageKey(2));
+        assert!(
+            matches!(
+                store.get(owner, ImageKey(1), (16, 16), None, false),
+                Lookup::Evicted { .. }
+            ),
+            "a geometry refusal survives an unrelated release"
+        );
+        store.run_jobs_until_idle();
+        assert!(
+            store.inner.lock().jobs.is_empty(),
+            "the refused size queues nothing"
+        );
+        assert_books(&store);
+    }
+
+    /// A release that removes nothing clears nothing: a second release of the same key, and a
+    /// release of a key the owner never had, must leave pressure refusals in place and wake
+    /// nobody.
+    #[test]
+    fn stale_release_clears_nothing() {
+        let per_owner = 2 * 16 * KB + 1024;
+        let store = Arc::new(ImageStore::with_caps(per_owner, 8 * per_owner));
+        let (keeper, victim) = (44, 45);
+        let k_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let mine = Captured::default();
+        store.register_owner(keeper, mine.hooks_probing(&k_term, &store));
+
+        store.submit(keeper, ImageKey(1), rgba(64, 64, 1));
+        store.submit(keeper, ImageKey(2), rgba(64, 64, 2));
+        store.submit(victim, ImageKey(9), rgba(32, 32, 9)); // 4 KiB: what the release frees
+        assert!(matches!(
+            store.get(keeper, ImageKey(1), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        assert!(matches!(
+            store.get(keeper, ImageKey(2), (16, 16), None, false),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Evicted { .. }
+            ),
+            "key 1's size is refused under pressure"
+        );
+        assert_books(&store);
+
+        // The one real release frees room and the refused size is queued again...
+        store.release(victim, ImageKey(9));
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Pending
+            ),
+            "a real release clears the pressure refusal"
+        );
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Ready(_)
+            ),
+            "key 1's copy is made again from the freed room"
+        );
+
+        // ...and a second refusal lands the same way: a new ask for the OTHER size, whose
+        // install pushes the caps over and makes key 1's just-recovered copy the victim.
+        store.submit(keeper, ImageKey(3), rgba(2, 2, 5)); // 16 bytes, a neighbour to release
+        store.release(keeper, ImageKey(3)); // frees the 16 bytes the new ask needs
+        // Key 2's copy is still cached (it never went), so ask a NEW size of key 2's picture:
+        // its install needs 1 KiB and evicts the least recently shown copy — key 1's, which the
+        // gets above stamped older than key 2's.
+        assert!(matches!(
+            store.get(keeper, ImageKey(2), (32, 32), None, false),
+            Lookup::Pending
+        ));
+        store.run_jobs_until_idle();
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(2), (32, 32), None, false),
+                Lookup::Ready(_)
+            ),
+            "the new copy is installed"
+        );
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Evicted { .. }
+            ),
+            "key 1's size is refused under pressure again"
+        );
+        let wakes = mine.wakes();
+        let epoch = store.generation(keeper);
+
+        // Releasing the same key again removes nothing: the refusal stays, nobody is woken.
+        store.release(victim, ImageKey(9));
+        assert_eq!(mine.wakes(), wakes, "a stale release wakes nobody");
+        assert_eq!(store.generation(keeper), epoch, "and it bumps nothing");
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Evicted { .. }
+            ),
+            "the pressure refusal is still in place"
+        );
+
+        // And a release of a key the owner never had is just as harmless.
+        store.release(keeper, ImageKey(7));
+        assert_eq!(mine.wakes(), wakes, "an unknown-key release wakes nobody");
+        assert_eq!(store.generation(keeper), epoch, "and it bumps nothing");
+        assert!(
+            matches!(
+                store.get(keeper, ImageKey(1), (16, 16), None, false),
+                Lookup::Evicted { .. }
+            ),
+            "the pressure refusal is still in place"
+        );
+        assert_books(&store);
+    }
+
+    /// After a clear the two placements that cannot coexist race once more: whichever copy
+    /// installs displaces the other's, that size is refused again under pressure, and both
+    /// settle — the bounded re-ask is what keeps the N4 loop dead.
+    #[test]
+    fn no_ping_pong_after_a_clear() {
+        let per_owner = 2 * 16 * KB + 1024;
+        let store = ImageStore::with_caps(per_owner, 8 * per_owner);
+        let owner = 46;
+        store.submit(owner, ImageKey(1), rgba(64, 64, 1));
+        store.submit(owner, ImageKey(2), rgba(64, 64, 2));
+
+        // Two rounds asking both sizes: they settle with one copy installed and the other refused.
+        for _ in 0..2 {
+            for key in [ImageKey(1), ImageKey(2)] {
+                store.get(owner, key, (16, 16), None, false);
+            }
+            store.run_jobs_until_idle();
+        }
+        let settled = |key: ImageKey| {
+            matches!(
+                store.get(owner, key, (16, 16), None, false),
+                Lookup::Evicted { .. }
+            )
+        };
+        assert!(
+            settled(ImageKey(1)) != settled(ImageKey(2)),
+            "the two copies must settle, one refused"
+        );
+
+        // The release that frees memory: a 3x3 neighbour of the owner.
+        store.submit(owner, ImageKey(3), rgba(3, 3, 5));
+        store.release(owner, ImageKey(3));
+
+        // After the clear, both placements ask every frame again: at most two more resamples are
+        // ever queued (the one the loser re-asked, and one more only if the winner's copy was
+        // displaced), then they settle again.
+        let mut pending_asks = 0usize;
+        for _ in 0..8 {
+            for key in [ImageKey(1), ImageKey(2)] {
+                if matches!(
+                    store.get(owner, key, (16, 16), None, false),
+                    Lookup::Pending
+                ) {
+                    pending_asks += 1;
+                }
+            }
+            store.run_jobs_until_idle();
+        }
+        assert!(
+            pending_asks <= 2,
+            "the race after a clear is bounded, got {pending_asks} resamples"
+        );
+        assert!(
+            settled(ImageKey(1)) != settled(ImageKey(2)),
+            "one size ends refused again: the N4 loop cannot restart"
+        );
+        assert!(store.inner.lock().jobs.is_empty());
+        assert_books(&store);
     }
 
     /// A decode that finishes while no hooks are registered does not lose its answer: the key
