@@ -23,3 +23,13 @@ ignore:
     package:
       name: actions/download-artifact
       type: github-action
+  # picomatch ReDoS on crafted glob patterns, every release up to 4.0.7 (the
+  # newest; no patched version exists). Only the docs site's build tooling
+  # uses it (website/package-lock.json), on glob patterns from our own config,
+  # never on outside input; it is not part of fbterm. Remove when a picomatch
+  # release above 4.0.7 is published and the lockfile picks it up. Same entry
+  # in website/audit-ci.jsonc.
+  - vulnerability: GHSA-fc5q-39xc-vjpf
+    package:
+      name: picomatch
+      type: npm
