@@ -201,6 +201,9 @@ pub fn spawn_local_into(
         ended.clone(),
         tx.clone(),
     );
+    // The handle keeps the router so the app can have output delivered after a resize that happens
+    // on its own thread - a pane's first real grid, which is what releases held bytes.
+    let router = feeder.router();
     // Reading and parsing run on separate threads. A read can return as little as about 1 KiB
     // (macOS caps each pty read there), so parsing every read as it came meant taking the
     // terminal lock once per KiB under heavy output. The reader only drains the pty into a
@@ -261,6 +264,7 @@ pub fn spawn_local_into(
             let _ = killer.lock().kill();
         }),
         connection: Mutex::new(None),
+        router: Some(router),
     })
 }
 

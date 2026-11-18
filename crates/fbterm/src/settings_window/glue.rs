@@ -84,7 +84,9 @@ impl App {
                 && !self.tunnels_panels.has_focus(wid),
             accent: None,
             // The window's own scale: a pane moved to another display tells its program new pixels.
-            scale: self.physical_scale(wid),
+            // Until the window reports one, 0.0 tells the view to report no grid at all, so a new
+            // pane's cells are never measured with an assumed factor (see `Terminal::hold_until_sized`).
+            scale: self.physical_scale_if_known(wid).unwrap_or(0.0),
             ..self.style.clone()
         }
     }

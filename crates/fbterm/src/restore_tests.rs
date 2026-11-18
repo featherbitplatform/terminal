@@ -424,6 +424,8 @@ fn restart_restores_grapheme_default() {
                 .expect("started tab has a terminal"),
         )
     };
+    // The pane laid out before its program switched the mode on (see `lay_out`).
+    lay_out(&term);
     term.lock().feed(b"\x1b[?2027h");
     assert!(
         term.lock()
@@ -722,7 +724,17 @@ pub(crate) fn first_terminal(app: &App) -> fbterm_term::SharedTerminal {
         .expect("started tab has a terminal")
 }
 
+/// This pane laid out and learned the cells its window really has, so anything its terminal held
+/// since the session started is parsed now (see `App::start`). Fixtures poke terminals directly
+/// rather than run iced's layout pass, which is what a real window does first. Does nothing to a
+/// terminal that was not holding.
+pub(crate) fn lay_out(term: &fbterm_term::SharedTerminal) {
+    term.lock().sized();
+}
+
+/// Output arriving from the program, one line after another, in a pane that has laid out.
 pub(crate) fn fill_history(term: &fbterm_term::SharedTerminal, lines: usize) {
+    lay_out(term);
     let mut t = term.lock();
     for i in 0..lines {
         t.feed(format!("line {i}\r\n").as_bytes());

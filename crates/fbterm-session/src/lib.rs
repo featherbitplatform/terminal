@@ -125,6 +125,9 @@ pub struct SessionHandle {
     pub(crate) ended: Ended,
     /// SSH sessions keep their shared connection alive until closed.
     pub(crate) connection: parking_lot::Mutex<Option<Arc<ssh::pool::Connection>>>,
+    /// This session's event router, for [`SessionHandle::deliver_events`]. `None` on a handle with
+    /// no session behind it ([`SessionHandle::inert`]), where nothing runs to route anything.
+    pub(crate) router: Option<Arc<Router>>,
 }
 
 impl SessionHandle {
@@ -143,6 +146,7 @@ impl SessionHandle {
             auth_warnings: Vec::new(),
             ended: Ended::default(),
             connection: parking_lot::Mutex::new(None),
+            router: None,
         }
     }
 
@@ -176,6 +180,19 @@ impl SessionHandle {
             }
         }
         let _ = self.commands.send(Command::Resize(size));
+    }
+
+    /// Deliver what this session's terminal queued with nobody to route it, as a feed would: its
+    /// replies to the program, its title, its pictures, and one `Dirty`.
+    ///
+    /// A pane started before its window laid out holds its output until the view reports the grid it
+    /// really has (see [`fbterm_term::Terminal::hold_until_sized`]); that resize happens on the app's
+    /// thread, where no feed follows it. Call this after such a resize, and never while holding the
+    /// terminal's lock: delivery hands pictures to the image store, which locks the terminal itself.
+    pub fn deliver_events(&self) {
+        if let Some(router) = &self.router {
+            router.deliver_queued();
+        }
     }
 
     /// Kill the session and stop its threads or tasks. Safe to call repeatedly.
@@ -284,6 +301,27 @@ impl Router {
         fbterm_term::images::reclaim(store, &self.terminal, self.owner);
     }
 
+    /// Deliver what the terminal queued with nobody to route it: output held for a pane's first real
+    /// grid (see [`fbterm_term::Terminal::hold_until_sized`]) is parsed by its view's resize, on the
+    /// app's thread, and what that produces - replies, titles, pictures - needs the same delivery a
+    /// feed gives it. Takes the terminal lock only to empty the queue: routing hands pictures to the
+    /// store, which may lock the terminal itself. Raises `Dirty` for the same reason a feed does.
+    fn deliver_queued(&self) {
+        let Some(terminal) = self.terminal.upgrade() else {
+            return; // nobody owns this terminal any more: nothing waits for its events
+        };
+        let events = {
+            let mut term = terminal.lock();
+            term.take_events()
+        };
+        drop(terminal);
+        if events.is_empty() {
+            return;
+        }
+        self.route(events);
+        self.mark_dirty();
+    }
+
     /// Raise `Dirty` unless one is already pending.
     fn mark_dirty(&self) {
         if !self.dirty_pending.swap(true, Ordering::AcqRel) {
@@ -388,6 +426,13 @@ impl Feeder {
             detached,
             router,
         }
+    }
+
+    /// This session's router: what delivers terminal events when no feed produced them (see
+    /// [`SessionHandle::deliver_events`]). A handle keeps a copy so the app can ask for that
+    /// delivery without reaching into the session's own thread.
+    pub(crate) fn router(&self) -> Arc<Router> {
+        self.router.clone()
     }
 
     /// Feed output, answering programs through the session's replies queue as the emulator asks.

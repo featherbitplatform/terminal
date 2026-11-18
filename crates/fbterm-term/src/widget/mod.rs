@@ -50,9 +50,11 @@ pub struct TerminalStyle {
     /// selection, the cursor and text stay opaque. At `0.0` the default background is not drawn
     /// at all, for a host that paints it behind the widget.
     pub background_opacity: f32,
-    /// Physical pixels per logical pixel of the window this terminal sits in (1.0 when unknown).
-    /// The grid the view reports carries it, so programs are told physical pixels; cells stay
-    /// logical, which is what the drawing uses.
+    /// Physical pixels per logical pixel of the window this terminal sits in. The grid the view
+    /// reports carries it, so programs are told physical pixels; cells stay logical, which is what
+    /// the drawing uses. `0.0` means the window has not reported a scale yet: a view given that
+    /// reports no grid at all, because every pixel number in it would be wrong (see
+    /// [`crate::Terminal::hold_until_sized`]).
     pub scale: f32,
 }
 
@@ -266,9 +268,20 @@ fn measure(font: Font, font_size: f32) -> Size {
 
 impl<Message> TerminalView<'_, Message> {
     /// Keep the terminal's grid in step with the widget bounds.
+    ///
+    /// `style.scale` is `0.0` until the window has reported a scale (see [`TerminalStyle::scale`]).
+    /// Until then there is no honest grid to hand over: its cells would tell programs half or twice
+    /// the pixels they really have, and a picture parsed against them keeps the wrong span for good.
+    /// So nothing is reported, and output held for this pane's first real grid keeps waiting (see
+    /// [`crate::Terminal::hold_until_sized`]). Because no provisional grid is ever recorded as
+    /// synced, the first pass that has a real scale always runs, whatever that scale turns out to
+    /// be, 1.0 included: that one would otherwise look like nothing had changed.
     fn sync_size(&self, state: &mut State, bounds: Rectangle, shell: &mut Shell<'_, Message>) {
         let Some(m) = state.measured else { return };
         if bounds.width < 1.0 || bounds.height < 1.0 {
+            return;
+        }
+        if self.style.scale <= 0.0 {
             return;
         }
         let grid = grid_size_from_bounds(bounds.size(), m.cell, self.style.scale);
@@ -277,12 +290,25 @@ impl<Message> TerminalView<'_, Message> {
         }
         state.synced = Some(grid);
         let mut term = self.term.lock();
-        if term.size() != grid {
+        // Resizing is also what parses the output held for this pane's first real grid. When the
+        // terminal already has exactly this grid - its session started at the size the layout turned
+        // out to need - nothing resizes, so `sized` releases the hold; parsing what waited changed
+        // the screen, which is why that case reports and redraws too.
+        let changed = if term.size() != grid {
             term.resize(grid);
-            drop(term);
-            shell.publish((self.on_event)(TerminalOutput::Resized(grid)));
-            shell.request_redraw();
+            true
+        } else {
+            term.sized()
+        };
+        drop(term);
+        // Report only what changed: a view that agrees with its terminal says nothing, which is how
+        // the Color schemes preview avoids rebuilding its sample every time it is laid out. A hold
+        // that released here did change the screen, so it counts as changed and is reported too.
+        if !changed {
+            return;
         }
+        shell.publish((self.on_event)(TerminalOutput::Resized(grid)));
+        shell.request_redraw();
     }
 }
 
@@ -636,6 +662,155 @@ mod tests {
         )
         .unwrap();
         assert_eq!(answer, "\x1b[6;32;16t", "cells of 16x32 physical px");
+    }
+
+    /// The window's scale arrives after it opens, asynchronously. Until then every pixel number a
+    /// grid could carry is wrong (a 2x display would be told 1x), so the view reports nothing at
+    /// all: neither the terminal nor the app hears a provisional size, and output held for the pane's
+    /// first real grid (`Terminal::hold_until_sized`) keeps waiting. The first pass that has a scale
+    /// runs whatever it says - 1.0 included, which would otherwise look like nothing had changed.
+    #[test]
+    fn a_view_reports_nothing_until_the_window_reports_its_scale() {
+        let term = Arc::new(parking_lot::Mutex::new(crate::Terminal::new(
+            GridSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            10,
+        )));
+        term.lock().hold_until_sized();
+        let mut state = State::default();
+        state.hold(&term);
+        state.measured = Some(Measured {
+            font: Font::with_name("Sample Mono"),
+            font_size: 14.0,
+            cell: Size::new(8.0, 16.0),
+            epoch: font_epoch(),
+        });
+        let bounds = Rectangle::new(iced::Point::new(0.0, 0.0), Size::new(800.0, 480.0));
+        term.lock().feed(b"ready");
+
+        let unknown = style_at(0.0);
+        let unknown_view = TerminalView {
+            term: &term,
+            style: Cow::Borrowed(&unknown),
+            highlight: None,
+            on_event: Box::new(|out| out),
+        };
+        assert!(
+            sync(&unknown_view, &mut state, bounds).is_empty(),
+            "a grid whose pixels are guesses is not worth reporting"
+        );
+        assert_eq!(
+            term.lock().size().cols,
+            80,
+            "the terminal keeps the size it started at"
+        );
+        assert_eq!(first_cell(&term), ' ', "and its output still waits");
+
+        // The window reports 2x. Cells stay cells; now the pixels are real, so this pass counts.
+        let at_two = style_at(2.0);
+        let two_view = TerminalView {
+            term: &term,
+            style: Cow::Borrowed(&at_two),
+            highlight: None,
+            on_event: Box::new(|out| out),
+        };
+        let out = sync(&two_view, &mut state, bounds);
+        let [TerminalOutput::Resized(grid)] = &out[..] else {
+            panic!("expected one resize once the scale is known, got {out:?}");
+        };
+        assert_eq!((grid.cols, grid.rows, grid.scale), (100, 30, 2.0));
+        assert_eq!(
+            first_cell(&term),
+            'r',
+            "the held output was parsed at these cells"
+        );
+        // And it is answered from them: a `CSI 16 t` after the release reports 16x32 px cells.
+        let answer = ask(&term, b"\x1b[16t");
+        assert_eq!(answer, "\x1b[6;32;16t");
+    }
+
+    /// A pane whose terminal was started at exactly the grid its first layout needs: nothing
+    /// resizes, and a view that only resized on a change would hold its output forever. The first
+    /// pass releases it and reports the size, so the app delivers what parsing produced.
+    #[test]
+    fn the_first_sync_releases_held_output_even_when_the_grid_matches() {
+        let term = Arc::new(parking_lot::Mutex::new(crate::Terminal::new(
+            GridSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            10,
+        )));
+        term.lock().hold_until_sized();
+        let mut state = State::default();
+        state.hold(&term);
+        state.measured = Some(Measured {
+            font: Font::with_name("Sample Mono"),
+            font_size: 14.0,
+            cell: Size::new(8.0, 16.0),
+            epoch: font_epoch(),
+        });
+        // Bounds that fit exactly the 80x24 grid the terminal already has.
+        let bounds = Rectangle::new(iced::Point::new(0.0, 0.0), Size::new(640.0, 384.0));
+        term.lock().feed(b"ready");
+
+        let style = style_at(1.0);
+        let view = TerminalView {
+            term: &term,
+            style: Cow::Borrowed(&style),
+            highlight: None,
+            on_event: Box::new(|out| out),
+        };
+        assert_eq!(term.lock().size(), grid_at(80, 24, 1.0));
+        let out = sync(&view, &mut state, bounds);
+        let [TerminalOutput::Resized(grid)] = &out[..] else {
+            panic!("the size is unchanged but output landed: expected one report, got {out:?}");
+        };
+        assert_eq!(*grid, grid_at(80, 24, 1.0));
+        assert_eq!(first_cell(&term), 'r');
+
+        // Nothing new to say on the next pass at the same bounds and scale.
+        assert!(sync(&view, &mut state, bounds).is_empty());
+    }
+
+    /// The first cell of screen row 0.
+    fn first_cell(term: &SharedTerminal) -> char {
+        use feathercritty::index::{Column, Line};
+        term.lock().term().grid().screen()[Line(0)][Column(0)].c
+    }
+
+    /// What the terminal answers one query, as text.
+    fn ask(term: &SharedTerminal, query: &[u8]) -> String {
+        let mut t = term.lock();
+        t.feed(query);
+        let bytes: Vec<u8> = t
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                crate::TermEvent::PtyWrite(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn grid_at(cols: u16, rows: u16, scale: f32) -> GridSize {
+        GridSize {
+            cols,
+            rows,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            scale,
+        }
     }
 
     #[test]

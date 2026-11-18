@@ -216,6 +216,12 @@ fn dims(size: GridSize) -> Dims {
 /// Ids handed to [`crate::images`] for decoded-image accounting, one per terminal ever made.
 static NEXT_IMAGE_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// The most a terminal holds while its output waits for the pane's first real grid (see
+/// [`Terminal::hold_until_sized`]). Past it the hold releases and the bytes are parsed at the size
+/// the terminal has, so a pane that never lays out - a window shown on a display that reports no
+/// scale, a tab nobody looks at - cannot grow memory without bound.
+const HOLD_CAP: usize = 4 * 1024 * 1024;
+
 /// An emulated terminal: grid, parser and pending events.
 pub struct Terminal {
     pub(crate) term: Term<EventProxy>,
@@ -230,6 +236,12 @@ pub struct Terminal {
     /// The `scrollback_images` setting: whether a picture stays when its rows have all scrolled
     /// off the screen. Off, like the default, it becomes a placeholder line and is released.
     scrollback_images: bool,
+    /// Output waits in `pending` until the pane's view reports a grid measured for real (see
+    /// [`Terminal::hold_until_sized`]).
+    holding: bool,
+    /// Bytes fed while `holding`, in order; parsed by the first [`Terminal::resize`] or
+    /// [`Terminal::sized`] after its new size and cell pixels are applied.
+    pending: Vec<u8>,
     pub(crate) generation: u64,
     /// Calls of [`Terminal::drop_history_cache`] (tests: the read cache itself is not visible
     /// outside feathercritty).
@@ -270,6 +282,8 @@ impl Terminal {
             image_owner: NEXT_IMAGE_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             images_enabled: true,
             scrollback_images: false,
+            holding: false,
+            pending: Vec::new(),
             generation: 0,
             #[cfg(test)]
             cache_drops: 0,
@@ -277,9 +291,68 @@ impl Terminal {
     }
 
     /// Feed bytes received from the session into the emulator.
+    ///
+    /// While a hold from [`Terminal::hold_until_sized`] is up the bytes only queue; see it.
     pub fn feed(&mut self, bytes: &[u8]) {
+        if self.holding {
+            self.pending.extend_from_slice(bytes);
+            if self.pending.len() >= HOLD_CAP {
+                tracing::warn!(
+                    bytes = self.pending.len(),
+                    "output held for this pane's first layout passed the cap; parsing it at the grid it has",
+                );
+                self.sized();
+            }
+            return;
+        }
         self.parser.advance(&mut self.term, bytes);
         self.generation += 1;
+    }
+
+    /// Hold output until this terminal's cell size is known for real.
+    ///
+    /// A window that has not laid out yet does not know its cell pixels or even its window scale,
+    /// and the emulator fixes a picture's cell span the moment it parses it: output parsed then is
+    /// placed against the wrong pixels for good - on a 2x display a 160 px image covers twice its
+    /// cells - and `CSI 14 t` / `CSI 16 t` answer wrong, so programs size themselves wrong too.
+    /// While held, [`Terminal::feed`] only queues bytes; the first [`Terminal::resize`] or
+    /// [`Terminal::sized`] - what a pane's view does at its first layout measured at the scale its
+    /// window reported - parses them, in order, against the new size, and their replies are then
+    /// answered from it. Past [`HOLD_CAP`] the hold releases on its own so a pane that never lays
+    /// out cannot grow memory without bound.
+    ///
+    /// [`Terminal::new`] does not hold: a host that sizes its terminal itself (tests, export, a
+    /// headless run) parses at once.
+    pub fn hold_until_sized(&mut self) {
+        self.holding = true;
+    }
+
+    /// Whether output is still waiting for the pane's first real grid.
+    pub fn holding(&self) -> bool {
+        self.holding
+    }
+
+    /// The pane's real cell size is now in this terminal (its view laid out at the scale its window
+    /// reported): parse what [`Terminal::feed`] held, in order, and stop holding. Returns whether
+    /// bytes were parsed, so a caller can tell output that landed from nothing happening.
+    ///
+    /// [`Terminal::resize`] calls this after applying the new size and cell pixels; call it directly
+    /// when the terminal already had this grid (a session started at the size its pane turned out
+    /// to need) and so did not resize.
+    pub fn sized(&mut self) -> bool {
+        if !self.holding {
+            return false;
+        }
+        self.holding = false;
+        let bytes = std::mem::take(&mut self.pending);
+        if bytes.is_empty() {
+            return false;
+        }
+        // One slice, in the order it arrived: the parser is a byte-stream state machine, so this
+        // parses exactly as the individual feeds would have.
+        self.parser.advance(&mut self.term, &bytes);
+        self.generation += 1;
+        true
     }
 
     /// This terminal's id in the app-wide image store ([`crate::images::store`]). The store
@@ -531,13 +604,16 @@ impl Terminal {
     }
 
     /// Resize the grid, and with it the cell size programs are told: the new grid carries the
-    /// window's physical scale (see [`Self::set_cell_pixel_size`]).
+    /// window's physical scale (see [`Self::set_cell_pixel_size`]). This is a pane's first real
+    /// grid for the purposes of [`Self::hold_until_sized`], so anything that waited for it is
+    /// parsed here, after the new size and cell pixels are applied.
     pub fn resize(&mut self, size: GridSize) {
         self.shared.lock().size = size;
         let (cell_w, cell_h) = size.physical_cell();
         self.term.resize(dims(size));
         self.term.set_cell_pixel_size(cell_w, cell_h);
         self.generation += 1;
+        self.sized();
     }
 
     /// The physical pixel size of one text cell. Placements convert pixels to cells with it, and
@@ -1184,6 +1260,147 @@ mod tests {
             "switching back on does not resurrect it"
         );
         assert!(t.take_events().is_empty());
+    }
+
+    /// The text of screen row `row`, spaces trimmed.
+    fn line(t: &Terminal, row: usize) -> String {
+        let cols = usize::from(t.size().cols);
+        let grid = t.term().grid();
+        let row: String = (0..cols)
+            .map(|c| grid.screen()[Line(row as i32)][Column(c)].c)
+            .collect();
+        row.trim_end().to_string()
+    }
+
+    /// Minimal standard-alphabet base64 (padding included) for building kitty frames in tests.
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            let t = |i: u32| T[i as usize] as char;
+            out.push(t(n >> 18));
+            out.push(t((n >> 12) & 63));
+            out.push(if chunk.len() > 1 {
+                t((n >> 6) & 63)
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 { t(n & 63) } else { '=' });
+        }
+        out
+    }
+
+    /// A terminal whose window has not laid out yet holds its output: nothing is parsed, and no
+    /// query is answered, until the first resize brings the grid the pane really has.
+    #[test]
+    fn held_output_is_parsed_by_the_first_resize() {
+        let mut t = Terminal::new(grid_of(80, 24, 8.0, 16.0, 1.0), 100);
+        t.hold_until_sized();
+        assert!(t.holding(), "the hold is opt-in but stays up");
+
+        t.feed(b"hi\r\nthere");
+        assert_eq!(line(&t, 0), "", "nothing is drawn while held");
+        assert_eq!(line(&t, 1), "");
+        assert!(t.take_events().is_empty());
+        // A program asking for the cell size before the layout gets no answer yet.
+        t.feed(b"\x1b[16t");
+        assert!(reply(&mut t).is_empty(), "held output asks nothing");
+
+        // The pane's first real grid: cells of 8.4x16.2 logical px in a 2x window = 17x32 px.
+        t.resize(grid_of(40, 6, 8.4, 16.2, 2.0));
+        assert!(!t.holding(), "the first resize releases the hold");
+        assert_eq!(line(&t, 0), "hi");
+        assert_eq!(line(&t, 1), "there");
+        // The query that arrived while held is answered once, from the cells it was parsed against.
+        assert_eq!(reply(&mut t), "\x1b[6;32;17t");
+
+        // And output after the release parses at once, as ever.
+        t.feed(b"\x1b[H\x1b[Jafter");
+        assert_eq!(line(&t, 0), "after");
+    }
+
+    /// The defect this hold is for, end to end: a picture transmitted before the pane's first
+    /// layout used to be placed against the provisional cells (8x16 px at scale 1), and its span
+    /// never changed again. Held until that layout, it gets the span the real pixels imply.
+    #[test]
+    fn a_held_image_gets_its_span_from_the_new_cells() {
+        // The grid a new window's first pane starts at: 80x24 cells of 8x16 logical px at scale 1.
+        let mut t = Terminal::new(grid_of(40, 10, 8.0, 16.0, 1.0), 100);
+        t.hold_until_sized();
+
+        // A 160x32 px opaque picture (transmit and display, raw RGBA): 20 cells wide at the
+        // provisional cells, 10 at the real ones.
+        let pixels = vec![255u8; 160 * 32 * 4];
+        t.feed(format!("\x1b_Ga=T,i=1,f=32,s=160,v=32;{}\x1b\\", b64(&pixels)).as_bytes());
+        assert!(
+            t.term().visible_placements().is_empty(),
+            "nothing is placed while held"
+        );
+
+        // The window laid out on a 2x display: the same cells, twice the physical pixels.
+        t.resize(grid_of(40, 10, 8.0, 16.0, 2.0));
+        let placements = t.term().visible_placements();
+        let [placement] = &placements[..] else {
+            panic!("exactly one placement after the release, got {placements:?}");
+        };
+        assert_eq!(
+            (placement.cols, placement.rows),
+            (10, 1),
+            "160x32 px against cells of 16x32 physical px"
+        );
+    }
+
+    /// A pane that never lays out must not buffer forever: at the cap the hold releases, everything
+    /// queued is parsed, and later output arrives as it would anywhere else.
+    #[test]
+    fn the_hold_releases_at_the_cap() {
+        let mut t = Terminal::new(grid_of(80, 24, 8.0, 16.0, 1.0), 100);
+        t.hold_until_sized();
+        let chunk = vec![b'x'; HOLD_CAP / 2];
+
+        t.feed(&chunk);
+        assert!(t.holding(), "under the cap it still waits");
+        assert_eq!(line(&t, 0), "");
+
+        t.feed(&chunk);
+        assert!(!t.holding(), "reaching the cap releases the hold");
+        assert_eq!(line(&t, 0).len(), 80, "the queued bytes were parsed");
+        let mut events = t.take_events();
+        events.truncate(1);
+
+        // Past the cap this terminal is an ordinary one: no more buffering.
+        t.feed(b"tail");
+        assert!(line(&t, 23).ends_with('l'), "later output lands at once");
+    }
+
+    /// The same grid, already applied: nothing resizes, so `sized` is what releases the hold (this
+    /// is the case a pane's first layout takes when its terminal was started at the size that
+    /// layout turned out to need).
+    #[test]
+    fn sized_releases_output_without_a_resize() {
+        let grid = grid_of(30, 8, 9.0, 18.0, 2.0);
+        let mut t = Terminal::new(grid, 100);
+        t.hold_until_sized();
+        t.feed(b"ready");
+        assert_eq!(line(&t, 0), "");
+
+        assert!(t.sized(), "the bytes it waited for are parsed now");
+        assert!(!t.holding());
+        assert_eq!(line(&t, 0), "ready");
+        assert!(!t.sized(), "and only once");
+    }
+
+    /// `Terminal::new` does not hold, so export, tests and any other host that sizes its own
+    /// terminal keep parsing at once.
+    #[test]
+    fn a_fresh_terminal_parses_at_once() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        assert!(!t.holding(), "the hold is opt-in");
+        t.feed(b"hi");
+        assert_eq!(line(&t, 0), "hi");
     }
 
     #[test]

@@ -1572,6 +1572,15 @@ impl App {
         self.os_scales.get(&id).copied().unwrap_or(1.0) * self.ui_scale
     }
 
+    /// [`Self::physical_scale`] without its fallback: `None` while a window has not reported an OS
+    /// factor yet. A pane's cells must be measured with the factor it will really draw at - a
+    /// provisional 1.0 bakes wrong cell sizes into what the program draws, which is why a pane that
+    /// starts before this is known holds its output (see [`fbterm_term::Terminal::hold_until_sized`]).
+    /// Window chrome needs a number and keeps using `physical_scale`.
+    pub(crate) fn physical_scale_if_known(&self, id: window::Id) -> Option<f32> {
+        self.os_scales.get(&id).copied().map(|s| s * self.ui_scale)
+    }
+
     /// The focused terminal window; while another of our windows has focus, the terminal
     /// window focused last (or any, if that one is gone).
     pub(crate) fn focused_window(&self) -> Option<window::Id> {

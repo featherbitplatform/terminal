@@ -617,6 +617,10 @@ async fn open_shell_channel(
         tx.clone(),
     );
 
+    // The handle keeps the router so the app can have output delivered after a resize that happens
+    // on its own thread - a pane's first real grid, which is what releases held bytes.
+    let router = feeder.router();
+
     tokio::spawn(write_loop(write, rx, closed_rx.clone(), connection.clone()));
     tokio::spawn(read_loop(
         read,
@@ -639,6 +643,7 @@ async fn open_shell_channel(
             closed_tx.send_replace(true);
         }),
         connection: Mutex::new(Some(connection)),
+        router: Some(router),
     })
 }
 
