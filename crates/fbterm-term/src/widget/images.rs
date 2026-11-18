@@ -169,6 +169,42 @@ fn natural_box_px(
     (area_w.div_ceil(cw) == cols && area_h.div_ceil(ch) == rows).then_some((area_w, area_h))
 }
 
+/// The box to ask the store for, when the protocol asked for a drawing box of its own: feathercritty's
+/// `box_px`, an OSC 1337 picture sized in `px` or `%`, in the cell size it was placed in.
+///
+/// Scaled per axis to the CURRENT cell size (rounding to the nearest), then clamped to at least one
+/// pixel and to the span it sits in: a box measured when the cell was smaller may now spill past the
+/// span, and the picture may not cover cells its program was never told about. `None` says "no box of
+/// its own" (kitty, sixel, cells-only and `auto` requests, and a request made before the host had
+/// told the cell size): the caller keeps its own rules for the span. A cell size of `box_cell_px`
+/// that is zero on an axis (which the emulator clamps to at least 1, so this is a guard, not an
+/// expectation) keeps that side as it was instead of dividing by zero.
+fn requested_box_px(
+    m: CellGeometry,
+    box_px: Option<(u32, u32)>,
+    box_cell_px: (u32, u32),
+    cols: u32,
+    rows: u32,
+) -> Option<(u32, u32)> {
+    let (bw, bh) = box_px?;
+    let (cw, ch) = m.physical_cell();
+    let (span_w, span_h) = placement_box_px(m, cols, rows);
+    let scale = |side: u32, from: u32, now: u32, span: u32| -> u32 {
+        // The u64 product guards a hostile cell size; rounding happens in f64.
+        let scaled = if from == 0 {
+            u64::from(side)
+        } else {
+            let exact = f64::from(side) * f64::from(now) / f64::from(from);
+            (exact.round() as u64).min(u32::MAX as u64)
+        };
+        u32::try_from(scaled).unwrap_or(u32::MAX).clamp(1, span)
+    };
+    Some((
+        scale(bw, box_cell_px.0, cw, span_w),
+        scale(bh, box_cell_px.1, ch, span_h),
+    ))
+}
+
 /// `r` cut to `pane`; `None` when they do not overlap at all. A rectangle with a zero axis overlaps
 /// nothing: a placement cannot cover less than a pixel.
 pub fn clip_rect(r: Rectangle, pane: Rectangle) -> Option<Rectangle> {
@@ -470,17 +506,25 @@ pub fn resolve(
         if clip_rect(box_, pane).is_none() {
             continue;
         }
-        // A picture whose span is its own pixels at this cell size asks for exactly those pixels and
-        // draws unscaled; a span the program sized, or one no longer matching after a cell-size
-        // change, asks for the span and resamples into it as before (finding I1). A placement the
-        // protocol asks to fill takes neither branch: it wants the whole span covered, so the copy is
-        // the span's own box even where that stretches the picture.
-        let box_px = if p.stretch {
-            placement_box_px(m, p.cols, p.rows)
-        } else {
-            natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
-                .unwrap_or_else(|| placement_box_px(m, p.cols, p.rows))
-        };
+        // A placement the protocol sized in pixels or percent asks for exactly the box it named
+        // (feathercritty's `box_px`), scaled to the current cell size and kept inside its span:
+        // that wins over every span-based rule below. It is drawn from the span's top-left and
+        // clipped to the span as everything else is. A placement the protocol asks to fill takes
+        // the span whole instead, because filling a box smaller than it would stretch the picture
+        // into a room the protocol did not ask for. Otherwise: a picture whose span is its own
+        // pixels at this cell size asks for exactly those pixels and draws unscaled; a span the
+        // program sized, or one no longer matching after a cell-size change, asks for the span and
+        // resamples into it as before (finding I1).
+        let box_px = requested_box_px(m, p.box_px, p.box_cell_px, p.cols, p.rows)
+            .or_else(|| {
+                if p.stretch {
+                    Some(placement_box_px(m, p.cols, p.rows))
+                } else {
+                    natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
+                        .or_else(|| Some(placement_box_px(m, p.cols, p.rows)))
+                }
+            })
+            .expect("every placement has a span to fall back to");
         match store.get(owner, p.key, box_px, p.src, p.stretch) {
             Lookup::Ready(res) => {
                 let crop = crop_for_src(p.src, res.source, (res.width, res.height));
@@ -927,13 +971,26 @@ mod tests {
     /// picture under both aspect rules.
     const PNG_160X96_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAKAAAABgCAYAAACaJ3mZAAAAx0lEQVR42u3SMREAAAjEsJeOFJzCgAiWDDHQa9I18EYEDIgBwYAYEAyIAcGAGBAMiAHBgBgQDIgBwYAYEAyIAcGAGBAMiAHBgBgQDIgBwYAYEAyIAcGAGBADioABMSAYEAOCATEgGBADggExIBgQA4IBMSAYEAOCATEgGBADggExIBgQA4IBMSAYEAOCATEgGBADYkAwIAYEA2JAMCAGBANiQDAgBgQDYkAwIAYEA2JAMCAGBANiQDAgBgQDYkAwIAYEA2JAOAs1+EtyH6AijAAAAABJRU5ErkJggg==";
 
-    /// One OSC 1337 inline transmission of [`PNG_160X96_B64`] sized `width` cells by `height` cells,
+    /// One OSC 1337 inline transmission of [`PNG_160X96_B64`] with raw `width`/`height` strings,
     /// asking (`preserve=false`) or not asking (`preserve=true`) to fill that box.
-    fn inline_1337(width: u32, height: u32, preserve: bool) -> String {
+    fn inline_1337_raw(width: &str, height: &str, preserve: bool) -> String {
         format!(
             "\x1b]1337;File=inline=1;width={width};height={height};preserveAspectRatio={}:{PNG_160X96_B64}\x07",
             if preserve { 1 } else { 0 },
         )
+    }
+
+    /// One OSC 1337 inline transmission of [`PNG_160X96_B64`] sized `width` cells by `height` cells,
+    /// asking (`preserve=false`) or not asking (`preserve=true`) to fill that box.
+    fn inline_1337(width: u32, height: u32, preserve: bool) -> String {
+        inline_1337_raw(&width.to_string(), &height.to_string(), preserve)
+    }
+
+    /// The first placement's cell span, as feathercritty computed it from the sequence.
+    fn span_of(term: &Terminal) -> (u32, u32) {
+        let placements = term.term().visible_placements();
+        let p = placements.first().expect("the placement is on screen");
+        (p.cols, p.rows)
     }
 
     /// A terminal of 20 columns by 6 rows whose physical cell is `cell` square pixels, with one inline
@@ -1096,6 +1153,246 @@ mod tests {
             rect(0.0, 0.0, 100.0, 80.0),
             "and it fills the new span whole"
         );
+    }
+
+    /// An OSC 1337 picture sized in pixels draws exactly that many pixels wide, not the cells its
+    /// width rounds up to: `width=100px` in 16 px cells takes a 7-cell span (100 px rounded up) and
+    /// used to be drawn 112 wide (the span); now it is drawn 100, and the height it left `auto`
+    /// comes from the picture's own ratio (160×96 → 100×58).
+    #[test]
+    fn inline_pixel_width_draws_exactly_that_wide() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 16.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(16, 16);
+        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("100px", "auto", true)).as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        let m = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        let layer = draw_after_decode(&store, &term, m, &ColorScheme::graphite());
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            span_of(&term),
+            (7, 5),
+            "the span is still the ceil of its pixels: 100 in 16-px cells is 7, 60 in 16 is 5"
+        );
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 100.0, 60.0),
+            "100 px wide, not the 112 the span covers: the box it asked for"
+        );
+    }
+
+    /// A percent size draws its exact share of the terminal's pixels on that axis: `width=50%` of a
+    /// 20-column terminal in 16 px cells is 20 × 16 / 2 = 160 px wide (the old answer was the span,
+    /// the share's ceil at 8 cells, 128 px). The height it left `auto` comes from the picture's own
+    /// ratio.
+    #[test]
+    fn inline_percent_draws_the_exact_share() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 16.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(16, 16);
+        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("50%", "auto", true)).as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        let m = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        let layer = draw_after_decode(&store, &term, m, &ColorScheme::graphite());
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            span_of(&term),
+            (10, 6),
+            "the span is the ceil of its pixels: 160 in 16-px cells is 10, 96 in 16 is 6"
+        );
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, -16.0, 160.0, 96.0),
+            "half of the 320 px terminal, at the picture's own ratio: the span (10 cells, 160 px) \
+             is its exact fit, so nothing is cropped and the picture's last row overflows the last \
+             cell and is cut there by the clip"
+        );
+    }
+
+    /// With `preserveAspectRatio=0` and both axes in pixels the picture fills the box it asked for
+    /// exactly — 100×30 here, which it would letterbox into a 57×30 box otherwise. The box, not the
+    /// span, is the fill rule's target too.
+    #[test]
+    fn inline_pixel_box_with_stretch_fills_the_box() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 16.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(16, 16);
+        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("100px", "30px", false)).as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        let m = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        let layer = draw_after_decode(&store, &term, m, &ColorScheme::graphite());
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 100.0, 30.0),
+            "filled into the box it asked for, ignoring the 160:96 ratio"
+        );
+    }
+
+    /// The box travels in the cell size it was placed in (`box_cell_px`), so a cell-size change
+    /// under the placement re-scales the picture to the same share of the new cells: the same
+    /// `width=100px` placement draws 100 wide in 16 px cells and 200 wide once the cell has doubled.
+    #[test]
+    fn inline_pixel_box_scales_with_the_cell_size() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 16.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(16, 16);
+        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("100px", "auto", true)).as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        let m = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        let scheme = ColorScheme::graphite();
+        let first = draw_after_decode(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = first.under_text.iter().chain(&first.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 100.0, 60.0),
+            "100 wide at the size it was placed in"
+        );
+
+        // The cell doubles: the same placement now occupies 14 × 8 cells (224 × 128 px), and the
+        // box it asked for doubles with it.
+        term.set_cell_pixel_size(32, 32);
+        let m = CellGeometry::new(Size::new(32.0, 32.0), 1.0);
+        assert!(
+            resolve(&store, &term, m, &scheme).pending,
+            "the doubled box is a copy the store has not made"
+        );
+        store.run_jobs_until_idle();
+        let second = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = second.under_text.iter().chain(&second.over_text).collect();
+        assert_eq!(draws.len(), 1, "still one picture");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 200.0, 120.0),
+            "the box scales with the cell size: 100 × 2, 60 × 2"
+        );
+    }
+
+    /// A cells-only request keeps today's behaviour exactly: no `box_px`, so the span is the only
+    /// size that matters and the picture is fitted into it as before. `width=4` in 16 px cells takes
+    /// a 4 × 3 span (64 × 48 px) and the 160×96 picture fits it at 64 × 38.
+    #[test]
+    fn cells_only_inline_pictures_draw_as_before() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 16.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(16, 16);
+        term.feed(format!("\x1b[1;1H{}", inline_1337_raw("4", "auto", true)).as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        let m = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        let layer = draw_after_decode(&store, &term, m, &ColorScheme::graphite());
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            span_of(&term),
+            (4, 3),
+            "4 cells by the ceil of its pixels: 38 in 16 is 3"
+        );
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 64.0, 38.0),
+            "fitted into the span, as it always has been"
+        );
+    }
+
+    /// The box may be larger than the span it sits in — the cell shrank after the placement was
+    /// made, or the request named more than the room it was placed in — and it is clamped back to
+    /// the span: a picture may not cover cells its program was never told about. A `box_cell_px` of
+    /// zero on an axis divides nothing: that side keeps the box as it was.
+    #[test]
+    fn requested_box_is_clamped_to_the_span() {
+        // 16 px cells: the span of 4 × 2 is 64 × 32, and the 100 × 50 box measured at the same
+        // size scales to itself, then clamps to the span.
+        let m = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        assert_eq!(
+            requested_box_px(m, Some((100, 50)), (16, 16), 4, 2),
+            Some((64, 32)),
+            "bigger than the span: cut back to it"
+        );
+        // The cell shrank under the box (32 at placement time, 16 now): the box halves to 50 × 25
+        // and clamps to the span it occupies at the smaller cell.
+        assert_eq!(
+            requested_box_px(m, Some((100, 50)), (32, 32), 4, 2),
+            Some((50, 25)),
+            "scaled down with the cell size, then kept inside the span"
+        );
+        // A zero `box_cell_px` axis keeps that side as it was, instead of dividing by zero.
+        let zeroed = CellGeometry::new(Size::new(16.0, 16.0), 1.0);
+        assert_eq!(
+            requested_box_px(zeroed, Some((100, 50)), (0, 16), 10, 4),
+            Some((100, 50)),
+            "no divide by zero: each side stands as it was, clamped to the span"
+        );
+        // No box of its own: the span-based rules still decide.
+        assert_eq!(requested_box_px(m, None, (16, 16), 4, 2), None);
     }
 
     /// An `x_off`/`y_off` shift moves a placement inside its cells; it must not carry the box past
