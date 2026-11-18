@@ -90,6 +90,23 @@ impl ResampledImage {
             .saturating_mul(4)
     }
 
+    /// Whether this copy IS the picture's own pixels rather than a frame the worker filtered: an
+    /// ask at exactly the source size aliases the source buffer (see [`Job::Resample`]), so it
+    /// accounts nothing and evicting it would free nothing.
+    fn shares_source(&self) -> bool {
+        self.width == self.source.0 && self.height == self.source.1
+    }
+
+    /// Bytes this copy adds to the caps: a full frame, except an alias of an accounted source,
+    /// which adds none (finding P4). Every accounting site uses this, never [`Self::bytes`].
+    fn charge(&self) -> usize {
+        if self.shares_source() {
+            0
+        } else {
+            self.bytes()
+        }
+    }
+
     /// The copy's pixels, read back out of the handle (tests: what a golden buffer must match).
     #[cfg(test)]
     pub(crate) fn pixels(&self) -> Vec<u8> {
@@ -315,6 +332,15 @@ enum Job {
     },
 }
 
+/// What a [`Job::Resample`] brings back to install: the frame the worker filtered, or — when the
+/// size asked for is the picture's own — an iced handle over the source buffer itself. Sharing it
+/// costs one refcount on bytes that are already accounted, and iced uploads the one texture those
+/// pixels have (finding P4); a picture drawn both 1:1 and scaled pays for a single frame.
+enum Copy {
+    Made(Rgba8Image),
+    Shares(Handle),
+}
+
 #[derive(Default)]
 struct Inner {
     owners: HashMap<u64, OwnerEntry>,
@@ -444,7 +470,7 @@ impl ImageStore {
             let img = Arc::new(Rgba8Image {
                 width,
                 height,
-                pixels,
+                pixels: pixels.into(),
             });
             let bytes = img.bytes();
             let entry = inner.owners.entry(owner).or_insert_with(new_owner);
@@ -634,12 +660,37 @@ impl ImageStore {
         Self::over(&inner, owner)
     }
 
+    /// The picture's own pixel size as this store holds it (`None` when the owner or key is gone).
+    ///
+    /// For a payload still waiting to decode this is the size its header declared — the same
+    /// numbers an evicted placement names in its `[image W×H]` placeholder; after a decode it is
+    /// what that decode produced. A drawer asks for exactly this box to be drawn at 1:1 instead of
+    /// filtered (finding I1), and such an ask is answered with the source's own bytes (finding P4).
+    pub fn source_size(&self, owner: u64, key: ImageKey) -> Option<(u32, u32)> {
+        let inner = self.inner.lock();
+        Some(inner.owners.get(&owner)?.images.get(&key)?.source)
+    }
+
     /// Drop buffers until the caps hold again (the step after scrollback eviction ran dry or was
     /// impossible): least recently shown first — this owner's resampled copies, then its whole
     /// images, then other owners' resamples, then their whole images. Whole images become
     /// [`Lookup::Evicted`] for later draws; released keys stay gone entirely. Any refusal this
     /// queues for an evicted owed key is followed by a worker wake (see [`Job::Refuse`]).
+    ///
+    /// Affected owners' `wake` hooks run here, with the store mutex already released, which is what
+    /// a caller holding no other lock wants. A caller that holds a lock of its own — a session router
+    /// holding its routing table — wants [`Self::collect_caps_reclaim`] instead: nothing may wake a
+    /// pane while a lock it could be waiting on is held (finding M3).
     pub fn enforce_caps(&self, owner: u64) {
+        let wake = self.collect_caps_reclaim(owner);
+        self.wake_owners(&wake);
+    }
+
+    /// [`Self::enforce_caps`] with the redraw notices left to the caller: returns the owners whose
+    /// visible state changed instead of calling their hooks. A hook delivers events and marks a pane
+    /// dirty, and a session's feeder thread that reads those deliveries may itself be waiting for a
+    /// lock this caller holds — so the caller runs [`Self::wake_owners`] once it has let go.
+    pub fn collect_caps_reclaim(&self, owner: u64) -> Vec<u64> {
         // Declared before the lock guard so everything it collects is freed after the mutex goes.
         let mut freed = Freed::default();
         let mut inner = self.inner.lock();
@@ -650,13 +701,14 @@ impl ImageStore {
             // other submit to happen to wake the worker.
             self.wake.notify_one();
         }
-        self.wake_owners(&freed.wake);
+        freed.wake
     }
 
     /// Ask each owner in `owners` (duplicates collapsed) to redraw, through the hook its session
     /// registered. Called after the store mutex is released: a hook delivers events and marks a
     /// pane dirty, and nothing of that belongs under the lock — the rule the worker already keeps.
-    fn wake_owners(&self, owners: &[u64]) {
+    /// A caller that held a lock of its own wakes only after dropping that too (finding M3).
+    pub fn wake_owners(&self, owners: &[u64]) {
         let mut seen: Vec<u64> = Vec::with_capacity(owners.len());
         for owner in owners {
             if !seen.contains(owner) {
@@ -884,8 +936,15 @@ impl ImageStore {
                 src,
             } => {
                 let source = (src.width, src.height);
-                let out = resample(&src, target, integer);
-                self.finish_resample(owner, key, target, out, source);
+                // The picture's own size asked back: nothing to filter and no second frame to make.
+                // Clone the handle over the source's shared bytes (a refcount bump) and hand that
+                // over as the copy (finding P4).
+                let copy = if target == source {
+                    Copy::Shares(Handle::from_rgba(src.width, src.height, src.pixels.clone()))
+                } else {
+                    Copy::Made(resample(&src, target, integer))
+                };
+                self.finish_resample(owner, key, target, copy, source);
             }
             Job::Refuse { owner, key, serial } => self.finish_refusal(owner, key, serial),
             Job::Answer { owner, key, serial } => self.finish_answer(owner, key, serial),
@@ -1072,7 +1131,10 @@ impl ImageStore {
         hooks: DeliveryHooks,
     ) {
         let (term, deliver, wake) = hooks;
-        reclaim(self, &term, owner);
+        let changed = reclaim(self, &term, owner);
+        // Nothing is held here, so the owners this reclaim displaced — possibly other panes — are
+        // asked to redraw right away, before anything of this answer goes out.
+        self.wake_owners(&changed);
         let Some(term) = term.upgrade() else { return };
         {
             let mut guard = term.lock();
@@ -1099,7 +1161,7 @@ impl ImageStore {
         owner: u64,
         key: ImageKey,
         target: (u32, u32),
-        out: Rgba8Image,
+        copy: Copy,
         source: (u32, u32),
     ) {
         // Declared before the lock guard so everything enforcement takes goes after the mutex.
@@ -1119,29 +1181,41 @@ impl ImageStore {
             if !queued {
                 return;
             }
-            let out = Arc::new(ResampledImage {
-                width: out.width,
-                height: out.height,
-                source,
-                // The one copy of these pixels iced ever sees: `from_rgba` takes the Vec by value,
-                // so nothing is copied here and no codec runs — the store decoded the payload.
-                handle: Handle::from_rgba(out.width, out.height, out.pixels),
+            let out = Arc::new(match copy {
+                Copy::Made(img) => ResampledImage {
+                    width: img.width,
+                    height: img.height,
+                    source,
+                    // The one copy of these pixels iced ever sees: `from_rgba` takes the buffer by
+                    // value, so nothing is copied here and no codec runs — the store decoded it.
+                    handle: Handle::from_rgba(img.width, img.height, img.pixels),
+                },
+                Copy::Shares(handle) => ResampledImage {
+                    width: source.0,
+                    height: source.1,
+                    source,
+                    // The source's own pixels under a handle of their own: the same buffer, and no
+                    // frame made for it (finding P4).
+                    handle,
+                },
             });
             let stamp = self.next_stamp();
-            let bytes = out.bytes();
+            let bytes = out.charge();
             // A copy that cannot fit beside its own source under the tightest cap is refused up
             // front: no enforcement pass could free more than "everything except this pair", and
-            // evicting other images for a copy that comes back out anyway is pure collateral.
-            let cannot_fit = inner
-                .owners
-                .get(&owner)
-                .and_then(|e| e.images.get(&key))
-                .is_some_and(|image| {
-                    let State::Ready(src) = &image.state else {
-                        return false; // vanished with the queued slot: nothing to install onto
-                    };
-                    src.bytes() + bytes > inner.per_owner_cap.min(inner.total_cap)
-                });
+            // evicting other images for a copy that comes back out anyway is pure collateral. An
+            // alias of the source accounts nothing, so it always fits (finding P4).
+            let cannot_fit = !out.shares_source()
+                && inner
+                    .owners
+                    .get(&owner)
+                    .and_then(|e| e.images.get(&key))
+                    .is_some_and(|image| {
+                        let State::Ready(src) = &image.state else {
+                            return false; // vanished with the queued slot: nothing to install onto
+                        };
+                        src.bytes() + bytes > inner.per_owner_cap.min(inner.total_cap)
+                    });
             if cannot_fit {
                 if let Some(image) = inner
                     .owners
@@ -1157,6 +1231,16 @@ impl ImageStore {
                 // (Here even a bare re-ask would answer differently than the asking frame drew, so
                 // the generation moves with the wake — see [`Freed::changed`].)
                 freed.changed(&mut inner, owner);
+            } else if out.shares_source() {
+                // The picture's own pixels, accounted where they already are: install the alias and
+                // wake the frame that parked on `pending` waiting for it. There is nothing for an
+                // enforcement pass to win here — this copy adds no bytes (finding P4) — so none runs.
+                if let Some(entry) = inner.owners.get_mut(&owner)
+                    && let Some(image) = entry.images.get_mut(&key)
+                {
+                    image.resamples.insert(target, Slot::Ready(stamp, out));
+                }
+                freed.woke(owner);
             } else {
                 if let Some(entry) = inner.owners.get_mut(&owner)
                     && let Some(image) = entry.images.get_mut(&key)
@@ -1223,7 +1307,12 @@ impl ImageStore {
 /// image worker (when a decode or a refusal finishes) call it, which is what makes "scrollback
 /// first" hold however the bytes grew. The terminal also emits `ImageReleased` for each eviction;
 /// [`ImageStore::release`] absorbs the duplicate.
-pub fn reclaim(store: &ImageStore, term: &Weak<Mutex<Terminal>>, owner: u64) {
+///
+/// Nothing is woken here: the owners whose visible state changed are returned instead, and the
+/// caller runs [`ImageStore::wake_owners`] once it holds no lock of its own. A wake delivers events
+/// and marks a pane dirty, and the session thread that reads those deliveries can be waiting for
+/// the very lock the caller holds (finding M3).
+pub fn reclaim(store: &ImageStore, term: &Weak<Mutex<Terminal>>, owner: u64) -> Vec<u64> {
     while store.over_cap(owner) {
         let Some(term) = term.upgrade() else {
             break; // the pane is gone; its whole share goes with it in `drop_owner`
@@ -1235,7 +1324,7 @@ pub fn reclaim(store: &ImageStore, term: &Weak<Mutex<Terminal>>, owner: u64) {
         };
         store.release(owner, key);
     }
-    store.enforce_caps(owner);
+    store.collect_caps_reclaim(owner)
 }
 
 /// Clears the worker's `running` flag when its thread ends (only by a panic escaping everything),
@@ -1283,7 +1372,11 @@ fn job_is(job: &Job, owner: u64, key: ImageKey) -> bool {
 /// the intersection with the image (feathercritty's [`Rect`] docs), so a rectangle that starts
 /// past the edge still yields at least one pixel rather than zero — a zero area would mean a
 /// divide by zero in [`fit_target`], and a placement cannot display less than a pixel.
-fn src_area(src: Option<Rect>, img_w: u32, img_h: u32) -> (u32, u32) {
+///
+/// `pub(crate)` because the drawer measures a picture the same way before asking for it: the box it
+/// asks for is scaled by this area, not by the whole picture (finding C2), and asking for exactly
+/// this area is what draws a picture 1:1 (finding I1).
+pub(crate) fn src_area(src: Option<Rect>, img_w: u32, img_h: u32) -> (u32, u32) {
     let Some(rect) = src else {
         return (img_w.max(1), img_h.max(1));
     };
@@ -1388,9 +1481,10 @@ fn covers(owner: u64, trigger: u64, scope: Scope) -> bool {
 
 /// Drop the least recently shown resampled copy in scope. The scan skips the copy `Reason::Install`
 /// names (with [`Reason::Routine`] — and for whole-image candidates, always — this is exactly the
-/// plain LRU step), and an install-time eviction marks the losing size [`Slot::Refused`]: a copy
-/// displaced to make room for a fresh install must not be re-made every frame. Returns whether
-/// anything went.
+/// plain LRU step), and it skips a copy that is its picture's own pixels: an alias accounts nothing
+/// (finding P4), so dropping it would free nothing and leave the cap where it was. An install-time
+/// eviction marks the losing size [`Slot::Refused`]: a copy displaced to make room for a fresh
+/// install must not be re-made every frame. Returns whether anything went.
 fn evict_resample(
     inner: &mut Inner,
     trigger: u64,
@@ -1405,9 +1499,12 @@ fn evict_resample(
         }
         for (key, image) in &entry.images {
             for (target, slot) in &image.resamples {
-                let Slot::Ready(stamp, _) = slot else {
+                let Slot::Ready(stamp, out) = slot else {
                     continue;
                 };
+                if out.shares_source() {
+                    continue; // the picture's own pixels: taking them back frees nothing
+                }
                 if matches!(reason, Reason::Install(p)
                     if p.owner == *owner && p.key == *key && p.target == *target)
                 {
@@ -1426,7 +1523,8 @@ fn evict_resample(
     let entry = inner.owners.get_mut(&owner).unwrap();
     let image = entry.images.get_mut(&key).unwrap();
     if let Some(Slot::Ready(_, out)) = image.resamples.remove(&target) {
-        let bytes = out.bytes();
+        // Never an alias (the scan skipped those), so this really does free a frame.
+        let bytes = out.charge();
         entry.bytes -= bytes;
         image.resample_bytes -= bytes;
         freed.copies.push(out); // dropped after the mutex goes
@@ -2057,7 +2155,8 @@ mod tests {
     }
 
     /// The identity resample (box exactly the source size) returns the fixture's pixels exactly,
-    /// read back out of the handle the drawer will draw.
+    /// read back out of the handle the drawer will draw — and it is the source's own buffer, not a
+    /// second frame: the copy accounts nothing (finding P4).
     #[test]
     fn decoded_buffers_survive_the_identity_resample() {
         let store = ImageStore::with_caps(64 * KB, 128 * KB);
@@ -2074,11 +2173,57 @@ mod tests {
                 assert_eq!(
                     img.bytes(),
                     tiny_rgba().len(),
-                    "accounting is the pixel buffer"
+                    "one RGBA8 frame of its size"
+                );
+                assert!(img.shares_source(), "the copy is the source's own pixels");
+                assert_eq!(
+                    img.charge(),
+                    0,
+                    "a picture drawn at its own size costs no second frame"
+                );
+                assert_eq!(
+                    store.owner_bytes(1),
+                    tiny_rgba().len(),
+                    "the decoded frame alone is accounted: the alias adds nothing"
                 );
             }
             other => panic!("expected the identity resample, got {other:?}"),
         }
+    }
+
+    /// The size a drawer must ask for to draw a picture 1:1 (finding I1): what a decoded buffer
+    /// holds, what a payload's header declared while its decode is still queued, and nothing for an
+    /// owner or key nobody holds.
+    #[test]
+    fn source_size_names_the_pixels_a_one_to_one_ask_needs() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let owner = 5;
+        // A payload that has not decoded yet: the header's numbers, which is also what an evicted
+        // placeholder names.
+        store.submit(owner, ImageKey(1), png(TINY_PNG));
+        assert_eq!(store.source_size(owner, ImageKey(1)), Some((4, 4)));
+        store.run_jobs_until_idle();
+        assert_eq!(
+            store.source_size(owner, ImageKey(1)),
+            Some((4, 4)),
+            "the decoded frame is the same size"
+        );
+
+        // Pixels the terminal decoded itself (a sixel's shape): stored as they arrived.
+        store.submit(
+            owner,
+            ImageKey(2),
+            ImageData::Rgba {
+                width: 4,
+                height: 12,
+                pixels: vec![0u8; 4 * 12 * 4],
+            },
+        );
+        assert_eq!(store.source_size(owner, ImageKey(2)), Some((4, 12)));
+
+        store.release(owner, ImageKey(2));
+        assert_eq!(store.source_size(owner, ImageKey(2)), None, "released");
+        assert_eq!(store.source_size(9_999, ImageKey(1)), None, "no such owner");
     }
 
     /// What `get` makes for a placement that shows only part of an image (`src`): the fit factor
@@ -2137,8 +2282,9 @@ mod tests {
             Lookup::Ready(img) => assert_eq!(img.source, (64, 32)),
             other => panic!("expected the second size, got {other:?}"),
         }
-        // Both sizes stay cached beside the source: 8 KiB + 32 KiB + 8 KiB.
-        assert_eq!(store.owner_bytes(owner), 8 * KB + 32 * KB + 8 * KB);
+        // Both sizes stay cached beside the source: 8 KiB + 32 KiB. The second copy is the picture
+        // at its own size, so it shares the source's buffer and accounts nothing (finding P4).
+        assert_eq!(store.owner_bytes(owner), 8 * KB + 32 * KB);
         assert_books(&store);
     }
 
@@ -2149,7 +2295,7 @@ mod tests {
         let big = Rgba8Image {
             width: 10_000,
             height: 10_000,
-            pixels: Vec::new(),
+            pixels: bytes::Bytes::new(),
         };
         // A huge box on a large source: the copy never exceeds one 64 MiB RGBA8 frame.
         let fitted = fit_target(&big, None, (u32::MAX, u32::MAX));
@@ -2159,14 +2305,14 @@ mod tests {
         let small = Rgba8Image {
             width: 8,
             height: 8,
-            pixels: Vec::new(),
+            pixels: bytes::Bytes::new(),
         };
         assert_eq!(fit_target(&small, None, (16, 16)), (16, 16));
         // The shown area, not the whole picture, decides the factor.
         let wide = Rgba8Image {
             width: 64,
             height: 32,
-            pixels: Vec::new(),
+            pixels: bytes::Bytes::new(),
         };
         assert_eq!(fit_target(&wide, None, (16, 8)), (16, 8));
         let strip = Some(Rect {
@@ -2257,8 +2403,9 @@ mod tests {
                     assert_eq!(keys.len(), usize::try_from(id).unwrap() - 1);
                     keys.push((id, key));
                     store.submit(owner, key, data);
-                    // Exactly what a session does after a submit, through the shared helper.
-                    reclaim(&store, &weak, owner);
+                    // Exactly what a session does after a submit: the shared helper, then the wakes
+                    // it left for the caller.
+                    store.wake_owners(&reclaim(&store, &weak, owner));
                 }
             }
         }
@@ -2663,6 +2810,53 @@ mod tests {
         assert_books(&store);
     }
 
+    /// The notices a caps reclaim produces can be collected without being sent (finding M3): a
+    /// caller holding a lock of its own — a session router holding its routing table, which the
+    /// feeder thread that reads those deliveries may be waiting on — takes the owners list, lets go
+    /// of its lock, and only then asks the panes to redraw.
+    #[test]
+    fn caps_reclaim_notices_can_be_deferred() {
+        let store = Arc::new(ImageStore::with_caps(8 * KB, 2 * KB));
+        let (trigger, other) = (30, 31);
+        let t_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let o_term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
+        let mine = Captured::default();
+        let theirs = Captured::default();
+        store.register_owner(trigger, mine.hooks_probing(&t_term, &store));
+        store.register_owner(other, theirs.hooks_probing(&o_term, &store));
+
+        store.submit(other, ImageKey(1), rgba(32, 32, 7)); // shown first
+        store.submit(trigger, ImageKey(1), rgba(32, 32, 9));
+
+        let wake = store.collect_caps_reclaim(trigger);
+        assert_eq!(
+            store.owner_bytes(trigger),
+            0,
+            "the trigger's own picture went"
+        );
+        assert_eq!(store.owner_bytes(other), 0, "then the older one");
+        assert_eq!(
+            mine.wakes() + theirs.wakes(),
+            0,
+            "collecting the notices sends nothing"
+        );
+
+        // A caller would release its own lock here, then wake.
+        let mut wake = wake;
+        wake.sort_unstable();
+        wake.dedup();
+        assert_eq!(wake, vec![trigger, other], "both owners are named");
+        store.wake_owners(&wake);
+        assert_eq!(mine.wakes(), 1, "the triggering pane redraws");
+        assert_eq!(theirs.wakes(), 1, "and so does the pane whose picture went");
+        assert_eq!(
+            theirs.locked_hooks() + mine.locked_hooks(),
+            0,
+            "no hook ran under the store mutex"
+        );
+        assert_books(&store);
+    }
+
     /// A frame reused without asking the store reports what it still shows (`ImageStore::touch_drawn`),
     /// or the LRU's idea of "least recently shown" drifts from what is on screen: a pane sitting on
     /// one picture while another fills the caps would lose that picture mid-view.
@@ -3043,7 +3237,7 @@ mod tests {
                 Some(Ok(Rgba8Image {
                     width: 4,
                     height: 4,
-                    pixels: tiny_rgba(),
+                    pixels: tiny_rgba().into(),
                 }))
             } else {
                 None // later payloads take the real decoder
@@ -3170,7 +3364,7 @@ mod tests {
             store.over_cap(owner),
             "the cap should be over before reclaiming"
         );
-        reclaim(&store, &weak, owner);
+        store.wake_owners(&reclaim(&store, &weak, owner));
 
         // The scrollback image went first — released outright by the emulator, and then by us.
         assert_eq!(

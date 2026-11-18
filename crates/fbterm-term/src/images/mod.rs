@@ -13,6 +13,9 @@ mod store;
 
 pub use decode::{DecodeError, Rgba8Image, decode};
 pub use resample::{fit_size, is_integer_multiple, resample};
+// `src_area` too: the drawer measures a picture the way the store does before asking for it
+// (findings C2 and I1), so the two can never disagree about what a placement shows.
+pub(crate) use store::src_area;
 pub use store::{ImageStore, Lookup, OwnerHooks, ResampledImage, reclaim, store};
 
 // The emulator's image vocabulary, re-exported so hosts route `TermEvent::ImageReceived` and

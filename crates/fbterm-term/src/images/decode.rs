@@ -12,16 +12,21 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 
+use bytes::Bytes;
 use feathercritty::event::{ImageData, ImageDecodeError, ImageFormat};
 use feathercritty::graphics::limits::{MAX_IMAGE_BYTES, MAX_IMAGE_SIDE};
 
 /// One decoded image: straight (non-premultiplied) 8-bit RGBA, `pixels.len()` equal to
 /// `width * height * 4`.
+///
+/// The buffer is reference counted (`bytes::Bytes`) rather than owned so that a copy at the
+/// picture's own size can hand out the source's allocation instead of filtering an identical
+/// second frame: a picture drawn both 1:1 and scaled keeps one RGBA8 buffer (finding P4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rgba8Image {
     pub width: u32,
     pub height: u32,
-    pub pixels: Vec<u8>,
+    pub pixels: Bytes,
 }
 
 impl Rgba8Image {
@@ -113,7 +118,7 @@ fn decode_inner(data: &ImageData) -> Result<Rgba8Image, DecodeError> {
             Ok(Rgba8Image {
                 width: *width,
                 height: *height,
-                pixels: pixels.clone(),
+                pixels: pixels.clone().into(),
             })
         }
         ImageData::Encoded { format, bytes, .. } => match format {
@@ -169,7 +174,7 @@ fn decode_png(bytes: &[u8]) -> Result<Rgba8Image, DecodeError> {
     Ok(Rgba8Image {
         width,
         height,
-        pixels: buf,
+        pixels: buf.into(),
     })
 }
 
@@ -194,7 +199,7 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Rgba8Image, DecodeError> {
     Ok(Rgba8Image {
         width: u32::from(info.width),
         height: u32::from(info.height),
-        pixels,
+        pixels: pixels.into(),
     })
 }
 
@@ -228,7 +233,7 @@ fn decode_gif(bytes: &[u8]) -> Result<Rgba8Image, DecodeError> {
     Ok(Rgba8Image {
         width,
         height,
-        pixels: buf,
+        pixels: buf.into(),
     })
 }
 

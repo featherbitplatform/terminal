@@ -65,7 +65,8 @@ pub fn resample(src: &Rgba8Image, target_px: (u32, u32), integer_scale: bool) ->
         return nearest(src, 1, 1);
     }
     if tw == src.width && th == src.height {
-        // Identity: the filter would only re-derive the same pixels.
+        // Identity: the filter would only re-derive the same pixels. The clone shares the buffer —
+        // `Bytes` is reference counted — so even here no frame is copied (finding P4).
         return src.clone();
     }
     let options = fr::ResizeOptions::new().resize_alg(pick_filter(src, tw, th, integer_scale));
@@ -92,7 +93,7 @@ pub fn resample(src: &Rgba8Image, target_px: (u32, u32), integer_scale: bool) ->
         Ok(pixels) => Rgba8Image {
             width: tw,
             height: th,
-            pixels,
+            pixels: pixels.into(),
         },
         Err(e) => {
             // Sizes are capped by the store long before this; an error here is a decoder giving a
@@ -119,7 +120,7 @@ fn nearest(src: &Rgba8Image, tw: u32, th: u32) -> Rgba8Image {
     Rgba8Image {
         width: tw,
         height: th,
-        pixels,
+        pixels: pixels.into(),
     }
 }
 
@@ -196,7 +197,7 @@ mod tests {
         let src = Rgba8Image {
             width: 8,
             height: 8,
-            pixels: vec![0u8; 8 * 8 * 4],
+            pixels: vec![0u8; 8 * 8 * 4].into(),
         };
         // Integer zooms of a small source use nearest...
         assert_eq!(pick_filter(&src, 16, 16, true), fr::ResizeAlg::Nearest);
@@ -211,7 +212,7 @@ mod tests {
         let big = Rgba8Image {
             width: 300,
             height: 300,
-            pixels: vec![0u8; 300 * 300 * 4],
+            pixels: vec![0u8; 300 * 300 * 4].into(),
         };
         assert_ne!(
             pick_filter(&big, 600, 600, true),

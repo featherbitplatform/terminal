@@ -110,6 +110,11 @@ impl CellGeometry {
 ///
 /// `row_in_view` and `col` are where feathercritty says the placement's first cell is (the row is
 /// negative when it starts above the top of the view).
+///
+/// The offset moves the box; it does not extend it. The result is cut back to the unshifted span, so
+/// a picture never covers pixels past the cells its program was told about (finding M5): what comes
+/// off is the sliver the offset would otherwise spill into the cell after the span. An offset beyond
+/// the whole span leaves nothing inside it, and such a box overlaps nothing when drawn.
 pub fn placement_rect(
     m: CellGeometry,
     row_in_view: i32,
@@ -119,10 +124,15 @@ pub fn placement_rect(
     x_off: u32,
     y_off: u32,
 ) -> Rectangle {
-    let mut r = m.cell_box(col as i64, i64::from(row_in_view), cols, rows);
+    let span = m.cell_box(col as i64, i64::from(row_in_view), cols, rows);
+    let mut r = span;
     r.x += m.logical_of(x_off);
     r.y += m.logical_of(y_off);
-    r
+    match clip_rect(r, span) {
+        Some(cut) => cut,
+        // Shifted clear of its own span: an empty box at the shifted place, which draws nothing.
+        None => Rectangle::new(Point::new(r.x, r.y), Size::ZERO),
+    }
 }
 
 /// The PHYSICAL pixel box of a `cols × rows` cell span: what to ask [`crate::images::ImageStore::get`]
@@ -131,6 +141,32 @@ pub fn placement_rect(
 pub fn placement_box_px(m: CellGeometry, cols: u32, rows: u32) -> (u32, u32) {
     let (cw, ch) = m.physical_cell();
     (cw.saturating_mul(cols), ch.saturating_mul(rows))
+}
+
+/// The PHYSICAL pixel box that draws a placement 1:1: the area of picture it shows, when its cell
+/// span is exactly what that area needs at the current physical cell size.
+///
+/// A picture sent without a cell size gets the span `div_ceil` rounds up from its own pixels
+/// (feathercritty's `span_for`), so this matches one: the copy asked for is the picture at its own
+/// size, nothing is filtered, pixel art and sixel output stay sharp, and the store answers with the
+/// source's own buffer (findings I1 and P4). It stops matching as soon as the font, line height or
+/// display scale changes — then the copy fills the new span, which is the scaling the spec allows.
+/// A span a program sized itself (`c`/`r`, OSC 1337 width or height) only matches by coincidence,
+/// and resampling to fill it stays as it was. `None` says "no match": ask for the span.
+fn natural_box_px(
+    store: &ImageStore,
+    owner: u64,
+    key: ImageKey,
+    src: Option<Rect>,
+    cols: u32,
+    rows: u32,
+    m: CellGeometry,
+) -> Option<(u32, u32)> {
+    let (src_w, src_h) = store.source_size(owner, key)?;
+    let (cw, ch) = m.physical_cell();
+    // The area this placement shows, measured exactly as the store measures it.
+    let (area_w, area_h) = crate::images::src_area(src, src_w, src_h);
+    (area_w.div_ceil(cw) == cols && area_h.div_ceil(ch) == rows).then_some((area_w, area_h))
 }
 
 /// `r` cut to `pane`; `None` when they do not overlap at all. A rectangle with a zero axis overlaps
@@ -434,7 +470,12 @@ pub fn resolve(
         if clip_rect(box_, pane).is_none() {
             continue;
         }
-        match store.get(owner, p.key, placement_box_px(m, p.cols, p.rows), p.src) {
+        // A picture whose span is its own pixels at this cell size asks for exactly those pixels and
+        // draws unscaled; a span the program sized, or one no longer matching after a cell-size
+        // change, asks for the span and resamples into it as before (finding I1).
+        let box_px = natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
+            .unwrap_or_else(|| placement_box_px(m, p.cols, p.rows));
+        match store.get(owner, p.key, box_px, p.src) {
             Lookup::Ready(res) => {
                 let crop = crop_for_src(p.src, res.source, (res.width, res.height));
                 // The copy is the whole image; shifting it by the crop's offset puts the part this
@@ -868,6 +909,30 @@ mod tests {
         assert_eq!(clip_rect(inside, pane), Some(inside));
     }
 
+    /// An `x_off`/`y_off` shift moves a placement inside its cells; it must not carry the box past
+    /// the span the program was given (finding M5). Cells here are 8×16 logical px.
+    #[test]
+    fn an_offset_never_spills_past_the_span() {
+        let m = geometry(1.0);
+        // A 2×1 span (16×16 px) pushed right 5 px and down 3: it still ends at the span's far edge.
+        let r = placement_rect(m, 0, 0, 2, 1, 5, 3);
+        assert_eq!((r.x, r.y), (5.0, 3.0), "the offset moves it");
+        assert_eq!(
+            (r.width, r.height),
+            (11.0, 13.0),
+            "and the box stops at x=16 and y=16, where its cells do, instead of spilling to 21×19"
+        );
+        // No offset: the span exactly, as before.
+        assert_eq!(
+            placement_rect(m, 0, 0, 2, 1, 0, 0),
+            rect(0.0, 0.0, 16.0, 16.0),
+        );
+        // Shifted clear of its own span (a hostile offset larger than the cells): nothing is left of
+        // the placement, so it draws nothing rather than covering a neighbour's cells.
+        let gone = placement_rect(m, 0, 0, 1, 1, 40, 0);
+        assert_eq!(clip_rect(gone, m.pane(10, 5)), None, "past its own cell");
+    }
+
     #[test]
     fn crops_map_onto_the_shared_copy() {
         // No src: the whole copy.
@@ -1183,6 +1248,192 @@ mod tests {
         );
         assert_eq!(layer.under_text[0].key, key);
         assert_eq!(layer.under_text[1].key, key);
+    }
+
+    /// A picture sent with no cell size is drawn at its own pixels (finding I1). An 800×600 sixel in
+    /// 9×18 px cells covers 89×34 cells — a span of 801×612 px, because the span rounds up to whole
+    /// cells — and it is drawn 800×600: the copy is the picture itself, so no filter runs and the
+    /// store gains no second frame (finding P4). The remainder of the last cell on each axis stays
+    /// empty.
+    #[test]
+    fn an_unsized_sixel_draws_at_its_own_pixels() {
+        let source = 800 * 600 * 4; // 1.92 MB of RGBA8
+        let store = ImageStore::with_caps(8 * 1024 * 1024, 16 * 1024 * 1024);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 90,
+                rows: 36,
+                cell_width: 9.0,
+                cell_height: 18.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(9, 18);
+        // The raster attributes declare an 800×600 canvas; one red pixel is painted in it. A sixel
+        // arrives decoded and unsized: its span comes from those pixels, not from the program.
+        term.feed(b"\x1bPq\"1;1;800;600#0;2;100;0;0#0~\x1b\\");
+        let mut key = None;
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key: k, data } = event {
+                assert!(
+                    matches!(
+                        data,
+                        ImageData::Rgba {
+                            width: 800,
+                            height: 600,
+                            ..
+                        }
+                    ),
+                    "the raster attributes set the canvas size"
+                );
+                store.submit(term.image_owner(), k, data);
+                key = Some(k);
+            }
+        }
+        assert!(key.is_some(), "the sixel reaches the store");
+        let m = CellGeometry::new(Size::new(9.0, 18.0), 1.0);
+        let scheme = ColorScheme::graphite();
+
+        let first = resolve(&store, &term, m, &scheme);
+        assert!(
+            first.pending,
+            "the copy is asked for, never made on the draw path"
+        );
+        store.run_jobs_until_idle();
+        let layer = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 800.0, 600.0),
+            "its own pixels, unscaled: not the 801×612 its cells round up to"
+        );
+        assert_eq!(
+            draws[0].clip,
+            rect(0.0, 0.0, 800.0, 600.0),
+            "the clip is cut to what the copy covers, so the span's last partial cell on each axis \
+             stays empty"
+        );
+        assert_eq!(
+            store.owner_bytes(term.image_owner()),
+            source,
+            "no second frame: the 1:1 copy is the source's own buffer"
+        );
+    }
+
+    /// The same rule at the size a sixel of a small picture makes (finding I1): a 4×12 px red band in
+    /// 8×16 px cells covers one cell, and it draws 4×12 — not stretched to fill the 8×16 cell, which
+    /// is what blurred it before.
+    #[test]
+    fn a_four_by_twelve_sixel_draws_at_its_own_pixels() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(8, 16);
+        // A red 4×12 px sixel: four painted columns, then a second band of four.
+        term.feed(b"\x1bPq#0;2;100;0;0#0~~~~-~~~~\x1b\\");
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        let m = geometry(1.0);
+        let scheme = ColorScheme::graphite();
+        assert!(
+            resolve(&store, &term, m, &scheme).pending,
+            "the 4×12 copy is asked for first"
+        );
+        store.run_jobs_until_idle();
+        let layer = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1);
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 4.0, 12.0),
+            "the picture's own pixels, not the 8×16 cell it rounds up to"
+        );
+        assert_eq!(
+            draws[0].clip,
+            rect(0.0, 0.0, 4.0, 12.0),
+            "cut to what the picture covers: the rest of its cell stays empty"
+        );
+        assert_eq!(
+            store.owner_bytes(term.image_owner()),
+            4 * 12 * 4,
+            "and no second frame for it"
+        );
+    }
+
+    /// The other half of the rule (finding I1): a span the program sized itself still resamples. The
+    /// same 4×12 picture asked for as 3 cells by 1 (24×16 px) is fitted to that box — 5×16, aspect
+    /// kept — and that copy costs its own bytes, because it is another picture from the source.
+    #[test]
+    fn a_program_sized_span_still_resamples() {
+        let store = ImageStore::with_caps(64 * KB, 128 * KB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(8, 16);
+        // A 4×12 red picture transmitted as id 7 (192 bytes of opaque red RGBA: sixteen copies of the
+        // 16-character base64 block this pixel pattern makes every 12 bytes), not displayed yet.
+        let pixels = "/wAA//8AAP//AAD/".repeat(16);
+        term.feed(format!("\x1b_Ga=t,f=32,s=4,v=12,i=7;{pixels}\x1b\\").as_bytes());
+        let mut key = None;
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key: k, data } = event {
+                store.submit(term.image_owner(), k, data);
+                key = Some(k);
+            }
+        }
+        assert!(key.is_some(), "the picture reaches the store");
+        // Two placements of it: one sized by its pixels (no `c`/`r`), one sized by the program as 3
+        // cells by 1, on row 2.
+        term.feed(b"\x1b[1;1H\x1b_Ga=p,i=7;\x1b\\");
+        term.feed(b"\x1b[3;1H\x1b_Ga=p,i=7,c=3,r=1;\x1b\\");
+        term.take_events(); // the OK replies: not what this is about
+
+        let m = geometry(1.0);
+        let scheme = ColorScheme::graphite();
+        assert!(resolve(&store, &term, m, &scheme).pending);
+        store.run_jobs_until_idle();
+        let layer = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 2, "both placements draw");
+        let own = draws
+            .iter()
+            .find(|d| d.bounds.width == 4.0)
+            .expect("the unsized placement draws at its own pixels");
+        assert_eq!(own.bounds, rect(0.0, 0.0, 4.0, 12.0));
+        let fitted = draws
+            .iter()
+            .find(|d| d.bounds.width == 5.0)
+            .expect("the program-sized span gets a fitted copy");
+        assert_eq!(
+            fitted.bounds,
+            rect(0.0, 32.0, 5.0, 16.0),
+            "4×12 aspect-fitted into 24×16 px: 5 wide by 16 tall"
+        );
+        assert_eq!(
+            store.owner_bytes(term.image_owner()),
+            4 * 12 * 4 + 5 * 16 * 4,
+            "the source frame plus the fitted copy: only the 1:1 alias was free"
+        );
     }
 
     /// A `U+10EEEE` cell whose tile cannot be resolved still does not go to text shaping: it is a

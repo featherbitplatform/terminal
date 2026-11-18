@@ -43,6 +43,10 @@ zune-core = "0.5"
 gif = "0.14"
 # Resampling decoded images to cell sizes; runtime-detected SIMD, pure Rust fallback.
 fast_image_resize = "6"
+# Reference-counted pixel buffers (`fbterm-term`'s `Rgba8Image`): a copy at a picture's own size
+# shares the source's bytes, and with them iced's one texture for those pixels. Already in the
+# tree through tokio.
+bytes = "1"
 # Encodes the JPEG test fixture (`fbterm-term` tests); dev-only, never shipped.
 jpeg-encoder = "0.7"
 rfd = "0.17.2"

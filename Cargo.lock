@@ -1579,6 +1579,7 @@ dependencies = [
 name = "fbterm-term"
 version = "0.10.1"
 dependencies = [
+ "bytes",
  "fast_image_resize",
  "fbterm-config",
  "feathercritty",
