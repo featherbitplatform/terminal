@@ -472,10 +472,16 @@ pub fn resolve(
         }
         // A picture whose span is its own pixels at this cell size asks for exactly those pixels and
         // draws unscaled; a span the program sized, or one no longer matching after a cell-size
-        // change, asks for the span and resamples into it as before (finding I1).
-        let box_px = natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
-            .unwrap_or_else(|| placement_box_px(m, p.cols, p.rows));
-        match store.get(owner, p.key, box_px, p.src) {
+        // change, asks for the span and resamples into it as before (finding I1). A placement the
+        // protocol asks to fill takes neither branch: it wants the whole span covered, so the copy is
+        // the span's own box even where that stretches the picture.
+        let box_px = if p.stretch {
+            placement_box_px(m, p.cols, p.rows)
+        } else {
+            natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
+                .unwrap_or_else(|| placement_box_px(m, p.cols, p.rows))
+        };
+        match store.get(owner, p.key, box_px, p.src, p.stretch) {
             Lookup::Ready(res) => {
                 let crop = crop_for_src(p.src, res.source, (res.width, res.height));
                 // The copy is the whole image; shifting it by the crop's offset puts the part this
@@ -655,9 +661,14 @@ impl<'a> VirtualTiles<'a> {
             let v = &self.virtuals[&id];
             (v.key, v.cols, v.rows)
         };
+        // A virtual placement carries no stretch flag: kitty has none, placeholders keep the ratio, so
+        // its copy is always fitted into the span and then mapped cell by cell onto it.
         let box_px = placement_box_px(self.m, cols, rows);
         if !self.copies.contains_key(&(key, box_px)) {
-            let copy = match self.store.get(self.term.image_owner(), key, box_px, None) {
+            let copy = match self
+                .store
+                .get(self.term.image_owner(), key, box_px, None, false)
+            {
                 Lookup::Ready(res) => Some(res),
                 // Pending: the pane redraws when the copy lands (see [`ImageLayer::pending`]).
                 // Unknown or evicted: a virtual placement's cells are text already, so per spec 5
@@ -907,6 +918,184 @@ mod tests {
         // Fully inside survives unchanged.
         let inside = placement_rect(m, 1, 1, 2, 2, 0, 0);
         assert_eq!(clip_rect(inside, pane), Some(inside));
+    }
+
+    const MB: usize = 1024 * 1024;
+
+    /// A 160x96 opaque PNG (256 bytes: solid RGBA, one filter-0 scanline per row, compressed) as the
+    /// base64 body an OSC 1337 sequence carries. Built once so the sizing tests can ask for the same
+    /// picture under both aspect rules.
+    const PNG_160X96_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAKAAAABgCAYAAACaJ3mZAAAAx0lEQVR42u3SMREAAAjEsJeOFJzCgAiWDDHQa9I18EYEDIgBwYAYEAyIAcGAGBAMiAHBgBgQDIgBwYAYEAyIAcGAGBAMiAHBgBgQDIgBwYAYEAyIAcGAGBADioABMSAYEAOCATEgGBADggExIBgQA4IBMSAYEAOCATEgGBADggExIBgQA4IBMSAYEAOCATEgGBADYkAwIAYEA2JAMCAGBANiQDAgBgQDYkAwIAYEA2JAMCAGBANiQDAgBgQDYkAwIAYEA2JAOAs1+EtyH6AijAAAAABJRU5ErkJggg==";
+
+    /// One OSC 1337 inline transmission of [`PNG_160X96_B64`] sized `width` cells by `height` cells,
+    /// asking (`preserve=false`) or not asking (`preserve=true`) to fill that box.
+    fn inline_1337(width: u32, height: u32, preserve: bool) -> String {
+        format!(
+            "\x1b]1337;File=inline=1;width={width};height={height};preserveAspectRatio={}:{PNG_160X96_B64}\x07",
+            if preserve { 1 } else { 0 },
+        )
+    }
+
+    /// A terminal of 20 columns by 6 rows whose physical cell is `cell` square pixels, with one inline
+    /// picture displayed at `width` × `height` cells starting on row 1, plus the store it submits to.
+    fn inline_term(cell: u32, width: u32, height: u32, preserve: bool) -> (ImageStore, Terminal) {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: cell as f32,
+                cell_height: cell as f32,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(cell, cell);
+        term.feed(format!("\x1b[1;1H{}", inline_1337(width, height, preserve)).as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        (store, term)
+    }
+
+    /// Drive an inline picture to the point where its placement draws, and return that layer. A
+    /// container payload (unlike kitty's raw RGBA, which `submit` installs at once) is only *queued* by
+    /// submit, so the first resolve finds a decode running and has no copy to ask for: pump the decode,
+    /// resolve to queue the resample, pump again, resolve to draw it.
+    fn draw_after_decode(
+        store: &ImageStore,
+        term: &Terminal,
+        m: CellGeometry,
+        scheme: &ColorScheme,
+    ) -> ImageLayer {
+        store.run_jobs_until_idle(); // the payload's decode
+        assert!(
+            resolve(store, term, m, scheme).pending,
+            "the copy is asked for, never made on the draw path"
+        );
+        store.run_jobs_until_idle(); // the copy itself
+        resolve(store, term, m, scheme)
+    }
+
+    /// The one case a protocol asks for a stretch: OSC 1337 with `preserveAspectRatio=0` and both axes
+    /// given as sizes. The copy is made at the span's own physical box (10 columns by 2 rows of 20x20
+    /// px cells, 200x40) and drawn over the whole span, so the picture's 160x96 ratio is ignored and
+    /// nothing is letterboxed (owner decision, 2026-11-18).
+    #[test]
+    fn an_inline_picture_that_asks_to_fill_fills_the_span() {
+        let (store, term) = inline_term(20, 10, 2, false);
+        let m = CellGeometry::new(Size::new(20.0, 20.0), 1.0);
+        let layer = draw_after_decode(&store, &term, m, &ColorScheme::graphite());
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 200.0, 40.0),
+            "10 columns by 2 rows of 20x20 px cells, covered whole"
+        );
+        assert_eq!(
+            draws[0].clip,
+            rect(0.0, 0.0, 200.0, 40.0),
+            "the clip is the span too: no letterbox bar is cut away"
+        );
+    }
+
+    /// The same request with the default `preserveAspectRatio=1` keeps today's behavior: fitted into
+    /// the span and anchored top-left, so 160x96 in a 200x40 box draws 67 wide by 40 tall.
+    #[test]
+    fn an_inline_picture_that_keeps_its_ratio_is_letterboxed() {
+        let (store, term) = inline_term(20, 10, 2, true);
+        let m = CellGeometry::new(Size::new(20.0, 20.0), 1.0);
+        let layer = draw_after_decode(&store, &term, m, &ColorScheme::graphite());
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 67.0, 40.0),
+            "160x96 fitted into 200x40 keeps its ratio: 67 wide"
+        );
+    }
+
+    /// kitty `c` together with `r` is NOT a stretch request: the protocol says "when both are specified
+    /// the image is letterboxed/pillarboxed to prevent distortion", and feathercritty reports
+    /// `stretch = false` for every kitty placement. Regression guard for that ruling, on the same
+    /// 160x96-into-200x40 geometry as the fill test above.
+    #[test]
+    fn a_kitty_placement_with_cells_and_rows_stays_letterboxed() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 20.0,
+                cell_height: 20.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(20, 20);
+        // A 160x96 opaque RGBA frame (61440 bytes) as id 7, then displayed over 10 columns by 2 rows.
+        let pixels = "/wAA//8AAP//AAD/".repeat(5120);
+        term.feed(format!("\x1b_Ga=t,f=32,s=160,v=96,i=7;{pixels}\x1b\\").as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        term.feed(b"\x1b[1;1H\x1b_Ga=p,i=7,c=10,r=2;\x1b\\");
+        term.take_events(); // the OK replies: not what this is about
+        let m = CellGeometry::new(Size::new(20.0, 20.0), 1.0);
+        let scheme = ColorScheme::graphite();
+        assert!(
+            resolve(&store, &term, m, &scheme).pending,
+            "the copy is asked for"
+        );
+        store.run_jobs_until_idle();
+        let layer = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 1, "the placement draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 67.0, 40.0),
+            "kitty keeps the ratio: 160x96 in a 10x2 span is 67 wide by 40 tall"
+        );
+    }
+
+    /// A stretched picture follows its span whatever the cells have become: after the physical cell
+    /// changes under it the copy is re-made at the new box (10 columns of 10 px by 2 rows of 40 px), so
+    /// a font, line-height or scale change cannot leave letterbox bars where the protocol asked for a fill.
+    #[test]
+    fn a_stretched_picture_still_fills_its_span_after_the_cell_size_changes() {
+        let (store, mut term) = inline_term(20, 10, 2, false);
+        let scheme = ColorScheme::graphite();
+        let m = CellGeometry::new(Size::new(20.0, 20.0), 1.0);
+        let first = draw_after_decode(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = first.under_text.iter().chain(&first.over_text).collect();
+        assert_eq!(draws.len(), 1, "the picture draws once");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 200.0, 40.0),
+            "the 20x20 px span"
+        );
+
+        // Taller, narrower cells: the same 10x2 cell span is now 100 px by 80 px.
+        term.set_cell_pixel_size(10, 40);
+        let m = CellGeometry::new(Size::new(10.0, 40.0), 1.0);
+        assert!(
+            resolve(&store, &term, m, &scheme).pending,
+            "the new box is a copy the store has not made"
+        );
+        store.run_jobs_until_idle();
+        let second = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = second.under_text.iter().chain(&second.over_text).collect();
+        assert_eq!(draws.len(), 1, "still one picture");
+        assert_eq!(
+            draws[0].bounds,
+            rect(0.0, 0.0, 100.0, 80.0),
+            "and it fills the new span whole"
+        );
     }
 
     /// An `x_off`/`y_off` shift moves a placement inside its cells; it must not carry the box past
