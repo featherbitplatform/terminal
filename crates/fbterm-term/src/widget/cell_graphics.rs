@@ -10,16 +10,19 @@
 //!
 //! Two rules keep the arithmetic exact:
 //!
-//! - A cell boundary is `round(origin + column × cell_width)` in physical pixels — never a sum of
-//!   rounded cell widths. Cell `n`'s right edge and cell `n + 1`'s left edge are then the same
-//!   number by construction, however the rounding falls out.
+//! - A cell boundary is wherever iced's quad shader puts that column's background: `round((origin +
+//!   column × cell_width) × scale + 0.001)`, in the same f32 order and with the same slack the shader
+//!   uses — never a sum of rounded cell widths. Cell `n`'s right edge and cell `n + 1`'s left edge are
+//!   then the same number by construction, however the rounding falls out, and a shape ends exactly
+//!   where its own cell's background ends.
 //! - Everything inside a cell is a fraction of that cell measured between two of its edges and
 //!   rounded once, and a line's thickness is a whole number of physical pixels. Lines are centred
 //!   on their cell's centre line and reach the cell edges, so joints land on the shared edge.
 //!
-//! Quads are handed back to iced in logical pixels as `physical ÷ scale`, which puts every corner
-//! on a whole physical pixel — exactly where iced's own snapping would put it anyway, so it changes
-//! nothing there.
+//! Quads are handed back to iced in logical pixels as `physical ÷ scale`. That division cannot always
+//! be exact, so the shader re-derives the pixel by the rule above — which is why [`Geometry::px`]
+//! follows that rule rather than rounding the physical position itself: both land on the same pixel,
+//! and a shape never leaves a hairline of the colour under it at one edge.
 //!
 //! Rounded corners (U+256D..=U+2570) and diagonals (U+2571..=U+2573) stay with the font: they are
 //! curves and slants, and a quad cannot stand in for one.
@@ -1003,20 +1006,46 @@ pub fn shapes(c: char) -> Option<&'static [Shape]> {
     (e.len > 0).then(|| &e.shapes[..e.len as usize])
 }
 
+/// Which end of an axis a position sits on: the low end (left along x, top along y) or the high one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Low,
+    High,
+}
+
+/// One axis of a joint between lines: the rails it paints, and the side its single arm points to when
+/// it has one. Rails are ordered along the axis they are separated by — the left rail of a vertical
+/// line is `lo`, its top rail is `lo` — and a line that is not double has one band, which `hi`
+/// repeats so a caller can walk both cases the same way.
+struct Axis {
+    /// Whether anything runs along this axis at all.
+    present: bool,
+    /// Whether the line is double, and so has two rails with a channel between them.
+    double: bool,
+    /// Whether arms run past the joint on both sides, which is what lets a line cross a joint instead
+    /// of stopping at it.
+    through: bool,
+    lo: (i64, i64),
+    hi: (i64, i64),
+    /// The side the arm is on when the axis has one arm and not two (`None` for a through line, or an
+    /// empty axis). Expressed along the axis the line travels along — which is the axis the
+    /// perpendicular line's rails are ordered along, so the two can be compared.
+    arm: Option<Side>,
+}
+
 /// Cell coordinates in, physical-pixel-accurate quads out.
 ///
 /// Built once per frame from the widget's bounds, cell size and display scale, and allocation-free
 /// while drawing: [`Geometry::cover`] walks a shape's pieces and hands each finished quad back.
 #[derive(Debug, Clone, Copy)]
 pub struct Geometry {
-    /// The grid's top-left corner, in physical pixels.
-    ox: f64,
-    oy: f64,
-    /// One cell in physical pixels. Fractional is fine: only boundaries get rounded (see the module
-    /// comment), and they round from the origin, so they do not drift across a row.
-    cw: f64,
-    ch: f64,
-    scale: f64,
+    /// The grid's top-left corner and one cell, in logical pixels — the units iced is given, and
+    /// therefore the units its shader multiplies by the scale.
+    bx: f32,
+    by: f32,
+    cw: f32,
+    ch: f32,
+    scale: f32,
     /// A [`Weight::Light`] line's thickness in physical pixels: `Heavy` is twice this, `Double` two
     /// lines of it with a gap of it between.
     light: i64,
@@ -1028,29 +1057,47 @@ impl Geometry {
     /// positive finite number becomes 1.0, as in [`super::images::CellGeometry`].
     pub fn new(bounds: Rectangle, cell: Size, scale: f32) -> Self {
         let scale = if scale.is_finite() && scale > 0.0 {
-            f64::from(scale)
+            scale
         } else {
             1.0
         };
-        let ch = f64::from(cell.height) * scale;
+        // The light thickness follows the rule the underline and strike lines use — `cell height /
+        // 16`, rounded, at least one pixel — but applies it in physical pixels, where those lines
+        // apply it in logical ones: the same formula, and at an integer scale the same number, while
+        // at a fractional one they can land a physical pixel apart. Shapes are measured in physical
+        // pixels because that is the unit in which two cells agree on an edge.
         Self {
-            ox: f64::from(bounds.x) * scale,
-            oy: f64::from(bounds.y) * scale,
-            cw: f64::from(cell.width) * scale,
-            ch,
+            bx: bounds.x,
+            by: bounds.y,
+            cw: cell.width,
+            ch: cell.height,
             scale,
-            // The same rule the underline and strike lines use (see `draw_text_group`), so a light
-            // line here is as thick as one there.
-            light: (ch / 16.0).round().max(1.0) as i64,
+            light: (f64::from(cell.height) * f64::from(scale) / 16.0)
+                .round()
+                .max(1.0) as i64,
         }
     }
 
+    /// The first physical pixel of a logical position, exactly as iced's quad shader computes it:
+    /// `round(pos × scale + 0.001)` (`solid.wgsl`, and `round(pos + size + 0.001)` for the far edge),
+    /// f32 throughout because that is what the shader uses. The background quads `render` draws go
+    /// through that arithmetic, so doing the same here is what makes a cell's shape and its background
+    /// end on the same pixel: at scale 1.25 on an 8.4-wide cell, column 1 is logical `8.4`, whose f32
+    /// form sits just under the true width — multiplied in f64 that is 10.4999995 and lands on 10,
+    /// while the shader's f32 product is exactly 10.5 and its slack carries it to 11.
+    fn px(&self, pos: f32) -> i64 {
+        (pos * self.scale + 0.001).round() as i64
+    }
+
+    /// Cell boundary `col`, in physical pixels: the shader's snap of the same logical position
+    /// `render`'s background rectangles use for that column, computed in the same f32 order. Never a
+    /// sum of rounded cell widths, so neighbours agree on the edge by construction.
     fn edge_x(&self, col: i64) -> i64 {
-        snap(self.ox + col as f64 * self.cw)
+        self.px(self.bx + col as f32 * self.cw)
     }
 
     fn edge_y(&self, row: i64) -> i64 {
-        snap(self.oy + row as f64 * self.ch)
+        self.px(self.by + row as f32 * self.ch)
     }
 
     /// The boundary at `part` parts into cell `col`, rounded once from that cell's two edges.
@@ -1064,14 +1111,16 @@ impl Geometry {
         a + snap((b - a) as f64 * f64::from(part) / f64::from(PARTS))
     }
 
-    /// The cell's centre line along x, unrounded: strokes are centred on it and their widths come
-    /// from whole pixels, so the rounding happens once, at the stack's near edge.
+    /// The cell's centre line along x, in physical pixels and still unrounded: strokes are centred on
+    /// it and their widths come from whole pixels, so the rounding happens once, at the stack's near
+    /// edge. It scales the same logical position [`Geometry::px`] snaps, so it stays anchored to the
+    /// cell the background quads are drawn over.
     fn axis_x(&self, col: i64) -> f64 {
-        self.ox + (col as f64 + 0.5) * self.cw
+        ((self.bx + (col as f32 + 0.5) * self.cw) * self.scale) as f64
     }
 
     fn axis_y(&self, row: i64) -> f64 {
-        self.oy + (row as f64 + 0.5) * self.ch
+        ((self.by + (row as f32 + 0.5) * self.ch) * self.scale) as f64
     }
 
     /// Where a stack of `bands` light thicknesses centred on `axis` starts.
@@ -1090,6 +1139,38 @@ impl Geometry {
                 (start, start + self.light),
                 (start + 2 * self.light, start + 3 * self.light),
             ],
+        }
+    }
+
+    /// The rails of the line running along one axis. `low_arm` and `high_arm` are its weights toward
+    /// the low and the high end of the axis it travels along; `across` is the cell's centre line in
+    /// the coordinate its rails are separated by. Both arms carry the same weight whenever both are
+    /// present — no character in [`TABLE`] mixes a double line with another weight on the same axis —
+    /// so one weight builds the stack.
+    fn line_axis(&self, low_arm: Option<Weight>, high_arm: Option<Weight>, across: f64) -> Axis {
+        let Some(w) = low_arm.or(high_arm) else {
+            return Axis {
+                present: false,
+                double: false,
+                through: false,
+                lo: (0, 0),
+                hi: (0, 0),
+                arm: None,
+            };
+        };
+        let [(l0, l1), (h0, h1)] = self.bands(across, w);
+        let double = w == Weight::Double;
+        Axis {
+            present: true,
+            double,
+            through: low_arm.is_some() && high_arm.is_some(),
+            lo: (l0, l1),
+            hi: if double { (h0, h1) } else { (l0, l1) },
+            arm: match (low_arm.is_some(), high_arm.is_some()) {
+                (true, true) | (false, false) => None,
+                (true, false) => Some(Side::Low),
+                (false, true) => Some(Side::High),
+            },
         }
     }
 
@@ -1213,6 +1294,17 @@ impl Geometry {
             return;
         }
 
+        // A double line is two rails with a channel between them, and that channel is what makes its
+        // joints more than one stroke crossing another: see [`Geometry::cover_joint`].
+        if [up, down, left, right]
+            .iter()
+            .flatten()
+            .any(|w| *w == Weight::Double)
+        {
+            self.cover_joint(f, shape, col, row, cells);
+            return;
+        }
+
         // Equal arms on an axis are one stroke across the cell. Across x that is also what lets a run
         // of them stand as one quad for the whole merged span, edges included: it starts on the first
         // cell's left edge and ends on the last one's right edge, so it meets the cells either side.
@@ -1266,19 +1358,142 @@ impl Geometry {
         }
     }
 
+    /// The quads of a shape with a double line in it, which has to be laid out rail by rail and not as
+    /// one stroke across the cell: the channel between a double line's two rails has to stay open
+    /// through the joint, or `╔` comes out as lines crossing with a filled box at every corner. Each
+    /// rule below was read off a real monospace's outlines of these characters.
+    ///
+    /// A rail stops at the near edge of the perpendicular rail it joins, so it never bridges a channel.
+    /// Two things do cross: a line that runs on past the joint (a single line through a double one is
+    /// unbroken), and the rail that goes around the outside of a bend — there the channel ends at the
+    /// joint, because the perpendicular line has only one arm. That is what makes `╔`'s two outer rails
+    /// one nested corner, and what breaks the crossbar's inner rail in `╦` instead.
+    fn cover_joint(
+        &self,
+        f: &mut impl FnMut(Rectangle),
+        shape: &Shape,
+        col: i64,
+        row: i64,
+        cells: i64,
+    ) {
+        let Shape::Lines {
+            up,
+            down,
+            left,
+            right,
+            ..
+        } = *shape
+        else {
+            return;
+        };
+        // The horizontal line's rails are the same in every cell of a merged run; the vertical line's
+        // are centred on their own cell.
+        let h = self.line_axis(left, right, self.axis_y(row));
+        if up.is_none() && down.is_none() && left == right {
+            // Nothing crosses this line: it is one stroke across the whole run, edges included, which
+            // is what lets a row of `═` stand as a single quad that meets the cells either side.
+            for (y0, y1) in [h.lo, h.hi] {
+                self.emit(f, self.edge_x(col), y0, self.edge_x(col + cells), y1);
+            }
+            return;
+        }
+        for c in col..col + cells {
+            let (x0, x1) = (self.edge_x(c), self.edge_x(c + 1));
+            let (y0, y1) = (self.edge_y(row), self.edge_y(row + 1));
+            let v = self.line_axis(up, down, self.axis_x(c));
+            // A line that runs through the cell and meets no other double line is one stroke across
+            // it: only two doubles have rails that stop short of each other.
+            if v.through && !(v.double && h.double) {
+                for (_, rail) in rails(&v) {
+                    self.emit(f, rail.0, y0, rail.1, y1);
+                }
+            } else {
+                for (side, arm) in [(Side::Low, up), (Side::High, down)] {
+                    if arm.is_none() {
+                        continue;
+                    }
+                    for (rail_side, rail) in rails(&v) {
+                        let stop = reach(&v, &h, side, rail_side, snap(self.axis_y(row)));
+                        match side {
+                            Side::Low => self.emit(f, rail.0, y0, rail.1, stop),
+                            Side::High => self.emit(f, rail.0, stop, rail.1, y1),
+                        }
+                    }
+                }
+            }
+            if h.through && !(v.double && h.double) {
+                for (_, rail) in rails(&h) {
+                    self.emit(f, x0, rail.0, x1, rail.1);
+                }
+            } else {
+                for (side, arm) in [(Side::Low, left), (Side::High, right)] {
+                    if arm.is_none() {
+                        continue;
+                    }
+                    for (rail_side, rail) in rails(&h) {
+                        let stop = reach(&h, &v, side, rail_side, snap(self.axis_x(c)));
+                        match side {
+                            Side::Low => self.emit(f, x0, rail.0, stop, rail.1),
+                            Side::High => self.emit(f, stop, rail.0, x1, rail.1),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// A box in physical pixels as the logical quad iced draws: dividing by the scale leaves every
     /// corner on a whole physical pixel, so iced's snapping has nothing left to change.
     fn emit(&self, f: &mut impl FnMut(Rectangle), x0: i64, y0: i64, x1: i64, y1: i64) {
         if x1 <= x0 || y1 <= y0 {
             return;
         }
+        let scale = f64::from(self.scale);
         f(Rectangle {
-            x: (x0 as f64 / self.scale) as f32,
-            y: (y0 as f64 / self.scale) as f32,
-            width: ((x1 - x0) as f64 / self.scale) as f32,
-            height: ((y1 - y0) as f64 / self.scale) as f32,
+            x: (x0 as f64 / scale) as f32,
+            y: (y0 as f64 / scale) as f32,
+            width: ((x1 - x0) as f64 / scale) as f32,
+            height: ((y1 - y0) as f64 / scale) as f32,
         });
     }
+}
+
+/// A line's rails to walk in order: both for a double line, and one band for anything else — the slot
+/// left empty is skipped by [`Geometry::emit`], as everywhere else in this module.
+fn rails(a: &Axis) -> [(Side, (i64, i64)); 2] {
+    [
+        (Side::Low, a.lo),
+        (Side::High, if a.double { a.hi } else { (0, 0) }),
+    ]
+}
+
+/// How far one rail of `a` reaches toward `side` before it stops, given the perpendicular axis `p`.
+/// The coordinate is the one this line travels along — which is the one `p`'s rails are ordered along,
+/// so its two rails and this line's arms sit on the same scale.
+fn reach(a: &Axis, p: &Axis, side: Side, rail: Side, centre: i64) -> i64 {
+    if !p.present {
+        return centre; // nothing crosses here, so an arm stops at the cell's centre line
+    }
+    // The far edge of the whole perpendicular stack from this side, and the near edge of the rail of
+    // it that is on this side.
+    let (across, near) = match side {
+        Side::Low => (p.hi.1, p.lo.1),
+        Side::High => (p.lo.0, p.hi.0),
+    };
+    if !p.double {
+        return across; // a single band is not split by anything: the line runs right across it
+    }
+    // A double line's outer rail turns around the bend with the perpendicular line's outer rail, so it
+    // covers the whole stack — possible because the channel ends at the joint when the perpendicular
+    // line has only one arm. Its inner rail joins the inner one and stops short of the channel. The
+    // side the perpendicular arm goes to is the inside of that bend. A single line has no rails to keep
+    // apart: it crosses the channel as well, unless it stops here while the channel runs on past.
+    let crosses = if a.double {
+        p.arm.is_some() && rail != p.arm.unwrap_or(Side::Low)
+    } else {
+        a.through || p.arm.is_some()
+    };
+    if crosses { across } else { near }
 }
 
 /// Rounds to the nearest physical pixel, half away from zero.
@@ -1339,21 +1554,35 @@ mod tests {
             .expect("a shape covers something")
     }
 
-    /// A quad's box back in physical pixels, which is the unit this module works in.
-    fn px(r: Rectangle, scale: f32) -> (i64, i64, i64, i64) {
-        let s = f64::from(scale);
-        let (x, y) = (f64::from(r.x), f64::from(r.y));
+    /// What iced's quad shader paints for a box: `solid.wgsl` scales the logical position and size by
+    /// the window scale in f32, then snaps to `round(pos + 0.001)` and `round(pos + size + 0.001)`.
+    /// That is the arithmetic every quad on screen goes through, including the background cells
+    /// `render` draws, so it is the yardstick for [`Geometry::px`].
+    fn shader_rect(pos: f32, size: f32, scale: f32) -> (i64, i64) {
+        let (pos, size) = (pos * scale, size * scale);
         (
-            snap(x * s),
-            snap(y * s),
-            snap((x + f64::from(r.width)) * s),
-            snap((y + f64::from(r.height)) * s),
+            (pos + 0.001).round() as i64,
+            (pos + size + 0.001).round() as i64,
         )
+    }
+
+    /// The pixels the background of cell `col` gets: the rect `render`'s `rect()` builds for a
+    /// one-cell span at that column, through [`shader_rect`].
+    fn background_cell(bx: f32, cw: f32, col: u32, scale: f32) -> (i64, i64) {
+        shader_rect(bx + col as f32 * cw, cw, scale)
+    }
+
+    /// A quad's box back in physical pixels the way the shader computes them: the unit this module
+    /// works in, and the number that lands on screen.
+    fn px(r: Rectangle, scale: f32) -> (i64, i64, i64, i64) {
+        let (l, right) = shader_rect(r.x, r.width, scale);
+        let (top, bottom) = shader_rect(r.y, r.height, scale);
+        (l, top, right, bottom)
     }
 
     /// A quad's box in physical pixels, with the scale taken from the geometry that made it.
     fn box_of(g: &Geometry, r: Rectangle) -> (i64, i64, i64, i64) {
-        px(r, g.scale as f32)
+        px(r, g.scale)
     }
 
     /// Whether two quads share more than an edge: a joint is solid only if they do.
@@ -1371,7 +1600,6 @@ mod tests {
         for &(scale, w) in &CASES {
             for origin in [(0.0, 0.0), (0.5, 1.25)] {
                 let g = grid_at(origin, (w, w * 1.2), scale);
-                let ox = f64::from(origin.0) * f64::from(scale);
                 let mut prev = None;
                 let mut widths = Vec::new();
                 for col in 0..200 {
@@ -1384,8 +1612,13 @@ mod tests {
                              (scale {scale}, width {w}, origin {origin:?})"
                         );
                     }
-                    assert_eq!(x0, snap(ox + col as f64 * g.cw));
-                    assert_eq!(x1, snap(ox + (col + 1) as f64 * g.cw));
+                    let (want0, want1) = background_cell(origin.0, w, col, scale);
+                    assert_eq!(
+                        (x0, x1),
+                        (want0, want1),
+                        "cell {col} must land where the shader puts that column's background \
+                         (scale {scale}, width {w}, origin {origin:?})"
+                    );
                     widths.push(x1 - x0);
                     prev = Some(x1);
                 }
@@ -1399,6 +1632,44 @@ mod tests {
                 let total: i64 = widths.iter().sum();
                 let exact = 200.0 * f64::from(w) * f64::from(scale);
                 assert!(((total as f64) - exact).abs() < 1.0, "{total} vs {exact}");
+            }
+        }
+    }
+
+    /// A shape must end where its cell's background ends, or a block shows a hairline of the colour
+    /// under it at one edge. So [`Geometry`]'s boundaries are the shader's own arithmetic on the rect
+    /// `render` draws for that column — same f32 order, same `+ 0.001`, same round.
+    #[test]
+    fn cell_edges_land_where_the_shader_puts_the_background() {
+        let cases = [
+            (1.0f32, 8.0f32),
+            (2.0, 8.43),
+            (1.25, 9.6),
+            // The near-tie that used to disagree: `8.4` as f32 sits just under the true width, so the
+            // old f64 product was 10.4999995 and rounded to 10, while the shader's f32 product is
+            // exactly 10.5 and its slack carries it to 11.
+            (1.25, 8.4),
+            (1.5, 7.4666667),
+        ];
+        for &(scale, w) in &cases {
+            for origin in [0.0f32, 0.5, -3.25, 7.3] {
+                let g = grid_at((origin, origin), (w, w * 1.2), scale);
+                for col in 0..240 {
+                    let (left, right) = background_cell(origin, w, col, scale);
+                    assert_eq!(
+                        (g.edge_x(i64::from(col)), g.edge_x(i64::from(col) + 1)),
+                        (left, right),
+                        "column {col} must end where its background ends ({scale}, {w}, {origin})"
+                    );
+                }
+                for row in 0..80 {
+                    let (top, bottom) = background_cell(origin, w * 1.2, row, scale);
+                    assert_eq!(
+                        (g.edge_y(i64::from(row)), g.edge_y(i64::from(row) + 1)),
+                        (top, bottom),
+                        "row {row} must end where its background ends ({scale}, {w}, {origin})"
+                    );
+                }
             }
         }
     }
@@ -1633,7 +1904,9 @@ mod tests {
             for (x0, _, x1, _) in vqs {
                 assert_eq!(x1 - x0, light);
             }
-            assert_eq!(quads(&g, '╬', 2, 2, 1).len(), 4, "two doubles crossing");
+            // A cross of two doubles is four hooks — each of the four arms is painted by its own two
+            // rails, because neither line's channel may be bridged. See the joint tests for the shape.
+            assert_eq!(quads(&g, '╬', 2, 2, 1).len(), 8, "two doubles crossing");
         }
     }
 
@@ -1751,6 +2024,457 @@ mod tests {
             assert_eq!(g.scale, 1.0);
             assert_eq!(g.light, (9.6f64 / 16.0).round().max(1.0) as i64);
             assert!(!quads(&g, '█', 0, 0, 1).is_empty());
+        }
+    }
+
+    /// One cell's worth of pixels, as the shader paints them: quads rasterized into a grid the size of
+    /// the cell, so a test can say exactly where the ink is.
+    struct Pixels {
+        w: usize,
+        h: usize,
+        ink: Vec<bool>,
+    }
+
+    impl Pixels {
+        fn new(w: i64, h: i64) -> Self {
+            Self {
+                w: w as usize,
+                h: h as usize,
+                ink: vec![false; (w * h) as usize],
+            }
+        }
+
+        /// The expected picture: the union of these boxes.
+        fn boxes(w: i64, h: i64, rects: &[(i64, i64, i64, i64)]) -> Self {
+            let mut out = Self::new(w, h);
+            for &(x0, y0, x1, y1) in rects {
+                out.fill((x0, y0, x1, y1));
+            }
+            out
+        }
+
+        fn fill(&mut self, (x0, y0, x1, y1): (i64, i64, i64, i64)) {
+            for y in y0.max(0)..y1.min(self.h as i64) {
+                for x in x0.max(0)..x1.min(self.w as i64) {
+                    self.ink[(y * self.w as i64 + x) as usize] = true;
+                }
+            }
+        }
+
+        /// Whether every pixel of the box is inked.
+        fn covers(&self, (x0, y0, x1, y1): (i64, i64, i64, i64)) -> bool {
+            (y0..y1).all(|y| (x0..x1).all(|x| self.ink[(y * self.w as i64 + x) as usize]))
+        }
+
+        /// Whether the box is free of ink.
+        fn clear(&self, (x0, y0, x1, y1): (i64, i64, i64, i64)) -> bool {
+            (y0..y1).all(|y| (x0..x1).all(|x| !self.ink[(y * self.w as i64 + x) as usize]))
+        }
+    }
+
+    /// The joint tests all use one geometry: scale 2 on a 10×16 cell, where a light line is two pixels,
+    /// a double line's rails are 7..9 and 11..13 across the cell and 13..15 and 17..19 down it, and the
+    /// channel between each pair of rails is two pixels wide. Small enough to write the pixels out.
+    fn joint_grid() -> Geometry {
+        grid((10.0, 16.0), 2.0)
+    }
+
+    /// A character's cell as [`Pixels`].
+    fn paint(g: &Geometry, c: char) -> Pixels {
+        let (ox, oy) = (g.edge_x(0), g.edge_y(0));
+        let mut out = Pixels::new(g.edge_x(1) - ox, g.edge_y(1) - oy);
+        for r in quads(g, c, 0, 0, 1) {
+            let q = box_of(g, r);
+            out.fill((q.0 - ox, q.1 - oy, q.2 - ox, q.3 - oy));
+        }
+        out
+    }
+
+    /// A double line's rails and the channel between them along one axis, as (near rail, gap, far rail).
+    fn stack_of(g: &Geometry, axis: f64) -> [(i64, i64); 3] {
+        let [(a0, a1), (b0, b1)] = g.bands(axis, Weight::Double);
+        [(a0, a1), (a1, b0), (b0, b1)]
+    }
+
+    /// The rails, channels and cell edges of [`joint_grid`], as pixel ranges.
+    struct Joints {
+        g: Geometry,
+        l: i64,
+        r: i64,
+        t: i64,
+        b: i64,
+        /// A vertical double line's rails across x, near and far from the cell's left edge.
+        v_lo: (i64, i64),
+        v_hi: (i64, i64),
+        /// A horizontal double line's rails down y, near and far from its top edge.
+        h_top: (i64, i64),
+        h_bot: (i64, i64),
+    }
+
+    impl Joints {
+        fn new() -> Self {
+            let g = joint_grid();
+            let v = stack_of(&g, g.axis_x(0));
+            let h = stack_of(&g, g.axis_y(0));
+            Self {
+                l: g.edge_x(0),
+                r: g.edge_x(1),
+                t: g.edge_y(0),
+                b: g.edge_y(1),
+                v_lo: v[0],
+                v_hi: v[2],
+                h_top: h[0],
+                h_bot: h[2],
+                g,
+            }
+        }
+
+        /// Where a single (light) line on this axis would sit.
+        fn light_v(&self) -> (i64, i64) {
+            self.g.bands(self.g.axis_x(0), Weight::Light)[0]
+        }
+
+        fn light_h(&self) -> (i64, i64) {
+            self.g.bands(self.g.axis_y(0), Weight::Light)[0]
+        }
+    }
+
+    /// The exact pixels of the double-line joints, read off a real monospace's outlines: `╔` is two
+    /// nested corners, `╦` breaks the crossbar's inner rail instead of bridging the arm's channel, `╬`
+    /// is four hooks with nothing crossing the middle, a light arm stops at the near band (`╟`, `╤`), a
+    /// double arm lands on a single line with both its bands (`╒`, `╓`), and `╪`'s single line runs
+    /// through both bands and across the gap. None of this was true before, when every band was drawn
+    /// from the far side of the crossing region and nothing trimmed the inner one.
+    #[test]
+    fn double_joints_are_two_rails_and_not_two_crossing_lines() {
+        let j = Joints::new();
+        let (xl, xr, yt, yb) = (j.l, j.r, j.t, j.b);
+        let (v0a, v0b) = j.v_lo;
+        let (v1a, v1b) = j.v_hi;
+        let (h0a, h0b) = j.h_top;
+        let (h1a, h1b) = j.h_bot;
+        let lv = j.light_v();
+        let lh = j.light_h();
+        type Box = (i64, i64, i64, i64);
+        let want: [(char, Vec<Box>); 10] = [
+            // Corners: the outer rail of each arm goes around the outside of the bend, the inner one
+            // meets the other line's inner rail, and both channels stay open.
+            (
+                '╔',
+                vec![
+                    (v0a, h0a, xr, h0b),
+                    (v1a, h1a, xr, h1b),
+                    (v0a, h0a, v0b, yb),
+                    (v1a, h1a, v1b, yb),
+                ],
+            ),
+            (
+                '╗',
+                vec![
+                    (xl, h0a, v1b, h0b),
+                    (xl, h1a, v0b, h1b),
+                    (v1a, h0a, v1b, yb),
+                    (v0a, h1a, v0b, yb),
+                ],
+            ),
+            // A tee: the through line's outer rail is unbroken, its inner one stops where the arm's
+            // channel passes, and each rail of the arm joins that inner rail.
+            (
+                '╠',
+                vec![
+                    (v0a, yt, v0b, yb),
+                    (v1a, yt, v1b, h0b),
+                    (v1a, h1a, v1b, yb),
+                    (v1a, h0a, xr, h0b),
+                    (v1a, h1a, xr, h1b),
+                ],
+            ),
+            (
+                '╦',
+                vec![
+                    (xl, h0a, xr, h0b),
+                    (xl, h1a, v0b, h1b),
+                    (v1a, h1a, xr, h1b),
+                    (v0a, h1a, v0b, yb),
+                    (v1a, h1a, v1b, yb),
+                ],
+            ),
+            // A cross of two doubles: four hooks, each rail stopping at the near rail of the other.
+            (
+                '╬',
+                vec![
+                    (xl, h0a, v0b, h0b),
+                    (v1a, h0a, xr, h0b),
+                    (xl, h1a, v0b, h1b),
+                    (v1a, h1a, xr, h1b),
+                    (v0a, yt, v0b, h0b),
+                    (v1a, yt, v1b, h0b),
+                    (v0a, h1a, v0b, yb),
+                    (v1a, h1a, v1b, yb),
+                ],
+            ),
+            // A light arm against a double line stops at the near band instead of bridging the gap; the
+            // through line's two rails run the whole way.
+            (
+                '╟',
+                vec![
+                    (v0a, yt, v0b, yb),
+                    (v1a, yt, v1b, yb),
+                    (v1a, lh.0, xr, lh.1),
+                ],
+            ),
+            (
+                '╤',
+                vec![
+                    (xl, h0a, xr, h0b),
+                    (xl, h1a, xr, h1b),
+                    (lv.0, h1a, lv.1, yb),
+                ],
+            ),
+            // A double arm against a single line joins it with both bands, and a light line crossing a
+            // double stack bridges it: the channel ends at that joint.
+            (
+                '╒',
+                vec![
+                    (lv.0, h0a, xr, h0b),
+                    (lv.0, h1a, xr, h1b),
+                    (lv.0, h0a, lv.1, yb),
+                ],
+            ),
+            (
+                '╓',
+                vec![
+                    (v0a, lh.0, xr, lh.1),
+                    (v0a, lh.0, v0b, yb),
+                    (v1a, lh.0, v1b, yb),
+                ],
+            ),
+            // The crosses mix one of each: the single line runs through both bands and across their
+            // gap, and the double's bands run through as well.
+            (
+                '╪',
+                vec![(xl, h0a, xr, h0b), (xl, h1a, xr, h1b), (lv.0, yt, lv.1, yb)],
+            ),
+        ];
+        for (c, rects) in want {
+            let got = paint(&j.g, c);
+            let want = Pixels::boxes(got.w as i64, got.h as i64, &rects);
+            assert_eq!(
+                got.ink, want.ink,
+                "{c:?} does not draw the joints the font draws"
+            );
+        }
+    }
+
+    /// The same joints by the properties that matter rather than an exact picture: the channel between
+    /// a double line's rails is empty inside the joint, every band reaches the cell edge its name
+    /// mentions, and where two bands meet they overlap instead of merely touching.
+    #[test]
+    fn double_joints_keep_their_channels_open_and_reach_their_edges() {
+        let j = Joints::new();
+        let (xl, xr, yt, yb) = (j.l, j.r, j.t, j.b);
+        let (v0a, v0b) = j.v_lo;
+        let (v1a, v1b) = j.v_hi;
+        let (h0a, h0b) = j.h_top;
+        let (h1a, h1b) = j.h_bot;
+        let lv = j.light_v();
+        let lh = j.light_h();
+        type Box = (i64, i64, i64, i64);
+
+        // Where a channel has to stay empty. Which ones those are comes from the same outlines as the
+        // exact pictures above: a corner's channels run out through the joint (`╔` keeps its own open
+        // below the miter and `╗` above it, and neither lets the other line's channel be bridged), a
+        // tee's arm channel runs out into the through line (`╠`, `╦`), `╬` has both channels running
+        // the whole way across the cell, and where a single line crosses a double stack only that line
+        // may fill it (`╒`, `╓`, `╪`).
+        let open: [(char, Vec<Box>); 10] = [
+            ('╔', vec![(v0b, h0b, v1a, yb), (v0b, h0b, xr, h1a)]),
+            (
+                '╗',
+                vec![
+                    (v0b, h0b, v1a, yb),
+                    (xl, h0b, v1a, h1a),
+                    (v1b, h0b, xr, h1a),
+                ],
+            ),
+            (
+                '╠',
+                vec![
+                    (v0b, yt, v1a, h0a),
+                    (v0b, h1b, v1a, yb),
+                    (v0b, h0b, xr, h1a),
+                ],
+            ),
+            ('╦', vec![(v0b, h1b, v1a, yb), (xl, h0b, xr, h1a)]),
+            ('╬', vec![(v0b, yt, v1a, yb), (xl, h0b, xr, h1a)]),
+            ('╟', vec![(v0b, yt, v1a, yb)]),
+            ('╤', vec![(xl, h0b, xr, h1a)]),
+            ('╒', vec![(xl, h0b, lv.0, h1a), (lv.1, h0b, xr, h1a)]),
+            ('╓', vec![(v0b, yt, v1a, lh.0), (v0b, lh.1, v1a, yb)]),
+            ('╪', vec![(xl, h0b, lv.0, h1a), (lv.1, h0b, xr, h1a)]),
+        ];
+        for (c, boxes) in open {
+            let p = paint(&j.g, c);
+            for b in boxes {
+                assert!(p.clear(b), "{c:?} fills the channel at {b:?}");
+            }
+        }
+        // Where a single line does cross a double stack it closes the channel there, and must: that is
+        // what makes `╪`'s light line run through unbroken rather than split in two.
+        let bridges = [
+            ('╒', (lv.0, h0b, lv.1, h1a)),
+            ('╓', (v0b, lh.0, v1a, lh.1)),
+            ('╪', (lv.0, h0b, lv.1, h1a)),
+        ];
+        for (c, b) in bridges {
+            assert!(
+                paint(&j.g, c).covers(b),
+                "{c:?} should bridge the gap where it crosses"
+            );
+        }
+
+        // Every band reaches the cell edge its arms are named for, and both rails of a double line
+        // reach it, not just one: `╔`'s two horizontal bands both run to the right edge and its two
+        // vertical rails both run to the bottom, `╗`'s run to the left edge and the bottom (its arms
+        // are down and left, so nothing of it touches the top), and a tee's through line reaches both
+        // of its ends.
+        let edges: [(char, Vec<Box>); 10] = [
+            (
+                '╔',
+                vec![
+                    (xr - 2, h0a, xr, h0b),
+                    (xr - 2, h1a, xr, h1b),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╗',
+                vec![
+                    (xl, h0a, xl + 2, h0b),
+                    (xl, h1a, xl + 2, h1b),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╠',
+                vec![
+                    (xr - 2, h0a, xr, h0b),
+                    (xr - 2, h1a, xr, h1b),
+                    (v0a, yt, v0b, yt + 2),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yt, v1b, yt + 2),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╦',
+                vec![
+                    (xl, h0a, xl + 2, h0b),
+                    (xr - 2, h0a, xr, h0b),
+                    (xl, h1a, xl + 2, h1b),
+                    (xr - 2, h1a, xr, h1b),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╬',
+                vec![
+                    (xl, h0a, xl + 2, h0b),
+                    (xr - 2, h0a, xr, h0b),
+                    (xl, h1a, xl + 2, h1b),
+                    (xr - 2, h1a, xr, h1b),
+                    (v0a, yt, v0b, yt + 2),
+                    (v1a, yt, v1b, yt + 2),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╟',
+                vec![
+                    (xr - 2, lh.0, xr, lh.1),
+                    (v0a, yt, v0b, yt + 2),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yt, v1b, yt + 2),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╤',
+                vec![
+                    (xl, h0a, xl + 2, h0b),
+                    (xr - 2, h0a, xr, h0b),
+                    (xl, h1a, xl + 2, h1b),
+                    (xr - 2, h1a, xr, h1b),
+                    (lv.0, yb - 2, lv.1, yb),
+                ],
+            ),
+            (
+                '╒',
+                vec![
+                    (xr - 2, h0a, xr, h0b),
+                    (xr - 2, h1a, xr, h1b),
+                    (lv.0, yb - 2, lv.1, yb),
+                ],
+            ),
+            (
+                '╓',
+                vec![
+                    (xr - 2, lh.0, xr, lh.1),
+                    (v0a, yb - 2, v0b, yb),
+                    (v1a, yb - 2, v1b, yb),
+                ],
+            ),
+            (
+                '╪',
+                vec![
+                    (xl, h0a, xl + 2, h0b),
+                    (xr - 2, h0a, xr, h0b),
+                    (xl, h1a, xl + 2, h1b),
+                    (xr - 2, h1a, xr, h1b),
+                    (lv.0, yt, lv.1, yt + 2),
+                    (lv.0, yb - 2, lv.1, yb),
+                ],
+            ),
+        ];
+        for (c, boxes) in edges {
+            let p = paint(&j.g, c);
+            for b in boxes {
+                assert!(p.covers(b), "{c:?} does not reach the edge at {b:?}");
+            }
+        }
+
+        // Where two bands join they share pixels rather than merely touching: these squares are those
+        // joins — the miters of a corner, and the place each band of an arm meets the line it joins —
+        // and every one of them has to be solid ink.
+        let joins: [(char, Vec<Box>); 10] = [
+            ('╔', vec![(v0a, h0a, v0b, h0b), (v1a, h1a, v1b, h1b)]),
+            ('╗', vec![(v0a, h1a, v0b, h1b), (v1a, h0a, v1b, h0b)]),
+            ('╠', vec![(v1a, h0a, v1b, h0b), (v1a, h1a, v1b, h1b)]),
+            ('╦', vec![(v0a, h1a, v0b, h1b), (v1a, h1a, v1b, h1b)]),
+            (
+                '╬',
+                vec![
+                    (v0a, h0a, v0b, h0b),
+                    (v1a, h0a, v1b, h0b),
+                    (v0a, h1a, v0b, h1b),
+                    (v1a, h1a, v1b, h1b),
+                ],
+            ),
+            ('╟', vec![(v1a, lh.0, v1b, lh.1)]),
+            ('╤', vec![(lv.0, h1a, lv.1, h1b)]),
+            ('╒', vec![(lv.0, h0a, lv.1, h0b), (lv.0, h1a, lv.1, h1b)]),
+            ('╓', vec![(v0a, lh.0, v0b, lh.1), (v1a, lh.0, v1b, lh.1)]),
+            ('╪', vec![(lv.0, h0a, lv.1, h0b), (lv.0, h1a, lv.1, h1b)]),
+        ];
+        for (c, boxes) in joins {
+            let p = paint(&j.g, c);
+            for b in boxes {
+                assert!(p.covers(b), "{c:?} has a hollow joint at {b:?}");
+            }
         }
     }
 }

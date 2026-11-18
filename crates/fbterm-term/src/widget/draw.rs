@@ -557,6 +557,28 @@ fn draw_text_group(
         height: ch,
     };
     let thin = (ch / 16.0).round().max(1.0);
+    // Block and box-drawing characters: cell-filling shapes whose edges are the grid's own, worked out
+    // in physical pixels so neighbours agree on them (see [`cell_graphics`]). They go where their glyphs
+    // used to — under the text — but before everything else this group paints, so an underline, a
+    // strike or the cursor over a full block is drawn on top of it rather than buried by it.
+    if !list.cell_graphics.is_empty() {
+        let g = cell_graphics::Geometry::new(bounds, m.cell, m.scale);
+        for &(span, c, fg) in &list.cell_graphics {
+            let Some(shapes) = cell_graphics::shapes(c) else {
+                continue;
+            };
+            for shape in shapes {
+                let paint = color(fg).scale_alpha(shape.alpha());
+                g.cover(
+                    shape,
+                    u32::from(span.col),
+                    u32::from(span.row),
+                    u32::from(span.cells),
+                    |r| fill_color(renderer, r, paint),
+                );
+            }
+        }
+    }
     for (span, c, kind) in &list.lines {
         let r = rect(*span);
         let mut line = |y: f32| {
@@ -606,27 +628,6 @@ fn draw_text_group(
                 },
                 iced::Color::TRANSPARENT,
             ),
-        }
-    }
-    // Block and box-drawing characters: cell-filling shapes whose edges are the grid's own, worked
-    // out in physical pixels so neighbours agree on them (see [`cell_graphics`]). They go where their
-    // glyphs used to, under the text.
-    if !list.cell_graphics.is_empty() {
-        let g = cell_graphics::Geometry::new(bounds, m.cell, m.scale);
-        for &(span, c, fg) in &list.cell_graphics {
-            let Some(shapes) = cell_graphics::shapes(c) else {
-                continue;
-            };
-            for shape in shapes {
-                let paint = color(fg).scale_alpha(shape.alpha());
-                g.cover(
-                    shape,
-                    u32::from(span.col),
-                    u32::from(span.row),
-                    u32::from(span.cells),
-                    |r| fill_color(renderer, r, paint),
-                );
-            }
         }
     }
     // Grid text is shaped here, with the run's OpenType features, and handed to the renderer as
@@ -1036,9 +1037,93 @@ mod tests {
         // INVERSE: the block takes the cell's background as its colour, like a glyph would.
         let list = build_row("\x1b[7ma█\x1b[0m".as_bytes());
         assert_eq!(list.cell_graphics[0].2, scheme().background);
-        // A search match tints the background only, so the shape keeps its colour and the run split.
-        let list = build_row("██".as_bytes());
-        assert_eq!(shape_runs(&list), vec![(0, 0, 2, '█')]);
+        // A search match tints the background only, and only the current match replaces the
+        // foreground, so a shape has to end up with whatever colour a letter in that cell gets. The
+        // query `[█b]` matches `██` and `bb` at the same two columns, and its second match is made the
+        // current one: column 0 is an ordinary match in both rows, column 1 the current one.
+        let (tint, strong, text) = (
+            Rgb { r: 1, g: 1, b: 1 },
+            Rgb { r: 2, g: 2, b: 2 },
+            Rgb { r: 3, g: 3, b: 3 },
+        );
+        let highlight_on = |bytes: &[u8]| -> (Terminal, Highlight) {
+            let t = term_with(bytes);
+            let pattern = crate::SearchPattern::new(&crate::SearchQuery::new("[█b]", true))
+                .unwrap()
+                .unwrap();
+            let all = t.visible_matches(&pattern);
+            let last = all[all.len() - 1];
+            assert_eq!((last.start.line, last.start.col, last.end.col), (0, 1, 1));
+            (
+                t,
+                Highlight {
+                    current: Some(last),
+                    pattern,
+                    match_bg: tint,
+                    current_bg: strong,
+                    current_fg: text,
+                },
+            )
+        };
+        let build_with = |bytes: &[u8]| {
+            let (t, h) = highlight_on(bytes);
+            (
+                build(
+                    &mut RowReader::new(),
+                    &t,
+                    &scheme(),
+                    true,
+                    None,
+                    Some(&h),
+                    store(),
+                    metrics(),
+                ),
+                h,
+            )
+        };
+        let (shapes, h) = build_with("██".as_bytes());
+        // The run splits where the match state does, so each block keeps its own colour.
+        assert_eq!(shape_runs(&shapes), vec![(0, 0, 1, '█'), (0, 1, 1, '█')]);
+        let (glyphs, _) = build_with("bb".as_bytes());
+        // Cell by cell, the shape's colour is what the letter in the same position was given: an
+        // ordinary match leaves the foreground alone, and only the current one replaces it.
+        let got: Vec<_> = shapes
+            .cell_graphics
+            .iter()
+            .map(|&(s, _, fg)| (s.col, fg))
+            .collect();
+        let want: Vec<_> = glyphs
+            .texts
+            .iter()
+            .flat_map(|r| (0..r.span.cells).map(move |i| (r.span.col + i, r.fg)))
+            .collect();
+        assert_eq!(want.len(), 2, "one run per match state, as for the shapes");
+        assert_eq!(
+            got, want,
+            "a shape gets the colour a letter in its cell gets"
+        );
+        assert_eq!(
+            got[0].1,
+            scheme().foreground,
+            "an ordinary match tints only the bg"
+        );
+        assert_eq!(
+            got[1].1, h.current_fg,
+            "the current match brings its own fg"
+        );
+        // The match colours still arrive as background quads under the shapes, exactly as they do for
+        // letters: nothing about a shape moves a tint into the shape's own colour.
+        let bg_of = |list: &DrawList| -> Vec<_> {
+            list.quads
+                .iter()
+                .map(|(s, c)| (s.row, s.col, s.cells, *c))
+                .filter(|(_, _, _, c)| *c == tint || *c == strong)
+                .collect()
+        };
+        assert_eq!(bg_of(&shapes), bg_of(&glyphs));
+        // Without a highlight the two blocks are one colour again, so they stay a single run.
+        let plain = build_row("██".as_bytes());
+        assert_eq!(shape_runs(&plain), vec![(0, 0, 2, '█')]);
     }
 
     /// A selected block takes the selection the same way text does. Selection changes only the
