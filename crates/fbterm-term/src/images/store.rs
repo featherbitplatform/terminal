@@ -5,7 +5,8 @@
 //! [`Terminal`] (fbterm-term cannot know the app's pane ids, and a reconnect feeds the same
 //! terminal through a new session), and each owner registers [`OwnerHooks`] so finished work can
 //! reach its session: the worker reports decode results to the terminal (which answers kitty
-//! clients), drains the resulting events through `on_events` and wakes the pane with `wake`.
+//! clients) and then calls the owner's `deliver` hook, which takes those events out of the terminal
+//! and routes them in the order it finds them; `wake` tells the pane to redraw.
 //!
 //! One thread, `fbterm-image-worker`, does all decoding and resampling — never on the UI thread,
 //! never while the store lock is held, and it sleeps on a condition variable when idle (it never
@@ -31,10 +32,12 @@ use feathercritty::graphics::kitty::Rect;
 use iced::advanced::image::Handle;
 use parking_lot::{Condvar, Mutex};
 
+#[cfg(test)]
+use crate::TermEvent;
+use crate::Terminal;
 use crate::images::decode::{self, DecodeError, DecodeHook, Rgba8Image};
 use crate::images::resample::{is_integer_multiple, resample};
 use crate::images::{PER_OWNER_CAP, TOTAL_CAP};
-use crate::{TermEvent, Terminal};
 
 /// What a session registered for one terminal, so finished image work reaches it.
 ///
@@ -44,9 +47,11 @@ use crate::{TermEvent, Terminal};
 /// decode results to its new session while the images survive.
 pub struct OwnerHooks {
     pub term: Weak<Mutex<Terminal>>,
-    /// Called (on the worker thread, no store lock held) with the events a finished decode made
-    /// the terminal raise: replies to programs and releases of failed images.
-    pub on_events: Arc<dyn Fn(Vec<TermEvent>) + Send + Sync>,
+    /// Called (on the worker thread, with no store lock and no terminal lock held) once a finished
+    /// decode has queued its answer in the terminal's event queue. It takes nothing: whoever routes
+    /// terminal events empties that queue itself, under its own lock, so an answer joins the replies
+    /// produced by output instead of being carried past them (see [`ImageStore::deliver`]).
+    pub deliver: Arc<dyn Fn() + Send + Sync>,
     /// Called when new pixels became available, so the pane redraws (it is `mark_dirty`).
     pub wake: Arc<dyn Fn() + Send + Sync>,
 }
@@ -55,7 +60,7 @@ pub struct OwnerHooks {
 /// held (what [`ImageStore::deliver`] hands an answer to).
 type DeliveryHooks = (
     Weak<Mutex<Terminal>>,
-    Arc<dyn Fn(Vec<TermEvent>) + Send + Sync>,
+    Arc<dyn Fn() + Send + Sync>,
     Arc<dyn Fn() + Send + Sync>,
 );
 
@@ -514,8 +519,8 @@ impl ImageStore {
         self.start_global_worker();
     }
 
-    /// Forget one image entirely (its [`TermEvent::ImageReleased`]). Idempotent: the terminal also
-    /// releases keys that scrollback eviction or a failed decode already dropped from the store,
+    /// Forget one image entirely (its [`crate::TermEvent::ImageReleased`]). Idempotent: the terminal
+    /// also releases keys that scrollback eviction or a failed decode already dropped from the store,
     /// and a second release of the same key must stay harmless. Nothing is answered for a released
     /// key: the terminal has forgotten it, client included.
     pub fn release(&self, owner: u64, key: ImageKey) {
@@ -971,7 +976,7 @@ impl ImageStore {
                 entry
                     .hooks
                     .as_ref()
-                    .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()))
+                    .map(|h| (h.term.clone(), h.deliver.clone(), h.wake.clone()))
             });
             inner.total = inner.total - delta.0 + delta.1;
             hooks.flatten().map(|hooks| (answer, hooks))
@@ -1005,7 +1010,7 @@ impl ImageStore {
                 let hooks = entry
                     .hooks
                     .as_ref()
-                    .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()));
+                    .map(|h| (h.term.clone(), h.deliver.clone(), h.wake.clone()));
                 if hooks.is_some() {
                     image.owes_reply = false; // claimed: the decode result will not answer
                     return hooks;
@@ -1035,7 +1040,7 @@ impl ImageStore {
                 let hooks = entry
                     .hooks
                     .as_ref()
-                    .map(|h| (h.term.clone(), h.on_events.clone(), h.wake.clone()));
+                    .map(|h| (h.term.clone(), h.deliver.clone(), h.wake.clone()));
                 let hooks = hooks?; // unregistered again: the answer waits for the next one
                 let image = entry.images.get_mut(&key)?;
                 if image.serial != serial || !image.owes_reply {
@@ -1054,8 +1059,11 @@ impl ImageStore {
 
     /// Hand one decode answer to the terminal and its session. No store lock is held here: the
     /// caps are reclaimed first (scrollback first, exactly as after a submit — see [`reclaim`]),
-    /// then the terminal is locked briefly to answer, then the hooks run with nothing held. A
-    /// dropped terminal means nobody waits, so it gets nothing.
+    /// then the terminal is locked briefly to answer — leaving what that answer raised in the
+    /// terminal's own event queue — then the hooks run with nothing held. `deliver` is what takes
+    /// those events out: an answer queued here cannot be carried past a reply that output produced
+    /// before it, because only whoever routes empties the queue. A dropped terminal means nobody
+    /// waits, so it gets nothing.
     fn deliver(
         &self,
         owner: u64,
@@ -1063,18 +1071,17 @@ impl ImageStore {
         answer: Result<(), ImageDecodeError>,
         hooks: DeliveryHooks,
     ) {
-        let (term, on_events, wake) = hooks;
+        let (term, deliver, wake) = hooks;
         reclaim(self, &term, owner);
         let Some(term) = term.upgrade() else { return };
-        let events = {
+        {
             let mut guard = term.lock();
             // Answers the client that was waiting (`OK`, `EBADPNG` or `ENOMEM`) and, on failure,
             // removes the image and its placements (raising their releases).
             guard.image_decoded(key, answer);
-            guard.take_events()
-        };
+        }
         drop(term);
-        on_events(events);
+        deliver();
         wake();
     }
 
@@ -1563,11 +1570,21 @@ mod tests {
         );
     }
 
+    /// Counts one hook call that ran while the probed store's mutex was still held. `try_lock`
+    /// returns a guard only when it actually takes the mutex; binding it in a statement drops it
+    /// again immediately, so this cannot deadlock.
+    fn record_held(held: &std::sync::atomic::AtomicUsize, store: Option<&ImageStore>) {
+        let Some(store) = store else { return };
+        if store.inner.try_lock().is_none() {
+            held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
     /// Events and wakes captured through the owner hooks.
     ///
-    /// With a probe store attached (see [`Captured::hooks_probing`]), each `wake` also checks that
-    /// the store mutex is NOT held when it runs: a hook delivers events and marks a pane dirty, and
-    /// none of that belongs inside the store's short critical section.
+    /// With a probe store attached (see [`Captured::hooks_probing`]), each hook also checks that the
+    /// store mutex is NOT held when it runs: a hook delivers events and marks a pane dirty, and none
+    /// of that belongs inside the store's short critical section.
     #[derive(Clone, Default)]
     struct Captured(
         Arc<StdMutex<Vec<TermEvent>>>,
@@ -1598,26 +1615,33 @@ mod tests {
         ) -> OwnerHooks {
             let sink = self.0.clone();
             let wakes = self.1.clone();
-            let held = self.2.clone();
             let probe = probe.or_else(|| self.3.lock().unwrap().clone());
+            // What a session's hook does: take the events out of the terminal and hand them on. The
+            // store hands nothing over any more, so this is where they leave the queue.
+            let drain = Arc::downgrade(term);
+            let deliver_probe = probe.clone();
+            let deliver_held = self.2.clone();
+            let wake_held = self.2.clone();
             OwnerHooks {
                 term: Arc::downgrade(term),
-                on_events: Arc::new(move |events| sink.lock().unwrap().extend(events)),
+                deliver: Arc::new(move || {
+                    record_held(&deliver_held, deliver_probe.as_deref());
+                    let Some(term) = drain.upgrade() else { return };
+                    let events = {
+                        let mut guard = term.lock();
+                        guard.take_events()
+                    };
+                    sink.lock().unwrap().extend(events);
+                }),
                 wake: Arc::new(move || {
                     wakes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let Some(store) = probe.clone() else { return };
-                    // `try_lock` returns a guard only when it actually takes the mutex; binding it
-                    // in a statement drops it again immediately, so this cannot deadlock.
-                    let free = store.inner.try_lock().is_some();
-                    if !free {
-                        held.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
+                    record_held(&wake_held, probe.as_deref());
                 }),
             }
         }
 
-        /// How many wakes ran while the probed store's mutex was still held (0 is the rule).
-        fn locked_wakes(&self) -> usize {
+        /// How many hooks ran while the probed store's mutex was still held (0 is the rule).
+        fn locked_hooks(&self) -> usize {
             self.2.load(std::sync::atomic::Ordering::Relaxed)
         }
 
@@ -1874,8 +1898,8 @@ mod tests {
     }
 
     /// The full decode loop against a real terminal: a corrupt payload answers the kitty client
-    /// `EBADPNG` through the owner's `on_events`, and the worker keeps serving the next job. A
-    /// decoder that panics (injected hook) is contained the same way.
+    /// `EBADPNG`, which the owner's `deliver` hook takes out of the terminal's queue, and the worker
+    /// keeps serving the next job. A decoder that panics (injected hook) is contained the same way.
     #[test]
     fn corrupt_and_panicking_decodes_are_contained() {
         let term = Arc::new(Mutex::new(Terminal::new(size(), 100)));
@@ -2569,7 +2593,7 @@ mod tests {
             "and it moves the epoch too: only a rebuilt frame draws the placeholder"
         );
         assert_eq!(
-            captured.locked_wakes(),
+            captured.locked_hooks(),
             0,
             "the hook ran with no store lock held"
         );
@@ -2632,9 +2656,9 @@ mod tests {
             "and so is the one enforcement freed room from"
         );
         assert_eq!(
-            theirs.locked_wakes() + mine.locked_wakes(),
+            theirs.locked_hooks() + mine.locked_hooks(),
             0,
-            "no wake ran under the store mutex"
+            "no hook ran under the store mutex"
         );
         assert_books(&store);
     }

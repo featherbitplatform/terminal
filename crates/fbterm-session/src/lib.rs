@@ -275,31 +275,27 @@ struct Router {
     /// One terminal's events are taken and routed together, by one thread at a time.
     ///
     /// Replies must reach a program in the order the emulator produced them, and a picture must
-    /// reach the store before the event that releases its key. Three threads can hold events for
-    /// the same terminal: the session's feeder ([`Feeder::feed`]), the app delivering what a pane's
-    /// first real grid released ([`Router::deliver_queued`]) and the image worker, through this
-    /// terminal's owner hooks. Emptying the queue is only atomic with delivering from it if both
-    /// happen under this lock - otherwise one thread can take the older events, drop the lock, and
-    /// be overtaken on the way to the replies queue by another that took newer ones.
+    /// reach the store before the event that releases its key. Three threads move events for one
+    /// terminal: the feeder ([`Feeder::feed`]), whoever delivers what a pane's first real grid or a
+    /// hidden pane's release parsed ([`Router::deliver_queued`], which is also what the image
+    /// store's `deliver` hook calls), and - only through that hook - the image worker, whose
+    /// finished decode queues its answer into the terminal rather than carrying it off. Each takes
+    /// this lock, then the terminal lock, empties the queue and routes everything it took; nothing
+    /// else in the app drains that queue, so no reply is overtaken on the way to the program's input.
     ///
-    /// Taken before the terminal lock and held across taking and routing, so the order is always
-    /// routing, then terminal, then store: routing takes the store lock (a picture goes there),
-    /// nothing takes this lock while holding the terminal or the store - the store runs its hooks
-    /// with nothing held - and `wake` (the redraw notice) is a channel send made without any lock.
+    /// What that guarantees, precisely: whatever was queued before a thread takes the queue goes out
+    /// in production order from that thread, and anything produced while it routes goes out after,
+    /// from the next taker. It does not order events two threads produce at the same moment - the
+    /// emulator's own lock decides which of those was produced first, and this section keeps that
+    /// order. The order of locks is routing, then terminal (released before routing), then store:
+    /// nothing takes this lock while holding the terminal or the store, the store runs its hooks with
+    /// nothing held, and `Dirty` - the redraw notice - is raised after the guard is dropped, never
+    /// under a lock.
     routing: parking_lot::Mutex<()>,
 }
 
 impl Router {
-    /// Route events the image worker produced for this terminal, in its turn: the store calls an
-    /// owner's hooks with nothing held, so this is where a finished decode's answer joins the queue
-    /// of replies and picture events, behind whatever was already waiting to be routed (see
-    /// [`Router::routing`]).
-    fn route_in_order(&self, term_events: Vec<TermEvent>) {
-        let _routing = self.routing.lock();
-        self.route(term_events);
-    }
-
-    /// Pass the events one feed (or one decode result) produced on to their destinations.
+    /// Pass the events one feed (or one delivery) produced on to their destinations.
     fn route(&self, term_events: Vec<TermEvent>) {
         for ev in term_events {
             match ev {
@@ -346,25 +342,30 @@ impl Router {
 
     /// Deliver what the terminal queued with nobody to route it: output held for a pane's first real
     /// grid (see [`fbterm_term::Terminal::hold_until_sized`]) is parsed by its view's resize, on the
-    /// app's thread, and what that produces - replies, titles, pictures - needs the same delivery a
-    /// feed gives it. Takes the terminal lock only to empty the queue: routing hands pictures to the
-    /// store, which may lock the terminal itself. Raises `Dirty` for the same reason a feed does.
+    /// app's thread, and so is a hidden pane's release; what either produces - replies, titles,
+    /// pictures - needs the same delivery a feed gives it. The image store's `deliver` hook calls
+    /// this too: that is how a finished decode's answer joins the queue of replies instead of being
+    /// carried past them. Takes the terminal lock only to empty the queue: routing hands pictures to
+    /// the store, which may lock the terminal itself. Raises `Dirty` for the same reason a feed does,
+    /// once this section's lock is dropped.
     fn deliver_queued(&self) {
         let Some(terminal) = self.terminal.upgrade() else {
             return; // nobody owns this terminal any more: nothing waits for its events
         };
-        // One critical section with the feeder and the image worker, so what this released reaches
-        // the program ahead of whatever output arrives next (see `Router::routing`).
-        let _routing = self.routing.lock();
+        // One critical section with the feeder and the image worker (see `Router::routing`).
+        let routing = self.routing.lock();
         let events = {
             let mut term = terminal.lock();
             term.take_events()
         };
         drop(terminal);
         if events.is_empty() {
-            return;
+            drop(routing);
+            return; // nothing queued: this call is not a reason to redraw
         }
         self.route(events);
+        drop(routing);
+        // The notice that the pane must redraw goes out with no lock held.
         self.mark_dirty();
     }
 
@@ -453,9 +454,11 @@ impl Feeder {
             owner,
             fbterm_term::images::OwnerHooks {
                 term: Arc::downgrade(&terminal),
-                on_events: {
+                // The worker leaves its answer in the terminal's queue; this delivers it through the
+                // same critical section a feed uses, behind whatever output queued ahead of it.
+                deliver: {
                     let router = router.clone();
-                    Arc::new(move |events| router.route_in_order(events))
+                    Arc::new(move || router.deliver_queued())
                 },
                 wake: {
                     let router = router.clone();
@@ -490,11 +493,11 @@ impl Feeder {
     /// graphics protocols' stall watchdog runs on the same lock: this app schedules no timers,
     /// so feeding output is what keeps chunked transmissions and parked replies moving.
     pub fn feed(&mut self, bytes: &[u8]) {
-        // Held across taking the events and routing them: this thread, the app delivering what a
-        // pane's first real grid released, and the image worker all route the same terminal's events,
-        // and only one of them at a time may move them from the queue to the program (see
+        // Held across taking the events and routing them: this thread, whoever delivers what a pane's
+        // release parsed, and the image worker (through `Router::deliver_queued`) all move the same
+        // terminal's events out of its queue, and only one of them at a time may do it (see
         // `Router::routing`). Taken before the terminal lock, which is the order everywhere.
-        let _routing = self.router.routing.lock();
+        let routing = self.router.routing.lock();
         let (term_events, history_jobs) = {
             let mut term = self.terminal.lock();
             if self.is_detached() {
@@ -509,6 +512,8 @@ impl Feeder {
             fbterm_term::history_worker::enqueue(&self.terminal);
         }
         self.router.route(term_events);
+        drop(routing);
+        // The notice that the pane must redraw goes out with no lock held.
         self.mark_dirty();
     }
 
@@ -704,6 +709,108 @@ mod routing_tests {
         );
         assert_eq!(got, [da.as_slice(), cell.as_slice()].concat());
     }
+
+    /// The image worker's hand-off is not a second route. Its answer stays in the terminal's queue,
+    /// and whoever delivers empties the whole queue under one lock - so a reply that output produced
+    /// afterwards cannot overtake it. A channel says when the worker reached its hook (no sleeping):
+    /// by then its answer is queued, this feeds a query behind it, and one delivery takes both.
+    ///
+    /// Under the hand-off this replaces - take the events, drop the lock, route them - the decode's
+    /// answer would leave last: it had already left the queue when the second reply was produced.
+    #[test]
+    fn a_decode_answer_and_the_reply_that_follows_it_leave_in_order() {
+        use fbterm_term::images::{ImageStore, OwnerHooks};
+
+        let (feeder, mut replies) = feeder(false);
+        let terminal = feeder.terminal.clone();
+        let owner = terminal.lock().image_owner();
+        // A store of our own, so nothing here depends on the app-wide one or on another test's jobs.
+        let store = ImageStore::with_caps(1024 * 1024, 8 * 1024 * 1024);
+
+        // The gate: the hook reports that it was reached (the answer is queued by then) and waits
+        // here until this test opens it, so nothing the worker does can race with what follows. A
+        // `Receiver` is not `Sync`, and a hook must be, so it lives behind a mutex - the only one
+        // that ever takes it is the thread running this hook.
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(parking_lot::Mutex::new(go_rx));
+        let hook_router = feeder.router();
+        store.register_owner(
+            owner,
+            OwnerHooks {
+                term: Arc::downgrade(&terminal),
+                deliver: Arc::new(move || {
+                    entered_tx
+                        .send(())
+                        .expect("nobody was waiting for the hand-off");
+                    gate.lock()
+                        .recv()
+                        .expect("the gate closed before it opened");
+                    hook_router.deliver_queued();
+                }),
+                wake: Arc::new(|| {}),
+            },
+        );
+
+        // A PNG the emulator defers to us, so the client's answer comes from this hand-off: the
+        // frame is fed (the terminal parks its pending transmission and takes no answer yet), and
+        // the payload goes to this store the way routing would hand it over. The bytes are the term
+        // crate's own checked-in 4x4 fixture, read rather than retyped.
+        let tiny = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fbterm-term/tests/fixtures/images/tiny.png"
+        ))
+        .expect("the term crate's tiny PNG fixture");
+        let frame = format!(
+            "\x1b_Gi=1,a=t,f=100;{}\x1b\\",
+            super::feeder_image_tests::b64(&tiny)
+        );
+        terminal.lock().feed(frame.as_bytes());
+        let events = {
+            let mut term = terminal.lock();
+            term.take_events()
+        };
+        let (key, data) = events
+            .into_iter()
+            .find_map(|e| match e {
+                fbterm_term::TermEvent::ImageReceived { key, data } => Some((key, data)),
+                _ => None,
+            })
+            .expect("the terminal should have deferred this PNG to us");
+        store.submit(owner, key, data);
+        // Jobs run on another thread: it parks in the hook while this one works.
+        let driver = std::thread::spawn(move || store.run_jobs_until_idle());
+
+        entered_rx
+            .recv()
+            .expect("the worker never reached its deliver hook");
+        // Output arriving now, put into the terminal as a feed puts it: asked after the decode was
+        // answered, so its reply has to leave after the decode's.
+        terminal.lock().feed(b"\x1b[c");
+        feeder.router().deliver_queued();
+
+        let got = written(&mut replies);
+        let text = String::from_utf8_lossy(&got).into_owned();
+        let ok_at = text
+            .find("i=1;OK")
+            .unwrap_or_else(|| panic!("the decode's answer never reached the program: {text:?}"));
+        let da_at = text
+            .find("\x1b[?")
+            .unwrap_or_else(|| panic!("no device-attributes answer: {text:?}"));
+        assert!(
+            ok_at < da_at,
+            "the decode's answer left after the reply produced after it: {text:?}"
+        );
+
+        // Open the gate and let that thread finish: by the time it returns, the hook has delivered
+        // too, so what is checked below is everything the hand-off ever sent.
+        let _ = go_tx.send(());
+        driver.join().expect("the thread driving the jobs");
+        assert!(
+            written(&mut replies).is_empty(),
+            "the hand-off routed a second copy of an answer"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -712,7 +819,7 @@ mod feeder_image_tests {
     use fbterm_term::images::store;
 
     /// Minimal standard-alphabet base64 for building kitty frames.
-    fn b64(bytes: &[u8]) -> String {
+    pub(super) fn b64(bytes: &[u8]) -> String {
         const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
         for chunk in bytes.chunks(3) {

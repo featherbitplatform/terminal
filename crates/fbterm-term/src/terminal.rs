@@ -372,8 +372,9 @@ impl Terminal {
 
     /// Report the result of decoding an image the store took from [`crate::images::store`]'s
     /// queue: `Ok` lets the emulator answer the program's transmission `OK`, the errors answer
-    /// `EBADPNG` and `ENOMEM`. The store calls this from its worker through a registered
-    /// [`crate::images::OwnerHooks`]; callers must `take_events` afterwards to deliver the reply.
+    /// `EBADPNG` and `ENOMEM`. The store calls this from its worker, then calls the owner's
+    /// [`crate::images::OwnerHooks::deliver`] hook, which takes the events this raised out of the
+    /// queue together with whatever output had queued ahead of them.
     pub fn image_decoded(
         &mut self,
         key: feathercritty::event::ImageKey,
