@@ -34,6 +34,34 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      # The ConPTY passthrough check runs only against the bundled, pinned ConPTY: portable-pty
+      # sideloads a conpty.dll sitting next to its own executable (`win/psuedocon.rs`), and
+      # crates/fbterm-session/tests/conpty_passthrough.rs refuses to run without one rather than
+      # silently measuring the system console layer. Building the test first is what makes its
+      # executable directory known, so the staged files can go beside it. `--nocapture` because a
+      # passing run's own output — which sequence arrived how — stays behind libtest's capture.
+      - name: ConPTY passthrough (bundled)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $lines = cargo test -p fbterm-session --test conpty_passthrough --no-run --message-format=json
+          $exe = ''
+          foreach ($line in $lines) {
+            if (-not $line.StartsWith('{')) { continue }
+            $msg = $line | ConvertFrom-Json
+            if ($msg.reason -eq 'compiler-artifact' -and $msg.target.kind -contains 'test' -and $msg.target.name -eq 'conpty_passthrough' -and $msg.executable) {
+              $exe = $msg.executable
+            }
+          }
+          if (-not $exe) { throw 'cargo test --no-run did not report the conpty_passthrough executable' }
+          ./dev/fetch-conpty.ps1 -OutDir (Split-Path -Parent $exe)
+          # Run it as cargo would: its own directory first, in case a dependency DLL sits beside it.
+          # portable-pty finds conpty.dll the same way either way (LoadLibraryW searches the
+          # executable's directory before PATH).
+          $env:PATH = "$(Split-Path -Parent $exe);$env:PATH"
+          $env:FBTERM_TEST_CONPTY = '1'
+          & $exe --exact image_sequences_pass_through_conpty --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "conpty_passthrough exited with $LASTEXITCODE" }
 
   # cargo-deny runs in security.yml (job cargo-deny), which also re-scans weekly.
 

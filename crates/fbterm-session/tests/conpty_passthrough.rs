@@ -1,18 +1,20 @@
 //! Do image escape sequences written by a local Windows program reach the terminal unchanged?
 //!
-//! The whole file is `cfg(windows)`: macOS and Linux compile nothing from it, and its answer comes
-//! from the `windows-latest` CI job (`cargo test --workspace`). A passing test's own output stays
-//! behind libtest's capture, so read the byte-level evidence with `--nocapture`:
+//! The whole file is `cfg(windows)`: macOS and Linux compile nothing from it. The check runs only
+//! with `FBTERM_TEST_CONPTY=1` set (the `FBTERM_TEST_SSH` pattern); otherwise the test prints one
+//! line and returns, so an ordinary `cargo test --workspace` never opens a pseudo-console. Set the
+//! variable when `conpty.dll` and `OpenConsole.exe` sit next to the test executable: portable-pty
+//! prefers that sideloaded pair over the system console layer (`win/psuedocon.rs`), and this test
+//! measures whichever one it gets, so it refuses to run at all without them.
+//! `.github/workflows/ci.yml`'s "ConPTY passthrough (bundled)" step builds the test, stages the
+//! pinned package beside it with `dev/fetch-conpty.ps1` and runs it with `--nocapture`, which is how
+//! its byte-level evidence reaches the CI log: a passing run's own output stays behind libtest's
+//! capture.
 //!
-//! ```sh
-//! cargo test -p fbterm-session --test conpty_passthrough -- --nocapture
-//! ```
-//!
-//! On Windows portable-pty's native pty system *is* ConPTY, so the child's console is the thing
-//! under test. The child is this same test executable, re-spawned with `FBTERM_CONPTY_HELPER=1` and
-//! asked to run only [`helper_writes_image_sequences`], which writes three small image sequences to
-//! its stdout. Each one sits between unique ASCII markers; the parent reads the master side and
-//! compares what arrived between a pair of markers, byte for byte, with what was written.
+//! The child is this same test executable, re-spawned through portable-pty with
+//! `FBTERM_CONPTY_HELPER=1` and asked to run only [`helper_writes_image_sequences`], which writes
+//! three small image sequences to its stdout. Each one sits between unique ASCII markers; the parent
+//! reads the master side and looks for the sequence's exact bytes inside its own pair of markers.
 //!
 //! The parent also answers ConPTY's start-up cursor position query, because portable-pty asks for a
 //! pseudo-console that inherits the cursor (`win/psuedocon.rs`) and such a ConPTY holds the child's
@@ -27,6 +29,9 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+/// Set to `1` to run the check at all. Without it the test prints one line and returns.
+const RUN_ENV: &str = "FBTERM_TEST_CONPTY";
+
 /// Set in the child so [`helper_writes_image_sequences`] writes instead of returning at once.
 const HELPER_ENV: &str = "FBTERM_CONPTY_HELPER";
 
@@ -38,6 +43,12 @@ const HELPER_TEST: &str = "helper_writes_image_sequences";
 /// What libtest prints when its filter matched nothing, which is what a renamed helper looks like
 /// from here. Caught early so the failure says that instead of blaming ConPTY for silence.
 const NO_TESTS_RUN: &[u8] = b"running 0 tests";
+
+/// The two files portable-pty sideloads when they sit next to its executable, named by it exactly
+/// like this. Their presence is what makes a run a measurement of the bundled ConPTY rather than the
+/// system one, so [`image_sequences_pass_through_conpty`] insists on them first.
+const CONPTY_DLL: &str = "conpty.dll";
+const OPEN_CONSOLE: &str = "OpenConsole.exe";
 
 /// The query ConPTY writes to the master side at start-up when the pseudo-console was created to
 /// inherit the cursor, as portable-pty does (`win/psuedocon.rs`): it wants the cursor position
@@ -94,6 +105,10 @@ const CASES: [Probe; 3] = [
     },
 ];
 
+fn enabled() -> bool {
+    std::env::var(RUN_ENV).as_deref() == Ok("1")
+}
+
 /// What the helper writes: every sequence between its markers, one per line. It is written in one
 /// `write` and one `flush`, so it leaves the child in a single console write and nothing can slip
 /// inside a sequence between two writes.
@@ -128,11 +143,20 @@ fn count(hay: &[u8], needle: &[u8]) -> usize {
     hits
 }
 
-/// The bytes between a probe's markers, or `None` when either marker is missing.
-fn arrived<'a>(stream: &'a [u8], p: &Probe) -> Option<&'a [u8]> {
+/// The bytes a probe's markers enclose, or `None` when its end marker never appears after its start.
+fn enclosed<'a>(stream: &'a [u8], p: &Probe) -> Option<&'a [u8]> {
     let head = find(stream, p.start)? + p.start.len();
     let tail = find(&stream[head..], p.end)?;
     Some(&stream[head..head + tail])
+}
+
+/// Whether every sequence has arrived intact somewhere inside its own markers. ConPTY may add bytes
+/// around it — cursor visibility codes, for instance — and that is not a failure, so this is the
+/// condition the wait loop stops on: it never judges a capture that is still mid-sequence.
+fn complete(stream: &[u8]) -> bool {
+    CASES
+        .iter()
+        .all(|p| enclosed(stream, p).is_some_and(|region| find(region, p.seq).is_some()))
 }
 
 /// Writes the three sequences, or does nothing. The parent test re-spawns this executable with
@@ -152,6 +176,38 @@ fn helper_writes_image_sequences() {
 /// ConPTY passes all three protocols through, kitty APC, sixel DCS and OSC 1337 alike.
 #[test]
 fn image_sequences_pass_through_conpty() {
+    if !enabled() {
+        println!(
+            "skipped: set {RUN_ENV}=1 with {CONPTY_DLL} and {OPEN_CONSOLE} beside this executable \
+             (see dev/fetch-conpty.ps1 and the ConPTY step in .github/workflows/ci.yml)"
+        );
+        return;
+    }
+
+    let exe = std::env::current_exe().expect("this test's own executable");
+    let dir = exe
+        .parent()
+        .expect("the test executable is in a directory")
+        .to_path_buf();
+    // Without them portable-pty uses the system console layer and this measures that instead,
+    // silently: refuse rather than report the system ConPTY as though it were the bundled one.
+    for name in [CONPTY_DLL, OPEN_CONSOLE] {
+        assert!(
+            dir.join(name).is_file(),
+            "{name} is not next to {} ({RUN_ENV}=1 asks for the bundled ConPTY, and portable-pty \
+             falls back to the system one without it). Stage it with: pwsh dev/fetch-conpty.ps1 \
+             -OutDir {}",
+            dir.display(),
+            dir.display()
+        );
+    }
+    // LoadLibraryW on the bare name searches the executable's own directory first, so these are the
+    // files portable-pty gets.
+    println!(
+        "bundled ConPTY: {CONPTY_DLL} and {OPEN_CONSOLE} next to {}",
+        dir.display()
+    );
+
     let pair = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -161,7 +217,6 @@ fn image_sequences_pass_through_conpty() {
         })
         .expect("open a pseudo-console");
 
-    let exe = std::env::current_exe().expect("this test's own executable");
     let mut cmd = CommandBuilder::new(&exe);
     cmd.args(["--exact", HELPER_TEST, "--nocapture", "--test-threads=1"]);
     cmd.env(HELPER_ENV, "1");
@@ -205,11 +260,10 @@ fn image_sequences_pass_through_conpty() {
         // many cursor queries it holds so far.
         let (finished, asked) = {
             let bytes = received.lock();
-            let done = find(&bytes, NO_TESTS_RUN).is_some()
-                || CASES
-                    .iter()
-                    .all(|p| find(&bytes, p.start).is_some() && find(&bytes, p.end).is_some());
-            (done, count(&bytes, CURSOR_QUERY))
+            (
+                complete(&bytes) || find(&bytes, NO_TESTS_RUN).is_some(),
+                count(&bytes, CURSOR_QUERY),
+            )
         };
         // Answer every query before giving up on the output: ConPTY withholds that output until it
         // has the report, so this is what makes the markers arrive at all.
@@ -280,27 +334,36 @@ fn image_sequences_pass_through_conpty() {
     }
     for p in &CASES {
         let name = p.name;
-        // Three verdicts, because conhost forwards an unknown sequence as soon as it parses one and
-        // renders the text around it afterwards: identical between the markers, present elsewhere in
-        // the capture (moved, which is not stripped), or gone.
-        let span = arrived(&bytes, p);
-        if span.is_some_and(|got| got == p.seq) {
-            println!(
-                "{name}: unchanged, all {} bytes arrived between its markers",
-                p.seq.len()
-            );
+        // What matters is the sequence's own bytes arriving intact somewhere inside its markers:
+        // conhost forwards an unknown sequence as soon as it parses one and renders the text around
+        // it afterwards, so it can add its own codes on either side of it. Those extras are worth
+        // reading in the log but they do not fail the run.
+        let span = enclosed(&bytes, p);
+        if let Some((span, at)) = span.and_then(|span| find(span, p.seq).map(|at| (span, at))) {
+            let (before, after) = (&span[..at], &span[at + p.seq.len()..]);
+            if before.is_empty() && after.is_empty() {
+                println!(
+                    "{name}: unchanged, all {} bytes arrived between its markers",
+                    p.seq.len()
+                );
+            } else {
+                println!(
+                    "{name}: unchanged, all {} bytes arrived between its markers; ConPTY added {} \
+                     byte(s) around it: before {before:?}, after {after:?}",
+                    p.seq.len(),
+                    before.len() + after.len()
+                );
+            }
             continue;
         }
         problems.push(name);
-        let inside = span.unwrap_or_default();
         let note = match span {
-            Some(_) => format!(
-                "its markers held {inside:?} ({} of {} bytes)",
-                inside.len(),
-                p.seq.len()
-            ),
-            None => "its markers never enclosed anything".to_owned(),
+            Some(span) => format!("its markers held {span:?} ({} bytes)", span.len()),
+            None => "its end marker never appeared after its start".to_owned(),
         };
+        // A sequence that arrived whole but outside its markers moved relative to the text around
+        // it, which is not the same as being stripped; only report it as missing when its exact
+        // bytes are nowhere in the capture at all.
         if find(&bytes, p.seq).is_some() {
             println!(
                 "{name}: moved, not stripped: its sequence is elsewhere in the capture; {note}"
