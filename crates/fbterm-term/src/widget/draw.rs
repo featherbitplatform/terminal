@@ -91,9 +91,8 @@ fn push_span<K: PartialEq>(out: &mut Vec<(Span, K)>, row: u16, col: u16, cells: 
 
 /// Narrow characters drawn at their own cell rather than inside a run: anything outside ASCII may
 /// come from a fallback font with a different advance, which would shift the rest of the run.
-/// Block and box-drawing characters never reach this: shapes draw them (see [`cell_graphics`]), and
-/// only the rounded corners and diagonals of that block, which stay glyphs, are kept in runs — the
-/// monospace fonts cover them and they make up whole rows of TUI frames.
+/// Block and box-drawing characters never reach this: shapes draw them all, curves included (see
+/// [`cell_graphics`]).
 fn standalone(c: char) -> bool {
     !c.is_ascii() && !('\u{2500}'..='\u{259f}').contains(&c)
 }
@@ -563,6 +562,9 @@ fn draw_text_group(
     // strike or the cursor over a full block is drawn on top of it rather than buried by it.
     if !list.cell_graphics.is_empty() {
         let g = cell_graphics::Geometry::new(bounds, m.cell, m.scale);
+        // The curves are rasterized per cell and their patterns shared across the frame; nothing else
+        // needs the memo, and an unused one allocates nothing (see [`cell_graphics::CurveMemo`]).
+        let mut memo = cell_graphics::CurveMemo::new();
         for &(span, c, fg) in &list.cell_graphics {
             let Some(shapes) = cell_graphics::shapes(c) else {
                 continue;
@@ -574,7 +576,10 @@ fn draw_text_group(
                     u32::from(span.col),
                     u32::from(span.row),
                     u32::from(span.cells),
-                    |r| fill_color(renderer, r, paint),
+                    &mut memo,
+                    // A curve's quads carry the fraction of the pixel they cover; every other shape's
+                    // carry 1.0 and leave the colour alone.
+                    |r, coverage| fill_color(renderer, r, paint.scale_alpha(coverage)),
                 );
             }
         }
@@ -1011,6 +1016,44 @@ mod tests {
             shape_runs(&list),
             vec![(0, 0, 1, '┌'), (0, 1, 4, '─'), (0, 5, 1, '┐')]
         );
+    }
+
+    /// The seven curved characters — the four rounded corners and the three diagonals — are shapes
+    /// like every other covered character: they leave the text runs entirely, each a run of its own,
+    /// and take whatever colour the cell's attributes give a letter in the same place.
+    #[test]
+    fn curves_are_shapes_and_take_the_texts_colour() {
+        let t = term_with("\x1b[2ma╭─╮│╰╯╱╲╳\x1b[0mb".as_bytes());
+        let list = build(
+            &mut RowReader::new(),
+            &t,
+            &scheme(),
+            true,
+            None,
+            None,
+            store(),
+            metrics(),
+        );
+        assert_eq!(row0(&list), vec!["a", "b"], "the curves are not text runs");
+        assert_eq!(
+            shape_runs(&list),
+            vec![
+                (0, 1, 1, '╭'),
+                (0, 2, 1, '─'),
+                (0, 3, 1, '╮'),
+                (0, 4, 1, '│'),
+                (0, 5, 1, '╰'),
+                (0, 6, 1, '╯'),
+                (0, 7, 1, '╱'),
+                (0, 8, 1, '╲'),
+                (0, 9, 1, '╳'),
+            ],
+            "every curve is its own cell-graphics entry"
+        );
+        let dim = list.texts[0].fg;
+        for (i, &(_, _, fg)) in list.cell_graphics.iter().enumerate() {
+            assert_eq!(fg, dim, "shape {i} does not take the DIM colour like `a`");
+        }
     }
 
     #[test]
