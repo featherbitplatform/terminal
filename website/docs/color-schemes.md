@@ -61,6 +61,8 @@ The themes come from [terminal-themes](https://github.com/featherbitplatform/ter
 
 A scheme that names a font gives its sessions that family and size instead of the global font in Settings. The size of a character cell follows the font, so the rows and columns of those panes change with it, and the program (or the SSH channel) is told the new size once. Panes with different fonts can sit in the same split tab. Saving a scheme with a different font reflows its open sessions once.
 
+Whatever the font, block elements and box-drawing lines are drawn by fbterm itself to fill their cells, so frames and block art look the same in every font and line up between panes.
+
 ## Suggested fonts
 
 A scheme can suggest a font that suits it, with a link to the font's official download page. The built-in schemes and every theme in the gallery carry one. A suggestion changes nothing by itself: fbterm never ships, downloads or installs fonts.
