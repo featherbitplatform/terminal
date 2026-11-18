@@ -19,7 +19,7 @@ use crate::app::{App, DEFAULT_GRID, Delivered, Message};
 use crate::layout::PaneId;
 use crate::pacing::{OUTPUT_FPS, OutputRate, Pacer};
 use crate::prompts::UiPrompter;
-use crate::tabs::{self, InputRoute, Pane, TabState, WindowState};
+use crate::tabs::{self, InputRoute, Pane, Tab, TabState, WindowState};
 use crate::tiles::TilesMsg;
 
 type Events = UnboundedReceiver<(SessionId, SessionEvent)>;
@@ -135,13 +135,19 @@ impl App {
     /// (Re)start a pane's session: spawn a local program, or dial an SSH profile.
     pub(crate) fn start(&mut self, wid: window::Id, id: PaneId) -> Task<Message> {
         let (grid, provisional) = self.initial_grid(wid, id);
-        // A grid measured from a laid-out pane's cells is what this pane's own view will report -
-        // same rectangles, same cells - so keep it now. Until the view says otherwise the app has no
-        // cell size to measure the next new pane against, and a view that finds its terminal already
-        // exactly this grid reports nothing (see `TerminalView::sync_size`).
-        if !provisional {
-            self.grids.insert(id, grid);
-        }
+        // Only a pane the window really draws can learn its cells soon enough for waiting to pay off:
+        // one behind another tab, or behind a maximized sibling, lays out no sooner than that changes.
+        // So note who is drawn now...
+        let shown_now = self
+            .windows
+            .get(&wid)
+            .and_then(|w| w.active_tab())
+            .is_some_and(|t| pane_is_drawn(t, id));
+        // ...and stop whatever the panes this window has just hidden from waiting: starting a pane
+        // takes the window's attention from them, and `--perf-tabs` or the debug openers start a run
+        // of tabs in one update, so without this every pane but the last would buffer up to the hold's
+        // cap before parsing it at the same provisional cells it would have parsed at anyway.
+        self.release_hidden_holds(wid);
         tracing::info!(pane = id.0, "starting pane");
         let fresh_terminal = self.new_terminal(grid);
         let events = self.events.clone();
@@ -188,10 +194,11 @@ impl App {
         // A pane whose window has not laid out yet starts at a guessed grid, and its program may
         // already be drawing pictures sized for cells measured with an assumed scale. Hold what it
         // writes until its own view reports the grid the window really has (see
-        // `Terminal::hold_until_sized`); `terminal_output` delivers whatever that release parses.
-        // Only a new terminal holds: a restart continues in one that was laid out long ago, and a
-        // pane whose grid came from a laid-out sibling or its own last layout has nothing to learn.
-        if fresh && provisional {
+        // `Terminal::hold_until_sized`); `terminal_output` and `connected` deliver whatever that
+        // release parses. Three things have to be true: this is a new terminal (a restart continues in
+        // one that was laid out long ago), its grid is a guess (`initial_grid` says so), and the window
+        // draws this pane now - the only panes whose views run before their programs get going.
+        if fresh && provisional && shown_now {
             terminal.lock().hold_until_sized();
         }
         // New or continued, local or remote: the pane's scheme as it is now.
@@ -279,6 +286,13 @@ impl App {
         if current != requested {
             handle.resize(current);
         }
+        // Output this pane held before its session existed - the window had not laid out when the
+        // dial finished, so its view's resize parsed those bytes on the app's thread - queued its
+        // answers with nobody to route them. This handle's router is what delivers them; the resize
+        // above may have released the hold just now, which is why this comes after it and before the
+        // pane's own notices, so everything reaches the program in the order it was produced. With
+        // nothing queued this does nothing at all.
+        handle.deliver_events();
         let pane = &mut window.tabs[t].panes[p];
         let profile = pane.profile;
         let warnings = handle.auth_warnings().to_vec();
@@ -575,6 +589,28 @@ impl App {
         }
     }
 
+    /// Parse whatever the panes of `wid` that its window cannot show have held for their first real
+    /// grid. A hidden pane's view runs no sooner than it is shown again, so waiting for it only buffers
+    /// what its program writes in the meantime - up to the hold's cap - before parsing it at the same
+    /// provisional cells it would have been parsed at anyway (see `App::start`, which releases them as
+    /// it takes the window's attention). A pane with nothing held is untouched.
+    fn release_hidden_holds(&self, wid: window::Id) {
+        let Some(window) = self.windows.get(&wid) else {
+            return;
+        };
+        for (i, tab) in window.tabs.iter().enumerate() {
+            for pane in &tab.panes {
+                // The shown tab's panes lay out on the next draw; anything else waits for the user.
+                if i == window.active && pane_is_drawn(tab, pane.id) {
+                    continue;
+                }
+                if let Some(term) = pane.terminal() {
+                    term.lock().sized();
+                }
+            }
+        }
+    }
+
     /// Set a divider's ratio unless a pane would end up below the minimum size: the old
     /// ratio stays then. Returns whether the layout changed.
     fn set_ratio_if_fits(
@@ -689,6 +725,12 @@ pub(crate) fn write_notice(pane: &Pane, text: &str, fresh: bool) {
     if let Some(term) = pane.terminal() {
         term.lock().feed(&tabs::notice_bytes(text, fresh));
     }
+}
+
+/// Whether this pane gets a view on screen while its tab is the one its window shows: behind a
+/// maximized sibling there is nothing to lay out until that is undone (see `Tab::shown_layout`).
+fn pane_is_drawn(tab: &Tab, pane: PaneId) -> bool {
+    tab.pane(pane).is_some() && tab.maximized.is_none_or(|m| m == pane)
 }
 
 /// What to do with a link the user clicked. The link comes from program output, so only
@@ -891,6 +933,22 @@ pub(crate) mod pane_tests {
         tab
     }
 
+    /// Everything a terminal's screen shows, to check that parsed output landed on it.
+    fn grid_text(terminal: &fbterm_term::SharedTerminal) -> String {
+        use feathercritty::index::{Column, Line};
+        let term = terminal.lock();
+        let (cols, rows) = (term.size().cols as usize, term.size().rows as i32);
+        let grid = term.term().grid();
+        let mut out = String::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                out.push(grid.screen()[Line(row)][Column(col)].c);
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     #[test]
     fn shown_starts_every_pane_of_the_active_tab() {
         let p = profile("a");
@@ -992,6 +1050,267 @@ pub(crate) mod pane_tests {
                 cell_height: 18.0,
                 scale: 1.0,
             }
+        );
+    }
+
+    /// A pane whose window has not laid out waits for its cells only while it is the one the window
+    /// shows: a pane behind another tab lays out no sooner than that tab is shown, so its output is
+    /// parsed at once, as it was before this hold existed. `--perf-tabs` and the debug openers rely on
+    /// that - they start a run of tabs in one update, and only the last one is ever shown first.
+    #[test]
+    fn a_pane_in_a_background_tab_holds_nothing() {
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let (pa, pb) = (Pane::for_profile(&p), Pane::for_profile(&p));
+        let (a, b) = (pa.id, pb.id);
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(Tab::single(pa)); // `push` makes it the shown tab...
+        w.push(Tab::single(pb)); // ...and this one replaces it: `a` starts already hidden.
+        app.windows.clear();
+        app.windows.insert(wid, w);
+
+        let _ = app.start(wid, a);
+        let _ = app.start(wid, b);
+        let term = |id| {
+            app.windows[&wid]
+                .tabs
+                .iter()
+                .find_map(|t| t.pane(id))
+                .unwrap()
+                .terminal()
+                .cloned()
+                .unwrap()
+        };
+
+        assert!(
+            !term(a).lock().holding(),
+            "a pane behind the shown tab parses at once"
+        );
+        assert!(
+            term(b).lock().holding(),
+            "the shown pane waits for the cells its window really has"
+        );
+        // The style is what tells the view there is nothing honest to report yet: 0.0 until the
+        // window says otherwise (`App::physical_scale_if_known`).
+        let tab = &app.windows[&wid].active_tab().unwrap();
+        assert_eq!(
+            app.pane_style(wid, tab, tab.pane(b).unwrap()).scale,
+            0.0,
+            "no display reported"
+        );
+        let _ = app.update(Message::WindowScale(wid, 2.0));
+        let tab = &app.windows[&wid].active_tab().unwrap();
+        assert_eq!(
+            app.pane_style(wid, tab, tab.pane(b).unwrap()).scale,
+            app.physical_scale(wid),
+            "and the pane's cells follow the display it reports"
+        );
+    }
+
+    /// A pane started into a tab the window does not show has no view running for it at all, so it
+    /// parses at once: that is what `FBTERM_SPLITS` does, replacing an existing tab's panes and
+    /// starting each one while another tab is shown. Nothing would release a hold armed in that
+    /// situation either - the sweep over hidden panes runs when a pane starts, before its own hold
+    /// would be armed, not after it.
+    #[test]
+    fn a_pane_started_into_a_hidden_tab_holds_nothing() {
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let (hidden_pane, shown_pane) = (Pane::for_profile(&p), Pane::for_profile(&p));
+        let (hidden, shown) = (hidden_pane.id, shown_pane.id);
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(Tab::single(hidden_pane)); // its tab is behind the next one from here on
+        w.push(Tab::single(shown_pane));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+
+        let term_of = |app: &App, id| {
+            app.windows[&wid]
+                .tabs
+                .iter()
+                .find_map(|t| t.pane(id))
+                .unwrap()
+                .terminal()
+                .cloned()
+                .unwrap()
+        };
+
+        let _ = app.start(wid, hidden);
+        assert!(
+            !term_of(&app, hidden).lock().holding(),
+            "a pane whose tab is not shown parses at once"
+        );
+        let _ = app.start(wid, shown);
+        assert!(
+            term_of(&app, shown).lock().holding(),
+            "the shown pane still waits for the cells its window really has"
+        );
+    }
+
+    /// Starting a pane takes the window's attention from the panes behind it: whatever they were
+    /// holding is parsed then, at the grid they have, instead of buffering until they are shown (up to
+    /// the hold's cap) and parsing at the same provisional cells anyway.
+    #[test]
+    fn starting_a_new_tab_stops_what_a_hidden_pane_was_holding() {
+        let p = profile("a");
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&p)), true);
+        app.state_saving_enabled = false;
+        let pa = Pane::for_profile(&p);
+        let a = pa.id;
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(Tab::single(pa));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+
+        let _ = app.start(wid, a);
+        let hidden = app.windows[&wid].tabs[0]
+            .pane(a)
+            .unwrap()
+            .terminal()
+            .cloned()
+            .unwrap();
+        assert!(hidden.lock().holding(), "the shown pane waits");
+        // The notice `start` wrote for this failed-to-spawn profile is in there too: while the pane
+        // holds, everything it is fed waits, even the app's own text.
+        let before = hidden.lock().held_bytes();
+        let written: &[u8] = b"written while waiting\r\n";
+        hidden.lock().feed(written);
+        assert_eq!(
+            hidden.lock().held_bytes(),
+            before + written.len(),
+            "and it buffers what arrives"
+        );
+
+        // A new tab shows, and its pane starts: `a` is behind it now and will not lay out until the
+        // user goes back to it.
+        let pb = Pane::for_profile(&p);
+        let b = pb.id;
+        app.windows.get_mut(&wid).unwrap().push(Tab::single(pb));
+        let _ = app.start(wid, b);
+
+        assert!(
+            !hidden.lock().holding(),
+            "the pane this window stopped showing stops waiting"
+        );
+        assert_eq!(hidden.lock().held_bytes(), 0, "what it held is parsed");
+        assert!(
+            grid_text(&hidden).contains("written while waiting"),
+            "parsed onto its grid, not dropped"
+        );
+        let shown = app.windows[&wid]
+            .active_tab()
+            .unwrap()
+            .pane(b)
+            .unwrap()
+            .terminal()
+            .cloned()
+            .unwrap();
+        assert!(
+            shown.lock().holding(),
+            "the new shown pane waits for its own cells"
+        );
+    }
+
+    /// An SSH pane whose dial outlived its window's first layout: the view's resize parses what the
+    /// pane held, on the app's thread, and its answer to the program is queued with no session
+    /// installed yet to route it. Installing the handle has to deliver it, or a program blocking on
+    /// the reply waits for output that may never come.
+    #[test]
+    fn held_replies_reach_a_session_that_connects_after_the_release() {
+        use fbterm_config::{AuthMethod, ProfileKind, SshProfile};
+        use fbterm_session::SessionHandle;
+        use fbterm_term::{Terminal, TerminalOutput};
+
+        let ssh = fbterm_config::Profile {
+            icon: None,
+            id: fbterm_config::ProfileId::new(),
+            name: "remote".into(),
+            group: None,
+            accent: None,
+            accent_style: Default::default(),
+            color_scheme: None,
+            kind: ProfileKind::Ssh(SshProfile {
+                host: "127.0.0.1".into(),
+                port: 1,
+                user: "sample".into(),
+                auth: AuthMethod::Agent,
+                jump: vec![],
+                tunnels: Vec::new(),
+            }),
+        };
+        let (mut app, _) = App::build(paths_with(std::slice::from_ref(&ssh)), true);
+        app.state_saving_enabled = false;
+        let pane = Pane::for_profile(&ssh);
+        let id = pane.id;
+        let wid = window::Id::unique();
+        let mut w = WindowState::new();
+        w.push(Tab::single(pane));
+        app.windows.clear();
+        app.windows.insert(wid, w);
+
+        // The dial is a task this fixture never runs, so the pane stays `Connecting` with its terminal
+        // and no session - exactly while a pooled connection would already be opening its shell.
+        let _ = app.start(wid, id);
+        let term = app.windows[&wid].tabs[0]
+            .pane(id)
+            .unwrap()
+            .terminal()
+            .cloned()
+            .unwrap();
+        assert!(term.lock().holding(), "the pane waits for its first grid");
+        assert!(
+            app.windows[&wid].tabs[0]
+                .pane(id)
+                .unwrap()
+                .session
+                .is_none()
+        );
+
+        // What the remote program prints as its shell starts: a device attributes query.
+        term.lock().feed(b"\x1b[c");
+
+        // The window reports its display, the view lays out and releases what waited. A resize has no
+        // feed after it, and this pane has no session to ask for one.
+        let real = GridSize {
+            cols: 100,
+            rows: 30,
+            cell_width: 9.0,
+            cell_height: 18.0,
+            scale: 2.0,
+        };
+        term.lock().resize(real);
+        let _ = app.update(Message::Terminal(wid, id, TerminalOutput::Resized(real)));
+
+        // The dial lands now. What the released query produced has to reach this handle's program.
+        let (handle, mut input) = SessionHandle::recording(term.clone());
+        let _ = app.update(Message::Connected(
+            id,
+            crate::app::Delivered::new(handle),
+            crate::app::DEFAULT_GRID,
+        ));
+
+        // What a terminal answers that query with, at the grid this pane really has.
+        let mut probe = Terminal::new(real, 1);
+        probe.feed(b"\x1b[c");
+        let expected: Vec<u8> = probe
+            .take_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fbterm_term::TermEvent::PtyWrite(b) => Some(b),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(!expected.is_empty(), "the fixture's query is answered");
+        let written: Vec<u8> = input.inputs().concat();
+        assert_eq!(
+            written, expected,
+            "the released query was not answered to the session that connected after it"
         );
     }
 
@@ -1124,6 +1443,55 @@ pub(crate) mod pane_tests {
                 "what it held is parsed now"
             );
             assert_eq!(app.grids[&id], real, "the app learned the grid");
+        }
+
+        /// The other shape a first layout takes: the terminal already has exactly the grid the view
+        /// measures, so nothing resizes and `sized` is what releases the hold. That release is still
+        /// reported (see `TerminalView::sync_size`), which is how the app ends up knowing this pane's
+        /// cells at all - `App::start` no longer notes a grid the view has not confirmed, and the next
+        /// new pane in this window is measured against what views have reported.
+        #[test]
+        fn a_first_layout_that_changes_nothing_still_tells_the_app_the_grid() {
+            let (mut app, wid) = app_with(
+                Pane::new(ProfileId::new(), "one", None),
+                Pane::new(ProfileId::new(), "two", None),
+            );
+            let id = app.windows[&wid].tabs[0].panes[0].id;
+            let _ = app.start(wid, id);
+            let term = app.windows[&wid].tabs[0]
+                .pane(id)
+                .unwrap()
+                .terminal()
+                .cloned()
+                .unwrap();
+            assert!(
+                term.lock().holding(),
+                "nothing told this pane its cells yet"
+            );
+            assert!(
+                !app.grids.contains_key(&id),
+                "start notes nothing the view has not confirmed"
+            );
+            term.lock().feed(b"printed before the layout\r\n");
+
+            // The window's first honest pass measures the same grid the terminal already has: the
+            // widget releases the hold with `sized` and publishes this pane's grid.
+            let same = term.lock().size();
+            assert!(
+                term.lock().sized(),
+                "the hold released, nothing was resized"
+            );
+            let _ = app.update(Message::Terminal(wid, id, TerminalOutput::Resized(same)));
+
+            assert!(
+                !term.lock().holding(),
+                "the release happened at the first layout"
+            );
+            assert!(screen(&term).contains("printed"), "what it held is parsed");
+            assert_eq!(
+                app.grids[&id], same,
+                "and the app learned it from that report"
+            );
         }
 
         /// The same pane started once its window has laid out and reported a grid: nothing about its

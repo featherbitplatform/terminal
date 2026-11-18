@@ -327,24 +327,51 @@ async fn closed_session_output_never_reaches_reused_terminal() {
 
 /// A pane started before its window laid out holds what its program wrote until its view reports the
 /// grid measured with the real cell size (see `Terminal::hold_until_sized`). That resize happens on
-/// the app's thread, where no feed follows it, so `deliver_events` is what gets the answers out -
-/// the same delivery a feed performs.
+/// the app's thread, where no feed follows it, so `deliver_events` is what gets the answers out - the
+/// same delivery a feed performs. The bytes come from a real program here, through the session's own
+/// feeder.
 #[cfg(unix)]
-#[test]
-fn released_output_is_delivered_as_a_feed_would() {
-    let (handle, mut rx) = start(&profile("sh", &["-c", "sleep 30"]), size(80, 24));
+#[tokio::test]
+async fn released_output_is_delivered_as_a_feed_would() {
+    // The program writes after a moment and then leaves: its `Exited` is what says every byte of it
+    // has been fed - which is what matters here, that the hold was armed before any of it arrived,
+    // as `App::start` arms it before spawning.
+    let (handle, mut rx) = start(
+        &profile(
+            "sh",
+            &[
+                "-c",
+                "sleep 0.3; printf '\\033]2;build host\\aprinted after holding\\r\\n'",
+            ],
+        ),
+        size(80, 24),
+    );
     handle.terminal.lock().hold_until_sized();
-    // Nothing has told this pane its cells yet, so what arrives waits: a title for the router to
-    // pass on, and text for the grid.
-    handle
-        .terminal
-        .lock()
-        .feed(b"\x1b]2;build host\x07printed after holding\r\n");
+
+    timeout(LIMIT, async {
+        loop {
+            match rx.recv().await {
+                Some((_, SessionEvent::Exited(_))) => return,
+                Some(_) => {}
+                None => panic!("sink closed before the program wrote"),
+            }
+        }
+    })
+    .await
+    .expect("the program's output never arrived");
+
     assert!(handle.terminal.lock().holding(), "no grid reported yet");
-    assert!(rx.try_recv().is_err(), "held output reached nobody");
+    assert!(
+        handle.terminal.lock().held_bytes() > 0,
+        "the feed buffered it"
+    );
+    assert!(
+        !grid_text(&handle).contains("printed"),
+        "held output was parsed anyway"
+    );
 
     // The pane's view laid out at the scale its window reported and resized the terminal, which
-    // parsed what waited. A resize has no feed after it: the events stay queued until asked for.
+    // parsed what waited. A resize has no feed after it: the title stays queued until asked for.
     handle.terminal.lock().resize(size(100, 30));
     assert!(
         !handle.terminal.lock().holding(),
@@ -354,10 +381,18 @@ fn released_output_is_delivered_as_a_feed_would() {
         grid_text(&handle).contains("printed"),
         "parsed at the new cells"
     );
-    assert!(rx.try_recv().is_err(), "nobody routes events on a resize");
 
     handle.deliver_events();
-    let (sid, ev) = rx.try_recv().expect("the title held output set");
+    let (sid, ev) = timeout(LIMIT, async {
+        loop {
+            let got = rx.recv().await.expect("sink closed");
+            if matches!(got.1, SessionEvent::Title(_)) {
+                return got;
+            }
+        }
+    })
+    .await
+    .expect("nothing was delivered");
     assert_eq!(sid, handle.id);
     assert_eq!(ev, SessionEvent::Title("build host".into()));
     handle.close();

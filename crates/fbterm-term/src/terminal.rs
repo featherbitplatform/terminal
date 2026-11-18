@@ -332,6 +332,14 @@ impl Terminal {
         self.holding
     }
 
+    /// How many bytes [`Terminal::feed`] has taken and not yet parsed, waiting for the grid this
+    /// pane's view will report (see [`Terminal::holding`]). A host can use it to tell held output
+    /// from no output at all; tests use it to wait for a program's first write to arrive.
+    #[doc(hidden)]
+    pub fn held_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
     /// The pane's real cell size is now in this terminal (its view laid out at the scale its window
     /// reported): parse what [`Terminal::feed`] held, in order, and stop holding. Returns whether
     /// bytes were parsed, so a caller can tell output that landed from nothing happening.
@@ -1368,8 +1376,6 @@ mod tests {
         t.feed(&chunk);
         assert!(!t.holding(), "reaching the cap releases the hold");
         assert_eq!(line(&t, 0).len(), 80, "the queued bytes were parsed");
-        let mut events = t.take_events();
-        events.truncate(1);
 
         // Past the cap this terminal is an ordinary one: no more buffering.
         t.feed(b"tail");

@@ -298,7 +298,15 @@ impl<Message> TerminalView<'_, Message> {
             term.resize(grid);
             true
         } else {
-            term.sized()
+            // The terminal already had this grid, so nothing resizes and `sized` is what releases a
+            // hold armed for this pane's first real grid. Report that release even when nothing was
+            // waiting to parse: it is the app's only notice that this pane laid out at all - its map
+            // of reported grids is where the next new pane's cells come from, and without a report
+            // nobody asks for what a release queued, so an answer parsed at this moment would sit in
+            // the terminal until the next resize or feed.
+            let released = term.holding();
+            term.sized();
+            released
         };
         drop(term);
         // Report only what changed: a view that agrees with its terminal says nothing, which is how
@@ -778,6 +786,50 @@ mod tests {
         assert_eq!(first_cell(&term), 'r');
 
         // Nothing new to say on the next pass at the same bounds and scale.
+        assert!(sync(&view, &mut state, bounds).is_empty());
+    }
+
+    /// The equal-grid pass even with nothing waiting to parse is still reported, once. That report is
+    /// how the app learns this pane's grid at all - its map of reported grids is where the next new
+    /// pane's cells come from - while a terminal that never held anything (the Color schemes preview,
+    /// whose sample is rebuilt at the grid it already has) still has nothing to say.
+    #[test]
+    fn a_release_with_nothing_waiting_is_still_reported_once() {
+        let term = Arc::new(parking_lot::Mutex::new(crate::Terminal::new(
+            GridSize {
+                cols: 80,
+                rows: 24,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            10,
+        )));
+        term.lock().hold_until_sized();
+        let mut state = State::default();
+        state.hold(&term);
+        state.measured = Some(Measured {
+            font: Font::with_name("Sample Mono"),
+            font_size: 14.0,
+            cell: Size::new(8.0, 16.0),
+            epoch: font_epoch(),
+        });
+        let bounds = Rectangle::new(iced::Point::new(0.0, 0.0), Size::new(640.0, 384.0));
+
+        let style = style_at(1.0);
+        let view = TerminalView {
+            term: &term,
+            style: Cow::Borrowed(&style),
+            highlight: None,
+            on_event: Box::new(|out| out),
+        };
+        let out = sync(&view, &mut state, bounds);
+        let [TerminalOutput::Resized(grid)] = &out[..] else {
+            panic!("a hold released at the same size is still this pane laying out, got {out:?}");
+        };
+        assert_eq!(*grid, grid_at(80, 24, 1.0));
+
+        // Nothing new to say afterwards: the hold is gone, so an equal grid is silence again.
         assert!(sync(&view, &mut state, bounds).is_empty());
     }
 
