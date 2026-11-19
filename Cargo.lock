@@ -1478,7 +1478,7 @@ checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
 name = "fbterm"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "block2 0.6.2",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-config"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "directories",
  "serde",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-secrets"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "age",
  "base64 0.22.1",
@@ -1551,7 +1551,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-session"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "async-trait",
  "data-encoding",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "fbterm-term"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "bytes",
  "fast_image_resize",
