@@ -33,9 +33,12 @@ stage="$dist/stage-linux-$arch"
 linux="crates/fbterm/linux"
 
 # Debian and RPM sort "~" before anything, so a pre-release precedes its release; RPM versions
-# may not contain "-".
-deb_version="${version//-/\~}"
-rpm_version="${version//-/\~}"
+# may not contain "-". pkg_version maps the version to both package forms (dev/lib/pkg-version.sh,
+# tested by dev/test-package-version.sh; its tilde comes from a variable so it holds under any
+# bash).
+# shellcheck source=dev/lib/pkg-version.sh
+source "$root/dev/lib/pkg-version.sh"
+pkg_version "$version"
 
 cargo build --locked --release -p fbterm
 bin="$target/release/fbterm"
