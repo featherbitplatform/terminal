@@ -26,6 +26,10 @@ pub enum SettingChange {
     UncompressedHistoryLines(usize),
     ColorScheme(String),
     KittyKeyboard(bool),
+    /// Show pictures programs send. Off also clears what is on screen in every open terminal.
+    InlineImages(bool),
+    /// Keep pictures when their rows scroll off the screen. Only counts with `inline_images` on.
+    ScrollbackImages(bool),
     GraphemeClusters(bool),
     Ligatures(bool),
     BackgroundOpacity(f32),
@@ -60,6 +64,8 @@ impl SettingChange {
             Self::UncompressedHistoryLines(_) => "uncompressed_history_lines",
             Self::ColorScheme(_) => "color_scheme",
             Self::KittyKeyboard(_) => "kitty_keyboard",
+            Self::InlineImages(_) => "inline_images",
+            Self::ScrollbackImages(_) => "scrollback_images",
             Self::GraphemeClusters(_) => "grapheme_clusters",
             Self::Ligatures(_) => "ligatures",
             Self::BackgroundOpacity(_) => "background_opacity",
@@ -98,6 +104,8 @@ impl SettingChange {
             Self::UncompressedHistoryLines(v) => settings.uncompressed_history_lines = Some(*v),
             Self::ColorScheme(v) => settings.color_scheme.clone_from(v),
             Self::KittyKeyboard(v) => settings.kitty_keyboard = *v,
+            Self::InlineImages(v) => settings.inline_images = *v,
+            Self::ScrollbackImages(v) => settings.scrollback_images = *v,
             Self::GraphemeClusters(v) => settings.grapheme_clusters = *v,
             Self::Ligatures(v) => settings.ligatures = *v,
             Self::BackgroundOpacity(v) => settings.background_opacity = *v,
@@ -126,6 +134,8 @@ impl SettingChange {
                 Value::from(i64::try_from(*v).unwrap_or(i64::MAX))
             }
             Self::KittyKeyboard(v)
+            | Self::InlineImages(v)
+            | Self::ScrollbackImages(v)
             | Self::GraphemeClusters(v)
             | Self::Ligatures(v)
             | Self::BackgroundBlur(v)
@@ -456,6 +466,8 @@ mod tests {
             SettingChange::HistoryCompression(true),
             SettingChange::UncompressedHistoryLines(5_000),
             SettingChange::KittyKeyboard(true),
+            SettingChange::InlineImages(false),
+            SettingChange::ScrollbackImages(true),
             SettingChange::GraphemeClusters(true),
             SettingChange::Ligatures(false),
             SettingChange::BackgroundOpacity(0.85),
@@ -984,6 +996,50 @@ mod tests {
             edited.contains("uncompressed_history_lines = 8000"),
             "{edited}"
         );
+    }
+
+    #[test]
+    fn settings_round_trip_images() {
+        // Through the text: each key goes under its own commented line, and the file loads back
+        // with exactly what was set.
+        let mut text = edit_text(SETTINGS_TEMPLATE, &SettingChange::InlineImages(false)).unwrap();
+        text = edit_text(&text, &SettingChange::ScrollbackImages(true)).unwrap();
+        assert_eq!(
+            text,
+            SETTINGS_TEMPLATE
+                .replace(
+                    "#inline_images = true\n",
+                    "#inline_images = true\ninline_images = false\n"
+                )
+                .replace(
+                    "#scrollback_images = false\n",
+                    "#scrollback_images = false\nscrollback_images = true\n"
+                )
+        );
+        let loaded: Settings = toml::from_str(&text).unwrap();
+        assert!(!loaded.inline_images);
+        assert!(
+            loaded.scrollback_images,
+            "off is the default, so it needs writing"
+        );
+        // Back to the defaults: both keys are written with their default value, and the file
+        // still parses to what a fresh install gets.
+        text = edit_text(&text, &SettingChange::InlineImages(true)).unwrap();
+        text = edit_text(&text, &SettingChange::ScrollbackImages(false)).unwrap();
+        assert!(text.contains("inline_images = true\n"));
+        assert!(text.contains("scrollback_images = false\n"));
+        let mut back = Settings::default();
+        SettingChange::InlineImages(true).apply(&mut back);
+        SettingChange::ScrollbackImages(false).apply(&mut back);
+        assert_eq!(toml::from_str::<Settings>(&text).unwrap(), back);
+        // On disk, from the template.
+        let dir = std::env::temp_dir().join(format!("fbterm-edit-{}", uuid::Uuid::new_v4()));
+        let path = dir.join("settings.toml");
+        Settings::write_field(&path, &SettingChange::ScrollbackImages(true)).unwrap();
+        let s = Settings::load(&path).unwrap();
+        assert!(s.inline_images, "the default: pictures show");
+        assert!(s.scrollback_images);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

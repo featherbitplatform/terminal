@@ -388,6 +388,7 @@ fn grapheme_setting_reaches_new_terminals() {
         rows: 24,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     };
     let on = |app: &App| {
         app.new_terminal(grid)
@@ -423,6 +424,8 @@ fn restart_restores_grapheme_default() {
                 .expect("started tab has a terminal"),
         )
     };
+    // The pane laid out before its program switched the mode on (see `lay_out`).
+    lay_out(&term);
     term.lock().feed(b"\x1b[?2027h");
     assert!(
         term.lock()
@@ -532,6 +535,54 @@ fn kitty_keyboard_setting_reaches_open_and_new_terminals() {
     std::fs::write(paths.settings(), "kitty_keyboard = false\n").unwrap();
     let _ = app.update(Message::ConfigChanged(changed));
     assert!(!open(&app).lock().kitty_keyboard());
+}
+
+/// The picture settings reach a terminal built for a new pane and every open one, both switches
+/// together (the `kitty_keyboard` pattern).
+#[test]
+fn image_settings_reach_open_and_new_terminals() {
+    let a = profile("a");
+    let paths = paths_with(std::slice::from_ref(&a));
+    SavedState {
+        windows: vec![saved(&[&a], 0)],
+        ..Default::default()
+    }
+    .save(&paths.state())
+    .unwrap();
+    let (mut app, _) = App::build(paths.clone(), true);
+    let open = |app: &App| {
+        app.windows.values().next().unwrap().tabs[0]
+            .terminal()
+            .cloned()
+            .expect("started tab has a terminal")
+    };
+    assert!(app.settings.inline_images, "pictures show by default");
+    assert!(
+        !app.settings.scrollback_images,
+        "scrollback pictures are off by default"
+    );
+    assert!(open(&app).lock().images_enabled());
+    assert!(!open(&app).lock().scrollback_images());
+    let changed = Changed {
+        profiles: false,
+        settings: true,
+        schemes: false,
+    };
+    std::fs::write(
+        paths.settings(),
+        "inline_images = false\nscrollback_images = true\n",
+    )
+    .unwrap();
+    let _ = app.update(Message::ConfigChanged(changed));
+    assert!(!open(&app).lock().images_enabled(), "open terminal updated");
+    assert!(open(&app).lock().scrollback_images());
+    let grid = open(&app).lock().size();
+    let fresh = app.new_terminal(grid);
+    assert!(
+        !fresh.lock().images_enabled(),
+        "a new pane's terminal gets both switches"
+    );
+    assert!(fresh.lock().scrollback_images());
 }
 
 #[test]
@@ -673,7 +724,17 @@ pub(crate) fn first_terminal(app: &App) -> fbterm_term::SharedTerminal {
         .expect("started tab has a terminal")
 }
 
+/// This pane laid out and learned the cells its window really has, so anything its terminal held
+/// since the session started is parsed now (see `App::start`). Fixtures poke terminals directly
+/// rather than run iced's layout pass, which is what a real window does first. Does nothing to a
+/// terminal that was not holding.
+pub(crate) fn lay_out(term: &fbterm_term::SharedTerminal) {
+    term.lock().sized();
+}
+
+/// Output arriving from the program, one line after another, in a pane that has laid out.
 pub(crate) fn fill_history(term: &fbterm_term::SharedTerminal, lines: usize) {
+    lay_out(term);
     let mut t = term.lock();
     for i in 0..lines {
         t.feed(format!("line {i}\r\n").as_bytes());

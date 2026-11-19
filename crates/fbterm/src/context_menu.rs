@@ -25,6 +25,7 @@ use iced::{keyboard, mouse, window};
 
 use crate::app::{App, Message};
 use crate::layout::PaneId;
+use crate::reconnect::Revive;
 use crate::tabs::TabId;
 use crate::theme::{Tokens, UI_FONT};
 use crate::ui::MONO;
@@ -40,9 +41,22 @@ pub(crate) enum MenuItem {
     CopyPassword,
     /// The tab menu: what the tab's close button does.
     CloseTab,
+    /// The tab menu: dial the tab's dropped SSH panes again (and restart any exited local
+    /// program beside them).
+    Reconnect,
+    /// The tab menu: start the tab's exited local programs again (no SSH pane dropped).
+    Restart,
 }
 
 impl MenuItem {
+    /// The tab menu's item for `revive`.
+    pub(crate) fn revive(revive: Revive) -> Self {
+        match revive {
+            Revive::Reconnect => MenuItem::Reconnect,
+            Revive::Restart => MenuItem::Restart,
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             MenuItem::Copy => "Copy",
@@ -50,6 +64,8 @@ impl MenuItem {
             MenuItem::RenameTab => "Rename tab",
             MenuItem::CopyPassword => "Copy password",
             MenuItem::CloseTab => "Close tab",
+            MenuItem::Reconnect => Revive::Reconnect.title(),
+            MenuItem::Restart => Revive::Restart.title(),
         }
     }
 
@@ -103,18 +119,23 @@ impl ContextMenu {
         )
     }
 
-    /// The tab menu for `tab`: `Rename tab` for a terminal tab (`rename`), `Copy password`
-    /// when the tab is a password SSH profile's (`password`), then `Close tab`; `chords` are
-    /// shown beside those items (see [`App::open_tab_menu`] for which ones).
+    /// The tab menu for `tab`: `Reconnect` or `Restart` when a pane's session ended
+    /// (`revive`), `Rename tab` for a terminal tab (`rename`), `Copy password` when the tab
+    /// is a password SSH profile's (`password`), then `Close tab`; `chords` are shown beside
+    /// those items (see [`App::open_tab_menu`] for which ones).
     pub fn for_tab(
         window: window::Id,
         tab: TabId,
         at: Point,
+        revive: Option<Revive>,
         rename: bool,
         password: bool,
         chords: Vec<(MenuItem, String)>,
     ) -> Self {
         let mut items = Vec::new();
+        if let Some(revive) = revive {
+            items.push((MenuItem::revive(revive), true));
+        }
         if rename {
             items.push((MenuItem::RenameTab, true));
         }
@@ -333,6 +354,9 @@ impl App {
             }
             (MenuItem::CopyPassword, MenuTarget::Tab(tab)) => self.copy_password(wid, tab),
             (MenuItem::RenameTab, MenuTarget::Tab(tab)) => self.start_rename(wid, tab),
+            (MenuItem::Reconnect | MenuItem::Restart, MenuTarget::Tab(tab)) => {
+                self.revive_tab(wid, tab)
+            }
             _ => Task::none(),
         }
     }
@@ -668,13 +692,13 @@ mod tests {
     fn a_tab_menu_shows_only_the_chords_it_was_given() {
         let (w, tab) = (window::Id::unique(), TabId::next());
         let chords = vec![(MenuItem::CloseTab, "\u{2318}W".to_string())];
-        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, false, true, chords);
+        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, None, false, true, chords);
         assert_eq!(
             m.chord_label(MenuItem::CloseTab).as_deref(),
             Some("\u{2318}W")
         );
         assert!(m.chord_label(MenuItem::CopyPassword).is_none());
-        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, false, false, vec![]);
+        let m = ContextMenu::for_tab(w, tab, Point::ORIGIN, None, false, false, vec![]);
         assert!(m.chord_label(MenuItem::CloseTab).is_none());
         assert_eq!(m.items, vec![(MenuItem::CloseTab, true)]);
     }
@@ -976,6 +1000,7 @@ mod tests {
             wid,
             TabId::next(),
             Point::new(100.0, 100.0),
+            None,
             false,
             true,
             vec![],

@@ -842,6 +842,7 @@ mod pool {
         rows: 30,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     };
 
     /// Trusts every host key and counts the questions; never expects a secret prompt.
@@ -1330,6 +1331,42 @@ mod pool {
         wait_for(&h, "@@25 90@@").await;
     }
 
+    /// The pixel fields of `pty-req` (at open) and `window-change` (after a resize) carry the grid
+    /// in PHYSICAL pixels: what a remote program sizes itself by. The shell can only report its
+    /// characters (`stty size`), and dev/ssh-test's image prints nothing else about the window size
+    /// - it has no python3, perl or compiler, and GNU `stty` reports characters only - so this test
+    /// proves the pixel-carrying requests travel and are applied (a server that disliked them would
+    /// leave the old size, or kill the channel), while
+    /// `ssh::pool::tests::ssh_pixels_are_the_grids_physical_area` pins the numbers fbterm puts on
+    /// the wire.
+    #[tokio::test]
+    async fn ssh_window_change_carries_pixels() {
+        if !enabled() {
+            return;
+        }
+        let w = World::new();
+        let pool = w.pool();
+        // Opened at scale 1: 100x30 cells of 8x16 px, so `pty-req` says 800 x 480.
+        let (h, _rx) = open(&pool, &w, w.bastion).await;
+        run(&h, "echo \"@@$(stty size)@@\"");
+        wait_for(&h, "@@30 100@@").await;
+
+        // The window moved to a 2x display and shrank a little: 90x25 cells of the same logical
+        // cells, so `window-change` now says 1440 x 800 physical px with 90 columns and 25 lines.
+        h.resize(GridSize {
+            cols: 90,
+            rows: 25,
+            cell_width: 8.0,
+            cell_height: 16.0,
+            scale: 2.0,
+        });
+        run(&h, "echo \"@@$(stty size)@@\"");
+        wait_for(&h, "@@25 90@@").await;
+        // The shell is still alive and answering on the resized pty.
+        run(&h, "echo \"@@$((41 + 1))@@\"");
+        wait_for(&h, "@@42@@").await;
+    }
+
     #[tokio::test]
     async fn unreachable_hop_error_names_the_hop() {
         if !enabled() {
@@ -1468,6 +1505,7 @@ mod access {
         rows: 30,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     };
 
     fn key_profile(name: &str, host: &str, jump: Vec<ProfileId>) -> Profile {

@@ -86,6 +86,7 @@ fn run(path: &Path) -> f64 {
         rows: 40,
         cell_width: 8.0,
         cell_height: 16.0,
+        scale: 1.0,
     };
     let (tx, _rx): (EventSink, _) = unbounded_channel();
     let start = Instant::now();

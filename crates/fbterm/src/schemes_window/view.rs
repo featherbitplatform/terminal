@@ -53,7 +53,9 @@ pub fn view<'a>(
     let pane = if state.showing_gallery {
         Some(gallery(t, state, installed))
     } else {
-        state.selected_draft().map(|d| form(t, state, d, base))
+        state
+            .selected_draft()
+            .map(|d| form(t, state, d, base, scale))
     };
     let form: Element<'a, Message> = match pane {
         Some(pane) => scrollable(
@@ -363,6 +365,7 @@ fn form<'a>(
     state: &'a SchemesState,
     d: &'a Scheme,
     base: &TerminalStyle,
+    scale: f32,
 ) -> Element<'a, Message> {
     let editable = state.editable();
     let title: Element<'a, Message> = if state.renaming && editable {
@@ -434,7 +437,7 @@ fn form<'a>(
                 .style(move |_| ui::card(t)),
         );
     }
-    col = col.push(preview(t, state, d, base));
+    col = col.push(preview(t, state, d, base, scale));
     if let Some(hint) = state.contrast_hint() {
         col = col.push(
             row![
@@ -621,18 +624,20 @@ fn suggestion<'a>(t: &'static Tokens, line: FontLine, compact: bool) -> Element<
     col.spacing(6).into()
 }
 
-/// The preview terminal, drawn with the draft's colors and font, on its own background.
+/// The preview terminal, drawn with the draft's colors and font, on its own background, at the
+/// window's physical `scale` (its grid tells programs physical pixels, like a pane's).
 fn preview<'a>(
     t: &'static Tokens,
     state: &'a SchemesState,
     d: &'a Scheme,
     base: &TerminalStyle,
+    scale: f32,
 ) -> Element<'a, Message> {
     let bg = ui::to_color(d.colors.background);
     container(
         container(highlighted_terminal_view(
             &state.preview,
-            state.preview_style(base),
+            state.preview_style(base, scale),
             None,
             |out| msg(SchemesMsg::Preview(out)),
         ))

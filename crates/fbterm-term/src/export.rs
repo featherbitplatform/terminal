@@ -464,6 +464,7 @@ mod tests {
                 rows,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             1000,
         );
@@ -637,6 +638,7 @@ mod tests {
                 rows: 3,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             })
         };
         let mut sink = Vec::new();
@@ -686,6 +688,7 @@ mod tests {
                 rows: 5,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             10_000,
         );

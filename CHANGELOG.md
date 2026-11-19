@@ -2,6 +2,28 @@
 
 All notable changes to featherbit terminal (`fbterm`). The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Each version links to its GitHub release, where the downloads are.
 
+## [0.11.0] - 2026-11-19
+
+### Added
+
+- Inline images: programs can show pictures in the terminal with sixel, the kitty graphics protocol (Unicode placeholders included) and OSC 1337, in local shells, over SSH and in local Windows shells through the bundled ConPTY. Pictures are display only, are drawn crisp at the size the program asked for, and stay within memory caps; `Inline images` and `Images in scrollback` in Settings turn them on and off ([#107](https://github.com/featherbitplatform/terminal/pull/107)).
+- Reconnect an ended session: a pane whose session ended shows a bar with the reason and a `Reconnect` or `Restart` button, `Cmd+Shift+O` (`Ctrl+Shift+O` on Linux and Windows) brings back every ended pane of the tab, and the tab menu has the same item ([#104](https://github.com/featherbitplatform/terminal/pull/104)).
+- The tab bar keeps its Settings, Profiles and Tunnels buttons always visible, and the tabs scroll sideways with the mouse or the arrows that appear when they no longer fit ([#102](https://github.com/featherbitplatform/terminal/pull/102)) by AlessandroVisconti.
+
+### Changed
+
+- Block elements and box-drawing characters (U+2500 to U+259F) are drawn by fbterm to fill their cells instead of coming from the font, so bars, frames and block art join with no gaps at any font size or display scale ([#109](https://github.com/featherbitplatform/terminal/pull/109)), ([#111](https://github.com/featherbitplatform/terminal/pull/111)). Rounded corners and diagonals are drawn the same way, with smooth edges ([#112](https://github.com/featherbitplatform/terminal/pull/112)).
+- In the Profiles tab, many save errors at once show the first few and a count of the rest, and the redundant close button is gone ([#102](https://github.com/featherbitplatform/terminal/pull/102)) by AlessandroVisconti.
+- The Welcome tab's `Done` button sits right under the questions ([#103](https://github.com/featherbitplatform/terminal/pull/103)).
+
+### Fixed
+
+- Double box-drawing lines join correctly at corners, tees and crosses ([#109](https://github.com/featherbitplatform/terminal/pull/109)).
+- A picture size dropped while memory was full comes back by itself once memory frees ([#110](https://github.com/featherbitplatform/terminal/pull/110)).
+- A picture sized in pixels or percent with OSC 1337 is drawn at exactly that size, not rounded up to whole cells ([#114](https://github.com/featherbitplatform/terminal/pull/114)).
+- A kitty picture whose requested columns and rows equal its own size is scaled to fill them ([#115](https://github.com/featherbitplatform/terminal/pull/115)).
+- Dragging the shown tab onto another tab and dropping it on its content tiles it into that tab again ([#105](https://github.com/featherbitplatform/terminal/pull/105)).
+
 ## [0.10.1] - 2026-11-10
 
 ### Fixed
@@ -227,6 +249,7 @@ The first release: the daily driver milestone, macOS only.
 - Compact scrollback history: a live `scrollback_lines` setting with a Settings confirmation, and memory given back when tabs close ([#2](https://github.com/featherbitplatform/terminal/pull/2)).
 - Unsigned macOS `.dmg` packaging and the release workflow ([#1](https://github.com/featherbitplatform/terminal/pull/1)).
 
+[0.11.0]: https://github.com/featherbitplatform/terminal/releases/tag/v0.11.0
 [0.10.1]: https://github.com/featherbitplatform/terminal/releases/tag/v0.10.1
 [0.10.0]: https://github.com/featherbitplatform/terminal/releases/tag/v0.10.0
 [0.9.0]: https://github.com/featherbitplatform/terminal/releases/tag/v0.9.0

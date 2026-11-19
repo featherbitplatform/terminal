@@ -14,15 +14,52 @@ use crate::Selection;
 use feathercritty::index::Side;
 use feathercritty::selection::{Selection as EmuSelection, SelectionType};
 
+pub use feathercritty::event::{ImageData, ImageKey};
 pub use feathercritty::term::TermMode;
 
 /// Terminal size in cells plus the pixel size of one cell.
+///
+/// `cell_width` and `cell_height` are LOGICAL pixels, exactly as the widget measures and draws
+/// them; `scale` is the window's physical scale (physical pixels per logical one, 1.0 when the
+/// window has not reported one). Programs - PTYs, SSH, the emulator's own reports - see physical
+/// pixels, which [`Self::physical_cell`] and [`Self::physical_area`] give.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridSize {
     pub cols: u16,
     pub rows: u16,
     pub cell_width: f32,
     pub cell_height: f32,
+    /// Physical pixels per logical pixel of the window this grid was measured in.
+    pub scale: f32,
+}
+
+impl GridSize {
+    /// One text cell in physical pixels: each axis is the logical cell rounded to a whole pixel at
+    /// `scale`, and at least 1 (what the emulator places images by and reports for a cell).
+    pub fn physical_cell(&self) -> (u32, u32) {
+        (
+            whole(self.cell_width * self.scale).max(1),
+            whole(self.cell_height * self.scale).max(1),
+        )
+    }
+
+    /// The text area in physical pixels: the [`Self::physical_cell`] by the cell counts, so a
+    /// program that divides this by `cols` or `rows` - as it must for `TIOCGWINSZ` and `CSI 14 t` -
+    /// gets exactly the cell size images are placed with. An empty axis is 0. Saturates instead of
+    /// overflowing.
+    pub fn physical_area(&self) -> (u32, u32) {
+        let (cell_w, cell_h) = self.physical_cell();
+        (
+            u32::from(self.cols).saturating_mul(cell_w),
+            u32::from(self.rows).saturating_mul(cell_h),
+        )
+    }
+}
+
+/// Logical pixels at a window's scale, as whole physical pixels: rounded, and saturating to
+/// `u32::MAX` rather than overflowing (`NaN` becomes 0).
+fn whole(logical: f32) -> u32 {
+    logical.round().max(0.0) as u32
 }
 
 /// Events the terminal raises towards the host.
@@ -33,6 +70,16 @@ pub enum TermEvent {
     /// Replies (device attributes, status reports, ...) that must be written back to the session.
     PtyWrite(Vec<u8>),
     Exit,
+    /// A picture a program sent: the emulator parsed it, the host decodes (if needed) and draws
+    /// it. `key` names it from then on, and an `Encoded` payload is answered once the host
+    /// reports its decode result to the emulator.
+    ImageReceived {
+        key: ImageKey,
+        data: ImageData,
+    },
+    /// Nothing references this picture any more, so the host frees its copy. Raised exactly once
+    /// per key, when its last placement, placeholder or stored reference is gone.
+    ImageReleased(ImageKey),
 }
 
 struct Shared {
@@ -109,12 +156,13 @@ impl EventListener for EventProxy {
             Event::Exit | Event::ChildExit(_) => TermEvent::Exit,
             Event::TextAreaSizeRequest(fmt) => {
                 let s = sh.size;
+                let (w, h) = s.physical_cell();
                 TermEvent::PtyWrite(
                     fmt(WindowSize {
                         num_lines: s.rows,
                         num_cols: s.cols,
-                        cell_width: s.cell_width as u16,
-                        cell_height: s.cell_height as u16,
+                        cell_width: w.min(u16::MAX as u32) as u16,
+                        cell_height: h.min(u16::MAX as u32) as u16,
                     })
                     .into_bytes(),
                 )
@@ -132,6 +180,9 @@ impl EventListener for EventProxy {
             }
             // Never read the clipboard on behalf of the program: reply with an empty payload.
             Event::ClipboardLoad(_, fmt) => TermEvent::PtyWrite(fmt("").into_bytes()),
+            // Pictures are the host's to decode and draw; releases tell it when to let go.
+            Event::ImageReceived { key, data } => TermEvent::ImageReceived { key, data },
+            Event::ImageReleased(key) => TermEvent::ImageReleased(key),
             _ => return,
         };
         sh.events.push(mapped);
@@ -162,12 +213,35 @@ fn dims(size: GridSize) -> Dims {
     }
 }
 
+/// Ids handed to [`crate::images`] for decoded-image accounting, one per terminal ever made.
+static NEXT_IMAGE_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The most a terminal holds while its output waits for the pane's first real grid (see
+/// [`Terminal::hold_until_sized`]). Past it the hold releases and the bytes are parsed at the size
+/// the terminal has, so a pane that never lays out - a window shown on a display that reports no
+/// scale, a tab nobody looks at - cannot grow memory without bound.
+const HOLD_CAP: usize = 4 * 1024 * 1024;
+
 /// An emulated terminal: grid, parser and pending events.
 pub struct Terminal {
     pub(crate) term: Term<EventProxy>,
     config: Config,
     parser: Processor,
     shared: Arc<Mutex<Shared>>,
+    /// This terminal's id in the app-wide image store ([`Terminal::image_owner`]).
+    image_owner: u64,
+    /// The `inline_images` setting: whether pictures programs send are shown at all. The emulator
+    /// starts with image support on, like the default here.
+    images_enabled: bool,
+    /// The `scrollback_images` setting: whether a picture stays when its rows have all scrolled
+    /// off the screen. Off, like the default, it becomes a placeholder line and is released.
+    scrollback_images: bool,
+    /// Output waits in `pending` until the pane's view reports a grid measured for real (see
+    /// [`Terminal::hold_until_sized`]).
+    holding: bool,
+    /// Bytes fed while `holding`, in order; parsed by the first [`Terminal::resize`] or
+    /// [`Terminal::sized`] after its new size and cell pixels are applied.
+    pending: Vec<u8>,
     pub(crate) generation: u64,
     /// Calls of [`Terminal::drop_history_cache`] (tests: the read cache itself is not visible
     /// outside feathercritty).
@@ -195,12 +269,21 @@ impl Terminal {
             osc52: feathercritty::term::Osc52::OnlyPaste,
             ..Config::default()
         };
-        let term = Term::new(config.clone(), &dims(size), proxy);
+        let mut term = Term::new(config.clone(), &dims(size), proxy);
+        // The emulator places images and answers `CSI 14 t` / `CSI 16 t` from the cell's physical
+        // size, so it gets it before any program can ask (see [`Self::set_cell_pixel_size`]).
+        let (cell_w, cell_h) = size.physical_cell();
+        term.set_cell_pixel_size(cell_w, cell_h);
         Self {
             term,
             config,
             parser: Processor::new(),
             shared,
+            image_owner: NEXT_IMAGE_OWNER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            images_enabled: true,
+            scrollback_images: false,
+            holding: false,
+            pending: Vec::new(),
             generation: 0,
             #[cfg(test)]
             cache_drops: 0,
@@ -208,9 +291,116 @@ impl Terminal {
     }
 
     /// Feed bytes received from the session into the emulator.
+    ///
+    /// While a hold from [`Terminal::hold_until_sized`] is up the bytes only queue; see it.
     pub fn feed(&mut self, bytes: &[u8]) {
+        if self.holding {
+            self.pending.extend_from_slice(bytes);
+            if self.pending.len() >= HOLD_CAP {
+                tracing::warn!(
+                    bytes = self.pending.len(),
+                    "output held for this pane's first layout passed the cap; parsing it at the grid it has",
+                );
+                self.sized();
+            }
+            return;
+        }
         self.parser.advance(&mut self.term, bytes);
         self.generation += 1;
+    }
+
+    /// Hold output until this terminal's cell size is known for real.
+    ///
+    /// A window that has not laid out yet does not know its cell pixels or even its window scale,
+    /// and the emulator fixes a picture's cell span the moment it parses it: output parsed then is
+    /// placed against the wrong pixels for good - on a 2x display a 160 px image covers twice its
+    /// cells - and `CSI 14 t` / `CSI 16 t` answer wrong, so programs size themselves wrong too.
+    /// While held, [`Terminal::feed`] only queues bytes; the first [`Terminal::resize`] or
+    /// [`Terminal::sized`] - what a pane's view does at its first layout measured at the scale its
+    /// window reported - parses them, in order, against the new size, and their replies are then
+    /// answered from it. Past [`HOLD_CAP`] the hold releases on its own so a pane that never lays
+    /// out cannot grow memory without bound.
+    ///
+    /// [`Terminal::new`] does not hold: a host that sizes its terminal itself (tests, export, a
+    /// headless run) parses at once.
+    pub fn hold_until_sized(&mut self) {
+        self.holding = true;
+    }
+
+    /// Whether output is still waiting for the pane's first real grid.
+    pub fn holding(&self) -> bool {
+        self.holding
+    }
+
+    /// How many bytes [`Terminal::feed`] has taken and not yet parsed, waiting for the grid this
+    /// pane's view will report (see [`Terminal::holding`]). A host can use it to tell held output
+    /// from no output at all; tests use it to wait for a program's first write to arrive.
+    #[doc(hidden)]
+    pub fn held_bytes(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The pane's real cell size is now in this terminal (its view laid out at the scale its window
+    /// reported): parse what [`Terminal::feed`] held, in order, and stop holding. Returns whether
+    /// bytes were parsed, so a caller can tell output that landed from nothing happening.
+    ///
+    /// [`Terminal::resize`] calls this after applying the new size and cell pixels; call it directly
+    /// when the terminal already had this grid (a session started at the size its pane turned out
+    /// to need) and so did not resize.
+    pub fn sized(&mut self) -> bool {
+        if !self.holding {
+            return false;
+        }
+        self.holding = false;
+        let bytes = std::mem::take(&mut self.pending);
+        if bytes.is_empty() {
+            return false;
+        }
+        // One slice, in the order it arrived: the parser is a byte-stream state machine, so this
+        // parses exactly as the individual feeds would have.
+        self.parser.advance(&mut self.term, &bytes);
+        self.generation += 1;
+        true
+    }
+
+    /// This terminal's id in the app-wide image store ([`crate::images::store`]). The store
+    /// accounts decoded pixels per owner so one tab cannot crowd the others out, and frees a
+    /// tab's whole budget when this terminal drops.
+    pub fn image_owner(&self) -> u64 {
+        self.image_owner
+    }
+
+    /// Report the result of decoding an image the store took from [`crate::images::store`]'s
+    /// queue: `Ok` lets the emulator answer the program's transmission `OK`, the errors answer
+    /// `EBADPNG` and `ENOMEM`. The store calls this from its worker, then calls the owner's
+    /// [`crate::images::OwnerHooks::deliver`] hook, which takes the events this raised out of the
+    /// queue together with whatever output had queued ahead of them.
+    pub fn image_decoded(
+        &mut self,
+        key: feathercritty::event::ImageKey,
+        result: Result<(), feathercritty::event::ImageDecodeError>,
+    ) {
+        self.term.image_decoded(key, result);
+        self.generation += 1;
+    }
+
+    /// Run the graphics protocols' stall watchdog (see `Term::tick`): drops a stalled chunked
+    /// kitty transmission and delivers image events parked by a resize. Call after feeding bytes
+    /// so replies arrive even while the terminal is otherwise idle.
+    pub fn tick(&mut self, now: std::time::Instant) {
+        self.term.tick(now);
+        self.generation += 1;
+    }
+
+    /// Turn the oldest scrollback image into a placeholder line and release it outright, so a
+    /// session over its share of the image store can reclaim memory until enough went (`None`
+    /// when scrollback holds no image). The emulator sends the matching `ImageReleased`.
+    pub fn evict_oldest_scrollback_image(&mut self) -> Option<feathercritty::event::ImageKey> {
+        let key = self.term.evict_oldest_scrollback_image();
+        if key.is_some() {
+            self.generation += 1;
+        }
+        key
     }
 
     /// Accept the kitty keyboard protocol from programs (off by default). While off, programs'
@@ -326,6 +516,39 @@ impl Terminal {
         self.config.kitty_keyboard
     }
 
+    /// Show pictures programs send (`enabled`), and whether a picture whose rows have all scrolled
+    /// off the screen stays in the history or becomes a line saying how big it was
+    /// (`keep_scrollback`).
+    ///
+    /// Switching `enabled` off drops everything the emulator already stored or displayed: each
+    /// picture on screen gets one [`TermEvent::ImageReleased`] and its cells are freed; programs'
+    /// picture sequences are consumed and answered as unsupported from then on. Switching it back
+    /// on does not bring the pictures back. Unlike [`Terminal::set_kitty_keyboard`], nothing is
+    /// re-announced here, so no title event needs dropping.
+    pub fn set_images(&mut self, enabled: bool, keep_scrollback: bool) {
+        if self.images_enabled != enabled {
+            self.images_enabled = enabled;
+            self.term.set_images_enabled(enabled);
+            self.generation += 1;
+        }
+        if self.scrollback_images != keep_scrollback {
+            self.scrollback_images = keep_scrollback;
+            self.term.set_scrollback_images(keep_scrollback);
+            self.generation += 1;
+        }
+    }
+
+    /// Whether pictures programs send are shown (the `inline_images` setting).
+    pub fn images_enabled(&self) -> bool {
+        self.images_enabled
+    }
+
+    /// Whether pictures stay when their rows scroll off the screen (the `scrollback_images`
+    /// setting).
+    pub fn scrollback_images(&self) -> bool {
+        self.scrollback_images
+    }
+
     /// Start with grapheme clusters on (DEC private mode 2027) after a reset or a restart. This
     /// only sets the default: the mode a running program has is never flipped. Like
     /// [`Terminal::set_kitty_keyboard`], the title the emulator re-announces is discarded.
@@ -389,9 +612,24 @@ impl Terminal {
         self.generation += 1;
     }
 
+    /// Resize the grid, and with it the cell size programs are told: the new grid carries the
+    /// window's physical scale (see [`Self::set_cell_pixel_size`]). This is a pane's first real
+    /// grid for the purposes of [`Self::hold_until_sized`], so anything that waited for it is
+    /// parsed here, after the new size and cell pixels are applied.
     pub fn resize(&mut self, size: GridSize) {
         self.shared.lock().size = size;
+        let (cell_w, cell_h) = size.physical_cell();
         self.term.resize(dims(size));
+        self.term.set_cell_pixel_size(cell_w, cell_h);
+        self.generation += 1;
+        self.sized();
+    }
+
+    /// The physical pixel size of one text cell. Placements convert pixels to cells with it, and
+    /// `CSI 14 t` / `CSI 16 t` answer from it, so programs that size their output by the cell see
+    /// what is drawn. Each axis is clamped to at least 1 by the emulator.
+    pub fn set_cell_pixel_size(&mut self, width: u32, height: u32) {
+        self.term.set_cell_pixel_size(width, height);
         self.generation += 1;
     }
 
@@ -429,6 +667,15 @@ impl Terminal {
     }
 }
 
+impl Drop for Terminal {
+    /// Hand this terminal's id back to the image store: queued work for it is dropped and its
+    /// share of the app-wide budget is freed (the store holds no strong reference back, so the
+    /// tab dropping is what ends the terminal → hooks → store chain).
+    fn drop(&mut self) {
+        crate::images::store().drop_owner(self.image_owner);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,7 +689,88 @@ mod tests {
             rows,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         }
+    }
+
+    /// A grid of fractional cells (logical px) in a window at `scale`.
+    fn grid_of(cols: u16, rows: u16, cell_width: f32, cell_height: f32, scale: f32) -> GridSize {
+        GridSize {
+            cols,
+            rows,
+            cell_width,
+            cell_height,
+            scale,
+        }
+    }
+
+    /// A fractional advance (7.4) and a ceiled line height (15.6): what `measure` gives a font
+    /// whose size is not a whole multiple of 5.
+    #[test]
+    fn physical_cell_is_the_logical_cell_rounded_at_the_scale() {
+        for (scale, w, h) in [(1.0, 7, 16), (2.0, 15, 31), (1.25, 9, 20), (1.5, 11, 23)] {
+            let g = grid_of(80, 24, 7.4, 15.6, scale);
+            assert_eq!(g.physical_cell(), (w, h), "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn physical_cell_is_at_least_one_pixel() {
+        let tiny = grid_of(80, 24, 0.2, 0.4, 1.0);
+        assert_eq!(tiny.physical_cell(), (1, 1));
+        // A window that reported no scale at all still has cells of a whole pixel.
+        let unscaled = grid_of(80, 24, 7.4, 15.6, 0.0);
+        assert_eq!(unscaled.physical_cell(), (1, 1));
+    }
+
+    /// The area a program is told must be the physical cell by the cells, not the whole grid
+    /// rounded once: `TIOCGWINSZ` and `CSI 14 t` report the area, and programs divide it by their
+    /// column and row counts to get the cell size. Rounding the grid as a whole (1680 x 972 here)
+    /// would divide back to a different cell than images are placed with.
+    #[test]
+    fn physical_area_is_the_physical_cell_by_the_cells() {
+        let g = grid_of(100, 30, 8.4, 16.2, 2.0);
+        assert_eq!(g.physical_cell(), (17, 32), "8.4 and 16.2 px at 2x");
+        assert_eq!(g.physical_area(), (1700, 960));
+
+        let at_one = grid_of(100, 30, 8.4, 16.2, 1.0);
+        assert_eq!(at_one.physical_cell(), (8, 16));
+        assert_eq!(at_one.physical_area(), (800, 480));
+    }
+
+    #[test]
+    fn the_area_divides_back_to_the_physical_cell() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let g = grid_of(100, 30, 8.4, 16.2, scale);
+            let (cell_w, cell_h) = g.physical_cell();
+            let (w, h) = g.physical_area();
+            assert_eq!(w / u32::from(g.cols), cell_w, "scale {scale}, width");
+            assert_eq!(h / u32::from(g.rows), cell_h, "scale {scale}, height");
+        }
+    }
+
+    #[test]
+    fn physical_area_of_an_empty_axis_is_zero() {
+        let g = grid_of(0, 0, 8.0, 16.0, 2.0);
+        assert_eq!(g.physical_area(), (0, 0));
+        assert_eq!(
+            g.physical_cell(),
+            (16, 32),
+            "the cell is still a whole pixel"
+        );
+        let rows_only = grid_of(40, 0, 8.0, 16.0, 1.0);
+        assert_eq!(rows_only.physical_area(), (320, 0));
+    }
+
+    #[test]
+    fn physical_sizes_saturate_instead_of_overflowing() {
+        let huge = grid_of(u16::MAX, u16::MAX, 1e20, 1e20, 1e9);
+        assert_eq!(huge.physical_cell(), (u32::MAX, u32::MAX));
+        assert_eq!(huge.physical_area(), (u32::MAX, u32::MAX));
+        // A product that is not even a finite number.
+        let infinite = grid_of(10, 10, f32::MAX, f32::MAX, f32::MAX);
+        assert_eq!(infinite.physical_cell(), (u32::MAX, u32::MAX));
+        assert_eq!(infinite.physical_area(), (u32::MAX, u32::MAX));
     }
 
     #[test]
@@ -632,6 +960,33 @@ mod tests {
         let mut t = Terminal::new(size(80, 24), 100);
         t.feed(b"\x1b[14t");
         assert_eq!(reply(&mut t), "\x1b[4;384;640t");
+    }
+
+    /// The emulator answers `CSI 16 t` (one cell) and `CSI 14 t` (the text area) from the physical
+    /// cell size the host reported with `set_cell_pixel_size`, so a program that sizes its output
+    /// by the cell uses the numbers the drawing actually uses.
+    #[test]
+    fn size_reports_answer_in_physical_pixels() {
+        let mut t = Terminal::new(grid_of(10, 5, 8.4, 16.2, 2.0), 100);
+        t.feed(b"\x1b[16t");
+        assert_eq!(
+            reply(&mut t),
+            "\x1b[6;32;17t",
+            "the cell at the window's scale"
+        );
+        t.feed(b"\x1b[14t");
+        // 10 cells of 17 px, 5 rows of 32: the area the emulator answers is the physical cell by
+        // the cells, exactly what `physical_area` reports and PTYs and SSH are told.
+        let (w, h) = t.size().physical_area();
+        assert_eq!((w, h), (170, 160));
+        assert_eq!(reply(&mut t), format!("\x1b[4;{h};{w}t"));
+
+        // Resizing carries the new grid's scale too.
+        t.resize(grid_of(20, 8, 8.4, 16.2, 1.0));
+        let (w, h) = t.size().physical_area();
+        assert_eq!((w, h), (160, 128));
+        t.feed(b"\x1b[16t\x1b[14t");
+        assert_eq!(reply(&mut t), format!("\x1b[6;16;8t\x1b[4;{h};{w}t"));
     }
 
     #[test]
@@ -861,6 +1216,198 @@ mod tests {
         // Main screen holds 40 * 128 = 5120 pushes, capped at 4096.
         assert!(flags_after_popping(&mut t, 4095));
         assert!(!flags_after_popping(&mut t, 1));
+    }
+
+    /// A sixel on screen, then the setting switched off: the placement is gone at once and its
+    /// image released exactly once; switching it back on does not bring it back.
+    #[test]
+    fn switch_off_clears_images() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        // Cells of 8x16 px: the picture below covers one cell.
+        t.set_cell_pixel_size(8, 16);
+        assert!(t.images_enabled(), "on by default");
+        // A red 4x12 px sixel: four painted columns, then a second band of four.
+        t.feed(b"\x1bPq#0;2;100;0;0#0~~~~-~~~~\x1b\\");
+        let keys: Vec<ImageKey> = t
+            .take_events()
+            .iter()
+            .filter_map(|e| match e {
+                TermEvent::ImageReceived { key, data } => {
+                    match data {
+                        ImageData::Rgba { width, height, .. } => {
+                            assert_eq!((*width, *height), (4, 12))
+                        }
+                        ImageData::Encoded { .. } => panic!("a sixel's pixels arrive decoded"),
+                    }
+                    Some(*key)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 1, "one picture arrives");
+        let key = keys[0];
+        assert_eq!(
+            t.term().visible_placements().len(),
+            1,
+            "and it is on screen"
+        );
+        t.set_images(false, false);
+        assert!(!t.images_enabled());
+        assert!(!t.scrollback_images());
+        assert!(
+            t.term().visible_placements().is_empty(),
+            "switching off clears what is on screen"
+        );
+        assert_eq!(
+            t.take_events(),
+            vec![TermEvent::ImageReleased(key)],
+            "the picture is released exactly once"
+        );
+        t.set_images(true, false);
+        assert!(
+            t.term().visible_placements().is_empty(),
+            "switching back on does not resurrect it"
+        );
+        assert!(t.take_events().is_empty());
+    }
+
+    /// The text of screen row `row`, spaces trimmed.
+    fn line(t: &Terminal, row: usize) -> String {
+        let cols = usize::from(t.size().cols);
+        let grid = t.term().grid();
+        let row: String = (0..cols)
+            .map(|c| grid.screen()[Line(row as i32)][Column(c)].c)
+            .collect();
+        row.trim_end().to_string()
+    }
+
+    /// Minimal standard-alphabet base64 (padding included) for building kitty frames in tests.
+    fn b64(bytes: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = (u32::from(chunk[0]) << 16)
+                | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*chunk.get(2).unwrap_or(&0));
+            let t = |i: u32| T[i as usize] as char;
+            out.push(t(n >> 18));
+            out.push(t((n >> 12) & 63));
+            out.push(if chunk.len() > 1 {
+                t((n >> 6) & 63)
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 { t(n & 63) } else { '=' });
+        }
+        out
+    }
+
+    /// A terminal whose window has not laid out yet holds its output: nothing is parsed, and no
+    /// query is answered, until the first resize brings the grid the pane really has.
+    #[test]
+    fn held_output_is_parsed_by_the_first_resize() {
+        let mut t = Terminal::new(grid_of(80, 24, 8.0, 16.0, 1.0), 100);
+        t.hold_until_sized();
+        assert!(t.holding(), "the hold is opt-in but stays up");
+
+        t.feed(b"hi\r\nthere");
+        assert_eq!(line(&t, 0), "", "nothing is drawn while held");
+        assert_eq!(line(&t, 1), "");
+        assert!(t.take_events().is_empty());
+        // A program asking for the cell size before the layout gets no answer yet.
+        t.feed(b"\x1b[16t");
+        assert!(reply(&mut t).is_empty(), "held output asks nothing");
+
+        // The pane's first real grid: cells of 8.4x16.2 logical px in a 2x window = 17x32 px.
+        t.resize(grid_of(40, 6, 8.4, 16.2, 2.0));
+        assert!(!t.holding(), "the first resize releases the hold");
+        assert_eq!(line(&t, 0), "hi");
+        assert_eq!(line(&t, 1), "there");
+        // The query that arrived while held is answered once, from the cells it was parsed against.
+        assert_eq!(reply(&mut t), "\x1b[6;32;17t");
+
+        // And output after the release parses at once, as ever.
+        t.feed(b"\x1b[H\x1b[Jafter");
+        assert_eq!(line(&t, 0), "after");
+    }
+
+    /// The defect this hold is for, end to end: a picture transmitted before the pane's first
+    /// layout used to be placed against the provisional cells (8x16 px at scale 1), and its span
+    /// never changed again. Held until that layout, it gets the span the real pixels imply.
+    #[test]
+    fn a_held_image_gets_its_span_from_the_new_cells() {
+        // The grid a new window's first pane starts at: 80x24 cells of 8x16 logical px at scale 1.
+        let mut t = Terminal::new(grid_of(40, 10, 8.0, 16.0, 1.0), 100);
+        t.hold_until_sized();
+
+        // A 160x32 px opaque picture (transmit and display, raw RGBA): 20 cells wide at the
+        // provisional cells, 10 at the real ones.
+        let pixels = vec![255u8; 160 * 32 * 4];
+        t.feed(format!("\x1b_Ga=T,i=1,f=32,s=160,v=32;{}\x1b\\", b64(&pixels)).as_bytes());
+        assert!(
+            t.term().visible_placements().is_empty(),
+            "nothing is placed while held"
+        );
+
+        // The window laid out on a 2x display: the same cells, twice the physical pixels.
+        t.resize(grid_of(40, 10, 8.0, 16.0, 2.0));
+        let placements = t.term().visible_placements();
+        let [placement] = &placements[..] else {
+            panic!("exactly one placement after the release, got {placements:?}");
+        };
+        assert_eq!(
+            (placement.cols, placement.rows),
+            (10, 1),
+            "160x32 px against cells of 16x32 physical px"
+        );
+    }
+
+    /// A pane that never lays out must not buffer forever: at the cap the hold releases, everything
+    /// queued is parsed, and later output arrives as it would anywhere else.
+    #[test]
+    fn the_hold_releases_at_the_cap() {
+        let mut t = Terminal::new(grid_of(80, 24, 8.0, 16.0, 1.0), 100);
+        t.hold_until_sized();
+        let chunk = vec![b'x'; HOLD_CAP / 2];
+
+        t.feed(&chunk);
+        assert!(t.holding(), "under the cap it still waits");
+        assert_eq!(line(&t, 0), "");
+
+        t.feed(&chunk);
+        assert!(!t.holding(), "reaching the cap releases the hold");
+        assert_eq!(line(&t, 0).len(), 80, "the queued bytes were parsed");
+
+        // Past the cap this terminal is an ordinary one: no more buffering.
+        t.feed(b"tail");
+        assert!(line(&t, 23).ends_with('l'), "later output lands at once");
+    }
+
+    /// The same grid, already applied: nothing resizes, so `sized` is what releases the hold (this
+    /// is the case a pane's first layout takes when its terminal was started at the size that
+    /// layout turned out to need).
+    #[test]
+    fn sized_releases_output_without_a_resize() {
+        let grid = grid_of(30, 8, 9.0, 18.0, 2.0);
+        let mut t = Terminal::new(grid, 100);
+        t.hold_until_sized();
+        t.feed(b"ready");
+        assert_eq!(line(&t, 0), "");
+
+        assert!(t.sized(), "the bytes it waited for are parsed now");
+        assert!(!t.holding());
+        assert_eq!(line(&t, 0), "ready");
+        assert!(!t.sized(), "and only once");
+    }
+
+    /// `Terminal::new` does not hold, so export, tests and any other host that sizes its own
+    /// terminal keep parsing at once.
+    #[test]
+    fn a_fresh_terminal_parses_at_once() {
+        let mut t = Terminal::new(size(80, 24), 100);
+        assert!(!t.holding(), "the hold is opt-in");
+        t.feed(b"hi");
+        assert_eq!(line(&t, 0), "hi");
     }
 
     #[test]

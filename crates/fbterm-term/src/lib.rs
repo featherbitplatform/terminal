@@ -4,6 +4,7 @@
 mod cold_tests;
 mod export;
 pub mod history_worker;
+pub mod images;
 mod input;
 mod kitty;
 pub mod ligature_sets;
@@ -27,7 +28,7 @@ pub use search::{
 pub use selection::Selection;
 pub use terminal::{EventProxy, GridSize, SharedTerminal, TermEvent, TermMode, Terminal};
 pub use widget::{
-    DrawList, FontFeatures, Highlight, RIGHT_CLICK, RightClick, TerminalOutput, TerminalStyle,
-    build_draw_list, cell_colors, font_epoch, fonts_loaded, grid_size_from_bounds,
+    CellGeometry, DrawList, FontFeatures, Highlight, RIGHT_CLICK, RightClick, TerminalOutput,
+    TerminalStyle, build_draw_list, cell_colors, font_epoch, fonts_loaded, grid_size_from_bounds,
     highlighted_terminal_view, paste_input, pixel_to_cell, pixel_to_point, terminal_view,
 };

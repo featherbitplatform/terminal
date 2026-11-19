@@ -17,8 +17,8 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use fbterm_term::{
-    ColorScheme, ExportFormat, GridSize, MATCH_CAP, SearchPattern, SearchQuery, SearchRequest,
-    SharedTerminal, Terminal, build_draw_list, export, search,
+    CellGeometry, ColorScheme, ExportFormat, GridSize, MATCH_CAP, SearchPattern, SearchQuery,
+    SearchRequest, SharedTerminal, Terminal, build_draw_list, export, search,
 };
 use feathercritty::grid::RowReader;
 use parking_lot::Mutex;
@@ -124,6 +124,7 @@ fn tab(compression: Option<usize>, bytes: &[u8]) -> SharedTerminal {
             rows: ROWS,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         },
         LINES,
     );
@@ -168,7 +169,16 @@ fn frames(t: &Terminal, scheme: &ColorScheme) -> f64 {
     let mut times: Vec<f64> = (0..FRAMES)
         .map(|_| {
             let start = Instant::now();
-            let list = build_draw_list(&mut reader, t, scheme, true, None, None);
+            let list = build_draw_list(
+                &mut reader,
+                t,
+                scheme,
+                true,
+                None,
+                None,
+                fbterm_term::images::store(),
+                CellGeometry::new(iced::Size::new(8.0, 16.0), 1.0),
+            );
             std::hint::black_box(list.texts.len());
             ms(start.elapsed())
         })
@@ -224,7 +234,16 @@ fn main() {
             t.scroll_to_bottom();
             t.scroll(offset);
             let start = Instant::now();
-            let list = build_draw_list(&mut RowReader::new(), &t, &scheme, true, None, None);
+            let list = build_draw_list(
+                &mut RowReader::new(),
+                &t,
+                &scheme,
+                true,
+                None,
+                None,
+                fbterm_term::images::store(),
+                CellGeometry::new(iced::Size::new(8.0, 16.0), 1.0),
+            );
             let d = ms(start.elapsed());
             std::hint::black_box(list.texts.len());
             d

@@ -180,6 +180,7 @@ mod tests {
             rows: 40,
             cell_width: 8.0,
             cell_height: 16.0,
+            scale: 1.0,
         };
         let c = cover(size);
         assert_eq!(c.rows, 3);

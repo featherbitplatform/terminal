@@ -557,6 +557,37 @@ I-on  159.4 159.4 111.5 111.5 1 1.2 0.00 0   (1.18)
 Columns: `scenario rss_mb rss_end_mb footprint_mb footprint_end_mb children children_rss_mb
 cpu_pct stragglers`.
 
+## Inline images (2026-11-18)
+
+Branch `feature/inline-images` against `develop` at its tip (`5ca5d1f`): release build, 20 tabs,
+3 runs each, the same command in every tab of a run, RSS medians. A, B and D are
+`dev/perf/sessions.sh` unchanged (load averages 1 to 3). Bi is every tab printing one picture in
+each protocol (kitty `a=t,f=32`, sixel, OSC 1337 and a kitty Unicode placeholder), each 160x96
+pixels, then idling with `inline_images = true`; Ai is Bi with the visible tab also streaming the
+system log. Bi and Ai are not in the script: same binary, tab count, warm-up and CPU sample, run
+straight through `--perf-tabs 20 --perf-cmd` with a config dir holding only `inline_images = true`.
+
+| Scenario | develop RSS (MB) | branch RSS (MB) | branch CPU over 10 s |
+|---|---|---|---|
+| A: 20 tabs, 19 idle + 1 visible streaming the log | 106.1 | 105.3 | - |
+| B: 20 idle tabs | 99.3 | 100.6 | 0.00% |
+| D: 1 idle tab (baseline) | 95.3 | 96.6 | 0.00% |
+| Bi: 20 tabs, four pictures each, then idle | - | 109.5 | 0.00% |
+| Ai: Bi plus the visible tab streaming the log | - | 113.7 | - |
+
+An empty cell is a number that does not exist: CPU over 10 s is quoted where the scenario idles (B, D
+and Bi), and develop draws no pictures, so Bi and Ai have nothing to be compared against there.
+
+Verdict: within 10% of develop. With pictures off the three scenarios are within 1.3 MB of develop
+(-0.8, +1.3, +1.3), and idle CPU is 0.00% in B, D and Bi: 80 stored pictures cause no work while
+nothing prints. Pictures cost what their pixels cost: 80 of them at 160x96 RGBA is 4.9 MB decoded (the
+store accounts the same), and Bi is 8.9 MB over B.
+
+A confirming paired run after the fixes landed, one run each on the same machine at load averages 4
+to 6 instead of 1 to 3: develop B 107.6 and D 103.9, branch B 107.5 and D 104.1. Level within 0.2
+MB, about 8 MB above the medians above in absolute terms on a busier machine. The branch read 0.00%
+idle CPU in both scenarios; the single develop runs read 0.30% and 1.90%, which was not investigated.
+
 ## Re-running
 
 ```

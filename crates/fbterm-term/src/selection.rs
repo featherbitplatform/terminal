@@ -126,6 +126,7 @@ mod tests {
                 rows: 5,
                 cell_width: 8.0,
                 cell_height: 16.0,
+                scale: 1.0,
             },
             100,
         )
