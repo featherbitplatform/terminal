@@ -521,7 +521,7 @@ pub fn resolve(
         // before (finding I1).
         let box_px = requested_box_px(m, p.box_px, p.box_cell_px, p.cols, p.rows)
             .or_else(|| {
-                if p.stretch {
+                if p.stretch || p.sized {
                     Some(placement_box_px(m, p.cols, p.rows))
                 } else {
                     natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
