@@ -151,8 +151,9 @@ pub fn placement_box_px(m: CellGeometry, cols: u32, rows: u32) -> (u32, u32) {
 /// size, nothing is filtered, pixel art and sixel output stay sharp, and the store answers with the
 /// source's own buffer (findings I1 and P4). It stops matching as soon as the font, line height or
 /// display scale changes — then the copy fills the new span, which is the scaling the spec allows.
-/// A span a program sized itself (`c`/`r`, OSC 1337 width or height) only matches by coincidence,
-/// and resampling to fill it stays as it was. `None` says "no match": ask for the span.
+/// A span a program sized itself (`c`/`r`, OSC 1337 width or height) never gets here: the drawer
+/// checks `sized` first and asks for that span, however it compares to the picture's pixels.
+/// `None` says "no match": ask for the span.
 fn natural_box_px(
     store: &ImageStore,
     owner: u64,
@@ -517,10 +518,10 @@ pub fn resolve(
         // span whole (filling a smaller room would stretch the picture into a place the protocol
         // did not ask for). A placement whose span the program fixed (`sized`) takes its span too,
         // like a fill, instead of the picture's own pixels; it fills or fits its span, not the
-        // picture at 1:1. Otherwise, a picture whose span is its own pixels at this cell size
-        // asks for exactly those pixels and draws unscaled, while a span the program sized, or one
-        // no longer matching after a cell-size change, asks for the span and resamples into it as
-        // before (finding I1).
+        // picture at 1:1. Only an unsized placement reaches the natural box: a picture whose span is
+        // its own pixels at this cell size asks for exactly those pixels and draws unscaled, while
+        // one no longer matching after a cell-size change asks for the span and resamples into it
+        // as before (finding I1).
         let box_px = requested_box_px(m, p.box_px, p.box_cell_px, p.cols, p.rows)
             .or_else(|| {
                 if p.stretch || p.sized {
@@ -1982,9 +1983,14 @@ mod tests {
             sized_placement.bounds.height, 16.0,
             "the height fits the 8×16 cell"
         );
-        // The program-sized placement draws at its own 4×12 pixels.
-        let program_sized = &draws[1];
-        assert_eq!(program_sized.bounds, rect(0.0, 32.0, 4.0, 12.0));
+        assert_eq!(
+            sized_placement.bounds.width,
+            5.0,
+            "4×12 fitted into 8×16 keeps its ratio: 5.33 wide, drawn on whole pixels as 5"
+        );
+        // The unsized placement draws at its own 4×12 pixels.
+        let unsized_draw = &draws[1];
+        assert_eq!(unsized_draw.bounds, rect(0.0, 32.0, 4.0, 12.0));
     }
 
     /// A `U+10EEEE` cell whose tile cannot be resolved still does not go to text shaping: it is a
