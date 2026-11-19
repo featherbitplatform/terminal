@@ -13,7 +13,7 @@ all = "warn"
 [workspace.dependencies]
 iced = "0.14.0"
 # Terminal emulation (our fork, see LICENSES.md). Change it in the feathercritty repo, then bump the rev.
-feathercritty = { git = "https://github.com/featherbitplatform/feathercritty", rev = "6cde6ce7792c84a1478705f907b41a396f06eb6c" }
+feathercritty = { git = "https://github.com/featherbitplatform/feathercritty", rev = "8f8bc7e1bc9378a2ba00b3b7a4ec62fc1b763c90" }
 russh = { version = "0.65.0", default-features = false, features = ["flate2", "ring", "rsa"] }
 # SFTP client over a russh channel stream (it does not depend on russh itself).
 russh-sftp = "3.0.1"

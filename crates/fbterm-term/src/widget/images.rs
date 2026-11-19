@@ -151,8 +151,9 @@ pub fn placement_box_px(m: CellGeometry, cols: u32, rows: u32) -> (u32, u32) {
 /// size, nothing is filtered, pixel art and sixel output stay sharp, and the store answers with the
 /// source's own buffer (findings I1 and P4). It stops matching as soon as the font, line height or
 /// display scale changes — then the copy fills the new span, which is the scaling the spec allows.
-/// A span a program sized itself (`c`/`r`, OSC 1337 width or height) only matches by coincidence,
-/// and resampling to fill it stays as it was. `None` says "no match": ask for the span.
+/// A span a program sized itself (`c`/`r`, OSC 1337 width or height) never gets here: the drawer
+/// checks `sized` first and asks for that span, however it compares to the picture's pixels.
+/// `None` says "no match": ask for the span.
 fn natural_box_px(
     store: &ImageStore,
     owner: u64,
@@ -515,13 +516,15 @@ pub fn resolve(
         // that wins over every span-based rule below. It is drawn from the span's top-left and
         // clipped to the span as everything else is. Without a box of its own, a fill takes the
         // span whole (filling a smaller room would stretch the picture into a place the protocol
-        // did not ask for), and otherwise a picture whose span is its own pixels at this cell size
-        // asks for exactly those pixels and draws unscaled, while a span the program sized, or one
-        // no longer matching after a cell-size change, asks for the span and resamples into it as
-        // before (finding I1).
+        // did not ask for). A placement whose span the program fixed (`sized`) takes its span too,
+        // like a fill, instead of the picture's own pixels; it fills or fits its span, not the
+        // picture at 1:1. Only an unsized placement reaches the natural box: a picture whose span is
+        // its own pixels at this cell size asks for exactly those pixels and draws unscaled, while
+        // one no longer matching after a cell-size change asks for the span and resamples into it
+        // as before (finding I1).
         let box_px = requested_box_px(m, p.box_px, p.box_cell_px, p.cols, p.rows)
             .or_else(|| {
-                if p.stretch {
+                if p.stretch || p.sized {
                     Some(placement_box_px(m, p.cols, p.rows))
                 } else {
                     natural_box_px(store, owner, p.key, p.src, p.cols, p.rows, m)
@@ -1923,6 +1926,70 @@ mod tests {
             4 * 12 * 4 + 5 * 16 * 4,
             "the source frame plus the fitted copy: only the 1:1 alias was free"
         );
+    }
+
+    /// A kitty placement whose requested cell span equals the picture's natural pixel span at 1:1 must
+    /// scale to fill the cells instead of being drawn unscaled. A 4×12 picture at 8×16 cells places as
+    /// 4×12 px, or one cell in each dimension: asking for c=1,r=1 with those dimensions keeps that
+    /// size but the program intended it to scale into the 8×16 cell.
+    #[test]
+    fn a_kitty_span_equal_to_the_natural_one_is_scaled_to_fill() {
+        let store = ImageStore::with_caps(8 * MB, 32 * MB);
+        let mut term = Terminal::new(
+            crate::GridSize {
+                cols: 20,
+                rows: 6,
+                cell_width: 8.0,
+                cell_height: 16.0,
+                scale: 1.0,
+            },
+            100,
+        );
+        term.set_cell_pixel_size(8, 16);
+        // A 4×12 red picture transmitted as id 7 (192 bytes of opaque red RGBA: sixteen copies of the
+        // 16-character base64 block this pixel pattern makes every 12 bytes), not displayed yet.
+        let pixels = "/wAA//8AAP//AAD/".repeat(16);
+        term.feed(format!("\x1b_Ga=t,f=32,s=4,v=12,i=7;{pixels}\x1b\\").as_bytes());
+        for event in term.take_events() {
+            if let crate::TermEvent::ImageReceived { key, data } = event {
+                store.submit(term.image_owner(), key, data);
+            }
+        }
+        // Place first at 1×1 cell (exactly matching the 4×12 natural pixels).
+        term.feed(b"\x1b[1;1H\x1b_Ga=p,i=7,c=1,r=1;\x1b\\");
+        // Place second at no c/r (unsized).
+        term.feed(b"\x1b[3;1H\x1b_Ga=p,i=7;\x1b\\");
+        term.take_events(); // the OK replies
+
+        let m = geometry(1.0);
+        let scheme = ColorScheme::graphite();
+        assert!(resolve(&store, &term, m, &scheme).pending);
+        store.run_jobs_until_idle();
+        let layer = resolve(&store, &term, m, &scheme);
+        let draws: Vec<&ImageDraw> = layer.under_text.iter().chain(&layer.over_text).collect();
+        assert_eq!(draws.len(), 2, "both placements draw");
+        // The sized placement (c=1,r=1) should scale to fill the 8×16 cell, not draw 4×12 px.
+        let sized_placement = &draws[0];
+        assert_eq!(
+            sized_placement.bounds.y, 0.0,
+            "the sized placement is at y=0"
+        );
+        assert_ne!(
+            sized_placement.bounds,
+            rect(0.0, 0.0, 4.0, 12.0),
+            "the sized 1×1 placement does NOT draw at its source size (4×12)"
+        );
+        assert_eq!(
+            sized_placement.bounds.height, 16.0,
+            "the height fits the 8×16 cell"
+        );
+        assert_eq!(
+            sized_placement.bounds.width, 5.0,
+            "4×12 fitted into 8×16 keeps its ratio: 5.33 wide, drawn on whole pixels as 5"
+        );
+        // The unsized placement draws at its own 4×12 pixels.
+        let unsized_draw = &draws[1];
+        assert_eq!(unsized_draw.bounds, rect(0.0, 32.0, 4.0, 12.0));
     }
 
     /// A `U+10EEEE` cell whose tile cannot be resolved still does not go to text shaping: it is a
