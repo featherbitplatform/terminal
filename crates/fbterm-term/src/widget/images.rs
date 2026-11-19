@@ -1984,8 +1984,7 @@ mod tests {
             "the height fits the 8×16 cell"
         );
         assert_eq!(
-            sized_placement.bounds.width,
-            5.0,
+            sized_placement.bounds.width, 5.0,
             "4×12 fitted into 8×16 keeps its ratio: 5.33 wide, drawn on whole pixels as 5"
         );
         // The unsized placement draws at its own 4×12 pixels.
