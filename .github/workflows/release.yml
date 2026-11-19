@@ -23,6 +23,8 @@ on:
       - crates/fbterm/Cargo.toml
       - dev/release-version.sh
       - dev/test-release-version.sh
+      - dev/lib/pkg-version.sh
+      - dev/test-package-version.sh
       - .github/workflows/release.yml
   workflow_dispatch:
 
@@ -40,8 +42,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
 
-  # The tag check every packaging job runs, tested with fake refs: the matching tag passes, a
-  # mismatched one is refused. Runs on pull requests too, where no real tag can be tried.
+  # The pure-bash tests for the release version scripts: the tag check every packaging job runs,
+  # tested with fake refs (the matching tag passes, a mismatched one is refused), and the package
+  # version mapping dev/package-linux.sh feeds to cargo-deb and cargo-generate-rpm. Runs on pull
+  # requests too, where no real tag can be tried.
   release-version-check:
     name: release version check
     runs-on: ubuntu-latest
@@ -52,9 +56,13 @@ jobs:
             Cargo.toml
             dev/release-version.sh
             dev/test-release-version.sh
+            dev/lib/pkg-version.sh
+            dev/test-package-version.sh
           sparse-checkout-cone-mode: false
       - name: Matching and mismatched tags
         run: bash dev/test-release-version.sh
+      - name: Package version mapping
+        run: bash dev/test-package-version.sh
 
   package:
     name: unsigned universal macOS dmg
